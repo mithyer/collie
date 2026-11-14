@@ -3430,6 +3430,26 @@ export function startServer(opts: {
         });
         return secure(new Response(null, { status: 204 }));
       }
+      if (pathname === "/api/subscribe" && req.method === "DELETE") {
+        // A phone that turns notifications off takes its own subscription away. Read-level like the POST
+        // above; the row must belong to the asking device (`removeOwn`), so a paired phone cannot remove
+        // another phone's. The web page has no use for this (the browser unsubscribes itself and Collie
+        // prunes the dead endpoint), so nothing existing changes.
+        const denied = guard(req, cfg, "read", pairingGate);
+        if (denied) return denied;
+        let body: JsonValue;
+        try {
+          // SAFETY: `Request.json()` output IS a JsonValue by construction; the one field read below is
+          // checked to be a string before it is used.
+          body = (await req.json()) as JsonValue;
+        } catch {
+          return text("bad subscription", 400);
+        }
+        const endpoint = asJsonRecord(body)?.endpoint;
+        if (typeof endpoint !== "string" || endpoint === "") return text("bad subscription", 400);
+        const removed = await push.removeOwn(endpoint, pairedLabel(req, pairingGate) ?? undefined);
+        return removed ? secure(new Response(null, { status: 204 })) : text("no such subscription", 404);
+      }
       if (pathname === "/api/notifications/snooze" && req.method === "POST") {
         // Managing your own notification quiet-hours isn't terminal-driving — read-level, like subscribe.
         const denied = guard(req, cfg, "read", pairingGate);

@@ -330,3 +330,37 @@ describe("Push and a client that cannot take an alert back", () => {
     expect(push["subs"].get("https://relay.example/v1/push/x")?.alertOnly).toBeUndefined();
   });
 });
+
+// A phone that turns notifications off takes its own subscription away (`DELETE /api/subscribe`).
+describe("removing one's own subscription", () => {
+  const keys = { p256dh: "p", auth: "a" };
+
+  test("the device that registered it can remove it, and only the exact endpoint goes", async () => {
+    const { push } = await rig([]);
+    await push.addSubscription({ endpoint: "https://relay.example/v1/push/a", keys }, { device: "pixel" });
+    await push.addSubscription({ endpoint: "https://relay.example/v1/push/b", keys }, { device: "pixel" });
+    expect(await push.removeOwn("https://relay.example/v1/push/a", "pixel")).toBe(true);
+    expect(push["subs"].has("https://relay.example/v1/push/a")).toBe(false);
+    expect(push["subs"].has("https://relay.example/v1/push/b")).toBe(true);
+  });
+
+  test("another device cannot remove it, and a request with no device label removes nothing", async () => {
+    const { push } = await rig([]);
+    await push.addSubscription({ endpoint: "https://relay.example/v1/push/a", keys }, { device: "pixel" });
+    expect(await push.removeOwn("https://relay.example/v1/push/a", "iphone")).toBe(false);
+    expect(await push.removeOwn("https://relay.example/v1/push/a", undefined)).toBe(false);
+    expect(push["subs"].has("https://relay.example/v1/push/a")).toBe(true);
+  });
+
+  test("a row registered with no device label belongs to no one who can ask", async () => {
+    const { push } = await rig([]);
+    await push.addSubscription({ endpoint: "https://push.example/web", keys }, {});
+    expect(await push.removeOwn("https://push.example/web", "pixel")).toBe(false);
+    expect(push["subs"].has("https://push.example/web")).toBe(true);
+  });
+
+  test("an unknown endpoint is reported as not removed", async () => {
+    const { push } = await rig([]);
+    expect(await push.removeOwn("https://relay.example/v1/push/none", "pixel")).toBe(false);
+  });
+});

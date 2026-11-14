@@ -636,6 +636,25 @@ export class Push {
   }
 
   /**
+   * Removes one subscription, on its owner's own request (`DELETE /api/subscribe`): the phone turned
+   * notifications off. Exact endpoint, and only when the row belongs to the same device that asks,
+   * so one paired phone cannot remove another's. The owner is the pairing label the row was
+   * registered under; a row with no label belongs to no one that can ask this way.
+   *
+   * @param endpoint The subscription's endpoint, exactly as it was registered.
+   * @param device The asking device's pairing label, or undefined when the request has none.
+   * @returns Whether a row was removed.
+   */
+  // TEST: push-rules.test.ts
+  async removeOwn(endpoint: string, device: string | undefined): Promise<boolean> {
+    const sub = this.subs.get(endpoint);
+    if (sub === undefined || device === undefined || sub.device !== device) return false;
+    this.drop(endpoint);
+    await this.save();
+    return true;
+  }
+
+  /**
    * Drop every row whose endpoint CONTAINS `match` (or all of them for `"*"`), and persist. Returns
    * how many went. This is the hand-operated counterpart to the automatic prune in {@link broadcast}
    * — which can only ever catch an endpoint the push service has disowned, and an orphan the device

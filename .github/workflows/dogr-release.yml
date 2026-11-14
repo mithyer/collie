@@ -1,0 +1,498 @@
+name: Dogr release
+
+# The fork's own release, one per `vX.Y.Z-dogr.N` tag. It is `release.yml` with what a fork does not need
+# taken out (the CI wait, Windows, the website and the packaging jobs) and with the Dogr stamp in place
+# of the Edge one (scripts/dogr-stamp.ts). The assets are the same set under the same names, so
+# `collie update` and `scripts/install.sh` read them unchanged; the in-binary update repository
+# is this repository, because the stamp wrote it before the build.
+#
+# THIS FILE IS OURS, NOT UPSTREAM'S, and upstream's `release.yml`, `ci.yml` and the rest are DISABLED in
+# the fork's Actions settings (`gh workflow disable`), not deleted, so that merging upstream never
+# conflicts on them. `release.yml` matches `v*.*.*`, which a Dogr tag also matches: leaving it enabled
+# would run both. collie-fork.md in the wiki holds the whole plan, including how to cut a release.
+#
+# A tag goes on a commit whose version files say plain X.Y.Z, and the tag list of this repository must
+# hold no strict `vX.Y.Z` at or above that X.Y.Z (the gate below refuses it).
+on:
+  push:
+    tags: ["v*.*.*-dogr.*"]
+
+permissions:
+  contents: write # create the release
+
+jobs:
+  # ── The tag must be one the update logic can live with ────────────────────
+  # Upstream waits here for its CI. The fork's CI is switched off and the tests are run by hand before
+  # a tag is cut (collie-fork.md), so the gate checks the one thing a machine cannot: the tag shape, the
+  # commit it sits on, and a tag list with no strict tag that would hide this build.
+  gate:
+    name: The tag is a Dogr tag on a matching commit
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: DeterminateSystems/nix-installer-action@v22
+      - name: Check the tag and the repository's tag list
+        run: |
+          set -euo pipefail
+          git tag --list > "$RUNNER_TEMP/tags.txt"
+          nix develop --command bun scripts/dogr-stamp.ts --tag "$GITHUB_REF_NAME" --tags-file "$RUNNER_TEMP/tags.txt"
+
+  # ── The per-platform payloads ──────────────────────────────────────────────
+  # One job per artifact, because two of the constraints are hard:
+  #   * macOS artifacts are BUILT ON macOS. A cross-produced Mach-O is unsigned, and an unsigned
+  #     arm64 binary does not execute on Apple Silicon at all — the kernel refuses it.
+  #   * linux-x64 ships Bun's BASELINE target. The default `bun-linux-x64` requires AVX2 and dies
+  #     with SIGILL on older hardware, which is exactly the hardware a self-hosted tool lives on.
+  #     Collie is I/O-bound (a Unix socket and static files), so the baseline penalty is not
+  #     observable here.
+  # The matrix ships all four targets; macos-x64 is cross-compiled on the macos-15 row (arm64, like macos-14 before it; #385). A
+  # platform with no row gets `collie update`'s honest "no artifact for your platform, build from
+  # source" rather than a wrong binary.
+  payload:
+    needs: gate
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - platform: linux-x64
+            runs-on: ubuntu-latest
+            bun-target: bun-linux-x64-baseline
+          - platform: macos-arm64
+            runs-on: macos-15
+            bun-target: bun-darwin-arm64
+          - platform: linux-arm64
+            runs-on: ubuntu-24.04-arm
+            bun-target: bun-linux-arm64
+          - platform: macos-x64
+            runs-on: macos-15
+            bun-target: bun-darwin-x64-baseline
+    runs-on: ${{ matrix.runs-on }}
+    steps:
+      - uses: actions/checkout@v4
+      # The build environment is `flake.nix`, not whatever Bun a setup action resolved on the day.
+      # This installer is the one that covers all three shipped runners — Linux x86_64, Linux
+      # aarch64 and macOS aarch64 — and it turns flakes on out of the box.
+      - uses: DeterminateSystems/nix-installer-action@v22
+
+      - name: Build the payload
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          BUN_TARGET: ${{ matrix.bun-target }}
+        run: |
+          set -eu
+          # The build body below is unchanged, and it runs under `nix develop` — so `bun`, `node`,
+          # `git`, `tmux` and `zellij` are the versions `flake.lock` names, on every runner, rather
+          # than whatever the machine happened to carry. It is written to a file rather than piped,
+          # so nothing competes for the shell's stdin, and it keeps its own `set -eu`.
+          cat > "$RUNNER_TEMP/build-payload.sh" <<'PAYLOAD'
+          set -eu
+          version="${GITHUB_REF_NAME#v}"
+          root="collie-$version-$PLATFORM"
+          stage="$RUNNER_TEMP/$root"
+          mkdir -p "$stage/bin" "$stage/web"
+
+          # The version gate `collie build` runs, run here too: a release whose four version files
+          # disagree must not become a downloadable artifact. It runs BEFORE the stamp below, because
+          # the files in git say plain X.Y.Z and the gate refuses anything else.
+          bash scripts/check-version.sh
+
+          # A DOGR TAG IS STAMPED BEFORE ANYTHING READS A VERSION. The files say plain X.Y.Z (the
+          # upstream release this branch was merged up to); this writes X.Y.Z-dogr.N into this runner's
+          # copy of the three, so the web build's stamp and `collie version` name the Dogr build, and it
+          # points every built-in "where do updates come from" default at THIS repository, so the binary
+          # asks the fork and not Collie's own repository. It refuses a tag on the wrong commit and a
+          # spot upstream has moved (scripts/dogr-stamp.ts holds the reasons).
+          bun scripts/dogr-stamp.ts --tag "$GITHUB_REF_NAME" --stamp --repo "$GITHUB_REPOSITORY"
+
+          bun install --frozen-lockfile
+          (cd web && bun install --frozen-lockfile && bun run build)
+
+          # NO LINT STEP, here or anywhere on an operator's path: oxlint's allocator SIGABRTs below
+          # roughly 7 GB of RAM and bricked real installs (1.0.0-beta.44). CI lints in its own
+          # workflow, over the full tree, which is the only run that defines "passing".
+          # THE COMPILE RUNS ON THE UPSTREAM BUN, not on the one this shell just used, because
+          # `bun build --compile` copies the RUNNING bun as the base of what it emits and nixpkgs
+          # patches its own copy into the Nix store (#184). scripts/upstream-bun.sh realises the
+          # archive `flake.nix` pins and prints its bun; its header carries the whole argument.
+          upstream_bun="$(FLAKE_ROOT="$GITHUB_WORKSPACE" bash scripts/upstream-bun.sh)"
+          bun run scripts/build-cli.ts \
+            --bun "$upstream_bun" \
+            --target "$BUN_TARGET" \
+            --outfile "$stage/bin/collie"
+          chmod 0755 "$stage/bin/collie"
+
+          # Ad-hoc codesign makes the binary RUNNABLE on Apple Silicon. It makes no claim about who
+          # produced it — notarization is a recorded gap (M14/01 §6.2), and the quarantine attribute
+          # a BROWSER download sets is documented in docs/install.md with its one-line removal.
+          case "$PLATFORM" in
+            macos-*)
+              codesign --force --sign - --timestamp=none "$stage/bin/collie"
+              codesign -dv "$stage/bin/collie"
+              ;;
+          esac
+
+          cp -R web/dist "$stage/web/dist"
+          # The math engines are not in any install (ADR 0132): they are the `collie-math-<version>`
+          # asset the host downloads on a tap. The release job proves this folder is gone.
+          rm -rf "$stage/web/dist/math"
+          # The files the bridge and the installer's closing text read at run time. `herdr-plugin.toml`
+          # is bridge/root.ts's MARKER and the canonical version; `package.json` is what
+          # bridge/index.ts reads `currentVersion` from — without it the bridge crashes at boot.
+          cp herdr-plugin.toml package.json .env.example CHANGELOG.md LICENSE README.md "$stage/"
+          cp -R docs "$stage/docs"
+          # The shim the MANIFEST names. Every `[[actions]]` entry in `herdr-plugin.toml` is frozen
+          # byte-for-byte as `bash scripts/collie-ctl.sh <verb>` (ADR 0006), so a payload that carries
+          # the manifest without the shim hands Herdr a set of action buttons that cannot resolve —
+          # which is exactly what an OS package built from this tarball would install. Only the shim
+          # is needed: it resolves nothing here and `exec`s `bin/collie`, which is already in $stage.
+          mkdir -p "$stage/scripts"
+          cp scripts/collie-ctl.sh "$stage/scripts/collie-ctl.sh"
+          chmod 0755 "$stage/scripts/collie-ctl.sh"
+
+          PAYLOAD
+          nix develop --command bash "$RUNNER_TEMP/build-payload.sh"
+
+      # OUTSIDE `nix develop`, and that is the whole point of it being its own step. Everything
+      # above ran inside the flake, and the bun derivation's own install check runs inside Nix too,
+      # so neither can see a link into the build machine's store. Nor can simply STARTING the binary
+      # here: nix-installer-action left a /nix/store on this runner, so a binary that only runs
+      # because that store exists runs perfectly. The loader check is the guard; the version run
+      # after it only proves the binary that passed the check is the binary that works (#184).
+      #
+      # The tarball is sealed HERE rather than in the build, because a tarball is what an operator
+      # downloads: it must not exist before the binary inside it has been checked.
+      - name: Check the binary an operator gets, then seal the tarball
+        # The id must stay `build`: "Describe the artifact" below reads this step's outputs.
+        id: build
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          set -euo pipefail
+          # Recomputed from the same two facts the build body used, rather than carried across: the
+          # tag and the matrix platform are both already in this step's environment.
+          version="${GITHUB_REF_NAME#v}"
+          root="collie-$version-$PLATFORM"
+          stage="$RUNNER_TEMP/$root"
+
+          bash scripts/check-payload-links.sh "$stage/bin/collie"
+
+          # The macos-x64 binary is cross-compiled on an arm64 runner and cannot run here: Rosetta has
+          # no AVX and Bun's x64 runtime dies with SIGILL under it, baseline target or not. So that row
+          # is checked by what it IS, an x86_64 Mach-O that carries a signature, and not by running it.
+          if [ "$PLATFORM" = "macos-x64" ]; then
+            archs="$(lipo -archs "$stage/bin/collie")"
+            [ "$archs" = "x86_64" ] || { echo "the macos-x64 binary is '$archs', not x86_64" >&2; exit 1; }
+            echo "✓ $root/bin/collie is x86_64 (not run: no x86_64 runtime on this runner)"
+            tar -czf "$RUNNER_TEMP/$root.tar.gz" -C "$RUNNER_TEMP" "$root"
+            echo "root=$root" >> "$GITHUB_OUTPUT"
+            echo "tarball=$RUNNER_TEMP/$root.tar.gz" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          reported="$("$stage/bin/collie" version)"
+          case "$reported" in
+            "$version"*) ;;
+            *) echo "the compiled binary reports '$reported', which does not start with '$version'" >&2; exit 1 ;;
+          esac
+          echo "✓ $root/bin/collie reports $reported"
+
+          # The only step in CI that runs the compiled binary, so it is also the only place the
+          # embedded manual can be proven: `docs crew` prints a page nothing on disk supplied.
+          page="$("$stage/bin/collie" docs crew | head -1)"
+          if [ "$page" != "# Crew commands" ]; then
+            echo "the compiled binary answered 'docs crew' with '$page', not the embedded page" >&2
+            exit 1
+          fi
+          echo "✓ $root/bin/collie carries the embedded operator docs"
+
+          tar -czf "$RUNNER_TEMP/$root.tar.gz" -C "$RUNNER_TEMP" "$root"
+          echo "root=$root" >> "$GITHUB_OUTPUT"
+          echo "tarball=$RUNNER_TEMP/$root.tar.gz" >> "$GITHUB_OUTPUT"
+
+      # `steps.build` is the sealing step above, not the build body — the tarball is an output of
+      # the step that made it, so that id may not move.
+      - name: Describe the artifact
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          BUN_TARGET: ${{ matrix.bun-target }}
+          TARBALL: ${{ steps.build.outputs.tarball }}
+          PAYLOAD_ROOT: ${{ steps.build.outputs.root }}
+        run: |
+          set -eu
+          # One entry of the manifest's `artifacts[]`, emitted per platform and merged in the release
+          # job. The hasher is resolved rather than assumed: Linux runners have `sha256sum`, macOS
+          # has `shasum`, and a missing one must FAIL here — a pipeline into `cut` would hide it and
+          # publish a manifest with an empty digest.
+          if command -v sha256sum >/dev/null 2>&1; then SHA="sha256sum"; else SHA="shasum -a 256"; fi
+          line="$($SHA "$TARBALL")"
+          sha="${line%% *}"
+          [ ${#sha} -eq 64 ] || { echo "no usable sha256 tool on this runner" >&2; exit 1; }
+          size="$(wc -c < "$TARBALL" | tr -d ' ')"
+          name="$(basename "$TARBALL")"
+          os="${PLATFORM%-*}"; arch="${PLATFORM##*-}"
+          mkdir -p "$RUNNER_TEMP/out"
+          cp "$TARBALL" "$RUNNER_TEMP/out/$name"
+          printf '%s  %s\n' "$sha" "$name" > "$RUNNER_TEMP/out/$name.sha256"
+          case "$os" in
+            linux) libc='"glibc"'; variant='"baseline"'; extra='' ;;
+            *)     libc='null';    variant='null';       extra=', "codesign": "adhoc", "notarized": false' ;;
+          esac
+          cat > "$RUNNER_TEMP/out/$PLATFORM.artifact.json" <<JSON
+          {
+            "name": "$name",
+            "platform": "$PLATFORM",
+            "os": "$os",
+            "arch": "$arch",
+            "libc": $libc,
+            "variant": $variant,
+            "bunTarget": "$BUN_TARGET",
+            "size": $size,
+            "sha256": "$sha",
+            "payloadRoot": "$PAYLOAD_ROOT"$extra
+          }
+          JSON
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: payload-${{ matrix.platform }}
+          path: ${{ runner.temp }}/out/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # ── Assemble and publish ───────────────────────────────────────────────────
+  release:
+    # Every payload row must be green: a release with a platform missing would tell that platform's
+    # machines "no artifact" while the others updated.
+    needs: payload
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The release notes carry a compare link against the PREVIOUS tag, and the step below
+          # asks git for it with `git describe --tags`. A default checkout is one commit deep and
+          # carries no tags at all, so `describe` would answer nothing and the compare line would
+          # silently disappear from every release page. Full depth is the cheap fix: this job is
+          # not the one that builds the payloads.
+          fetch-depth: 0
+      # The same flake as the payload job, for the same reason: this job builds the `web/dist`
+      # asset the demo runs, and reads the manifest back with Bun.
+      - uses: DeterminateSystems/nix-installer-action@v22
+
+      # The same stamp the payload jobs take, before this job builds `web/dist`, so that bundle names
+      # the Dogr build and the fork's repository as well.
+      - name: Reconcile the tag with the version files
+        run: nix develop --command bun scripts/dogr-stamp.ts --tag "$GITHUB_REF_NAME" --stamp --repo "$GITHUB_REPOSITORY"
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: payload-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/assets
+
+      # The built frontend, published as an asset. It is what colliepwa.dev's demo runs: a pinned
+      # release bundle whose network calls are answered in the browser, so the demo shows the real
+      # app without this repo carrying a line of demo code. Collie itself never consumes it — a
+      # binary install gets `web/dist` inside its own payload — and it is listed under the manifest's
+      # `extras`, not its `artifacts`, for exactly that reason.
+      - name: Build and package web/dist
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          nix develop --command bash -c "cd web && bun install --frozen-lockfile && bun run build"
+          tar -czf "$RUNNER_TEMP/assets/web-dist-$version.tar.gz" --exclude='dist/math' -C web dist
+
+      # THE MATH PACK (ADR 0132). Both engines, every file under `math/`, from this job's build, as a
+      # ustar archive with sorted names, owner 0 and a fixed mtime, so the same build makes the same
+      # bytes. It is listed in the manifest's `extras` with role `math-pack`; the host fetches it only
+      # when someone taps "Download the math engines" in Settings, and checks it against that entry.
+      - name: Build the math pack
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          tar --format=ustar --sort=name --owner=0 --group=0 --numeric-owner --mtime=@0 \
+            -cf - -C web/dist math | gzip -9n > "$RUNNER_TEMP/assets/collie-math-$version.tar.gz"
+          ls -l "$RUNNER_TEMP/assets/collie-math-$version.tar.gz"
+
+      # No install carries the engines, and every install finds its own in the pack. The engines are
+      # self-contained bundles (web/vite.math.ts), so the pack must hold the files the app's loader
+      # names and import nothing outside each engine's folder. Every payload (each tarball, the Windows
+      # zip when there is one) and the web-dist asset is unpacked and read: engine code in its app
+      # bundle fails the release, and so does a `web/dist/math` that is not the pack. The payloads build
+      # `web/dist` on their own runners, so this is the step that makes "the pack fits every payload" a
+      # fact. `scripts/math-pack.test.ts` pins the rules.
+      - name: Check the math pack against every payload
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          work="$RUNNER_TEMP/math-check"
+          mkdir -p "$work"
+          dists=()
+          for f in "$RUNNER_TEMP"/assets/collie-"$version"-*.tar.gz; do
+            d="$work/$(basename "$f" .tar.gz)"
+            mkdir -p "$d"
+            tar -xzf "$f" -C "$d"
+            dists+=("$d"/*/web/dist)
+          done
+          for f in "$RUNNER_TEMP"/assets/*.zip; do
+            [ -e "$f" ] || continue
+            d="$work/$(basename "$f" .zip)"
+            mkdir -p "$d"
+            unzip -q "$f" -d "$d"
+            dists+=("$d"/*/web/dist)
+          done
+          mkdir -p "$work/web-dist"
+          tar -xzf "$RUNNER_TEMP/assets/web-dist-$version.tar.gz" -C "$work/web-dist"
+          dists+=("$work/web-dist/dist")
+          nix develop --command bun scripts/math-pack.ts check \
+            --pack "$RUNNER_TEMP/assets/collie-math-$version.tar.gz" "${dists[@]}"
+          rm -rf "$work"
+
+      - name: Write the integrity manifest
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          cd "$RUNNER_TEMP/assets"
+          # `prerelease` follows the tag's own hyphen, the same rule `gh release create` is given
+          # below — one fact, spelled twice, never derived two ways.
+          prerelease=false
+          case "$GITHUB_REF_NAME" in *-*) prerelease=true ;; esac
+          {
+            printf '{\n'
+            printf '  "schemaVersion": 1,\n'
+            printf '  "repo": "%s",\n' "$GITHUB_REPOSITORY"
+            printf '  "tag": "%s",\n' "$GITHUB_REF_NAME"
+            printf '  "version": "%s",\n' "$version"
+            printf '  "prerelease": %s,\n' "$prerelease"
+            printf '  "releasedAt": "%s",\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            printf '  "commit": "%s",\n' "$GITHUB_SHA"
+            printf '  "artifacts": [\n'
+            first=1
+            for f in *.artifact.json; do
+              [ "$first" -eq 1 ] || printf ',\n'
+              first=0
+              sed 's/^/    /' "$f"
+            done
+            printf '\n  ],\n'
+            printf '  "extras": [\n'
+            printf '    {\n'
+            printf '      "name": "web-dist-%s.tar.gz",\n' "$version"
+            printf '      "role": "web-bundle",\n'
+            printf '      "size": %s,\n' "$(wc -c < "web-dist-$version.tar.gz" | tr -d ' ')"
+            printf '      "sha256": "%s"\n' "$(sha256sum "web-dist-$version.tar.gz" | cut -d' ' -f1)"
+            printf '    },\n'
+            printf '    {\n'
+            printf '      "name": "collie-math-%s.tar.gz",\n' "$version"
+            printf '      "role": "math-pack",\n'
+            printf '      "size": %s,\n' "$(wc -c < "collie-math-$version.tar.gz" | tr -d ' ')"
+            printf '      "sha256": "%s"\n' "$(sha256sum "collie-math-$version.tar.gz" | cut -d' ' -f1)"
+            printf '    }\n'
+            printf '  ]\n'
+            printf '}\n'
+          } > "collie-$version.manifest.json"
+          rm -f ./*.artifact.json
+          # Machine-readable proof that the document we just wrote is JSON, before anyone downloads
+          # it: a manifest that does not parse fails the release, not the operator's update.
+          # This step's cwd is $RUNNER_TEMP/assets, outside the checkout, so the flake must be
+          # named by path — `nix develop` alone finds no flake.nix above the assets directory.
+          nix develop "$GITHUB_WORKSPACE" --command bun -e 'JSON.parse(await Bun.file(process.argv[1]).text())' "collie-$version.manifest.json"
+          # A sidecar beside EVERY asset, including the manifest — `sha256sum -c <asset>.sha256` on
+          # Linux, `shasum -a 256 -c` on macOS, both unmodified.
+          for f in *.tar.gz *.manifest.json; do
+            [ -e "$f.sha256" ] || sha256sum "$f" > "$f.sha256"
+          done
+          ls -l
+
+      # ── What this release says about itself (M27/06) ──────────────────────
+      # One tiny asset, `collie-release.json`, carrying the version, the CREW WIRE VERSION this
+      # release speaks, and the `**Urgent.**` line when the CHANGELOG section carries one. The update
+      # check on an installed Collie reads it and can then tell an operator, BEFORE they confirm,
+      # that the update changes the link their crew talks over, and that the release asked to reach
+      # them today (ADR 0046). Generic by construction: the notices are about a NUMBER and about a
+      # line the author wrote, so the release after the next one says them too with no code change.
+      #
+      # THE DOCUMENT IS EVALUATED, NEVER TRANSCRIBED. `scripts/release-reading.ts` imports the same
+      # module the binary compiles, so the protocol number cannot drift from the build, and it reads
+      # the urgent line out of the same CHANGELOG the release page is built from. A missing or
+      # non-integer protocol fails the release here, before anything is published, rather than
+      # shipping a document an install would silently discard. `scripts/release-reading.test.ts`
+      # pins the shape.
+      - name: Write the release reading
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          # The Dogr twin of scripts/release-reading.ts: the CHANGELOG section of the BASE version, and the
+          # Dogr version on top of it.
+          nix develop --command bun scripts/dogr-stamp.ts --tag "$GITHUB_REF_NAME" --reading \
+            > "$RUNNER_TEMP/assets/collie-release.json"
+          # Proof it parses before anyone downloads it, exactly as the manifest is proved above.
+          nix develop --command bun -e 'JSON.parse(await Bun.file(process.argv[1]).text())' \
+            "$RUNNER_TEMP/assets/collie-release.json"
+          cat "$RUNNER_TEMP/assets/collie-release.json"
+          # ONE LINE THAT MAKES URGENCY A SEEN DECISION (ADR 0046). The marker changes how hard this
+          # release pushes at every operator, so it is stated in the log and on the job summary
+          # rather than left to whoever opens the asset. An ordinary release says so too, so the
+          # absence of the line never means "nobody looked".
+          reason="$(nix develop --command bun -e 'const d = JSON.parse(await Bun.file(process.argv[1]).text()); process.stdout.write(d.urgent?.reason ?? "")' "$RUNNER_TEMP/assets/collie-release.json")"
+          if [ -n "$reason" ]; then
+            line="urgent: $reason"
+          else
+            line="urgent: none, ordinary release"
+          fi
+          echo "$line"
+          echo "$line" >> "$GITHUB_STEP_SUMMARY"
+
+      # THE NOTES ARE OUR OWN, NOT scripts/release-notes.ts. That script reads this version's section of
+      # CHANGELOG.md, and a Dogr build has none: the section belongs to the base release, which is
+      # Collie's. The page says what the build is, where its changes are, and how to install and verify it.
+      - name: Write release notes
+        id: notes
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          # The base version and the build counter come from the same script that checked the tag. They are
+          # picked out by name, because `nix develop` may print its own lines on stdout.
+          read_out="$(nix develop --command bun scripts/dogr-stamp.ts --tag "$GITHUB_REF_NAME")"
+          base="$(printf '%s\n' "$read_out" | sed -n 's/^base=//p')"
+          n="$(printf '%s\n' "$read_out" | sed -n 's/^n=//p')"
+          [ -n "$base" ] && [ -n "$n" ] || { echo "dogr-stamp printed no base or counter: $read_out" >&2; exit 1; }
+          notes="$RUNNER_TEMP/notes.md"
+          # The previous Dogr tag, asked of git; an empty answer (the first build) means no compare line.
+          prev="$(git describe --tags --abbrev=0 --match 'v*-dogr.*' "${GITHUB_REF_NAME}^" 2>/dev/null || true)"
+          {
+            printf 'Dogr build %s of Collie %s.\n\n' "$n" "$base"
+            printf 'This is the Dogr fork of [Collie](https://github.com/AltanS/collie), built from upstream release v%s plus the fork'"'"'s own changes. What Collie %s changed is in [its changelog](https://github.com/AltanS/collie/blob/v%s/CHANGELOG.md).\n\n' "$base" "$base" "$base"
+            printf '## Update\n\nOn a machine that already runs this fork:\n\n    collie update\n\n'
+            printf 'A first install, or a machine that runs Collie'"'"'s own build, pinned to this tag:\n\n'
+            printf '    COLLIE_UPDATE_REPO=%s COLLIE_TAG=%s sh -c "$(curl -fsSL https://raw.githubusercontent.com/%s/%s/scripts/install.sh)"\n\n' "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME"
+            if [ -n "$prev" ]; then
+              printf '## Changes since %s\n\n[%s...%s](https://github.com/%s/compare/%s...%s)\n\n' "$prev" "$prev" "$GITHUB_REF_NAME" "$GITHUB_REPOSITORY" "$prev" "$GITHUB_REF_NAME"
+            fi
+            printf '## Verify a download\n\nEvery asset has a `.sha256` file beside it: `sha256sum -c collie-%s-linux-x64.tar.gz.sha256` on Linux, `shasum -a 256 -c` on macOS. `collie-%s.manifest.json` lists every asset with its size and digest.\n' "$version" "$version"
+          } > "$notes"
+          cat "$notes"
+          echo "file=$notes" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # GitHub does NOT infer "prerelease" from a semver hyphen — the API defaults to
+          # prerelease:false, which also moves the Latest badge. An `-edge.N` tag (or an old `-beta`)
+          # must never take that badge from the Stable line, so mark it explicitly, and say
+          # `--latest=false` as well rather than leave it to GitHub's own reading of the two flags.
+          flags=()
+          case "$GITHUB_REF_NAME" in *-*) flags=(--prerelease --latest=false) ;; esac
+          # No `--generate-notes`. GitHub's generated summary only knows merged pull requests, and
+          # most of Collie's history lands as direct commits or as cherry-picks that keep the
+          # author, so that list showed a handful of entries under a release that moved twenty
+          # things and read as if almost nothing had happened. The compare link was the one part
+          # worth keeping, and the notes file now writes it itself.
+          gh release create "$GITHUB_REF_NAME" "${flags[@]}" \
+            --title "$GITHUB_REF_NAME" \
+            --notes-file "${{ steps.notes.outputs.file }}" \
+            "$RUNNER_TEMP"/assets/*

@@ -7,7 +7,7 @@ import { loadConfig } from "./config.ts";
 import type { JsonObject } from "./json.ts";
 import { defaultPhoneRules, type PhoneRules, RulesGate, RulesStore } from "./notify-rules.ts";
 import { CLEAR_BURST_MS, Push } from "./push.ts";
-import type { PushMessage, PushSender, SendOptions } from "./push.ts";
+import type { PushMessage, PushSender, SendOptions, StoredSubscription } from "./push.ts";
 
 // The seam between push.ts and the per-phone rules: what each subscription is sent, when, and what a
 // clear or a newer render cancels. The gate is the real one over a real store; only the clock, the
@@ -53,7 +53,7 @@ type Sent = { endpoint: string; body: JsonObject; options: SendOptions };
 
 /** A Push with the real gate, phones named by endpoint and pairing label, and a recording sender. */
 async function rig(
-  phones: { endpoint: string; device?: string; rules?: PhoneRules }[],
+  phones: { endpoint: string; device?: string; rules?: PhoneRules; alertOnly?: boolean }[],
   options: { bridgeDelayMs?: number; withGate?: boolean; revisions?: number[] } = {},
 ) {
   const cfg = { ...loadConfig(), stateDir: await tempDir() };
@@ -83,7 +83,9 @@ async function rig(
   // both fields against their real declarations.
   push["_enabled"] = true;
   for (const p of phones) {
-    push["subs"].set(p.endpoint, { endpoint: p.endpoint, keys: { p256dh: "p", auth: "a" }, device: p.device });
+    const row: StoredSubscription = { endpoint: p.endpoint, keys: { p256dh: "p", auth: "a" }, device: p.device };
+    if (p.alertOnly === true) row.alertOnly = true;
+    push["subs"].set(p.endpoint, row);
     if (p.device !== undefined && p.rules !== undefined) await store.set(p.device, p.rules);
   }
   /** What reached one phone as a notification (a clear is silent and not counted). */
@@ -273,5 +275,58 @@ describe("Push with the phones' rules", () => {
     await push.send(alert("collie:herd:p1", "w1:p1", "agent.done"));
     await clock.advance(60 * 60_000);
     expect(shown("a")).toHaveLength(1);
+  });
+});
+
+// A client behind the relay (the Dogr app) cannot take an alert back: a clear sent to it would show
+// up as a message of its own. So it is registered `alertOnly`, and Push leaves the clears out.
+describe("Push and a client that cannot take an alert back", () => {
+  /** What reached one phone as a clear. */
+  const clears = (sent: Sent[], endpoint: string) => sent.filter((x) => x.endpoint === endpoint && x.body.type === "clear");
+
+  test("a clear goes to a browser and not to an alert-only phone, which still gets every alert", async () => {
+    const { push, clock, sent, shown } = await rig([
+      { endpoint: "browser", device: "mac" },
+      { endpoint: "app", device: "pixel", alertOnly: true },
+    ]);
+    await push.send(alert("collie:herd:p1"));
+    expect(shown("browser")).toHaveLength(1);
+    expect(shown("app")).toHaveLength(1);
+    await push.send({ type: "clear", tag: "collie:herd:p1", title: "", body: "" });
+    await clock.advance(CLEAR_BURST_MS + 1);
+    expect(clears(sent, "browser")).toHaveLength(1);
+    expect(clears(sent, "app")).toHaveLength(0);
+  });
+
+  test("a clear with no slot is left out for the alert-only phone too", async () => {
+    const { push, sent } = await rig([
+      { endpoint: "browser", device: "mac" },
+      { endpoint: "app", device: "pixel", alertOnly: true },
+    ]);
+    await push.send({ type: "clear", title: "", body: "" });
+    expect(clears(sent, "browser")).toHaveLength(1);
+    expect(clears(sent, "app")).toHaveLength(0);
+  });
+
+  test("a clear does not use up the alert-only phone's silent-clear budget", async () => {
+    const { push, clock, sent } = await rig([{ endpoint: "app", device: "pixel", alertOnly: true }]);
+    for (let n = 0; n < 8; n += 1) {
+      await push.send({ type: "clear", tag: `collie:herd:p${n}`, title: "", body: "" });
+      await clock.advance(CLEAR_BURST_MS + 1);
+    }
+    expect(clears(sent, "app")).toHaveLength(0);
+    expect(push["clearSpends"].get("app") ?? []).toHaveLength(0);
+  });
+
+  test("a registration that says alertOnly is stored as such, and one that does not is not", async () => {
+    const { push } = await rig([]);
+    const keys = { p256dh: "p", auth: "a" };
+    await push.addSubscription({ endpoint: "https://relay.example/v1/push/x", keys }, { alertOnly: true });
+    await push.addSubscription({ endpoint: "https://push.example/y", keys }, {});
+    expect(push["subs"].get("https://relay.example/v1/push/x")?.alertOnly).toBe(true);
+    expect(push["subs"].get("https://push.example/y")?.alertOnly).toBeUndefined();
+    // Registering the same endpoint again without the flag takes it away: the registration is the truth.
+    await push.addSubscription({ endpoint: "https://relay.example/v1/push/x", keys }, {});
+    expect(push["subs"].get("https://relay.example/v1/push/x")?.alertOnly).toBeUndefined();
   });
 });

@@ -3425,6 +3425,7 @@ export function startServer(opts: {
           userAgent: req.headers.get("user-agent") ?? undefined,
           device: pairedLabel(req, pairingGate) ?? undefined,
           closesOwn: asJsonRecord(body)?.closesOwn === true,
+          alertOnly: asJsonRecord(body)?.alertOnly === true,
           badges: subscribeBadges(body),
         });
         return secure(new Response(null, { status: 204 }));

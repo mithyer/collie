@@ -51,6 +51,14 @@ export interface StoredSubscription extends PushSubscription {
    */
   closesOwn?: boolean;
   /**
+   * The registering client can show an alert but can never take one back: a clear sent to it would
+   * arrive as a visible message of its own. Set by a client that sits behind a relay (the Dogr app),
+   * where every message is sealed and the relay cannot tell a clear from an alert. Such a row gets
+   * alerts and nothing else of the clear kind; the client closes stale notifications itself.
+   * Absent on every row a browser registers, so those behave exactly as before.
+   */
+  alertOnly?: boolean;
+  /**
    * Whether the page that registered this row has the Badging API (`navigator.setAppBadge`).
    * Information only, for the log and `push list`: no rule reads it. It once gated rule 2, until a
    * live Android Chrome 156 reported `true` (2026-11-06); the page now zeroes the slot's count
@@ -75,6 +83,8 @@ export interface SubscriptionMeta {
   device?: string;
   /** The page closes its own pane notifications on a read ({@link StoredSubscription.closesOwn}). */
   closesOwn?: boolean;
+  /** The client cannot take an alert back ({@link StoredSubscription.alertOnly}). */
+  alertOnly?: boolean;
   /** Whether the page has the Badging API ({@link StoredSubscription.badges}). */
   badges?: boolean;
 }
@@ -125,6 +135,7 @@ function coerceStored(v: JsonValue | undefined): StoredSubscription | null {
   if (typeof o.userAgent === "string") row.userAgent = o.userAgent.slice(0, USER_AGENT_MAX);
   if (typeof o.device === "string" && o.device !== "") row.device = o.device;
   if (o.closesOwn === true) row.closesOwn = true;
+  if (o.alertOnly === true) row.alertOnly = true;
   if (typeof o.badges === "boolean") row.badges = o.badges;
   return row;
 }
@@ -600,6 +611,8 @@ export class Push {
     // getting every push.
     if (meta.device !== undefined && meta.device !== "") row.device = meta.device;
     if (meta.closesOwn === true && row.device !== undefined) row.closesOwn = true;
+    // Like the two above, what this registration says and nothing carried over from an earlier one.
+    if (meta.alertOnly === true) row.alertOnly = true;
     if (meta.badges !== undefined) row.badges = meta.badges;
     this.subs.set(sub.endpoint, row);
     // A re-subscribe is fresh evidence even when the endpoint string is unchanged — the device just
@@ -712,6 +725,11 @@ export class Push {
       const verdicts: string[] = [];
       const out: Delivery[] = [];
       for (const sub of this.subs.values()) {
+        if (sub.alertOnly === true) {
+          this.count(sub, "skipped");
+          verdicts.push(`${deviceName(sub)} skipped (cannot take an alert back)`);
+          continue;
+        }
         if (!this.spendClear(sub.endpoint)) {
           this.count(sub, "overBudget");
           verdicts.push(`${deviceName(sub)} skipped (over the daily budget)`);
@@ -970,6 +988,17 @@ export class Push {
     const out: Delivery[] = [];
     const verdicts: string[] = [];
     for (const sub of this.subs.values()) {
+      // A client that cannot take an alert back would show the clear as a message of its own. The
+      // slots are still closed, so nothing else is sent for them, and the client sweeps its own.
+      if (sub.alertOnly === true) {
+        for (const tag of tags) {
+          this.unhold(sub.endpoint, tag);
+          this.setSlot(sub.endpoint, tag, "closed");
+        }
+        this.count(sub, "skipped");
+        verdicts.push(`${deviceName(sub)} skipped (cannot take an alert back)`);
+        continue;
+      }
       const due = tags.filter((tag) => this.slotOf(sub.endpoint, tag) !== "closed");
       // A slot whose count is owed and whose clear is skipped is owed a zero instead.
       for (const tag of tags) if (!due.includes(tag) && this.badgeDue.get(sub.endpoint)?.has(tag)) this.oweBadge(sub.endpoint, tag, 0);

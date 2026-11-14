@@ -899,6 +899,9 @@ describe("solo zero-tax — routes", () => {
       "/api/notifications/cache-watch/forget",
       "/api/notifications/cache-watch/list",
       "/api/notifications/prefs",
+      // The Dogr build's per-phone rules (bridge/notify-rules.ts): a SOLO route like the two around it,
+      // answered by the collie that holds the phone's subscription, never forwarded across a link.
+      "/api/notifications/rules",
       "/api/notifications/snooze",
       // The Crew overview (bridge/crew/status-wire.ts) — a FRONT-DOOR route, and it legitimately
       // extends this list rather than being exempted, exactly as pairing and STT do. It is not a
@@ -1307,6 +1310,9 @@ const STATE_DIR_ENTRIES = [
   // Written by that tap and by nothing else: absent on every bridge whose operator never taps it.
   "math",
   "notify-prefs.json",
+  // The Dogr build's per-phone notification rules (bridge/notify-rules.ts): written only when a phone
+  // uploads rules, so a bridge no phone has configured never creates it.
+  "notify-rules.json",
   // Device pairing. Both are absent until the operator runs `collie pair`, and an install that
   // never does keeps writing exactly the six entries above it.
   "paired-devices.json",

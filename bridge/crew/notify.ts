@@ -4,6 +4,7 @@ import {
   paneClears,
   type MuteGate,
   type NotifyClock,
+  type NotifyDelayFor,
   type PushSender,
 } from "../notifications.ts";
 import type { PushMessage } from "../push.ts";
@@ -90,6 +91,8 @@ export interface PeerNotifierDeps<H> {
   /** The LEAD's snooze. Crew-wide by construction: the lead is the only thing that sends (§5). */
   readonly mute: MuteGate;
   readonly delayMs: number;
+  /** The delay per kind, when it is not one number (the per-phone rules, bridge/notify-rules.ts). */
+  readonly delayFor?: NotifyDelayFor;
   /** The LEAD's notify prefs, read live — same reason, same construction. */
   readonly isNotifiable: (status: AgentStatus) => boolean;
   /** The LEAD's "one notification per agent" pref, read live. Absent: the per-host summary. */
@@ -218,6 +221,7 @@ export class PeerNotifier<H = unknown> {
         this.deps.delayMs,
         this.deps.isNotifiable,
         this.deps.individual,
+        this.deps.delayFor,
       ),
       statuses: new Map<string, AgentStatus>(),
     } satisfies HostEntry<H>;

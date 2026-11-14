@@ -227,6 +227,15 @@
       "rules": {
         "anti-slop/no-module-mocking": "off"
       }
+    },
+    {
+      // The Dogr build's per-phone notification rules (bridge/notify-rules.ts): one reader of the untrusted body of the rules upload and of `<stateDir>/notify-rules.json`, `notify-prefs.ts`'s sibling. Every `typeof` sits in its field readers (`flag`, `whole`, `record`) and IS the parse. Its own block, at the end, so merging upstream never has to touch the long list above.
+      "files": [
+        "**/bridge/notify-rules.ts"
+      ],
+      "rules": {
+        "anti-slop/no-runtime-typeof": "off"
+      }
     }
   ]
 }

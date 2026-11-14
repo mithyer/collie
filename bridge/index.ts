@@ -42,7 +42,7 @@ import {
   privateRoot,
   type PrivateRoot,
 } from "./owner-only.ts";
-import type { AgentView, CrewMode, CrewStatusResponse, Launcher } from "./types.ts";
+import type { AgentStatus, AgentView, CrewMode, CrewStatusResponse, Launcher } from "./types.ts";
 import { EventPoker } from "./event-poker.ts";
 import { durableLogDir, moveFlatLogs, sourceLogDir } from "./durable/log.ts";
 import { GitHeads, nodeGitHeadDisk } from "./git-head.ts";
@@ -72,7 +72,8 @@ import { TERN_BINARY_OPTION } from "./mux/tern/adapter.ts";
 import { TMUX_BINARY_OPTION } from "./mux/tmux/adapter.ts";
 import type { MuxAdapter } from "./mux/types.ts";
 import { ZELLIJ_BINARY_OPTION } from "./mux/zellij/adapter.ts";
-import { NotificationCoordinator, makeNotifySink, type NotifyClock } from "./notifications.ts";
+import { NotificationCoordinator, makeNotifySink, type NotifyClock, type NotifyDelayFor } from "./notifications.ts";
+import { RulesGate, RulesStore } from "./notify-rules.ts";
 import { pushTitle } from "./push-titles.ts";
 import { NotifyPrefsStore } from "./notify-prefs.ts";
 import { FolderStore } from "./folders.ts";
@@ -765,14 +766,45 @@ function crewStoreChanged(): void {
 // ── Process-global services, shared across every session ─────────────────────
 // Clears wait CLEAR_BURST_MS for company, so one retract across many agents is one push per device
 // (bridge/push.ts § the three rules). The CLI's own Push sends at once.
-const push = new Push(cfg, undefined, { clearBurstMs: CLEAR_BURST_MS });
+//
+// The Dogr build adds per-phone rules (bridge/notify-rules.ts): each paired phone may upload its own
+// switches, waits, quiet hours and per-pane choices. The gate decides per subscription what a render
+// does; a phone with no upload is judged by the bridge-wide prefs and debounce exactly as before.
+const notifyPrefs = new NotifyPrefsStore(cfg);
+await notifyPrefs.load();
+const notifyRules = new RulesStore(cfg);
+await notifyRules.load();
+/** The adapter of each live session, by the session name a push carries (undefined = primary), so the
+ *  gate can ask whether a pane's screen is still changing. Filled by `makeSession`. */
+const screenProbes = new Map<string | undefined, MuxAdapter>();
+const rulesGate = new RulesGate({
+  store: notifyRules,
+  prefs: () => notifyPrefs.current(),
+  bridgeDelayMs: cfg.notifyDelayMs,
+  revision: async (session, paneId) => {
+    const adapter = screenProbes.get(session);
+    if (adapter === undefined) return undefined;
+    try {
+      // A viewport read never scrolls the operator's screen (paneScreen in server.ts reads the same way).
+      const grid = await adapter.readGrid(paneId, { scope: "viewport", lines: 200, styling: "preserve" });
+      return grid.ok ? grid.value.revision : undefined;
+    } catch {
+      return undefined;
+    }
+  },
+  sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+  now: () => Date.now(),
+});
+/** The coordinators' debounce: the shortest wait any phone asks for, never above the bridge's own. */
+const notifyDelay: NotifyDelayFor = (status) => rulesGate.baseDelayMs(status);
+/** Whether a status raises an alert at all: the bridge-wide prefs, or any phone's own rules. */
+const notifiable = (status: AgentStatus): boolean =>
+  notifyPrefs.isNotifiable(status) || ((status === "blocked" || status === "done") && rulesGate.wants(status));
+const push = new Push(cfg, undefined, { clearBurstMs: CLEAR_BURST_MS, gate: rulesGate });
 await push.init();
 
 const snooze = new Snooze(cfg);
 await snooze.load();
-
-const notifyPrefs = new NotifyPrefsStore(cfg);
-await notifyPrefs.load();
 
 // Device pairing (bridge/pairing.ts). Constructed unconditionally and holding no state of its own:
 // it re-reads `<stateDir>/paired-devices.json` per request (cached on mtime), so `collie pair` and
@@ -1739,6 +1771,8 @@ const makeSession: SessionFactory = (name, endpoint, isPrimary) => {
   // The worktree capability sits just inside it, outside the beacon and hint wrappers: it reads their
   // declaration and lifts `createWorktree` from `createSpace` plus git (bridge/worktree-capability.ts).
   const herdr = withRepoFacts(withWorktreeCapability(withBeaconsIfBlind(built.adapter, target), { git: worktreeGit }), { facts: (folder) => repoFactsOf(folder, nodeGitHeadDisk, homedir()) });
+  // The phones' rules ask this adapter whether a pane's screen is still changing (bridge/notify-rules.ts).
+  screenProbes.set(isPrimary ? undefined : name, herdr);
   const engine = new StateEngine(herdr, cfg.pollMs, { museSessionName: museNames });
 
   // Event-poked polling: a long-lived watch on the multiplexer pokes an immediate re-poll on any
@@ -1824,8 +1858,9 @@ const makeSession: SessionFactory = (name, endpoint, isPrimary) => {
     clock,
     sink,
     cfg.notifyDelayMs,
-    (status) => notifyPrefs.isNotifiable(status),
+    notifiable,
     () => notifyPrefs.current().individual,
+    notifyDelay,
   );
   // A pane whose adapter raises asks as data (ADR 0100) does not push on its way into `blocked`: the
   // ask guard decides, once per ask, after each poll. Every other pane, and every other transition,
@@ -2311,7 +2346,8 @@ const peerNotifier =
         push,
         mute: snooze,
         delayMs: cfg.notifyDelayMs,
-        isNotifiable: (status) => notifyPrefs.isNotifiable(status),
+        delayFor: notifyDelay,
+        isNotifiable: notifiable,
         individual: () => notifyPrefs.current().individual,
         asks: askPush,
       })
@@ -3308,6 +3344,7 @@ const server = listenOrExit("front door", cfg.host, cfg.port, () => startServer(
   push,
   snooze,
   notifyPrefs,
+  notifyRules,
   updateMonitor,
   // The preflight and the handoff, or undefined on an install with no compiled binary to run —
   // where the route answers 503 and the phone says so (M15/05).

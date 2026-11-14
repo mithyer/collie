@@ -23,6 +23,13 @@ import type { AgentStatus, AgentView, AskPushText } from "./types.ts";
 
 type NotifiableStatus = "blocked" | "done";
 
+/**
+ * How long a state of this kind must hold before it raises an alert. The Dogr build passes one, so the
+ * delay follows the shortest wait any phone asks for (bridge/notify-rules.ts). Evaluated when the
+ * alert is armed; the plain `delayMs` is what an absent one means.
+ */
+export type NotifyDelayFor = (status: NotifiableStatus) => number;
+
 /** The timer primitive the coordinator schedules against — real setTimeout in the bridge, fake in tests. */
 export interface NotifyClock<H> {
   schedule(fn: () => void, delayMs: number): H;
@@ -263,6 +270,8 @@ export class NotificationCoordinator<H = unknown> {
     private readonly isNotifiable: (status: AgentStatus) => boolean,
     // Whether each alert is its own notification, read live like `isNotifiable`. Absent: the summary.
     private readonly individual: () => boolean = () => false,
+    // The delay per kind, read when an alert is armed. Absent: `delayMs` for every kind.
+    private readonly delayFor?: NotifyDelayFor,
   ) {
     this.individualShown = individual();
   }
@@ -305,7 +314,7 @@ export class NotificationCoordinator<H = unknown> {
       this.pending.delete(id);
       this.outstanding.set(id, alert);
       this.emitAlert(id, true);
-    }, this.delayMs);
+    }, this.delayFor?.(alert.status) ?? this.delayMs);
     this.pending.set(id, { handle, status: alert.status });
   }
 

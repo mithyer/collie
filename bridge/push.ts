@@ -5,6 +5,7 @@ import { join } from "node:path";
 import type { Config } from "./config.ts";
 import type { PushTitleCode, PushTitleDetail } from "./push-titles.ts";
 import { redactText } from "./redact.ts";
+import { renderKind, type GateRender, type RenderGate } from "./notify-rules.ts";
 
 // Optional Web Push (VAPID). Zero hard dependency: if `web-push` isn't installed or VAPID keys
 // aren't configured, push is silently disabled and the rest of the bridge works unchanged.
@@ -338,10 +339,21 @@ export interface PushOptions {
   clock?: PushClock;
   /** {@link CLEAR_BURST_MS} in the bridge; 0 = flush on the next microtask. */
   clearBurstMs?: number;
+  /**
+   * The per-phone rules (bridge/notify-rules.ts). Absent in a test, a CLI and an upstream build:
+   * every render then goes to every device as it always did.
+   */
+  gate?: RenderGate;
 }
 
 /** One tally line's counters for one device. `clear` is the silent count: every clear sent ends
  *  with no notification shown by design. */
+/** The identity of one parked render or reminder series. Compared by reference: whatever replaced or
+ *  removed it from its map is what ended it, and a timer that finds another one there does nothing. */
+interface Waiting {
+  readonly tag: string;
+}
+
 type Tally = { render: number; clear: number; held: number; late: number; dropped: number; skipped: number; overBudget: number };
 const emptyTally = (): Tally => ({ render: 0, clear: 0, held: 0, late: 0, dropped: 0, skipped: 0, overBudget: 0 });
 const HOUR_MS = 3_600_000;
@@ -511,6 +523,13 @@ export class Push {
   private tallySince: number;
   private readonly clock: PushClock;
   private readonly clearBurstMs: number;
+  /** The per-phone rules, or undefined for the behaviour of every build before the rules existed. */
+  private readonly gate: RenderGate | undefined;
+  /** endpoint → slot → a render the gate asked to wait for. The object is its identity: a newer render
+   *  or a clear for the slot replaces or removes it, and a wait that finds it gone does nothing. */
+  private parked = new Map<string, Map<string, Waiting>>();
+  /** endpoint → slot → the reminder series of an alert that went out, by the same identity rule. */
+  private reminders = new Map<string, Map<string, Waiting>>();
   // ── Rule 4's state, the one rule kept on disk ({@link CLEAR_BUDGET_FILE}). ──
   /** Endpoint → when its silent clears went, oldest first, at most {@link SILENT_CLEAR_BUDGET}`.clears`. */
   private clearSpends = new Map<string, number[]>();
@@ -529,6 +548,7 @@ export class Push {
     this.sender = sender ?? ((sub, payload, options) => this.lib!.sendNotification(sub, payload, options));
     this.clock = opts.clock ?? realClock;
     this.clearBurstMs = opts.clearBurstMs ?? 0;
+    this.gate = opts.gate;
     this.tallySince = this.clock.now();
   }
 
@@ -672,7 +692,12 @@ export class Push {
     if (!this.enabled) return;
     // A clear with a slot waits for its burst (rule 3). One without a slot names nothing a ledger
     // could hold, so it goes to everyone at once, as every push did before.
-    if (msg.type === "clear" && msg.tag !== undefined) return this.queueClear(msg.tag, options.topic);
+    if (msg.type === "clear" && msg.tag !== undefined) {
+      // The state this alert was about is over: a render still waiting on a phone's rules, and the
+      // reminders of one that went out, have nothing left to say.
+      this.cancelWaiting(msg.tag);
+      return this.queueClear(msg.tag, options.topic);
+    }
     const body = { ...msg, data };
     // A machine alert is the one push a visible app does not stand in for (web/src/lib/push-decision.ts),
     // so it is never held; a clear without a slot has nothing to hold.
@@ -700,7 +725,12 @@ export class Push {
       await Promise.all([this.deliver(out), out.length > 0 ? this.saveBudget() : undefined]);
       return;
     }
-    await this.sendRender(body, options, msg.tag ?? "", msg.type ?? "render", msg.badge);
+    // Only an agent alert is judged by the phones' rules: it is the one message with no type.
+    const judged: GateRender | undefined =
+      msg.type === undefined && this.gate !== undefined
+        ? { kind: renderKind(msg.titleCode), paneId: msg.paneId, session: msg.session }
+        : undefined;
+    await this.sendRender(body, options, msg.tag ?? "", msg.type ?? "render", msg.badge, judged);
   }
 
   /** Convenience for a one-off render (used by the manual push-test script). */
@@ -715,26 +745,149 @@ export class Push {
     tag: string,
     kind: string,
     badge: number | undefined,
+    render?: GateRender,
   ): Promise<void> {
     const now = this.clock.now();
     const out: StoredSubscription[] = [];
     const verdicts: string[] = [];
     for (const sub of this.subs.values()) {
-      if (sub.device !== undefined && this.looking(sub.device, now)) {
-        this.hold(sub.endpoint, tag, { body, options, at: now, label: sub.device, kind, badge });
-        this.count(sub, "held");
-        verdicts.push(`${deviceName(sub)} held (looking)`);
-        continue;
+      if (this.gate !== undefined && render !== undefined) {
+        // A newer render for the slot supersedes whatever this device was still waiting to be sent.
+        this.parked.get(sub.endpoint)?.delete(tag);
+        this.reminders.get(sub.endpoint)?.delete(tag);
+        const verdict = this.gate.judge(sub.device, render, now);
+        if (verdict.act === "drop") {
+          verdicts.push(`${deviceName(sub)} dropped (${verdict.why})`);
+          continue;
+        }
+        if (verdict.act === "wait") {
+          this.park(sub, { body, options, tag, kind, badge, render }, verdict.ms);
+          verdicts.push(`${deviceName(sub)} waits ${Math.round(verdict.ms / 1000)} s (${verdict.why})`);
+          continue;
+        }
       }
-      this.unhold(sub.endpoint, tag);
-      // Open from the moment it is sent, not from a 201: a clear racing this send must still go.
-      if (tag !== "") this.setSlot(sub.endpoint, tag, "open");
-      this.count(sub, "render");
-      verdicts.push(`${deviceName(sub)} sent`);
-      out.push(sub);
+      this.placeRender(sub, body, options, tag, kind, badge, now, out, verdicts);
+      if (render !== undefined) this.remind(sub, { body, options, tag, render });
     }
     this.log(kind, tag, verdicts);
     await this.deliver(out.map((sub) => ({ sub, body, options, names: tag === "" ? [] : [tag] })));
+  }
+
+  /**
+   * Rule 1 for one device: hold the render when the device is looking, else mark the slot open and
+   * queue the delivery. Split out of {@link sendRender} so a render that waited on the phone's rules
+   * goes through the very same path when its wait is over.
+   */
+  private placeRender(
+    sub: StoredSubscription,
+    body: PushBody,
+    options: SendOptions,
+    tag: string,
+    kind: string,
+    badge: number | undefined,
+    now: number,
+    out: StoredSubscription[],
+    verdicts: string[],
+  ): void {
+    if (sub.device !== undefined && this.looking(sub.device, now)) {
+      this.hold(sub.endpoint, tag, { body, options, at: now, label: sub.device, kind, badge });
+      this.count(sub, "held");
+      verdicts.push(`${deviceName(sub)} held (looking)`);
+      return;
+    }
+    this.unhold(sub.endpoint, tag);
+    // Open from the moment it is sent, not from a 201: a clear racing this send must still go.
+    if (tag !== "") this.setSlot(sub.endpoint, tag, "open");
+    this.count(sub, "render");
+    verdicts.push(`${deviceName(sub)} sent`);
+    out.push(sub);
+  }
+
+  /** What a parked render needs to go out later, exactly as it would have gone out at once. */
+  private park(
+    sub: StoredSubscription,
+    item: { body: PushBody; options: SendOptions; tag: string; kind: string; badge: number | undefined; render: GateRender },
+    ms: number,
+  ): void {
+    let perSub = this.parked.get(sub.endpoint);
+    if (perSub === undefined) {
+      perSub = new Map();
+      this.parked.set(sub.endpoint, perSub);
+    }
+    const entry: Waiting = { tag: item.tag };
+    perSub.set(item.tag, entry);
+    this.clock.schedule(() => void this.afterWait(sub.endpoint, item, entry), ms);
+  }
+
+  /** The wait is over: let the gate check the screen and the quiet window, then send or drop. */
+  private async afterWait(
+    endpoint: string,
+    item: { body: PushBody; options: SendOptions; tag: string; kind: string; badge: number | undefined; render: GateRender },
+    entry: Waiting,
+  ): Promise<void> {
+    const gate = this.gate;
+    const sub = this.subs.get(endpoint);
+    if (gate === undefined || sub === undefined || this.parked.get(endpoint)?.get(item.tag) !== entry) return;
+    const verdict = await gate.settle(sub.device, item.render);
+    // The slot may have been cleared, or replaced by a newer render, while the screen was watched.
+    if (this.parked.get(endpoint)?.get(item.tag) !== entry) return;
+    this.parked.get(endpoint)?.delete(item.tag);
+    if (verdict === "drop") {
+      this.log(item.kind, item.tag, [`${deviceName(sub)} dropped (the phone's rules, after waiting)`]);
+      return;
+    }
+    const out: StoredSubscription[] = [];
+    const verdicts: string[] = [];
+    this.placeRender(sub, item.body, item.options, item.tag, item.kind, item.badge, this.clock.now(), out, verdicts);
+    this.remind(sub, item);
+    this.log(item.kind, item.tag, verdicts.map((v) => `${v} after waiting`));
+    await this.deliver(out.map((s) => ({ sub: s, body: item.body, options: item.options, names: item.tag === "" ? [] : [item.tag] })));
+  }
+
+  /**
+   * Schedule the reminders the phone asked for after an alert went out. Each one is a fresh render of
+   * the same slot, sent only while the slot is still open and the rules still allow it.
+   */
+  private remind(
+    sub: StoredSubscription,
+    item: { body: PushBody; options: SendOptions; tag: string; render: GateRender },
+  ): void {
+    const plan = this.gate?.reminder(sub.device, item.render) ?? null;
+    if (plan === null || item.tag === "") return;
+    let perSub = this.reminders.get(sub.endpoint);
+    if (perSub === undefined) {
+      perSub = new Map();
+      this.reminders.set(sub.endpoint, perSub);
+    }
+    const entry: Waiting = { tag: item.tag };
+    perSub.set(item.tag, entry);
+    const step = (left: number): void => {
+      this.clock.schedule(() => void this.reminderDue(sub.endpoint, item, entry, left, step), plan.everyMs);
+    };
+    step(plan.count);
+  }
+
+  private async reminderDue(
+    endpoint: string,
+    item: { body: PushBody; options: SendOptions; tag: string; render: GateRender },
+    entry: Waiting,
+    left: number,
+    next: (left: number) => void,
+  ): Promise<void> {
+    const sub = this.subs.get(endpoint);
+    if (sub === undefined || this.reminders.get(endpoint)?.get(item.tag) !== entry) return;
+    if (left > 1) next(left - 1);
+    else this.reminders.get(endpoint)?.delete(item.tag);
+    // A reminder inside the quiet window, or after the phone turned them off, is skipped, not queued.
+    if (this.gate?.again(sub.device, item.render, this.clock.now()) !== true) return;
+    this.log("reminder", item.tag, [`${deviceName(sub)} sent`]);
+    await this.deliver([{ sub, body: { ...item.body, renotify: true }, options: item.options, names: [item.tag] }]);
+  }
+
+  /** A clear for the slot: nothing waiting for it, and no reminder, may go out after this. */
+  private cancelWaiting(tag: string): void {
+    for (const perSub of this.parked.values()) perSub.delete(tag);
+    for (const perSub of this.reminders.values()) perSub.delete(tag);
   }
 
   /**
@@ -887,6 +1040,8 @@ export class Push {
     this.failures.delete(endpoint);
     this.slots.delete(endpoint);
     this.held.delete(endpoint);
+    this.parked.delete(endpoint);
+    this.reminders.delete(endpoint);
     this.badgeDue.delete(endpoint);
     // Every caller saves after a drop; the budget file follows only when it held a row for this one.
     if (this.clearSpends.delete(endpoint)) this.budgetDirty = true;

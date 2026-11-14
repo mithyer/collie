@@ -42,6 +42,7 @@ import { createSessionFolders, createSessionLabels, resolveSessionFolder, withSe
 import { computeEtag, gzipJsonResponse, notModified, wantsGzip } from "./http-cache.ts";
 import { pluginRoot } from "./root.ts";
 import { DEFAULT_NOTIFY_PREFS, type NotifyPrefs, type NotifyPrefsStore } from "./notify-prefs.ts";
+import { defaultPhoneRules, parseRulesRequest, type RulesStore } from "./notify-rules.ts";
 import { paneClears, paneTag } from "./notifications.ts";
 import { browseFolders, type FolderBrowseContext } from "./folder-browse.ts";
 import { MAX_FAVOURITES, MAX_FOLDER_CHARS, type FolderSurface } from "./folders.ts";
@@ -1176,6 +1177,11 @@ export function startServer(opts: {
   push: Push;
   snooze: Snooze;
   notifyPrefs: NotifyPrefsStore;
+  /**
+   * The Dogr build's per-phone notification rules (bridge/notify-rules.ts). Absent on a build that
+   * does not carry them: the rules route then answers 404.
+   */
+  notifyRules?: RulesStore;
   updateMonitor: UpdateMonitor;
   /**
    * The two effects `POST /api/update` needs and this file must not own: the cached preflight
@@ -1495,7 +1501,7 @@ export function startServer(opts: {
    */
   machines?: MachineSurface;
 }) {
-  const { cfg, registry, push, snooze, notifyPrefs, updateMonitor, audit, activity, crew } = opts;
+  const { cfg, registry, push, snooze, notifyPrefs, notifyRules, updateMonitor, audit, activity, crew } = opts;
   // The prompt-cache ledger, built in bridge/index.ts beside the journal registry it probes through,
   // because the state engine's poll is what drives it and that poll is wired there. Undefined when
   // `COLLIE_TRANSCRIPT` is off: no journal, no probe, and every pane reads exactly as it did in 1.8.2.
@@ -1664,6 +1670,8 @@ export function startServer(opts: {
   revokeWatch(pairedLabels());
   const forgetDevice = async (label: string, reason: string): Promise<void> => {
     await forgetDeviceRows(addedLaunchers, label, "local", audit, reason);
+    // A revoked phone takes its notification rules with it (the Dogr build; absent elsewhere).
+    await notifyRules?.forget(label);
     if (crewLead !== undefined) void forgetOnMembers(label);
   };
   const noticeRevokes = async (): Promise<void> => {
@@ -3486,6 +3494,47 @@ export function startServer(opts: {
           // Same fan, one dimension out — a disabled kind must retract on every host, not just here.
           peerNotifier?.applyPrefs();
           return json(updated, req.headers.get("accept-encoding"));
+        }
+        return text("method not allowed", 405);
+      }
+      if (pathname === "/api/notifications/rules" && notifyRules !== undefined) {
+        // The per-phone notification rules of the Dogr build (bridge/notify-rules.ts): which events
+        // push to THIS phone, how long each waits, quiet hours, reminders and per-pane switches.
+        // Read-level for the reason the prefs block above is: setting your own preferences does not
+        // drive a terminal. The phone is the key: its pairing label, the same one its push
+        // subscription carries, so a host's own local credential (no label) has nothing to key on.
+        const denied = guard(req, cfg, "read", pairingGate);
+        if (denied) return denied;
+        const label = pairedLabel(req, pairingGate);
+        if (label === null) return text("no paired device", 409);
+        const encoding = req.headers.get("accept-encoding");
+        if (req.method === "GET") {
+          // `rules: null` says "never uploaded": the phone then shows the defaults and the bridge
+          // judges this phone by its bridge-wide prefs alone.
+          return json({ rules: notifyRules.get(label) ?? null, defaults: defaultPhoneRules() }, encoding);
+        }
+        if (req.method === "PUT" || req.method === "POST") {
+          let body: JsonValue;
+          try {
+            // SAFETY: `Request.json()` output IS a JsonValue by construction; `parseRulesRequest`
+            // checks every field and clamps every number.
+            body = (await req.json()) as JsonValue;
+          } catch {
+            return text("bad request", 400);
+          }
+          const rules = parseRulesRequest(body);
+          if (rules === null) return text("bad rules", 400);
+          await notifyRules.set(label, rules);
+          // New rules can switch an event off for this phone: re-arm what is pending or showing.
+          for (const rt of registry.all()) rt.notifications.applyPrefs();
+          peerNotifier?.applyPrefs();
+          return json({ rules }, encoding);
+        }
+        if (req.method === "DELETE") {
+          await notifyRules.forget(label);
+          for (const rt of registry.all()) rt.notifications.applyPrefs();
+          peerNotifier?.applyPrefs();
+          return json({ rules: null }, encoding);
         }
         return text("method not allowed", 405);
       }

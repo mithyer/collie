@@ -236,9 +236,12 @@ export interface RenderGate {
 export class RulesStore {
   private rows = new Map<string, PhoneRules>();
   private readonly file: string;
+  /** The state folder the file lives in; named here so the private-roots guard sees the write is rooted. */
+  private readonly stateDir: string;
 
   constructor(cfg: Pick<Config, "stateDir">) {
-    this.file = join(cfg.stateDir, "notify-rules.json");
+    this.stateDir = cfg.stateDir;
+    this.file = join(this.stateDir, "notify-rules.json");
   }
 
   /** Read the file; a missing or unreadable file means no phone has uploaded rules. */
@@ -287,7 +290,7 @@ export class RulesStore {
 
   /** Atomic, owner-only write: a fresh temp file (mode 0600), then a rename over the target. */
   private async save(): Promise<void> {
-    await mkdir(this.file.slice(0, this.file.lastIndexOf("/")), { recursive: true, mode: 0o700 });
+    await mkdir(this.stateDir, { recursive: true, mode: 0o700 });
     const tmp = `${this.file}.tmp`;
     const devices = Object.fromEntries(this.rows);
     await writeFile(tmp, JSON.stringify({ version: 1, devices }, null, 2), { mode: 0o600 });

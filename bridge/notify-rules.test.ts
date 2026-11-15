@@ -7,6 +7,7 @@ import type { JsonValue } from "./json.ts";
 import {
   coercePhoneRules,
   defaultPhoneRules,
+  type EventRule,
   type GateRender,
   inQuietHours,
   paneKey,
@@ -33,9 +34,27 @@ afterAll(async () => {
   await Promise.all(dirs.map((d) => rm(d, { recursive: true, force: true })));
 });
 
+/**
+ * What a test may change in the rules: any field, an event rule given in part, and `steadySec` to set
+ * the screen-stillness seconds of both event kinds at once (an event's own value wins).
+ */
+type RulesChange = Omit<Partial<PhoneRules>, "blocked" | "done"> & {
+  blocked?: Partial<EventRule>;
+  done?: Partial<EventRule>;
+  steadySec?: number;
+};
+
 /** The defaults with some fields replaced, as a phone's upload would. */
-function rules(change: Partial<PhoneRules> = {}): PhoneRules {
-  return { ...defaultPhoneRules(), ...change };
+function rules(change: RulesChange = {}): PhoneRules {
+  const base = defaultPhoneRules();
+  const { blocked, done, steadySec, ...rest } = change;
+  const steady = steadySec ?? base.blocked.steadySec;
+  return {
+    ...base,
+    ...rest,
+    blocked: { ...base.blocked, steadySec: steady, ...blocked },
+    done: { ...base.done, steadySec: steady, ...done },
+  };
 }
 
 describe("coercePhoneRules — an upload is clamped, never trusted", () => {
@@ -48,38 +67,57 @@ describe("coercePhoneRules — an upload is clamped, never trusted", () => {
 
   test("a mistyped field falls back to its default and a good neighbour is kept", () => {
     const got = coercePhoneRules({
-      blocked: { on: "yes", waitSec: 45 },
+      blocked: { on: "yes", waitSec: 45, steadySec: "long" },
       done: { on: false, waitSec: "soon" },
       steadySec: null,
       repeat: { on: true },
     });
-    expect(got.blocked).toEqual({ on: true, waitSec: 45 });
-    expect(got.done).toEqual({ on: false, waitSec: 30 });
-    expect(got.steadySec).toBe(10);
+    expect(got.blocked).toEqual({ on: true, waitSec: 45, steadySec: 10 });
+    expect(got.done).toEqual({ on: false, waitSec: 30, steadySec: 10 });
     expect(got.repeat).toEqual({ on: true, everyMin: 10, count: 3 });
   });
 
   test("every number is clamped into its range and rounded", () => {
     const got = coercePhoneRules({
-      blocked: { waitSec: 99_999 },
-      done: { waitSec: -5 },
-      steadySec: 61.4,
+      blocked: { waitSec: 99_999, steadySec: 61.4 },
+      done: { waitSec: -5, steadySec: -3 },
       repeat: { everyMin: 0, count: 50 },
       quiet: { on: true, fromMin: -1, toMin: 5000, utcOffsetMin: 9999 },
     });
     expect(got.blocked.waitSec).toBe(RULE_LIMITS.waitSec.max);
     expect(got.done.waitSec).toBe(RULE_LIMITS.waitSec.min);
-    expect(got.steadySec).toBe(RULE_LIMITS.steadySec.max);
+    expect(got.blocked.steadySec).toBe(RULE_LIMITS.steadySec.max);
+    expect(got.done.steadySec).toBe(RULE_LIMITS.steadySec.min);
     expect(got.repeat.everyMin).toBe(RULE_LIMITS.everyMin.min);
     expect(got.repeat.count).toBe(RULE_LIMITS.count.max);
     expect(got.quiet).toEqual({ on: true, fromMin: 0, toMin: 1439, utcOffsetMin: RULE_LIMITS.utcOffsetMin.max });
-    expect(coercePhoneRules({ steadySec: 7.6 }).steadySec).toBe(8);
+    expect(coercePhoneRules({ blocked: { steadySec: 7.6 } }).blocked.steadySec).toBe(8);
+  });
+
+  test("each event kind keeps its own screen-stillness seconds", () => {
+    const got = coercePhoneRules({ blocked: { steadySec: 3 }, done: { steadySec: 40 } });
+    expect(got.blocked.steadySec).toBe(3);
+    expect(got.done.steadySec).toBe(40);
+    // One kind named, the other not: the other keeps the default, it does not copy its neighbour.
+    const half = coercePhoneRules({ done: { steadySec: 0 } });
+    expect(half.blocked.steadySec).toBe(10);
+    expect(half.done.steadySec).toBe(0);
+  });
+
+  test("the single value of the first Dogr build still applies to a kind that has none of its own", () => {
+    const got = coercePhoneRules({ steadySec: 4, done: { on: true, waitSec: 30, steadySec: 25 } });
+    expect(got.blocked.steadySec).toBe(4);
+    // A value of the kind's own wins over the old shared one.
+    expect(got.done.steadySec).toBe(25);
+    expect(coercePhoneRules({ steadySec: 500 }).done.steadySec).toBe(RULE_LIMITS.steadySec.max);
+    expect(coercePhoneRules({ steadySec: 0 }).blocked.steadySec).toBe(0);
   });
 
   test("a number that is not finite is the default, not a clamp", () => {
     // JSON cannot carry NaN or Infinity, but a value built in code can reach the store.
-    expect(coercePhoneRules({ steadySec: Number.NaN }).steadySec).toBe(10);
-    expect(coercePhoneRules({ steadySec: Number.POSITIVE_INFINITY }).steadySec).toBe(10);
+    expect(coercePhoneRules({ blocked: { steadySec: Number.NaN } }).blocked.steadySec).toBe(10);
+    expect(coercePhoneRules({ done: { steadySec: Number.POSITIVE_INFINITY } }).done.steadySec).toBe(10);
+    expect(coercePhoneRules({ steadySec: Number.NaN }).blocked.steadySec).toBe(10);
   });
 
   test("pane choices keep only on/off, usable keys, and at most the limit", () => {
@@ -201,6 +239,20 @@ describe("RulesStore", () => {
     expect(again.get("pixel")).toEqual(rules({ steadySec: 4, panes: { "w1:p1": "off" } }));
   });
 
+  test("each kind's own screen-stillness seconds survive a restart", async () => {
+    const stateDir = await tempDir();
+    const store = new RulesStore({ stateDir });
+    await store.set("pixel", rules({ blocked: { steadySec: 2 }, done: { steadySec: 45 } }));
+    const again = new RulesStore({ stateDir });
+    await again.load();
+    expect(again.get("pixel")?.blocked.steadySec).toBe(2);
+    expect(again.get("pixel")?.done.steadySec).toBe(45);
+    // The file holds them inside the kinds, with no shared value left over.
+    const file = JSON.parse(await readFile(join(stateDir, "notify-rules.json"), "utf8"));
+    expect(file.devices.pixel.blocked.steadySec).toBe(2);
+    expect("steadySec" in file.devices.pixel).toBe(false);
+  });
+
   test("a copy handed out cannot change what is stored", async () => {
     const store = new RulesStore({ stateDir: await tempDir() });
     await store.set("pixel", rules());
@@ -210,8 +262,8 @@ describe("RulesStore", () => {
     got.blocked.on = false;
     got.panes["w1:p1"] = "off";
     expect(store.get("pixel")).toEqual(rules());
-    for (const row of store.all()) row.steadySec = 55;
-    expect(store.get("pixel")?.steadySec).toBe(10);
+    for (const row of store.all()) row.blocked.steadySec = 55;
+    expect(store.get("pixel")?.blocked.steadySec).toBe(10);
   });
 
   test("a second upload replaces the first", async () => {
@@ -219,7 +271,7 @@ describe("RulesStore", () => {
     await store.set("pixel", rules({ steadySec: 4 }));
     await store.set("pixel", rules({ steadySec: 9 }));
     expect(store.all()).toHaveLength(1);
-    expect(store.get("pixel")?.steadySec).toBe(9);
+    expect(store.get("pixel")?.blocked.steadySec).toBe(9);
   });
 
   test("forgetting says whether there was anything, and the file follows", async () => {
@@ -257,7 +309,9 @@ describe("RulesStore", () => {
     );
     const b = new RulesStore({ stateDir: edited });
     await b.load();
-    expect(b.get("pixel")?.steadySec).toBe(RULE_LIMITS.steadySec.max);
+    // The single shared value an older file holds is read into both kinds.
+    expect(b.get("pixel")?.blocked.steadySec).toBe(RULE_LIMITS.steadySec.max);
+    expect(b.get("pixel")?.done.steadySec).toBe(RULE_LIMITS.steadySec.max);
     expect(b.get("bad\nkey")).toBeUndefined();
     expect(JSON.parse(await readFile(join(edited, "notify-rules.json"), "utf8")).version).toBe(1);
   });
@@ -376,6 +430,18 @@ describe("RulesGate", () => {
     expect(gate.judge("pixel", blocked(), now())).toEqual({ act: "send" });
   });
 
+  test("the still-screen seconds are read per event kind", async () => {
+    const { store, gate, now } = await rig({ bridgeDelayMs: 30_000 });
+    // "Needs you" asks for no still-screen check at all, "done" asks for 20 s.
+    await store.set("pixel", rules({ blocked: { on: true, waitSec: 60, steadySec: 0 }, done: { on: true, waitSec: 60, steadySec: 20 } }));
+    expect(gate.judge("pixel", blocked("w1:p1"), now())).toMatchObject({ act: "wait", ms: 30_000 });
+    expect(gate.judge("pixel", done("w1:p1"), now())).toMatchObject({ act: "wait", ms: 10_000 });
+    // A kind with no check and no wait left is sent at once, whatever the other kind asks.
+    await store.set("pixel", rules({ blocked: { on: true, waitSec: 30, steadySec: 0 }, done: { on: true, waitSec: 30, steadySec: 20 } }));
+    expect(gate.judge("pixel", blocked("w1:p1"), now())).toEqual({ act: "send" });
+    expect(gate.judge("pixel", done("w1:p1"), now())).toMatchObject({ act: "wait", ms: 0 });
+  });
+
   test("a phone that asks for a shorter wait than the others sends at once", async () => {
     const { store, gate, now } = await rig({ bridgeDelayMs: 30_000 });
     await store.set("quick", rules({ blocked: { on: true, waitSec: 5 }, steadySec: 0 }));
@@ -397,6 +463,17 @@ describe("RulesGate", () => {
     // One read to start, then a sleep and a read per round until two reads agree.
     expect(reads).toHaveLength(4);
     expect(sleeps).toEqual([4_000, 4_000, 4_000]);
+  });
+
+  test("settle: each kind sleeps its own seconds between two looks at the screen", async () => {
+    const { store, gate, reads, sleeps } = await rig({ revisions: [1, 1] });
+    await store.set("pixel", rules({ blocked: { steadySec: 0 }, done: { steadySec: 7 } }));
+    // "Needs you" has no check: the screen is not read at all.
+    expect(await gate.settle("pixel", blocked("w1:p1"))).toBe("send");
+    expect(reads).toHaveLength(0);
+    expect(await gate.settle("pixel", done("w1:p1"))).toBe("send");
+    expect(sleeps).toEqual([7_000]);
+    expect(reads).toHaveLength(2);
   });
 
   test("settle: a screen that cannot be read does not hold the alert back", async () => {

@@ -5,7 +5,7 @@ import { join } from "node:path";
 
 import { loadConfig } from "./config.ts";
 import type { JsonObject } from "./json.ts";
-import { defaultPhoneRules, type PhoneRules, RulesGate, RulesStore } from "./notify-rules.ts";
+import { defaultPhoneRules, type EventRule, type PhoneRules, RulesGate, RulesStore } from "./notify-rules.ts";
 import { CLEAR_BURST_MS, Push } from "./push.ts";
 import type { PushMessage, PushSender, SendOptions, StoredSubscription } from "./push.ts";
 
@@ -93,9 +93,26 @@ async function rig(
   return { push, clock, sent, shown, store, reads };
 }
 
-/** The defaults with some fields replaced, as a phone's upload would. */
-function rules(change: Partial<PhoneRules> = {}): PhoneRules {
-  return { ...defaultPhoneRules(), steadySec: 0, ...change };
+/**
+ * The defaults with some fields replaced, as a phone's upload would. The screen-stillness check is
+ * off unless a test asks: `steadySec` sets it for both event kinds, an event's own value wins.
+ */
+function rules(
+  change: Omit<Partial<PhoneRules>, "blocked" | "done"> & {
+    blocked?: Partial<EventRule>;
+    done?: Partial<EventRule>;
+    steadySec?: number;
+  } = {},
+): PhoneRules {
+  const base = defaultPhoneRules();
+  const { blocked, done, steadySec, ...rest } = change;
+  const steady = steadySec ?? 0;
+  return {
+    ...base,
+    ...rest,
+    blocked: { ...base.blocked, steadySec: steady, ...blocked },
+    done: { ...base.done, steadySec: steady, ...done },
+  };
 }
 
 const alert = (tag: string, paneId = "w1:p1", titleCode: PushMessage["titleCode"] = "agent.blocked"): PushMessage => ({

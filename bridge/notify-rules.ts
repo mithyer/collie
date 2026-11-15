@@ -24,11 +24,17 @@ import type { PushTitleCode } from "./push-titles.ts";
 /** The two agent states Collie raises an alert for. */
 export type RuleKind = "blocked" | "done";
 
-/** One event kind: whether it pushes at all, and how long the state must hold before it does. */
+/** One event kind: whether it pushes at all, how long the state must hold, and how still the screen must be. */
 export interface EventRule {
   on: boolean;
   /** Seconds the state must hold, counted from the moment the agent entered it. */
   waitSec: number;
+  /**
+   * Seconds the pane's screen must stay unchanged before an alert of this kind goes out; 0 turns the
+   * check off. Per kind because the two moments differ: a finished turn often prints a summary for a
+   * while, a question usually does not.
+   */
+  steadySec: number;
 }
 
 /** A reminder for a "needs you" alert nobody has answered yet. */
@@ -58,8 +64,6 @@ export type PaneChoice = "on" | "off";
 export interface PhoneRules {
   blocked: EventRule;
   done: EventRule;
-  /** Seconds the pane's screen must stay unchanged before an alert goes out; 0 turns the check off. */
-  steadySec: number;
   repeat: RepeatRule;
   quiet: QuietRule;
   /** Per-pane choices, keyed by {@link paneKey}. */
@@ -88,9 +92,8 @@ const STEADY_ROUNDS = 20;
 /** The rules a phone starts from, and what a missing key in an upload falls back to. */
 export function defaultPhoneRules(): PhoneRules {
   return {
-    blocked: { on: true, waitSec: 30 },
-    done: { on: true, waitSec: 30 },
-    steadySec: 10,
+    blocked: { on: true, waitSec: 30, steadySec: 10 },
+    done: { on: true, waitSec: 30, steadySec: 10 },
     repeat: { on: false, everyMin: 10, count: 3 },
     quiet: { on: false, fromMin: 23 * 60, toMin: 7 * 60, utcOffsetMin: 0 },
     panes: {},
@@ -111,9 +114,18 @@ function whole(raw: JsonValue | undefined, range: { min: number; max: number }, 
   return Math.min(range.max, Math.max(range.min, Math.round(raw)));
 }
 
-function eventRule(raw: JsonValue | undefined, fallback: EventRule): EventRule {
+/**
+ * One event kind of an upload. `legacySteadySec` is the single screen-stillness value that the first
+ * Dogr build kept at the top of the rules: an upload (or a file on disk) that has no per-kind value
+ * still gets it, so nothing a phone saved before is lost.
+ */
+function eventRule(raw: JsonValue | undefined, fallback: EventRule, legacySteadySec: number): EventRule {
   const o = record(raw);
-  return { on: flag(o.on, fallback.on), waitSec: whole(o.waitSec, RULE_LIMITS.waitSec, fallback.waitSec) };
+  return {
+    on: flag(o.on, fallback.on),
+    waitSec: whole(o.waitSec, RULE_LIMITS.waitSec, fallback.waitSec),
+    steadySec: whole(o.steadySec, RULE_LIMITS.steadySec, legacySteadySec),
+  };
 }
 
 /** A pane key that cannot hide control characters or run away in length. */
@@ -132,15 +144,15 @@ export function coercePhoneRules(raw: JsonValue | undefined): PhoneRules {
   const o = record(raw);
   const repeat = record(o.repeat);
   const quiet = record(o.quiet);
+  const legacySteadySec = whole(o.steadySec, RULE_LIMITS.steadySec, base.blocked.steadySec);
   const panes: Record<string, PaneChoice> = {};
   for (const [key, choice] of Object.entries(record(o.panes))) {
     if (Object.keys(panes).length >= RULE_LIMITS.panes) break;
     if (usableKey(key) && (choice === "on" || choice === "off")) panes[key] = choice;
   }
   return {
-    blocked: eventRule(o.blocked, base.blocked),
-    done: eventRule(o.done, base.done),
-    steadySec: whole(o.steadySec, RULE_LIMITS.steadySec, base.steadySec),
+    blocked: eventRule(o.blocked, base.blocked, legacySteadySec),
+    done: eventRule(o.done, base.done, legacySteadySec),
     repeat: {
       on: flag(repeat.on, base.repeat.on),
       everyMin: whole(repeat.everyMin, RULE_LIMITS.everyMin, base.repeat.everyMin),
@@ -366,8 +378,9 @@ export class RulesGate implements RenderGate {
     }
     if (inQuietHours(rules.quiet, at)) return { act: "drop", why: "quiet hours" };
     // The steadiness check spends its own seconds after the wait, so they come off the wait.
-    const steady = render.paneId !== undefined && rules.steadySec > 0;
-    const wait = Math.max(0, rules[kind].waitSec * 1000 - base - (steady ? rules.steadySec * 1000 : 0));
+    const steadySec = rules[kind].steadySec;
+    const steady = render.paneId !== undefined && steadySec > 0;
+    const wait = Math.max(0, rules[kind].waitSec * 1000 - base - (steady ? steadySec * 1000 : 0));
     if (wait > 0 || steady) return { act: "wait", ms: wait, why: steady ? "waiting for a still screen" : "the phone's wait" };
     return { act: "send" };
   }
@@ -375,12 +388,13 @@ export class RulesGate implements RenderGate {
   async settle(device: string | undefined, render: GateRender): Promise<"send" | "drop"> {
     const rules = device === undefined ? undefined : this.deps.store.get(device);
     const kind = this.ruleKind(render.kind);
-    if (rules !== undefined && kind !== null && render.paneId !== undefined && rules.steadySec > 0) {
+    if (rules !== undefined && kind !== null && render.paneId !== undefined && rules[kind].steadySec > 0) {
+      const gap = rules[kind].steadySec * 1000;
       let last = await this.deps.revision(render.session, render.paneId);
       // A screen that cannot be read is no reason to hold an alert back.
       if (last !== undefined) {
         for (let round = 0; round < STEADY_ROUNDS; round++) {
-          await this.deps.sleep(rules.steadySec * 1000);
+          await this.deps.sleep(gap);
           const next = await this.deps.revision(render.session, render.paneId);
           if (next === undefined || next === last) break;
           last = next;

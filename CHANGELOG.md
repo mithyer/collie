@@ -23,9 +23,48 @@ Running a crew? Update the lead first; members follow on their own. Details:
 
 ## [Unreleased]
 
+## [1.28.5] - 2026-11-16
+
 ### Fixed
 
+- **Changes applies the deny list and the folder bound of Files.** The Changes view never lists or diffs a `.git` folder, Collie's own state and config folders, or a file named like a Collie state secret, and it reads an untracked file through the same checked reader as Files. A workspace folder that is a link to home or above it shows no folder, as in Files. A pane's own folder at home or above it, and a repo found at home or above it, also through a `.git` file, show only to a device with the Files right, decided on a crew member by that member's own device rules. With no `COLLIE_DEVICE_HEADER` set, every paired device has the right.
+- **A command sent right after you answer a menu is no longer refused while the agent is still catching up.** When the agent prints its queued messages after the answer, the screen keeps moving for a few seconds with no spinner. A command sent then, such as `/login`, now goes in the way a message already did on that screen, on harnesses that take a command during a turn. A command that must never wait, such as `/clear`, is still refused there.
+- **A message queued while Claude Code compacts shows its queued card in Chat.** A message sent from the phone during a compaction gets the same card, with Send now, as one queued during a normal turn.
+
+## [1.28.4] - 2026-11-14
+
+### Fixed
+
+- **A WalkyTalky line runs nothing when it lands at a shell prompt.** The line a message types into a pane named its sender in parentheses, `<address> (<harness>, <label>)` and `(<label>)`. fish runs a parenthesis as a command, so a folder or branch name in the label could run there when the agent had just quit, and zsh ran a backtick in any of its fields. The sender now stands in words, `from agent <address> on <harness> in "<label>"` and `from operator "<label>"`. On the line, the address, the harness and the label keep only ASCII letters, digits and `. , _ / # + @ = : % -`, the label also spaces, and every other character becomes `_`. The stored label, `collie walky who` and the phone keep the name as it is, and the phone reads lines in both forms. The machine that owns the pane types the line, so update each crew member too; `collie update` brings the agents' skill text to the new form.
+
+- **A message that Stop puts back in the box gets a Send and Discard card again.** 1.28.0 lost this fix of 1.27.3. When you tap Stop early in a turn, Claude Code takes your prompt out of the transcript and puts it back in its input box. The phone did not know that text was yours, so it showed no card, and every later send was refused because the box held a draft. Collie again keeps the text of a send that started a turn, and when Stop's read shows it back in the box, the "Back in the box" card offers Send and Discard. A turn that ends normally drops it after two idle reads, and nothing is pressed. Thanks @peter50216 and @bardrop (#774, #776).
+
+- **A formula makes no link and loads nothing.** With Math set to MathJax, `\mmlToken` could put a link of any scheme, an image, a style, a class or an id into an agent reply or a Markdown file, and `\color`, `\colorbox` and `mathcolor` could name a `url()` paint. A formula now draws its glyphs and its colours only, with either engine. Thanks @bardrop (#775). Reported by @peter50216 (#773).
+
+- **The background-agents bar shows above the composer on Claude Code for macOS.** On macOS Claude Code draws the header of its background-agents footer as `⏺ main`, where Linux draws `● main`. Collie knew only the Linux mark, so the collapsed agents bar stayed hidden, and while a turn ran a focused `❯ ⏺ main` panel read as something open at the box and refused a send. Both marks now match, in the footer reader, the agents bar and the Claude profile. Thanks @GGGODLIN (#782).
+
+## [1.28.3] - 2026-11-13
+
+**Urgent.** Claude Code's Remote Control can make Collie hold messages you send from the phone.
+
+### Changed
+
+- **The WalkyTalky skill moves out of your instruction files into each agent's skills folder.** Codex, opencode, pi and Gemini CLI got the skill as a block in `AGENTS.md` or `GEMINI.md`, so its whole text rode in every prompt, and its last line changed with every Collie build, which cost each session after an update its prompt cache. Now they get `collie-walky-talky/SKILL.md` in their own skills folder, as Claude Code already did, and keep only its one-line description in the prompt; omp gets the file too, and Antigravity, Grok and Muse read it from a folder Collie already writes. Codex needs 0.150.0 or later and Gemini CLI 0.26.0 or later to read it; an older one keeps working through the message line typed into its pane. `collie update` and `collie skill sync` cut the old block once the file is in place, after a copy of the file as it was, `<file>.collie-pre-skill-move`, and leave every other line as it was; a block with damaged or doubled markers, or edited by hand, stays, and `collie skill status` and `collie doctor` name the file to clean by hand. Thanks @tangentyh (#770).
+
+### Fixed
+
+- **Claude's Remote Control row coming or going no longer fails a send.** Claude Code draws its Remote Control status (`/rc`, `/rc active`, `/rc connecting…`, `/rc reconnecting`, `/rc failed`) as a row under the box. Had that row come or gone while Collie typed, the send's probe failed, the send was held as "Something is open at the box", and each retry could fail the same way. The Claude profile now names the row as a hint, so it no longer counts as the screen moving; its focused form, which takes Enter, still counts. Thanks @hubrix (#767).
+
+- **A long `/rewind` list reads as a menu again.** Claude Code opens the list under a plain `─` border, and once it held ten turns or more that border sat more than 30 rows above its footer. Collie found no top, and the phone showed the unread-dialog card instead of Continue and Cancel. A border now counts out to 60 rows.
+
+## [1.28.2] - 2026-11-11
+
+### Fixed
+
+- **`collie crew update` no longer refuses a member whose checkout holds only an untracked `config.toml`.** The check that a member's checkout is clean counted that file, the machine's own config, as a change and stopped the update. Now it looks at tracked files only, and the `config.toml` line is in `.gitignore`. Thanks @OowhitecatoO (#733).
 - **The Collie mark rests until you touch the app.** Since 1.28.1 a page you opened drifted the mark for its first 20 seconds with no touch at all, background tabs included. Now the mark rests until your first touch, key press or mouse wheel, and 20 seconds after the last one it slows to a stop as before. A page left open and a page in the background draw nothing for the mark. A scroll the app makes by itself, such as the chat following new output, does not count as a touch. This undoes a slowdown seen in WebKit (Safari's engine) tests since 1.28.1.
+- **`collie pair` refuses in a pane where an agent works, and the audit log says where each pairing came from.** A paired device can read and drive every session, so an agent does not pair one for itself. `collie pair`, `--json` included, now asks the running bridge whether its pane runs an agent and refuses there, with a line that tells the agent to ask its operator; run it in a shell pane or a terminal of your own. With no bridge running, or a bridge that does not know the pane, it does not refuse: the check is a speed bump, not a wall, and your user account stays the boundary. The audit log's `pair` line now names the route the claim came by (`loopback`, `tailnet`, `lan` or `internet`, never the address) and the pane that made the code, or `not placed`, and a refused `collie pair` writes a `pair-refused` line. No code or token is ever written there. What a program running as you can still do is listed in the security docs.
+- **A slow Windows PowerShell no longer makes Collie say its task is missing.** On a laptop where PowerShell takes more than 10 seconds to answer, `collie status`, `collie doctor` and the update check read the timeout as "no Task Scheduler task", and the check went red and blocked the Update button on the phone. Collie now asks `schtasks /Query /XML` first, which needs no PowerShell, and asks PowerShell only when that cannot decide, for up to 60 seconds. A task it could not read is reported as "could not read", with the time limit: amber in the update check, and `collie start` and `collie restart` never register a task over one they could not read. Because `schtasks` does not report whether a task is running, `status` now says `registered` where it said `Running` when `schtasks` answers. Thanks @EricSanzLuna (#762).
 
 ## [1.28.1] - 2026-11-10
 

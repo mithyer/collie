@@ -60,6 +60,18 @@ const NEUTRAL = new Set([
   // The same footer with Claude Code 2.1.293's active-agent pointer (`❯ ◯ …`) on its last row — still
   // composer chrome below a live box, never a dialog.
   "claude--footer-pointed-agent.txt",
+  // Claude Code 2.1.319 with Remote Control on: a lone `/rc` row under the statusline, the mode row and
+  // the update notice. A status row under a live box, never a slash-command list or a dialog.
+  "claude--v2319-rc-footer-idle--w100.txt",
+  // Claude Code 2.1.323 with Remote Control on, as the lab captured it: the pill `/rc active` right-aligned under
+  // the box, on the mode row or on a row of its own. An idle box, a draft and a running turn, and the idle box
+  // with Remote Control off: composer chrome, never a dialog.
+  "claude--v2323-rc-off-idle--w100.txt",
+  "claude--v2323-rc-on-draft--w100.txt",
+  "claude--v2323-rc-on-idle-joined--w100.txt",
+  "claude--v2323-rc-on-idle-notice--w100.txt",
+  "claude--v2323-rc-on-idle-usage--w100.txt",
+  "claude--v2323-rc-on-running--w100.txt",
   // The /model picker DISMISSED: the input box is back, so this is an ordinary idle screen. It is the
   // negative control for the generic menu grammar — its statusline is `·`-separated like a key-hint
   // footer, and the input-box gate is the only thing that keeps it raw.
@@ -185,6 +197,10 @@ const NEUTRAL = new Set([
   "claude--v2301-lab-agents-panel-more.txt",
   "claude--v2301-lab-agents-panel-tasks-pill.txt",
   "claude--v2301-lab-agents-panel-focused.txt",
+  // Stock Claude Code 2.1.322 on macOS draws `⏺ main` (U+23FA) instead of Linux's `● main` (U+25CF).
+  "claude--v2322-macos-agents-panel-idle--w80.txt",
+  "claude--v2322-macos-agents-panel-focused--w80.txt",
+  "claude--v2322-macos-agents-panel-working--w80.txt",
 ]);
 
 const allClaudeFixtures = readdirSync(PANES_DIR)

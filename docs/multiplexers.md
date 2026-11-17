@@ -276,6 +276,9 @@ What works:
   that cuts the row names nothing), and exactly one log in the folder with those totals; otherwise
   the Chat stays empty and says why. A pane that has just started, or just run `/new`, has no totals
   yet, and its Chat appears with the first reply. `pi --session <id>` still names the log outright.
+  The footer and the log are written a moment apart, so right after a turn they can disagree for a
+  second or two. A pane that was matched keeps its log for 20 seconds after the last match, so the
+  Chat does not blank in between; a new match (`/new`, `/resume`) replaces it at once.
 
 What looks different on the core:
 

@@ -200,6 +200,7 @@ import { TranscriptStore } from "./journal/store.ts";
 import type { AgentSessionRef, DiscoverHints, ForegroundProcess, JournalAdapter, PaneScreen } from "./journal/types.ts";
 import { isBlobHash, resolveBlobPath } from "./journal/pi.ts";
 import { realpathOf, statFile } from "./journal/files.ts";
+import { settleSharedRef } from "./journal/shared-ref.ts";
 import {
   bearerToken,
   normalizeLabel,
@@ -4843,7 +4844,11 @@ export async function journalRefOf(
     // Discovery hears about the neighbour, so a folder-keyed adapter answers no session rather than
     // the neighbour's (#508). The flag rides only when true; otherwise the hints pass untouched.
     const told: DiscoverHints | undefined = neighbour ? { ...hints, shared: true } : hints;
-    return (await adapter.discover?.(pane.cwd, told)) ?? null;
+    const found = (await adapter.discover?.(pane.cwd, told)) ?? null;
+    // A shared folder tells its panes apart by the footer, which a log can lead by a moment: the last
+    // answer stands for a short grace so a poll between two views does not turn it into "no session"
+    if (!neighbour || adapter.sharedFolderBlind !== true) return found;
+    return settleSharedRef(adapter, pane.paneId, found, Date.now());
   }
   if (adapter.reconcile === undefined || pane.agent !== adapter.agent) return reported;
   // A fresh pane's row may not be written yet; with a neighbour, the one live session found in the

@@ -5879,6 +5879,30 @@ describe("journalRefOf — which session the history and chat routes read", () =
     expect(await journalRefOf(a, mine, [mine, pane({ paneId: "w1:p3", agent: "omp", cwd: "/elsewhere" })])).toEqual(resumed);
   });
 
+  test("a pane in a shared folder keeps the log it found when one poll finds none (the footer leads or lags the log)", async () => {
+    // The footer of a shared pane names its log; for a moment after a turn the two disagree and discovery answers null
+    let answer: typeof resumed | null = resumed;
+    const a = adapter({ agent: "pi", sharedFolderBlind: true, discover: async () => answer });
+    const mine = pane({ agent: "pi" });
+    const other = pane({ paneId: "w1:p2", agent: "pi" });
+    expect(await journalRefOf(a, mine, [mine, other])).toEqual(resumed);
+    answer = null;
+    expect(await journalRefOf(a, mine, [mine, other])).toEqual(resumed);
+    // The neighbour never inherits it, and a pane alone in its folder is answered by its own walk
+    expect(await journalRefOf(a, other, [mine, other])).toBeNull();
+    expect(await journalRefOf(a, mine, [mine])).toBeNull();
+  });
+
+  test("an adapter that is not folder-blind keeps no memory: a null stays null", async () => {
+    let answer: typeof resumed | null = resumed;
+    const a = adapter({ agent: "grok", discover: async () => answer });
+    const mine = pane({});
+    const other = pane({ paneId: "w1:p2" });
+    expect(await journalRefOf(a, mine, [mine, other])).toEqual(resumed);
+    answer = null;
+    expect(await journalRefOf(a, mine, [mine, other])).toBeNull();
+  });
+
   describe("another pane in the folder", () => {
     const calls: string[] = [];
     const a = adapter({

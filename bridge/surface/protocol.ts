@@ -394,6 +394,14 @@ const FIRST_GAP_MS = 80;
  * time left to read, and the probe ended "could not confirm" (minibuch, herdr-core, 2026-10-30).
  */
 const PROBE_BACK_FLOOR_MS = FIRST_GAP_MS + BOUNDS.probe.ms / BOUNDS.probe.reads;
+/**
+ * The fewest reads the probe's Backspace half gets. The two halves share {@link BOUNDS.probe}'s three reads and the
+ * character may take two of them (a loaded machine or a busy agent draws a typed key on the second read), which left
+ * Backspace one read, {@link FIRST_GAP_MS} after the key: a box that drew it a little later ended
+ * `refused(probe_failed)` "Backspace did not give the box back as it was" with nothing typed (a pi pane under load,
+ * 4 of 20 probed sends on 2026-11-18). Backspace gets as many reads as the character may take.
+ */
+const PROBE_BACK_MIN_READS = 2;
 /** The gap between the two S0 reads. */
 const S0_GAP_MS = 120;
 /**
@@ -5188,7 +5196,7 @@ export class SendProtocol {
       if (err instanceof Ended && err.outcome === "refused") throw failed(`Backspace after the probe was refused: ${err.extra.detail ?? err.message}`, typed.snap);
       throw err;
     }
-    const readsLeft = Math.max(1, budget.reads - typed.reads);
+    const readsLeft = Math.max(PROBE_BACK_MIN_READS, budget.reads - typed.reads);
     // Never less than one read's time: a half cut to its first gap slept and never read.
     const back = await this.poll(state, "probe", { reads: readsLeft, ms: Math.max(PROBE_BACK_FLOOR_MS, budget.ms - spent) }, (snap) => {
       if (s0.frame !== null) {

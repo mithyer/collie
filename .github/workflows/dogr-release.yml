@@ -49,7 +49,10 @@ jobs:
   #     with SIGILL on older hardware, which is exactly the hardware a self-hosted tool lives on.
   #     Collie is I/O-bound (a Unix socket and static files), so the baseline penalty is not
   #     observable here.
-  # The matrix ships all four targets; macos-x64 is cross-compiled on the macos-15 row (arm64, like macos-14 before it; #385). A
+  # The matrix ships all four targets; macos-x64 is cross-compiled on the macos-15 row (arm64, like macos-14 before it; #385). The
+  # macos-arm64 row runs on macos-14 instead: on 2026-11-18 the hosted macos-15 arm64 pool was so short of capacity that this job
+  # was never given a runner ten times in a row ("The job was not acquired by Runner of type hosted even after multiple
+  # attempts"), which failed the whole release although nothing in the build was wrong. A
   # platform with no row gets `collie update`'s honest "no artifact for your platform, build from
   # source" rather than a wrong binary.
   payload:
@@ -62,7 +65,7 @@ jobs:
             runs-on: ubuntu-latest
             bun-target: bun-linux-x64-baseline
           - platform: macos-arm64
-            runs-on: macos-15
+            runs-on: macos-14
             bun-target: bun-darwin-arm64
           - platform: linux-arm64
             runs-on: ubuntu-24.04-arm

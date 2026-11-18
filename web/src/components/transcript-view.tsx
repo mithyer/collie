@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { memo, useCallback, useState } from "react";
 import { Icon } from "@/components/icons/icon";
 
 import { AgentIcon } from "@/components/agent-icon";
@@ -29,16 +29,31 @@ function clockTime(iso: string): string {
   if (!iso) return "";
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return "";
-  const locale = getLocaleSnapshot().locale;
-  return new Intl.DateTimeFormat(locale, { hour: "2-digit", minute: "2-digit" }).format(d);
+  return formatter("clock", getLocaleSnapshot().locale).format(d);
 }
 
 function dayKey(iso: string): string {
   if (!iso) return "";
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return "";
-  const locale = getLocaleSnapshot().locale;
-  return new Intl.DateTimeFormat(locale, { dateStyle: "medium" }).format(d);
+  return formatter("day", getLocaleSnapshot().locale).format(d);
+}
+
+// A date formatter costs far more to build than to use, and a thread asks for two of them per turn on every
+// render: 800 turns made 1600 of them. One per kind and locale is built once and kept.
+const formatters = new Map<string, Intl.DateTimeFormat>();
+
+function formatter(kind: "clock" | "day", locale: string): Intl.DateTimeFormat {
+  const key = `${kind}:${locale}`;
+  let found = formatters.get(key);
+  if (found === undefined) {
+    found = new Intl.DateTimeFormat(
+      locale,
+      kind === "clock" ? { hour: "2-digit", minute: "2-digit" } : { dateStyle: "medium" },
+    );
+    formatters.set(key, found);
+  }
+  return found;
 }
 
 /** Plain text with find hits marked — for strings that are NOT Markdown (shell commands, output). */
@@ -344,6 +359,81 @@ function TurnBody({
   );
 }
 
+/** What one row of the thread needs: all of it plain values, so that a row whose turn did not change is not drawn again. */
+interface RowProps {
+  entry: TranscriptEntry;
+  agent?: string;
+  /** The day label to draw above this turn, or null when it does not start a new day. */
+  newDay: string | null;
+  showHeader: boolean;
+  /** The turn a find/jump landed on. */
+  focused: boolean;
+  query: string;
+  scope?: Scope;
+  drawTools: boolean;
+  drawCompactions: boolean;
+  /** The locale store's revision. Not read: a changed value is what draws the row again when the language changes. */
+  revision: number;
+  /** Takes the turn's uuid so that one function serves every row (a new function per row would defeat the memo). */
+  onShowTools: (uuid: string) => void;
+}
+
+/**
+ * One turn with its day divider.
+ *
+ * Memoised on purpose. A thread of several hundred turns re-renders on every poll (the newest turn grows while the agent
+ * writes), and drawing every turn again for that took about half a millisecond per turn on a phone-class CPU, so the cost
+ * of an update grew with the length of the thread. A turn's object keeps its identity while it does not change (the chat
+ * window only replaces turns that changed), so a row that gets the same props is skipped.
+ */
+const TranscriptRow = memo(function TranscriptRow({
+  entry,
+  agent,
+  newDay,
+  showHeader,
+  focused,
+  query,
+  scope,
+  drawTools,
+  drawCompactions,
+  onShowTools,
+}: RowProps) {
+  return (
+    <div
+      data-turn={entry.uuid}
+      // The jump target's mark is a border that is present in every turn and transparent
+      // until the turn is the one you jumped to, so nothing reflows when it lands. It used to
+      // be `ring-2 ring-offset-2`, which paints OUTSIDE the box: in this scroller the first
+      // and last turn lost their mark at the container edge, and a later turn's own fill
+      // painted over it. The radius is unconditional for the same reason — a shape that
+      // changes with state is still a box that changes.
+      className={cn(
+        "rounded-lg border border-transparent",
+        showHeader ? "space-y-3 pt-1" : "space-y-3",
+        focused && "border-primary/60",
+      )}
+    >
+      {newDay !== null && (
+        <div className="flex items-center gap-2 pt-1">
+          <div className="h-px flex-1 bg-border" />
+          <span className="text-[11px] font-medium text-muted-foreground">{newDay}</span>
+          <div className="h-px flex-1 bg-border" />
+        </div>
+      )}
+      <TurnBody
+        entry={entry}
+        agent={agent}
+        showHeader={showHeader}
+        query={query}
+        scope={scope}
+        drawTools={drawTools}
+        drawCompactions={drawCompactions}
+        onShowTools={() => onShowTools(entry.uuid)}
+      />
+    </div>
+  );
+});
+
 export function TranscriptView({
   entries,
   agent,
@@ -362,7 +452,7 @@ export function TranscriptView({
    *  named them, so a blob URL takes the same scope every other per-pane request takes. */
   scope?: Scope;
 }) {
-  useLocale();
+  const { revision } = useLocale();
   const { prefs } = useDashPrefs();
   // Turns whose steps the reader asked to see again, by uuid. Per view and never persisted: the
   // setting is the standing answer, this is "show me this one".
@@ -373,6 +463,8 @@ export function TranscriptView({
   const drawTools = prefs.showToolCalls || query !== "";
   // Same rule for a compaction's recap: a search must be able to land inside it.
   const drawCompactions = prefs.showCompactions || query !== "";
+  // One function for every row, so that the rows can be memoised (see TranscriptRow).
+  const showTools = useCallback((uuid: string) => setShown((s) => ({ ...s, [uuid]: true })), []);
   // Consecutive turns from the same speaker are GROUPED — only the first of a run carries the
   // role/time header. A real thread is overwhelmingly long runs of assistant turns (892 of 914 in a
   // measured session), so repeating "CLAUDE 06:43 PM" above every tool call would roughly double the
@@ -388,39 +480,20 @@ export function TranscriptView({
         const showHeader = newDay || entry.role !== lastRole;
         lastRole = entry.role;
         return (
-          <div
+          <TranscriptRow
             key={entry.uuid}
-            data-turn={entry.uuid}
-            // The jump target's mark is a border that is present in every turn and transparent
-            // until the turn is the one you jumped to, so nothing reflows when it lands. It used to
-            // be `ring-2 ring-offset-2`, which paints OUTSIDE the box: in this scroller the first
-            // and last turn lost their mark at the container edge, and a later turn's own fill
-            // painted over it. The radius is unconditional for the same reason — a shape that
-            // changes with state is still a box that changes.
-            className={cn(
-              "rounded-lg border border-transparent",
-              showHeader ? "space-y-3 pt-1" : "space-y-3",
-              entry.uuid === focusedUuid && "border-primary/60",
-            )}
-          >
-            {newDay && (
-              <div className="flex items-center gap-2 pt-1">
-                <div className="h-px flex-1 bg-border" />
-                <span className="text-[11px] font-medium text-muted-foreground">{day}</span>
-                <div className="h-px flex-1 bg-border" />
-              </div>
-            )}
-            <TurnBody
-              entry={entry}
-              agent={agent}
-              showHeader={showHeader}
-              query={query}
-              scope={scope}
-              drawTools={drawTools || shown[entry.uuid] === true}
-              drawCompactions={drawCompactions}
-              onShowTools={() => setShown((s) => ({ ...s, [entry.uuid]: true }))}
-            />
-          </div>
+            entry={entry}
+            agent={agent}
+            newDay={newDay ? day : null}
+            showHeader={showHeader}
+            focused={entry.uuid === focusedUuid}
+            query={query}
+            scope={scope}
+            drawTools={drawTools || shown[entry.uuid] === true}
+            drawCompactions={drawCompactions}
+            revision={revision}
+            onShowTools={showTools}
+          />
         );
       })}
     </div>

@@ -1,0 +1,40 @@
+
+
+ $ sleep 40 (timeout 50s)
+
+ (no output)
+
+ Took 40.0s
+
+
+
+ curl steer two
+
+
+ done
+
+
+ Run this exact bash command with your bash tool, then say done: for i in $(seq 1 40); do echo $i; sleep 1; done
+
+
+
+ $ for i in $(seq 1 40); do echo $i; sleep 1; done (timeout 50s)
+
+ ... (5 earlier lines, ctrl+o to expand)
+ 6
+ 7
+ 8
+ 9
+ 10
+
+ Elapsed 9.1s
+
+
+ Steering: say banana
+ ↳ Option+Up to edit all queued messages
+
+── ⠏ Working ───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+/private/tmp/collie-live/work
+↑8.0k ↓281 R4.9k CH85.4% $0.010 0.6%/272k (auto)                                                                                                                          (my-gpt) gpt-6.1-terra • xhigh

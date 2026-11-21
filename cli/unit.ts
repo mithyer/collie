@@ -45,6 +45,12 @@ export interface ServiceSpec {
   instance: string | null;
   /** The supervised program: `<root>/bin/collie`. */
   binary: string;
+  /**
+   * The program the supervisor starts INSTEAD of `binary`, or absent: on macOS a binary install runs a
+   * copy whose path never changes (`cli/stable-runner.ts`), so the system's per-program privacy answers
+   * survive an update. `binary` stays the version folder's own file for every other use.
+   */
+  launcher?: string | null;
   configDir: string;
   socket: string;
   port: number;
@@ -106,7 +112,8 @@ export function agentFilePath(home: string, instance: string | null = null): str
  * drift and the liveness guard would silently degrade to killing nothing.
  */
 export function bridgeCommand(spec: ServiceSpec): string[] {
-  const argv = [spec.binary, "_exec-bridge"];
+  // TEST:cli/unit.test.ts[the launch agent runs the stable copy when there is one]
+  const argv = [spec.launcher ?? spec.binary, "_exec-bridge"];
   // A suffixed instance carries `--instance <name>`, and that is the ONLY reason the flag exists:
   // two instances out of one checkout share a binary path, so without it the pidfile predicate
   // ({@link isOurBridge}) could not tell one bridge from the other and `start` on the second could

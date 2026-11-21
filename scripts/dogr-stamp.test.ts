@@ -11,7 +11,16 @@ import { spawnSync } from "node:child_process";
 
 import { describe, expect, test } from "bun:test";
 
-import { REPO_SPOTS, UPSTREAM_REPO, readDogrTag, reconcileDogr, stampRepoSpot, strictTagsAtOrAbove } from "./dogr-stamp.ts";
+import {
+	REPO_SPOTS,
+	UPSTREAM_REPO,
+	dogrTagsAtOrAboveCounter,
+	nextDogrCounter,
+	readDogrTag,
+	reconcileDogr,
+	stampRepoSpot,
+	strictTagsAtOrAbove,
+} from "./dogr-stamp.ts";
 import { tomlVersion } from "./release-tag.ts";
 
 const SCRIPT = join(import.meta.dir, "dogr-stamp.ts");
@@ -87,6 +96,52 @@ describe("strictTagsAtOrAbove", () => {
 	test("compares numbers, not text", () => {
 		expect(strictTagsAtOrAbove(["v1.100.0"], "1.28.1")).toEqual(["v1.100.0"]);
 		expect(strictTagsAtOrAbove(["v1.9.0"], "1.28.1")).toEqual([]);
+	});
+});
+
+describe("dogrTagsAtOrAboveCounter", () => {
+	// Real history of the fork: the counter went 1-3 on 1.28.1, then 1-3 and 6-10 on 1.28.5 (4 and 5 were never published).
+	const tags = ["v1.28.1-dogr.1", "v1.28.1-dogr.3", "v1.28.5-dogr.1", "v1.28.5-dogr.10", "v1.28.5", "v1.28.5-edge.12"];
+	const reading = (tag: string) => {
+		const read = readDogrTag(tag);
+		if (read === null) throw new Error(`not a Dogr tag: ${tag}`);
+		return read;
+	};
+
+	test("a counter above every other Dogr tag passes, even for a new upstream base", () => {
+		expect(dogrTagsAtOrAboveCounter(tags, reading("v1.29.1-dogr.11"))).toEqual([]);
+		expect(dogrTagsAtOrAboveCounter(tags, reading("v1.28.5-dogr.11"))).toEqual([]);
+	});
+
+	test("a counter that restarts for a new base is refused and names the tags it does not rise above", () => {
+		expect(dogrTagsAtOrAboveCounter(tags, reading("v1.29.1-dogr.1"))).toEqual(["v1.28.1-dogr.1", "v1.28.1-dogr.3", "v1.28.5-dogr.1", "v1.28.5-dogr.10"]);
+	});
+
+	test("the same counter on another base is refused", () => {
+		expect(dogrTagsAtOrAboveCounter(tags, reading("v1.29.1-dogr.10"))).toEqual(["v1.28.5-dogr.10"]);
+	});
+
+	test("the tag being cut is not compared with itself", () => {
+		expect(dogrTagsAtOrAboveCounter([...tags, "v1.29.1-dogr.11"], reading("v1.29.1-dogr.11"))).toEqual([]);
+	});
+
+	test("strict and Edge tags are not Dogr tags", () => {
+		expect(dogrTagsAtOrAboveCounter(["v1.28.5", "v1.28.5-edge.99"], reading("v1.28.5-dogr.1"))).toEqual([]);
+	});
+});
+
+describe("nextDogrCounter", () => {
+	test("is one more than the highest counter on any base", () => {
+		expect(nextDogrCounter(["v1.28.1-dogr.3", "v1.28.5-dogr.10", "v1.28.5-dogr.2"])).toBe(11);
+	});
+
+	test("compares numbers, not text", () => {
+		expect(nextDogrCounter(["v1.28.5-dogr.9", "v1.28.5-dogr.10"])).toBe(11);
+	});
+
+	test("starts at 1 when there is no Dogr tag", () => {
+		expect(nextDogrCounter(["v1.28.5", "v1.28.5-edge.3"])).toBe(1);
+		expect(nextDogrCounter([])).toBe(1);
 	});
 });
 
@@ -248,6 +303,22 @@ describe("the command", () => {
 			expect(done.stderr).toContain("v1.28.1");
 			writeFileSync(list, "v1.26.3\nv1.28.1-dogr.1\n");
 			expect(run(root, "--tag", "v1.28.1-dogr.2", "--tags-file", list).status).toBe(0);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	test("refuses a counter that does not rise above every other Dogr tag, whatever the base", () => {
+		const root = scratch("1.29.1");
+		try {
+			const list = join(root, "tags.txt");
+			writeFileSync(list, "v1.28.5-dogr.9\nv1.28.5-dogr.10\nv1.29.1-dogr.1\n");
+			const restart = run(root, "--tag", "v1.29.1-dogr.1", "--tags-file", list);
+			expect(restart.status).toBe(1);
+			expect(restart.stderr).toContain("up to v1.28.5-dogr.10");
+			expect(restart.stderr).toContain("next free counter is 11");
+			writeFileSync(list, "v1.28.5-dogr.9\nv1.28.5-dogr.10\nv1.29.1-dogr.11\n");
+			expect(run(root, "--tag", "v1.29.1-dogr.11", "--tags-file", list).status).toBe(0);
 		} finally {
 			rmSync(root, { recursive: true, force: true });
 		}

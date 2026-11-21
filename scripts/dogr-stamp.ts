@@ -28,6 +28,12 @@
 // offered an update to a package that does not exist (it was run against Collie's own update logic:
 // see bridge/dogr-update.test.ts). `--tags-file` is how the release job refuses such a tag list.
 //
+// THE COUNTER ONLY RISES. `N` in `vX.Y.Z-dogr.N` is one running count of our builds. It does not restart at 1
+// when the upstream release moves: the build after `1.28.5-dogr.10` is `1.29.1-dogr.11`. Machines still order
+// builds by the upstream version first and the counter second, so nothing depends on the restart; the owner
+// wants a number that tells the age of a build at a glance. `--tags-file` also refuses a tag whose counter is
+// not above every other Dogr tag, so a forgotten rule shows up as a red release job, not as a confusing number.
+//
 // No dependency beyond Node's own modules and `release-tag.ts`: the payload job runs this before
 // `bun install`, like `release-version.ts`.
 
@@ -48,7 +54,7 @@ export interface DogrTag {
 	readonly tag: string;
 	/** The upstream release this build is based on, `1.28.1`; the version the files carry in git. */
 	readonly base: string;
-	/** The build counter after `-dogr.`, from 1 for each base. */
+	/** The build counter after `-dogr.`: one running count of our builds, never restarted for a new base. */
 	readonly n: number;
 	/** The version the build reports, `1.28.1-dogr.1`. */
 	readonly version: string;
@@ -107,6 +113,45 @@ export function strictTagsAtOrAbove(tags: readonly string[], base: string): stri
 		}
 		return true;
 	});
+}
+
+/**
+ * The other Dogr tags whose counter is not below the new build's: the build would not be the newest by counter.
+ * @param tags Every tag name of the fork; the tag being cut may be among them and is skipped.
+ * @param reading The build being cut.
+ * @returns The Dogr tags (any upstream base) whose counter is equal to or higher than `reading.n`; empty when the
+ *   counter rises above all of them.
+ */
+// TEST:scripts/dogr-stamp.test.ts[dogrTagsAtOrAboveCounter]
+export function dogrTagsAtOrAboveCounter(tags: readonly string[], reading: DogrTag): string[] {
+	const found: string[] = [];
+	for (const name of tags) {
+		const other = readDogrTag(name);
+		if (other !== null && other.tag !== reading.tag && other.n >= reading.n) found.push(other.tag);
+	}
+	return found;
+}
+
+/**
+ * The counter the next Dogr build must carry.
+ * @param tags Every tag name of the fork.
+ * @returns One more than the highest counter of any Dogr tag, or 1 when there is none.
+ */
+// TEST:scripts/dogr-stamp.test.ts[nextDogrCounter]
+export function nextDogrCounter(tags: readonly string[]): number {
+	let highest = 0;
+	for (const name of tags) highest = Math.max(highest, readDogrTag(name)?.n ?? 0);
+	return highest + 1;
+}
+
+/**
+ * The Dogr tag(s) that carry a counter, for a message.
+ * @param n The counter.
+ * @param tags Every tag name of the fork.
+ * @returns The tag names with that counter, joined by a comma.
+ */
+function tagsByCounter(n: number, tags: readonly string[]): string {
+	return tags.filter((name) => readDogrTag(name)?.n === n).join(", ");
 }
 
 /** Collie's own repository: what the files in git say, and what a Dogr build replaces. */
@@ -209,6 +254,15 @@ async function main(argv: readonly string[]): Promise<number> {
 			console.error(
 				`✗ dogr-stamp: this repository holds strict tag(s) ${hidden.join(", ")}, which sort above ${reading.version}. ` +
 					"Every machine would be offered an update to a package that does not exist. Delete the tag(s) from this repository.",
+			);
+			return 1;
+		}
+		const notAbove = dogrTagsAtOrAboveCounter(tags, reading);
+		if (notAbove.length > 0) {
+			const next = nextDogrCounter(tags);
+			console.error(
+				`✗ dogr-stamp: ${reading.tag} has counter ${reading.n}, but this repository already holds ${notAbove.length} Dogr tag(s) with that counter or higher, ` +
+					`up to ${tagsByCounter(next - 1, tags)}. The counter keeps rising across upstream versions (it never restarts at 1); the next free counter is ${next}.`,
 			);
 			return 1;
 		}

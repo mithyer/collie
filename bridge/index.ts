@@ -26,6 +26,7 @@ import { MachineSampler } from "./machine-stats.ts";
 import { machineRosterOf, MachineWatch, SOLO_MACHINE_ID, type MachineRosterEntry } from "./machines.ts";
 import { localWatchPane, peerWatchPane } from "./cache/watch-key.ts";
 import { museSessionNameReader } from "./journal/muse.ts";
+import { configureInlineBlobs } from "./journal/inline-blobs.ts";
 import { buildJournalRegistry } from "./journal/registry.ts";
 import { createCacheRulesReader } from "./operator-cache-rules.ts";
 import { AuditLog, fileAuditAppender } from "./audit.ts";
@@ -507,6 +508,11 @@ if (HOST.platform === "win32") {
   securePrivateRoot(cfg.stateDir, "state", !stateDirExisted);
   for (const line of flushAclBackups(cfg.stateDir)) console.warn(line);
 }
+
+// Big inline pictures of a session log are kept here and named by a short `/api/blobs/<hash>` address,
+// so a chat or history page does not carry them (journal/inline-blobs.ts). After the folder's private
+// list above, so the new folder inherits it. A folder that cannot be made leaves pictures inline.
+configureInlineBlobs(join(cfg.stateDir, "inline-blobs"));
 
 // Append-only audit trail of write-level actions (see audit.ts). A write failure here is swallowed
 // inside record() so it can never break the user action it's auditing.

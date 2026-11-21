@@ -30,6 +30,21 @@ describe("parsePiFooter: the footers the corpus prints", () => {
     ],
     ["↑↓ choose · Enter confirm · Esc cancel · D details", true, "select", false, false, "cancel", false],
     ["Enter to select · Ctrl+S to set as default · Escape/Ctrl+C to cancel", false, "select", false, false, "cancel", false],
+    // rpiv-ask-user-question (pi--v152-rpiv-*): a lower-case `n` for notes, `Ctrl+]` to collapse, Tab between questions
+    [
+      "Enter to select · ↑/↓ to navigate · n to add notes · Esc to cancel · Ctrl+] to collapse",
+      true, "select", false, false, "cancel", false,
+    ],
+    [
+      "Enter to select · ↑/↓ to navigate · n to add notes · Tab to switch questions · Esc to cancel · Ctrl+] to collapse",
+      true, "select", false, false, "cancel", false,
+    ],
+    ["Enter to select · ↑/↓ to navigate · n to add a note · Esc to cancel", true, "select", false, false, "cancel", false],
+    // The same dialog's text editor (the free-text row or the notes box)
+    [
+      "Enter to select · ↑/↓ to navigate · Esc to cancel · Ctrl+] to collapse · Shift+Enter for newline · Ctrl+U to clear",
+      true, "select", false, false, "cancel", false,
+    ],
   ] as const)("%s", (text, arrowsMove, enter, digitsSelect, spaceToggles, escapeVerb, tabs) => {
     expect(parsePiFooter(text)).toEqual({ text, arrowsMove, enter, digitsSelect, spaceToggles, escapeVerb, tabs });
   });
@@ -42,6 +57,7 @@ describe("parsePiFooter: what is not a footer", () => {
     ["a countdown", "Ask user · 30m"],
     ["a counter", "Submit (0/1 answered) — Enter advances"],
     ["an unknown key", "↑↓ navigate • F5 to refresh • Esc to cancel"],
+    ["a chord with two keys after ctrl", "↑↓ navigate • Ctrl+Shift to refresh • Esc to cancel"],
     ["a sentence", "Pick a color for the Collie probe?"],
     ["an empty row", ""],
     ["a key torn from its verb", "↑↓ navigate • Enter to select • Esc • to cancel"],

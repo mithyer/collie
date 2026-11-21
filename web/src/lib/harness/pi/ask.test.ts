@@ -122,6 +122,16 @@ const LIFTS_397 = new Map<string, Expect>([
   // editor, its pointer on each of two choices (issue 660).
   ["pi--v140-gentle-float-dialog--w100.txt", "walk"],
   ["pi--v140-gentle-float-dialog-moved--w100.txt", "walk"],
+  // rpiv-ask-user-question 2.15.0 on pi 1.5.2 through herdr-core (plain reads): its footer stands under the bottom rule.
+  // One question, the pages of a tabbed dialog, and the review page that ends it (no bottom rule, the footer follows the options).
+  ["pi--v152-rpiv-single--w200.txt", "walk"],
+  ["pi--v152-rpiv-single-moved--w200.txt", "walk"],
+  ["pi--v152-rpiv-tabs-first--w200.txt", "walk"],
+  ["pi--v152-rpiv-tabs-first-moved--w200.txt", "walk"],
+  ["pi--v152-rpiv-tabs-second--w200.txt", "walk"],
+  ["pi--v152-rpiv-tabs-second-moved--w200.txt", "walk"],
+  ["pi--v152-rpiv-submit--w200.txt", "walk"],
+  ["pi--v152-rpiv-submit-moved--w200.txt", "walk"],
 ]);
 /** Screens with a pi modal up that stay raw: the Escape card's evidence. */
 const RAW_MODALS = new Set([
@@ -160,6 +170,12 @@ const RAW_MODALS = new Set([
   // The model selector under pi-powerline-footer, which replaces pi's editor with its own (issue 544,
   // live 2026-10-20): pi's selector still takes the editor's place in column zero.
   "pi--v130-powerline-model-selector--w120.txt",
+  // rpiv-ask-user-question 2.15.0: a multi-select, a text editor with the keyboard (empty and typed) and its notes box stay raw,
+  // and the footer still names Esc, so the Escape card is offered.
+  "pi--v152-rpiv-multi--w200.txt",
+  "pi--v152-rpiv-free-focused--w200.txt",
+  "pi--v152-rpiv-free-typed--w200.txt",
+  "pi--v152-rpiv-notes--w200.txt",
   ...["v0871", "v110"].flatMap((v) => [
     `pi--${v}-question-other-focused.txt`,
     `pi--${v}-question-answer-editor.txt`,
@@ -743,6 +759,98 @@ describe("the Submit page", () => {
     for (const name of ["pi--v0871-questionnaire-submit-incomplete.txt", "pi--v110-review-incomplete.txt"]) {
       expect(detectPiQuestion(load(name))).toBeNull();
     }
+  });
+});
+
+describe("rpiv-ask-user-question: the footer under the bottom rule (pi 1.5.2 through herdr-core)", () => {
+  // TEST: the fixtures pi--v152-rpiv-*--w200.txt are plain reads, so the rows carry no colour and the frame is found by its rules.
+  const SINGLE = "pi--v152-rpiv-single--w200.txt";
+  const rowsOf = (name: string) => raw(name).replace(/\n$/, "").split("\n");
+  const labelsAndKeys = (model: PromptModel) => model.options.map((o) => [o.label, o.keys]);
+
+  it("lifts a one-question dialog: the chip row is the caption, the pointer row sends Enter, the others walk down", () => {
+    const model = prompt(load(SINGLE));
+    expect(model.question).toBe("Which color do you like?");
+    expect(model.caption).toBe("Color");
+    expect(labelsAndKeys(model)).toEqual([
+      ["Red", ["Enter"]],
+      ["Green", ["Down", "Enter"]],
+      ["Cancel", ["Escape"]],
+    ]);
+  });
+
+  it("walks the pointer: with it on option 2, option 1 is one Up away", () => {
+    const model = prompt(load("pi--v152-rpiv-single-moved--w200.txt"));
+    expect(labelsAndKeys(model)).toEqual([
+      ["Red", ["Up", "Enter"]],
+      ["Green", ["Enter"]],
+      ["Cancel", ["Escape"]],
+    ]);
+  });
+
+  it("lifts both pages of a tabbed dialog, the tab strip standing where the chip row stood", () => {
+    expect(prompt(load("pi--v152-rpiv-tabs-first--w200.txt")).question).toBe("Which color do you like?");
+    const second = prompt(load("pi--v152-rpiv-tabs-second--w200.txt"));
+    expect(second.question).toBe("Which size do you want?");
+    expect(labelsAndKeys(second).map(([label]) => label)).toEqual(["Small", "Large", "Cancel"]);
+  });
+
+  it("lifts the review page as a select of Submit answers and Cancel, with no bottom rule to find", () => {
+    const model = prompt(load("pi--v152-rpiv-submit--w200.txt"));
+    expect(model.question).toBe("Ready to submit your answers?");
+    expect(labelsAndKeys(model)[0]).toEqual(["Submit answers", ["Enter"]]);
+    expect(labelsAndKeys(model)[1]).toEqual(["Cancel", ["Down", "Enter"]]);
+  });
+
+  it("gives a screen the same identity on two reads, and a different one on the next page", () => {
+    const first = liftDialog(piAdapter.buildBlocks(load("pi--v152-rpiv-tabs-first--w200.txt")));
+    const again = liftDialog(piAdapter.buildBlocks(load("pi--v152-rpiv-tabs-first--w200.txt")));
+    const next = liftDialog(piAdapter.buildBlocks(load("pi--v152-rpiv-tabs-second--w200.txt")));
+    expect(first?.hash).toBeDefined();
+    expect(again?.hash).toBe(first?.hash);
+    expect(next?.hash).not.toBe(first?.hash);
+  });
+
+  it("reads as an ask on the Surface with the harness's own words for each option", () => {
+    const read = readScreen(load(SINGLE), "pi", idleFor("pi"));
+    expect(modalWord(read.surface.modal)).toBe("ask");
+    expect(askOf(read.surface.modal)?.options.map((o) => o.label)).toEqual(["Red", "Green", "Cancel"]);
+  });
+
+  it("keeps a multi-select and both text editors raw, so a typed row is never taken for an option", () => {
+    for (const name of [
+      "pi--v152-rpiv-multi--w200.txt",
+      "pi--v152-rpiv-free-focused--w200.txt",
+      "pi--v152-rpiv-free-typed--w200.txt",
+      "pi--v152-rpiv-notes--w200.txt",
+    ]) {
+      expect(detectPiQuestion(load(name)), name).toBeNull();
+    }
+  });
+
+  it("declines a dialog whose footer does not name Escape, or that has prose between the options and the rule", () => {
+    const rows = rowsOf(SINGLE);
+    const footer = rows.findIndex((r) => r.includes("Enter to select"));
+    const noEscape = [...rows];
+    noEscape[footer] = " Enter to select · ↑/↓ to navigate · n to add notes · Ctrl+] to collapse";
+    expect(detectPiQuestion(linesOf(noEscape.join("\n")))).toBeNull();
+    const rule = rows.findIndex((r, at) => at > 0 && r.startsWith("─") && at < footer);
+    const prose = [...rows.slice(0, rule), "an extra row of prose here", ...rows.slice(rule)];
+    expect(detectPiQuestion(linesOf(prose.join("\n")))).toBeNull();
+  });
+
+  it("declines the same rows once the status rows under the footer are gone", () => {
+    const rows = rowsOf(SINGLE);
+    const footer = rows.findIndex((r) => r.includes("Enter to select"));
+    expect(detectPiQuestion(linesOf(rows.slice(0, footer + 1).join("\n")))).toBeNull();
+  });
+
+  it("stays raw when the dialog is quoted in the agent's prose above pi's own editor", () => {
+    // The dialog's rows stop before its footer, as when an agent quotes them, and pi's real editor follows.
+    const footer = rowsOf(SINGLE).findIndex((r) => r.includes("Enter to select"));
+    const quoted = [...linesOf(rowsOf(SINGLE).slice(0, footer).join("\n")), ...load("pi--v110-idle.txt")];
+    expect(detectPiQuestion(quoted)).toBeNull();
+    expect(piAdapter.composerReady?.(quoted)).toBe(true);
   });
 });
 

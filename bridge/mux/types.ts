@@ -26,7 +26,7 @@
 // capability — it does not get a VT parser written for it.
 
 import type { AgentSessionRef, ForegroundProcess } from "../journal/types.ts";
-import type { AgentStatus, AnswerRequest, Ask, AskDecided, ControlRequest, PaneAction } from "../types.ts";
+import type { AgentStatus, AnswerRequest, BlockedBy, Ask, AskDecided, ControlRequest, PaneAction } from "../types.ts";
 import type { MuxCapability, MuxCapabilityDeclaration } from "./capabilities.ts";
 import type { MuxIdentity } from "./identity.ts";
 
@@ -187,6 +187,13 @@ export interface MuxPane extends MuxIdentity {
   readonly paneId: string;
   readonly spaceId: string;
   readonly spaceLabel: string;
+  /**
+   * True when `spaceLabel` is a name of the space's own: one the operator or the multiplexer's own naming
+   * gave it, never the id it fell back to and never a label derived from a folder. Walky talky reads it
+   * (bridge/walky/space.ts): a named space joins the space of the same name on another machine, an unnamed
+   * one stays on its machine. Each adapter says it; absent means `spaceLabel !== spaceId`.
+   */
+  readonly spaceNamed?: boolean;
   /** The space's position, as the multiplexer orders them. 1-based; 0 when it has no ordering. */
   readonly spaceNumber: number;
   readonly tabId: string;
@@ -226,6 +233,15 @@ export interface MuxPane extends MuxIdentity {
   readonly agent: string;
   /** How that agent is doing. `"unknown"` is the honest answer without `agentDetection`. */
   readonly status: AgentStatus;
+  /**
+   * Why a `blocked` pane needs a person, when it is NOT a question: `"error"` when the program reported
+   * that its turn stopped on a failure (herdr-core's OSC 7501 `state=error`: an API 5xx, an overload, a
+   * stream that broke off). Such a pane asks for a look and waits on nothing: no dialog is open, Load
+   * older reads, and a send goes as on an idle pane. Absent on every other pane, so a plain `blocked`
+   * stays a question. Only the herdr-core adapter sets it; a screen-detected dialog takes it away
+   * (bridge/state-engine.ts).
+   */
+  readonly blockedBy?: BlockedBy;
   /**
    * The operator's own label for this pane — ONLY a name given through Collie's {@link
    * MuxAdapter.renamePane}, and never a title the pane's program printed.
@@ -505,6 +521,21 @@ export interface MuxTabRequest {
 export interface MuxSpaceRequest {
   readonly cwd: string;
   readonly label?: string;
+  /**
+   * A fact about the folder, not a request: `cwd` is a linked git worktree of the repository at
+   * `repoRoot`, which is the MAIN repository root, never a linked checkout's top level. The bridge
+   * guarantees it (the worktree route reads it from git; `withRepoFacts` fills it from disk for any
+   * other caller), on the machine that owns the folder. MUX_CONTRACT.md, *A worktree space*:
+   *
+   *  - an adapter MUST open the folder and answer the same {@link MuxCreatedPane} shape with the fact
+   *    as without it, and MUST NOT refuse or answer differently because it is present;
+   *  - it MAY use the fact to file the space under its repository in its own record (Herdr's
+   *    `worktree.open`), and an adapter with no such record ignores it;
+   *  - when its own worktree call is missing or refuses, it MUST fall back to its plain open;
+   *  - a rejection that may have opened the folder (timeout, dropped connection) is a refusal the
+   *    caller can retry, and the adapter MUST NOT follow it with a plain open in the same call.
+   */
+  readonly worktree?: { readonly repoRoot: string };
 }
 
 /**

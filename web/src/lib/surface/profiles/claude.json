@@ -22,8 +22,47 @@
       "maxDraftRows": 100,
       "maxTailRows": 60
     },
+    "frameAlternates": [
+      {
+        "walk": "interior",
+        "top": { "pattern": "^─+$", "minCells": 8, "column": 0 },
+        "prompt": { "pattern": "^  Paste code here if prompted > ?(?<draft>.*)$", "column": 2 },
+        "bottom": { "pattern": "^", "column": 0, "maxColumn": 3, "open": true },
+        "trailer": { "row": "^  Esc to cancel$", "hint": true },
+        "continuationIndent": 0,
+        "maxDraftRows": 40,
+        "maxTailRows": 0,
+        "answers": true,
+        "newlineSubmits": true,
+        "secret": { "mask": { "glyph": "*", "clear": 6, "cut": "…" } },
+        "note": "The sign-in field of /login (Claude Code 2.1.325, lab 2026-11-15, claude--v2325-login-*.txt): under the rule, `Login`, the sign-in address wrapped at the pane's edge, then `Paste code here if prompted >` and `Esc to cancel`. The field shows each character as `*` but the last six (`***************ESTATE`), and a text longer than the row as `*` cut with `…`, with no space after `>`."
+      },
+      {
+        "walk": "interior",
+        "top": { "pattern": "^(?:Welcome to Claude Code v\\S+|\\.{3,}█.*\\.{3,})$", "column": 0 },
+        "prompt": { "pattern": "^ Paste code here if prompted > ?(?<draft>.*)$", "column": 1 },
+        "bottom": { "pattern": "^", "column": 0, "maxColumn": 31, "open": true },
+        "continuation": "^ {31}(?<text>\\S+)$",
+        "continuationIndent": 31,
+        "maxDraftRows": 40,
+        "maxTailRows": 0,
+        "answers": true,
+        "newlineSubmits": true,
+        "secret": { "mask": { "glyph": "*", "clear": 6 }, "wrap": true },
+        "note": "The sign-in field of Claude Code's FIRST RUN, an empty config folder (2.1.325, lab 2026-11-15, claude--v2325-first-run-*.txt): no rule, no `Login` title and no `Esc to cancel` (Esc does nothing there). Under the welcome art's dotted last row (or, below about 50 columns, the `Welcome to Claude Code v…` row, the art is not drawn), the sign-in address from column 0, then ` Paste code here if prompted >` from column 1. The same mask as /login, but a text longer than the row wraps under the label, 31 columns in, and is never cut; only the last row shows clear characters (`wrap`): 21 characters at 40 columns draw `********`, `********`, `STATE`."
+      }
+    ],
+    "dialogRows": ["^Let's get started\\.$"],
+    "dialogRowsNote": "Claude Code 2.1.325's first-run theme step (an empty config folder, lab 2026-11-15, claude--v2325-first-run-theme-*): `Let's get started.` over `Choose the text style that looks best with your terminal` and an unnumbered list, no footer, no key named, and Esc does nothing. The theme grammar (harness/claude/first-run-theme.ts) lifts it as a pointed list (a tap walks the pointer with Down or Up and sends Enter, measured live 2026-11-16); this row stays as the wider net, so a screen with these words and no list Collie reads still names a dialog, and the composer never types into it. `/theme` in a session draws the same list under a `Theme` title with `Enter to select · Esc to cancel` and no `Let's get started.`.",
+    "signInRows": ["^Paste code here if prompted >"],
+    "signInRowsNote": "Claude Code 2.1.325 draws its sign-in field after `Paste code here if prompted >`, on /login two columns in and on the first run one (lab 2026-11-15). The two layouts above read the two shapes and draw the card; this row is the wider net: a screen that ends near such a row and shows no ordinary input box keeps no draft and no line of what is sent there, whatever else is drawn around it.",
+    "signInErrors": ["^OAuth error:"],
+    "signInErrorsNote": "Claude Code 2.1.325 answers a code it did not take with `OAuth error: That code wasn't accepted…` where the field stood, then `Press Enter to retry.` (lab 2026-11-15, claude--v2325-login-bad-code--w61.txt). A code send that reads it ends refused (`code_rejected`) with those words.",
+    "signInSettleMs": 15000,
+    "signInSettleMsNote": "After a code is submitted Claude Code checks it with its server before it draws `Login successful` or the error (2026-11-16, Altan's run on the dev lane: a good code ended `unknown`, S2's 3 s were not enough). The screen between the two is not captured yet; this bound is a guess on the safe side, and only delays the receipt.",
     "placeholders": {
-      "texts": ["Press up to edit queued messages"],
+      "texts": ["Press up to edit queued messages", "Resend your message to try again"],
+      "textsNote": "Claude Code 2.1.328 paints `Resend your message to try again` (a no-break space after the prompt marker) inside the empty box after a turn fails on an API error. It is faint on a styled read; on herdr-core the read is plain text, so only these exact words tell it from a draft (capture 2026-11-19, a refused connection). The text must match whole: the same words with more typed after them stay a draft.",
       "patterns": ["^Try \"[^\"]*\"$"],
       "patternsNote": "Live 2026-10-30, Claude Code 2.1.314 on herdr-core: the empty box rotates faint hints (`Try \"refactor <filepath>\"`, `Try \"fix lint errors\"`, `Try \"how do I log an error?\"`). herdr-core reads the screen as plain text, so the faint attribute is gone and the hint read as a draft; a walky talky delivery stayed held as draft present. The shape counts only on a read with no styling at all; on a styled read the faint attribute decides, so a typed `Try \"…\"` stays a draft. Fixture surface/claude--v2-1-314-placeholder-plain--w120 (plain text, as herdr-core reads it).",
       "sgr": 2,
@@ -37,11 +76,12 @@
         "footerMaxRows": 8,
         "hints": ["^\\s*You(?:'|’)ve used \\d+% of your (?:[\\w-]+ )*limit\\b.*$", "^\\s*tmux focus-events off\\b.*$", "^\\s*/rc(?: (?:active|connecting…|reconnecting|failed))?$"],
         "hintsNote": "Live check 2026-10-30, Claude Code 2.1.312 over tmux, 120 columns: a fresh pane draws `You've used 75% of your weekly limit · resets Nov 4, 2am (…) · /usage-credits to keep using Claude Code` under the footer, and drops it once the box grows to two rows. The rows under the box went from 2 to 1 and the send ended typed_not_submitted (changed). The pattern covers any percentage and any limit name (`weekly`, `5-hour`, `Opus weekly`); the tail after `limit` is free. Fixture claude--v2312-weekly-limit-row--w120. Lab 2026-11-01, Claude Code 2.1.316 over tmux (focus-events off, the tmux default), 100 columns: while a turn runs, Claude draws `tmux focus-events off · add 'set -g focus-events on' to ~/.tmux.conf and reattach for focus tracking` under the footer, and drops it once the box holds a draft of two paragraphs (the footer turns to `ctrl+g to edit in nano`). The rows under the box went from 2 to 1 and a two-paragraph send into the turn ended typed_not_submitted (changed); the same send with focus-events on, on an idle box, and over Herdr was sent. Fixtures bridge/surface/fixtures/claude--v2316-two-paragraphs-*--w100. Remote Control (2.1.319, issue 767, a field report, not a capture): Claude draws `/rc`, `/rc active`, `/rc connecting…`, `/rc reconnecting` or `/rc failed` as a row of its own under the footer and may draw or drop it while Collie types; the pattern matches that whole row and nothing longer, so the focused `/rc · enter to view` and a pointed `❯ /rc` still count. Fixture claude--v2319-rc-footer-idle--w100 (built). Live check 2026-11-13, Claude Code 2.1.323 over tmux, 100 columns, `claude --remote-control`: the pill is right-aligned in the footer, `/rc active` (`/rc` after five sightings), and shares the mode row when it fits or takes a row of its own under a full-width notice, so the rows under the box move between one and three on their own; the pattern is right for the own-row form, spaces and all. Dialogs draw no footer, so no pill stands under one. Fixtures claude--v2323-rc-on-*.",
+        "footerRowsNote": "Field case 2026-11-13, Claude Code 2.1.323 over Herdr, lane 8788: a send went into a running turn while the session resumed a background agent (SendMessage, 17:38:02.055Z, inside the 2.5 s S1 window that began at about 17:38:02.0Z). The agents panel under the box gained a `◯` row, the rows under the box no longer matched S0's count, and the send ended typed_not_submitted (changed) with the text in the box. The panel's rows (`chrome: true`) add, drop and redraw on their own while the box keeps the keys, so the Send Protocol leaves them out of its count, but only inside a panel the frame walk accepted: a blank row over `● main`, then only panel rows to the bottom. The mode row's `↓ to view` hint (tasks-view-hint) is no chrome. Repro bridge/surface/protocol.test.ts, \"the agents panel under the box is chrome\".",
         "footerRows": [
-          { "name": "agents-panel-main", "pattern": "^\\s*(?:❯\\s+)?[●⏺]\\s+main(?:\\s.*)?$" },
-          { "name": "agents-panel-agent", "pattern": "^\\s*(?:❯\\s+)?◯\\s+\\S.*$" },
-          { "name": "agents-panel-more", "pattern": "^\\s*↓ \\d+ more$" },
-          { "name": "agents-panel-manage-hint", "pattern": "^\\s*↓ to manage$" },
+          { "name": "agents-panel-main", "pattern": "^\\s*(?:❯\\s+)?[●⏺]\\s+main(?:\\s.*)?$", "chrome": true },
+          { "name": "agents-panel-agent", "pattern": "^\\s*(?:❯\\s+)?◯\\s+\\S.*$", "chrome": true },
+          { "name": "agents-panel-more", "pattern": "^\\s*↓ \\d+ more$", "chrome": true },
+          { "name": "agents-panel-manage-hint", "pattern": "^\\s*↓ to manage$", "chrome": true },
           { "name": "tasks-view-hint", "pattern": "^\\s*(?:⏵⏵|⏸|\\?)\\s.*\\s·\\s↓ to view(?:\\s·\\s|$)" }
         ],
         "otherScreens": [

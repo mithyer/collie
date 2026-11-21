@@ -30,6 +30,13 @@ const RAW_PLATFORM_READS: ReadonlyMap<string, number> = new Map([
   ["cli/sys.ts", 5],
 ]);
 const SCANNED = ["bridge", "cli", "scripts"];
+/**
+ * Files in the scanned folders that are not Collie code. `cli/trick-kit/trick.ts` is the trick helper
+ * (M94): `collie trick init` copies it as text into a trick folder, where it runs under plain bun, outside
+ * this repo and without `bridge/host.ts`. It is user-side code shipped as a file, so the host rule for
+ * Collie's own source does not reach it.
+ */
+const SHIPPED_AS_TEXT: ReadonlySet<string> = new Set(["cli/trick-kit/trick.ts"]);
 
 const PATTERNS = {
   startsWithSlash: /\.startsWith\(\s*"\/"\s*\)/,
@@ -54,12 +61,14 @@ const NOT_REACHED_BY_WINDOWS: readonly Allowed[] = [
   { file: "bridge/mux/tmux/adapter.ts", pattern: "splitOnSlash", count: 1, why: "tmux session path, tmux has no Windows build" },
   { file: "bridge/operator-commands.ts", pattern: "startsWithSlash", count: 1, why: "a slash command such as /model, not a path" },
   { file: "bridge/journal/muse.ts", pattern: "startsWithSlash", count: 1, why: "a recorded slash command such as /model, not a path" },
+  { file: "bridge/journal/proc-locks.ts", pattern: "startsWithSlash", count: 1, why: "a mount point from Linux's /proc/self/mountinfo; the lock lookup is not reached on Windows (LINUX_PROC answers null off Linux)" },
   { file: "bridge/worktree-base.ts", pattern: "startsWithSlash", count: 1, why: "a git ref name, `/`-separated on every host, never a path" },
   { file: "bridge/worktree-base.ts", pattern: "splitOnSlash", count: 1, why: "the same git ref name, cut into its components" },
   { file: "bridge/worktree-branch.ts", pattern: "startsWithSlash", count: 1, why: "a new branch name, `/`-separated on every host, never a path" },
   { file: "bridge/worktree-branch.ts", pattern: "splitOnSlash", count: 1, why: "the same branch name, cut into its components" },
   { file: "bridge/config.ts", pattern: "splitOnSlash", count: 1, why: "COLLIE_BASE_PATH is a URL mount, always slashes" },
   { file: "bridge/crew/forward.ts", pattern: "splitOnSlash", count: 3, why: "crew route names, URL paths" },
+  { file: "bridge/inside/wire.ts", pattern: "startsWithSlash", count: 1, why: "a hello's cwd: an absolute POSIX path or a drive path, both forms checked on every host" },
   { file: "bridge/files-view.ts", pattern: "startsWithSlash", count: 1, why: "the wire's relative path, `/`-separated on every host; joined with host.path" },
   { file: "bridge/math/tar.ts", pattern: "splitOnSlash", count: 2, why: "tar entry names, `/`-separated in every archive; written through path.join" },
   { file: "scripts/math-pack.ts", pattern: "splitOnSlash", count: 1, why: "pack paths: tar entry names and the pack's relative imports, `/`-separated on every host" },
@@ -68,7 +77,18 @@ const NOT_REACHED_BY_WINDOWS: readonly Allowed[] = [
   { file: "cli/install-kind.ts", pattern: "splitOnSlash", count: 2, why: "git remote URLs, always slashes" },
   { file: "cli/update.ts", pattern: "splitOnSlash", count: 2, why: "a literal list of payload names, joined by path.join; and a systemd unit path" },
   { file: "cli/fakes.ts", pattern: "splitOnSlash", count: 2, why: "test-only fake filesystem, keys are POSIX by design" },
+  { file: "bridge/tricks/scan.ts", pattern: "startsWithSlash", count: 1, why: "`isBareImport` reads an import specifier, a module path written with `/` on every host, never a file path" },
+  { file: "bridge/tricks/inputs.ts", pattern: "splitOnSlash", count: 1, why: "`walkGlobs` counts the steps of an `inputs` glob, a manifest pattern written with `/` on every host (M99), never a file path" },
+  { file: "bridge/tricks/propose-wire.ts", pattern: "startsWithSlash", count: 1, why: "`proposedPathProblem` reads a proposal's wire path, written with `/` on every host (crew slice 8), and refuses one that opens with it" },
+  { file: "bridge/tricks/propose-wire.ts", pattern: "splitOnSlash", count: 4, why: "a proposal's wire path, written with `/` on every host (crew slice 8), cut into its steps to check each one and its folders, and whether it is a picture of `media/` or `captures/`" },
+  { file: "bridge/tricks/proposal-install.ts", pattern: "splitOnSlash", count: 1, why: "the folders above a wire path or a code walk path, both written with `/` on every host (crew slice 8)" },
+  { file: "cli/trick-folder.ts", pattern: "splitOnSlash", count: 3, why: "`leftBehind` and `readFolderPicture` read the wire path the walk built by joining names with `/` on every host (crew slice 8), and `namedPictures` a part's picture `src`, which the schema writes with `/`" },
+  { file: "bridge/tricks/scan.ts", pattern: "splitOnSlash", count: 1, why: "`isScannedFile` reads a path `walkTrickCode` built by joining names with `/` on every host (M94)" },
+  { file: "bridge/tricks/code-hash.ts", pattern: "splitOnSlash", count: 1, why: "`isCodePath` reads a git tree path or a `walkTrickCode` path, both written with `/` on every host (official update)" },
+  { file: "cli/trick-add.ts", pattern: "splitOnSlash", count: 2, why: "a folder inside a git repository and the paths of a git tree, which git writes with `/` on every host (M94 review 15)" },
+  { file: "bridge/crew/standby-tricks.ts", pattern: "splitOnSlash", count: 3, why: "a carried trick's wire path, written with `/` on every host (crew slice 10, CREW_PROTOCOL §25), cut into its steps and folders to check them, and its top folder read" },
   { file: "bridge/changes.ts", pattern: "splitOnSlash", count: 2, why: "a path git listed in a repo, which git writes with `/` on every host, cut into names before host.path.join (M103)" },
+  { file: "bridge/tricks/fetch.ts", pattern: "splitOnSlash", count: 2, why: "the paths of a fetched git tree, which git writes with `/` on every host (M94 review 15, moved from cli/trick-add.ts)" },
 ];
 
 /**
@@ -109,6 +129,7 @@ function hitsByFile(): Map<string, number> {
   for (const top of SCANNED) {
     for (const file of sourceFiles(join(ROOT, top))) {
       const name = relative(ROOT, file).split(sep).join("/");
+      if (SHIPPED_AS_TEXT.has(name)) continue;
       for (const line of readFileSync(file, "utf8").split("\n")) {
         if (isCommentLine(line)) continue;
         for (const [id, re] of Object.entries(PATTERNS)) {

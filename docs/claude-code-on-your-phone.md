@@ -79,9 +79,10 @@ a branch other than the default, and it opens on **This branch**. Changes you ha
 stay behind, because the new worktree starts from the last commit. Collie never fetches, so the
 default is the copy of the branch you already have.
 
-**Branch folder** says where the worktree goes. **Herdr's default** puts it where Herdr puts its
-own worktrees: `~/.herdr/worktrees/<repo>/<branch>`, unless Herdr's `config.toml` names another
-`[worktrees] directory`. Collie uses this folder on every multiplexer.
+**Branch folder** says where the worktree goes. **Default folder** puts it in the folder named in
+Settings, System, Worktree folder, as `<folder>/<repo>/<branch>`. While that is not set, it puts it
+where Herdr puts its own worktrees: `~/.herdr/worktrees/<repo>/<branch>`, unless Herdr's `config.toml`
+names another `[worktrees] directory`. Collie uses this folder on every multiplexer.
 **Other folder** puts it in a folder you name, which must already exist under your home folder, and
 must not be hidden, a link, or inside the repo. The page shows the full path of the new folder
 before you tap Start, and Collie checks the rule again at the moment it creates it. Collie remembers
@@ -225,9 +226,62 @@ collie push-keys     # writes the VAPID keys to your .env
 collie restart
 ```
 
-Turn notifications on in Collie's Settings on the phone. **Needs input** is enabled by default. On
+Turn notifications on in Collie's Settings on the phone. **Needs you** is enabled by default. On
 an iPhone, install Collie to your home screen first. Safari restricts Web Push to home-screen web
 apps. See [Web Push](voice-and-push.md#web-push-optional).
+
+## Send by data (optional, experimental)
+
+Send by data is an experiment. You turn it on yourself, for Claude Code only, and nothing in Collie
+asks you to. The normal road is the screen: Collie types each message into the pane and reads the box
+back to prove it arrived. That road works with no link, and it carries every message that the link
+does not.
+
+With Collie 1.29.0 or later you can link Claude Code. A plain message from the phone then goes into
+Claude Code as data, and no key is typed, when the plugin is connected, Collie knows the state of the
+turn and the message is plain text. Any other send keeps the screen road, so on a linked machine
+many sends can still go by the screen. `collie harness unlink claude` turns the link off.
+
+```bash
+collie harness link claude     # needs Claude Code on your PATH
+collie harness status          # which harnesses are linked
+collie harness unlink claude   # back to typing, for every session
+```
+
+What linking does:
+
+- It writes a small Claude Code plugin to `~/.config/collie/inside/claude` and adds it to Claude Code
+  for your user (`claude plugin`, user scope). It changes no settings file and restarts nothing.
+- A running Claude Code session takes the plugin after `/reload-plugins`. A new session takes it at
+  start. The bridge sees the link within 15 seconds.
+- A plain message and a WalkyTalky message go in as data. At the desk, Claude Code shows "Prompt from
+  the collie plugin" above such a prompt.
+- A WalkyTalky message still waits while you have a draft in the box, as when Collie types, and goes
+  in once the box is empty. The plugin tells Collie only whether a draft is there, never its text.
+- An Allow or Deny tap on a permission card answers the dialog through the plugin. A tap at the desk
+  still wins when it comes first.
+- Everything else keeps the screen path: slash commands, shell lines, attachments and steers. So do
+  questions and plans (`AskUserQuestion`, `ExitPlanMode`), a session that started before the link and
+  has not run `/reload-plugins`, and a session that runs as a background job.
+- The plugin never calls a model, never reads a key or a password, and writes no file.
+
+What it does not do:
+
+- Nothing goes by data until you run `collie harness link claude`. Only Claude Code can be linked;
+  the other agents keep the screen path.
+- It does not remove send failures. When Claude Code refuses a message and nothing entered, the same
+  send is typed once by the screen road. Any other failure still reads "may have arrived".
+- Windows keeps the screen path. `collie harness link` refuses there.
+- When an administrator sets `allowManagedHooksOnly`, Claude Code runs no plugin hooks. The plugin
+  then stays idle and Collie types as before. `collie doctor` says so on its `link-claude` line.
+- The link is for your user account, shared by every Collie on the machine. `collie uninstall`
+  removes it only with the last Collie that is installed. `COLLIE_INSIDE=off` in a Collie's `.env`
+  turns sending by data off for that Collie alone.
+
+The `collie harness` verbs need Collie 1.29.0 or later. An older Collie does not know `collie
+harness` and prints its usage error. `collie link` and `collie unlink` with a word after them were
+never the way: they put `collie` on your PATH and take it off again, and they now refuse a word. See
+[Put `collie` on your PATH](commands.md#put-collie-on-your-path).
 
 ## Start an agent or a shell from the phone
 
@@ -266,9 +320,9 @@ machine ([Launchers added from a phone](configure.md#launchers-added-from-a-phon
 permission prompts carries a **No prompts** badge, and the phone asks you once before it first starts
 it.
 
-**Send waits for the agent's first screen.** After a start, Send reads Starting… and your draft stays
-editable. Collie sends nothing on its own, so a dialog such as workspace trust shows before any text
-reaches the agent. Send is ready once Collie reads the agent's first screen, the agent leaves the
+**Send waits for the agent's first screen.** After a start, the header reads Starting…, and the box is off with Starting… as its hint. A
+draft you typed before is kept and is editable again when the box comes back. Collie sends nothing on its own, so a dialog such as workspace trust shows before any text
+reaches the agent. The box and Send are ready once Collie reads the agent's first screen, the agent leaves the
 pane, or two minutes pass.
 
 A refused Start shows its reason in a notice above Start, in your language. A folder that does not

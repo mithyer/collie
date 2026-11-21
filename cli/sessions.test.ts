@@ -5,6 +5,7 @@ import { asJsonObject, asJsonString, parseJson } from "../web/src/lib/json.ts";
 import { peerStore } from "../bridge/crew/fixtures.ts";
 import { serializeTrustStore, trustStorePath } from "../bridge/crew/trust-store.ts";
 import { localSecretPath, mintLocalSecret } from "../bridge/local-secret.ts";
+import { localSnapshotView } from "../bridge/local-key.ts";
 import { capture, context, fakeFiles, STATE } from "./fakes.ts";
 import { EXIT } from "./io.ts";
 import { ageOf, cmdSessions, MEMBER_FOOTER, SESSIONS_USAGE, SESSIONS_VERB, type SessionsDeps } from "./sessions.ts";
@@ -45,7 +46,7 @@ const LEAD_WIDE = {
     { name: "desk", isPrimary: false, reachable: true, agents: 1, working: 0, blocked: 0, host: "collie-04rj6a", mux: "durable", kind: "program" },
   ],
   servers: [
-    { id: "collie-04rj6a", name: "bluefin", isLead: true, reachable: true, protocol: "ok", lastSeenAt: NOW, mux: "herdr" },
+    { id: "collie-04rj6a", name: "annex", isLead: true, reachable: true, protocol: "ok", lastSeenAt: NOW, mux: "herdr" },
     { id: "lab", name: "lab", isLead: false, reachable: true, protocol: "ok", lastSeenAt: NOW, mux: "herdr-core" },
   ],
 };
@@ -122,9 +123,9 @@ describe("collie sessions", () => {
     expect(lines[0]).toMatch(/^MEMBER\s+MUX\s+SEAT\s+HARNESS\s+STATE\s+SESSION\s+ACTIVE$/);
     const body = lines.slice(1, 6).map((l) => l.split(/\s{2,}/));
     expect(body).toEqual([
-      ["bluefin", "durable", "-", "desk", "working", "yes", "3m"],
-      ["bluefin", "herdr", "collie (t1)", "claude claude-opus-5-5", "blocked", "yes", "3m"],
-      ["bluefin", "herdr", "zeta (t2)", "codex gpt-9", "working", "yes", "2h"],
+      ["annex", "durable", "-", "desk", "working", "yes", "3m"],
+      ["annex", "herdr", "collie (t1)", "claude claude-opus-5-5", "blocked", "yes", "3m"],
+      ["annex", "herdr", "zeta (t2)", "codex gpt-9", "working", "yes", "2h"],
       ["lab", "herdr-core", "-", "edge", "idle", "yes", "3m"],
       ["lab", "herdr-core", "narrow (p9)", "claude", "idle", "yes", "3m"],
     ]);
@@ -168,7 +169,7 @@ describe("collie sessions", () => {
     await cmdSessions(byId.deps, ["--member", "collie-04rj6a"]);
     expect(byId.io.stdout.at(-1)).toBe("3 sessions: 1 blocked, 2 working");
     const byName = harness(crew);
-    await cmdSessions(byName.deps, ["--member", "bluefin"]);
+    await cmdSessions(byName.deps, ["--member", "annex"]);
     expect(byName.io.stdout.at(-1)).toBe("3 sessions: 1 blocked, 2 working");
   });
 
@@ -178,7 +179,7 @@ describe("collie sessions", () => {
     const { rows } = parsed(h);
     const lead = rows.find((r) => r.paneId === "t1")!;
     expect(lead.member).toBe("collie-04rj6a");
-    expect(lead.memberName).toBe("bluefin");
+    expect(lead.memberName).toBe("annex");
     const member = rows.find((r) => r.paneId === "p9")!;
     expect(member.member).toBe("lab");
     expect(member.memberName).toBe("lab");
@@ -192,7 +193,7 @@ describe("collie sessions", () => {
     const snapshot = {
       ...LEAD_WIDE,
       servers: [
-        { id: "collie-04rj6a", name: "bluefin", isLead: true, reachable: true, protocol: "ok", lastSeenAt: NOW, mux: "herdr" },
+        { id: "collie-04rj6a", name: "annex", isLead: true, reachable: true, protocol: "ok", lastSeenAt: NOW, mux: "herdr" },
         { id: "old", name: "old", isLead: false, reachable: true, protocol: "ok", lastSeenAt: NOW },
       ],
       agents: [...LEAD_WIDE.agents.filter((a) => a.host === "collie-04rj6a"), pane({ host: "old", paneId: "o1", session: "default" })],
@@ -241,7 +242,7 @@ describe("collie sessions", () => {
       kind: "agent",
       model: "claude-opus-5-5",
       member: "collie-04rj6a",
-      memberName: "bluefin",
+      memberName: "annex",
       mux: "herdr",
       seat: "collie (t1)",
       harness: "claude claude-opus-5-5",
@@ -250,7 +251,7 @@ describe("collie sessions", () => {
       active: "3m",
     });
     expect(rows.map((r) => r.member)).toEqual(["collie-04rj6a", "collie-04rj6a", "collie-04rj6a", "lab", "lab"]);
-    expect(rows.map((r) => r.memberName)).toEqual(["bluefin", "bluefin", "bluefin", "lab", "lab"]);
+    expect(rows.map((r) => r.memberName)).toEqual(["annex", "annex", "annex", "lab", "lab"]);
   });
 
   test("on a member the footer says its panes only, and --json carries the same note", async () => {
@@ -319,6 +320,68 @@ describe("collie sessions", () => {
     await cmdSessions(h.deps, ["--json"]);
     expect(h.io.stderr.join("\n")).toContain("could not read lab wide");
     expect(parsed(h).rows.filter((r) => r.member === "lab").map((r) => r.paneId)).toEqual(["p9"]);
+  });
+});
+
+// ── The local key's view (bridge/local-key.ts): the table prints the same from it ───────────
+
+describe("collie sessions over the local key's view of the snapshot", () => {
+  // Text the view leaves out, on every pane: a title, an ask and a held send.
+  const texty = (body: { agents: JsonObject[]; shellPanes: JsonObject[] } & JsonObject): JsonObject => {
+    const add = (p: JsonObject): JsonObject => ({
+      ...p,
+      terminalTitle: "a title an agent wrote",
+      asks: [{ question: "Shall I delete the production database now?" }],
+      held: [{ text: "push it to main" }],
+    });
+    return { ...body, agents: body.agents.map(add), shellPanes: body.shellPanes.map(add) };
+  };
+  const FULL_LEAD = texty(LEAD_WIDE);
+  const FULL_LAB = texty(LAB_WIDE);
+  const SOLO = texty({
+    agents: [pane({ paneId: "t1", model: "claude-opus-5-5" }), pane({ paneId: "t2", agent: "codex", status: "working", workspaceLabel: "zeta", workspaceNumber: 2 })],
+    shellPanes: [pane({ paneId: "t3", agent: "shell", kind: "shell", status: "unknown", hasSession: undefined })],
+    sessions: [{ name: "default", isPrimary: true, reachable: true, agents: 2, working: 1, blocked: 0 }],
+  });
+
+  async function printed(answer: (url: string) => Response, args: string[]): Promise<{ code: number; out: string; err: string }> {
+    const h = harness(answer);
+    const code = await cmdSessions(h.deps, args);
+    return { code, out: out(h), err: h.io.stderr.join("\n") };
+  }
+
+  const full = (url: string): Response => json(url.includes("host=lab") ? FULL_LAB : FULL_LEAD);
+  const viewed = (url: string): Response => json(localSnapshotView(url.includes("host=lab") ? FULL_LAB : FULL_LEAD));
+
+  for (const args of [[], ["--all"], ["--member", "lab"], ["--state", "blocked"]]) {
+    test(`with members, \`${["sessions", ...args].join(" ")}\` prints the same`, async () => {
+      const said = await printed(full, args);
+      expect(said.out).not.toBe("");
+      expect(await printed(viewed, args)).toEqual(said);
+    });
+  }
+
+  for (const args of [[], ["--all"]]) {
+    test(`solo, \`${["sessions", ...args].join(" ")}\` prints the same`, async () => {
+      const said = await printed(() => json(SOLO), args);
+      expect(said.out).toContain("zeta (t2)");
+      expect(await printed(() => json(localSnapshotView(SOLO)), args)).toEqual(said);
+    });
+  }
+
+  test("--json keeps every derived column; the raw pane fields shrink to the view's", async () => {
+    const columns = ["member", "memberName", "mux", "seat", "harness", "state", "session", "active"];
+    const rowsOf = async (answer: (url: string) => Response): Promise<JsonObject[]> => {
+      const h = harness(answer);
+      await cmdSessions(h.deps, ["--json", "--all"]);
+      return parsed(h).rows;
+    };
+    const pick = (rows: JsonObject[]) => rows.map((r) => Object.fromEntries(columns.map((c) => [c, r[c]])));
+    const fromFull = await rowsOf(full);
+    const fromView = await rowsOf(viewed);
+    expect(pick(fromView)).toEqual(pick(fromFull));
+    expect(JSON.stringify(fromFull)).toContain("a title an agent wrote");
+    expect(JSON.stringify(fromView)).not.toContain("a title an agent wrote");
   });
 });
 

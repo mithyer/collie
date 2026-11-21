@@ -3,7 +3,9 @@ import type { ReactNode } from "react";
 
 import { StatusDot } from "@/components/status-badge";
 import type { AgentStatus } from "@/lib/types";
+import { CrossfadeText } from "@/components/ui/crossfade-text";
 import { cn } from "@/lib/utils";
+import { HEADING_TAP_TARGET } from "@/components/ui/tap-target";
 
 interface SectionHeaderProps {
   /** Section name, e.g. "Recent". Rendered uppercase. */
@@ -51,6 +53,8 @@ interface SectionHeaderProps {
    * case, so the rows under it carry the one full ink.
    */
   tone?: "muted" | "strong" | "quiet";
+  /** What the label names (a Space), when a rename can change it: the label then crossfades ({@link CrossfadeText}). */
+  fade?: string;
   className?: string;
 }
 
@@ -73,6 +77,7 @@ export function SectionHeader({
   level = 2,
   id,
   tone: toneName = "muted",
+  fade,
   className,
 }: SectionHeaderProps) {
   const foldable = open !== undefined && onToggle !== undefined;
@@ -89,7 +94,7 @@ export function SectionHeader({
       )}
       {mark !== undefined && <StatusDot status={mark} className="size-2.5" />}
       {dot && <span className={cn("size-2 shrink-0 rounded-full", dot)} aria-hidden />}
-      <span className="truncate">{label}</span>
+      <span className="truncate">{fade === undefined ? label : <CrossfadeText text={label} identity={fade} />}</span>
       {count !== undefined && <span className="opacity-60 tabular-nums">({count})</span>}
     </>
   );
@@ -127,6 +132,7 @@ export function SectionHeader({
             // min-h-9 keeps the row on the 36px touch floor even though the text is tiny.
             className={cn(
               "flex min-h-9 min-w-0 flex-1 items-center gap-1.5 rounded text-left transition-colors",
+              HEADING_TAP_TARGET,
               type,
               tone,
             )}

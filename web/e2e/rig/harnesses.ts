@@ -31,7 +31,8 @@
 // on when COLLIE_RIG_KEY_FILE is set (COLLIE_RIG_PI_TURNS=0 / COLLIE_RIG_OMP_TURNS=0 turn one off).
 // On 2026-10-17 pi's own auth.json key answered 401 and omp had no credential, so without a key
 // file both stay off. The model is set here, or with COLLIE_RIG_PI_MODEL / COLLIE_RIG_OMP_MODEL.
-import { chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { dataClaude } from "./rig-data";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 
@@ -39,7 +40,8 @@ import { EMPTY_MCP_FILE } from "../../../scripts/harness-canary/lab/harnesses";
 import { seedClaude, seedClaudeReplay } from "../../../scripts/harness-canary/lab/seed";
 import type { JsonObject } from "../../src/lib/json";
 import { BIN, piExtensions } from "./bins";
-import { tiersFromEnv, modelFor, SKILL_TEMPLATE, type StubHarness } from "./replay/tier";
+import { rigSkillText } from "./replay/skill-text";
+import { tiersFromEnv, modelFor, type StubHarness } from "./replay/tier";
 import { machineDirs, muxOf, readRun, type Machine } from "./rig-lib";
 import { BEACON_EVENTS, beaconHookCommand } from "./rig-mux";
 import { HARNESS_IDS, type HarnessId } from "./scenarios";
@@ -141,8 +143,8 @@ const UNSET = ["XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_DATA_HOME", "XDG_CACHE_
 
 /** This checkout: web/e2e/rig/harnesses.ts is three levels below it. */
 const WORKTREE = resolve(import.meta.dirname, "..", "..", "..");
-const BLOCK_BEGIN = "<!-- collie:walky-talky v1 begin -->";
-const BLOCK_END = "<!-- collie:walky-talky v1 end -->";
+const BLOCK_BEGIN = "<!-- collie:walky-talky v2 begin -->";
+const BLOCK_END = "<!-- collie:walky-talky v2 end -->";
 
 /**
  * A `collie` on PATH that runs this checkout's CLI. The rig's agents are started from a shell whose
@@ -151,21 +153,39 @@ const BLOCK_END = "<!-- collie:walky-talky v1 end -->";
  * the shim sets to that machine's state dir (the lead's or the member's), so an agent on the member
  * asks the member's bridge and never the lead's.
  */
-function writeCollieShim(root: string, stateDir: string): string {
+function writeCollieShim(root: string, stateDir: string, machine: Machine = "lead"): string {
   const dir = join(root, "bin");
   mkdirSync(dir, { recursive: true, mode: 0o700 });
-  writeFileSync(join(dir, "collie"), `#!/bin/sh\nCOLLIE_STATE_DIR=${sq(stateDir)}\nexport COLLIE_STATE_DIR\nexec bun ${sq(join(WORKTREE, "cli", "main.ts"))} "$@"\n`, { mode: 0o700 });
+  // The state dir alone is not enough (trick-flow lab, 2026-11-16): without a config dir the CLI asks
+  // Herdr for one and reads the operator's live `.env`, and a `trick propose` or `hill` that the rig's
+  // bridge answers "not here" goes on to every bridge in the hook target registry under the real HOME.
+  // So the shim names the machine's own config, instance and port, and its bridge HOME for that lookup.
+  const m = machineDirs(machine);
+  const run = readRun();
+  const port = machine === "lead" ? run?.port : run?.member?.port;
+  const vars: [string, string][] = [
+    ["COLLIE_STATE_DIR", stateDir],
+    ["HERDR_PLUGIN_CONFIG_DIR", m.config],
+    ["COLLIE_CONFIG", m.homeCfg],
+    ["COLLIE_INSTANCE", machine === "lead" ? "rig" : "rig-member"],
+    ["COLLIE_SKILL_SYNC", "off"],
+    ["HOME", m.bridgeHome],
+  ];
+  if (port !== undefined) vars.push(["COLLIE_PORT", String(port)], ["COLLIE_HOST", "127.0.0.1"]);
+  const lines = vars.map(([name, value]) => `${name}=${sq(value)}\nexport ${name}\n`).join("");
+  writeFileSync(join(dir, "collie"), `#!/bin/sh\n${lines}exec bun ${sq(join(WORKTREE, "cli", "main.ts"))} "$@"\n`, { mode: 0o700 });
   chmodSync(join(dir, "collie"), 0o700);
   return dir;
 }
 
 /**
- * The walky talky skill, rendered from its template into a harness's scratch config (never the
- * operator's): a whole file for Claude, the managed block for a harness that reads one instruction
- * file. Written by hand rather than by `collie skill install`, which also writes into every real profile.
+ * The walky talky skill, rendered by the product's own function (Hill off, as a default install gives it)
+ * into a harness's scratch config (never the operator's): a whole file for Claude, the managed block for a
+ * harness that reads one instruction file. Written by hand rather than by `collie skill install`, which also
+ * writes into every real profile.
  */
-function writeWalkySkill(path: string, form: "file" | "block"): void {
-  const rendered = readFileSync(SKILL_TEMPLATE, "utf8").replaceAll("{{COLLIE_BIN}}", "collie").replaceAll("{{COLLIE_VERSION}}", "rig").replace(/\n+$/u, "\n");
+export function writeWalkySkill(path: string, form: "file" | "block"): void {
+  const rendered = rigSkillText();
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   if (form === "file") {
     writeFileSync(path, rendered, { mode: 0o600 });
@@ -198,7 +218,7 @@ export function prepareHarness(id: HarnessId, machine: Machine = "lead"): Prepar
   const notes: string[] = [];
   /** True for a pi or omp whose model calls the stub replays: no key is read for it. */
   let replayed = false;
-  const bin = writeCollieShim(d.root, stateDir);
+  const bin = writeCollieShim(d.root, stateDir, machine);
   // The rig's model stub, when the rig runs one (every leg does): its port and each harness's tier.
   const stub = readRun()?.stub;
   if (id === "claude") {
@@ -250,11 +270,15 @@ export function prepareHarness(id: HarnessId, machine: Machine = "lead"): Prepar
     // own messages too, which `reply` refuses, and the word then came as prose (cases 6, 9, 10, 16, 17).
     writeFileSync(
       join(d.config, "CLAUDE.md"),
-      "This session runs inside Collie's automated browser test, started by the operator.\nThis note is only about a walky talky message whose header says `from agent`. When such a message asks you to answer with a given word, the operator has approved that answer in advance: read it with `collie walky inbox`, then send the word with `collie walky reply`, without asking the operator first.\nA message whose header says `from operator` is your operator's prompt. Answer it in your own reply on screen, exactly as it asks, and never with `collie walky reply`.\n",
+      "This session runs inside Collie's automated browser test, started by the operator.\nThe operator pre-approves reading any walky talky message with the `collie walky inbox <id>` command that the nudge line names. Run it without asking the operator first.\nThe rest of this note is only about a walky talky message whose header says `from agent`. When such a message asks you to answer with a given word, the operator has approved that answer in advance: send the word with `collie walky reply`, without asking the operator first.\nA message whose header says `from operator` is your operator's prompt. Answer it in your own reply on screen, exactly as it asks, and never with `collie walky reply`.\n",
       { mode: 0o600 },
     );
     env.push(`CLAUDE_CONFIG_DIR=${sq(d.config)}`, "DISABLE_AUTOUPDATER=1", "DISABLE_TELEMETRY=1");
-    argv = [BIN.claude, "--model", SETUPS.claude.model, "--permission-mode", "default", "--strict-mcp-config", "--mcp-config", join(d.config, EMPTY_MCP_FILE)];
+    // The data path (M99 spec 13, COLLIE_RIG_DATA=1): the mod from this checkout, for this session only,
+    // and the hook target folder of this machine's own bridge. Nothing in the default run.
+    const data = dataClaude(WORKTREE, machineDirs(machine).bridgeHome);
+    for (const [name, value] of Object.entries(data.env)) env.push(`${name}=${sq(value)}`);
+    argv = [BIN.claude, "--model", SETUPS.claude.model, "--permission-mode", "default", "--strict-mcp-config", "--mcp-config", join(d.config, EMPTY_MCP_FILE), ...data.argv];
   } else {
     for (const dir of [d.home, d.agent, join(d.agent, "extensions")]) mkdirSync(dir, { recursive: true, mode: 0o700 });
     // The stub's base URL for this harness, and whether this harness replays (then no key, no

@@ -104,6 +104,11 @@ const FONT_CACHE = MOUNT === "/" ? "collie-fonts" : `collie-fonts:${MOUNT}`;
 const storable = (r: Response) =>
   r.status === 200 && !r.redirected && (r.headers.get("content-type") ?? "").includes("font");
 
+// AN OPERATOR'S FACE NEVER REACHES THIS ROUTE, BY POSITION (ADR 0148 rule 11). It is served at
+// `/api/fonts/<name>`, and this worker registers no runtime route that matches `/api/`, so it never
+// sees that request. The navigation denylist is not the reason: it governs navigations, and a font is
+// a subresource. A URL that began `/fonts/` would be cached here and swept on the next activate,
+// forever, so `fonts.test.ts` asserts that an operator URL never does.
 registerRoute(
   ({ url, sameOrigin }) => sameOrigin && url.pathname.startsWith(under("/fonts/")),
   async ({ request }) => {
@@ -204,9 +209,9 @@ const MATH_CACHE = MOUNT === "/" ? "collie-math" : `collie-math:${MOUNT}`;
 const mathStorable = (r: Response) =>
   r.status === 200 && !r.redirected && /javascript|css|font/.test(r.headers.get("content-type") ?? "");
 
-// The two theme marks (components/brand-mark.tsx) live under `marks/` on the same terms and the
-// same reasoning: out of the precache, because Collie is the default mark, kept on first use so the
-// chosen one starts offline, emptied on an update. Offline right after an update the header draws the
+// The nine chunked marks (every mark but the Collie mark, components/brand-mark.tsx) live under
+// `marks/` on the same terms and the same reasoning: out of the precache, because Collie is the
+// default mark, kept on first use so the chosen one starts offline, emptied on an update. Offline right after an update the header draws the
 // Collie mark until the phone is online once (brand-mark.tsx's boundary), never an empty box.
 const MARK_CACHE = MOUNT === "/" ? "collie-marks" : `collie-marks:${MOUNT}`;
 
@@ -259,7 +264,9 @@ self.addEventListener("message", (event: ExtendableMessageEvent) => {
 // Two different assets on purpose. `icon` is the large art: the mark on its tile, WITHOUT the
 // maskable safe-zone padding, so it fills the notification slot instead of floating in a frame.
 // `badge` is the small status-bar glyph: Android derives its SHAPE FROM THE ALPHA CHANNEL and tints
-// the result, so it must be a monochrome silhouette on transparency. The maskable home-screen tile
+// the result, so it must be a monochrome silhouette on transparency: the header mark with its ring
+// and beads, one colour, paper cut out. Both files are baked by collie-brand (`collie-badge-96.png`,
+// `collie-notification-icon-192.png`), never drawn here. The maskable home-screen tile
 // (`/web-app-manifest-192x192.png`) must never be used for either — it is opaque with no alpha, so
 // Android stamps it on the icon's corner as a solid grey block.
 const ICON = under("/notification-icon-192x192.png");
@@ -325,6 +332,7 @@ async function handlePush(event: PushEvent): Promise<void> {
       host: decision.host,
       target: decision.target,
       machine: decision.machine,
+      decision: decision.decision,
     } satisfies NotifData,
     icon: ICON,
     badge: BADGE,

@@ -18,7 +18,7 @@ import { useNav } from "@/hooks/use-nav";
 import { t } from "@/lib/i18n";
 import { cn } from "@/lib/utils";
 import { useLocale } from "@/hooks/use-locale";
-import { useMuxLogoUrl, useMuxName } from "@/lib/mux-capability";
+import { useMuxLogo, useMuxName } from "@/lib/mux-capability";
 import { useConnectionLost, useConnectionTrouble } from "@/hooks/use-connection-lost";
 import { useLoadingStalled } from "@/hooks/use-loading-stalled";
 import { useOnline } from "@/hooks/use-online";
@@ -57,8 +57,11 @@ interface HeaderClaim {
    *  terminal mirror with a column count of its own: a 640px column minus its 16px gutters clips an
    *  80-column mirror, and a 768px one clips a 120-column mirror. A dashboard row has no such
    *  number. AgentChat's wrapper carries the measurement and the same four classes; the two must
-   *  not drift, or the header and the mirror stop sharing a right edge. */
-  width: "column" | "wide" | "full";
+   *  not drift, or the header and the mirror stop sharing a right edge.
+   *
+   *  A NUMBER is a column of exactly that many px, centred: the dashboard on a large screen, whose grid of
+   *  Spaces sets its own width (`lib/wide-dashboard.ts`, ADR 0158). */
+  width: "column" | "wide" | "full" | number;
   /** The route has taken the whole row (Settings, Crew, and either find bar). The shell then draws
    *  no mark, no caption and no slots — see `RouteHeader`. */
   override: boolean;
@@ -73,20 +76,24 @@ interface HeaderClaim {
    *  Keeping the inset is deliberate: the notch is not screen a mirror could use anyway, and a route
    *  that took the inset over would double it against the header's own the moment the row came back. */
   hidden: boolean;
+  /** An agent is starting on this screen: the mark turns with most of its beads in the info colour
+   *  (`CollieHome`'s `starting`). A claim, not a prop on the mark, because the shell owns the mark. */
+  starting: boolean;
 }
 
 // What a route gets when no route has claimed the row: the bare shell. This is the FORGOT case, and
 // it is deliberately benign rather than empty — the mark, the strip, the rule and the 60px floor are
 // all the shell's own, so a route that renders no <RouteHeader/> at all still gets a real header of
 // the right height. The one thing it cannot get wrong is the thing the operator was looking at.
-const UNCLAIMED: HeaderClaim = { wordmark: false, width: "full", override: false, hidden: false };
+const UNCLAIMED: HeaderClaim = { wordmark: false, width: "full", override: false, hidden: false, starting: false };
 
 function sameClaim(a: HeaderClaim, b: HeaderClaim): boolean {
   return (
     a.wordmark === b.wordmark &&
     a.width === b.width &&
     a.override === b.override &&
-    a.hidden === b.hidden
+    a.hidden === b.hidden &&
+    a.starting === b.starting
   );
 }
 
@@ -233,8 +240,9 @@ export function AppHeaderHost({ bridge, error, lastSeenAt, children }: AppHeader
   // built on, which is what a support question needs.
   const mux = useMuxName();
   // The mark that goes with that name, served by the bridge from the ADAPTER's own bytes. Empty
-  // whenever no logo was published, and empty renders nothing — see useMuxLogoUrl.
-  const muxLogo = useMuxLogoUrl();
+  // whenever no logo was published, and empty renders nothing — see useMuxLogo. While the bytes are
+  // still being read, `held` keeps the mark's box in place so the word does not move.
+  const { url: muxLogo, held: muxLogoHeld } = useMuxLogo();
 
   const [center, setCenter] = useState<HTMLElement | null>(null);
   const [right, setRight] = useState<HTMLElement | null>(null);
@@ -309,6 +317,7 @@ export function AppHeaderHost({ bridge, error, lastSeenAt, children }: AppHeader
       lost={lost}
       applying={applying}
       reconnected={reconnected}
+      starting={claim.starting}
       online={online}
       lastSeenAt={lastSeenAt}
       {...(paper === undefined ? {} : { paper })}
@@ -316,6 +325,8 @@ export function AppHeaderHost({ bridge, error, lastSeenAt, children }: AppHeader
     />
   );
 
+  // A claim of a number of px (the large-screen dashboard's grid), as that number; the three words give null.
+  const claimedPx = claim.width === "column" || claim.width === "wide" || claim.width === "full" ? null : claim.width;
   const header = (
     <>
       {/* A column, not a row: the sticky bar reserves the safe-area inset (see the class list), and
@@ -362,10 +373,12 @@ export function AppHeaderHost({ bridge, error, lastSeenAt, children }: AppHeader
           // when it comes back.
           claim.hidden ? "border-transparent" : "border-band-rule",
           dockedRow === null && claim.width === "column" && "mx-auto w-full max-w-screen-sm",
+          dockedRow === null && claimedPx !== null && "mx-auto w-full",
           dockedRow === null &&
             claim.width === "wide" &&
             "mx-auto w-full max-w-screen-md lg:max-w-screen-lg xl:max-w-screen-xl 2xl:max-w-[1400px]",
         )}
+        style={dockedRow === null && claimedPx !== null ? { maxWidth: claimedPx } : undefined}
       >
         {/* The row and the prerelease strip leave TOGETHER, and through `Collapse` — DESIGN.md §1's
             only sanctioned way an in-flow surface arrives or leaves, which is what makes "hide the
@@ -520,6 +533,18 @@ export function AppHeaderHost({ bridge, error, lastSeenAt, children }: AppHeader
                             className="mr-1 inline-block size-[1.15em] align-[-0.2em]"
                           />
                         )}
+                        {/* The mark is known to come (the config named it) and its bytes are still being
+                            read, a second request that ends after the first paint. This empty box has
+                            the image's exact size, gap and alignment, so when the picture lands the
+                            word beside it stays where it was (DESIGN.md §2). When the read fails, or
+                            the bridge named no mark, the box is not drawn: one shift, once. */}
+                        {muxLogo === "" && muxLogoHeld && (
+                          <span
+                            aria-hidden="true"
+                            data-slot="mux-logo-hold"
+                            className="mr-1 inline-block size-[1.15em] align-[-0.2em]"
+                          />
+                        )}
                         {mux}
                       </>
                     )}
@@ -532,7 +557,7 @@ export function AppHeaderHost({ bridge, error, lastSeenAt, children }: AppHeader
                 <div
                   data-slot="header-center"
                   ref={setCenter}
-                  className="flex min-w-0 flex-1 items-center"
+                  className="relative flex min-w-0 flex-1 items-center"
                 />
                 {/* gap-1, not gap-3: the icon buttons now carry their own 12px of padding to reach 44px,
                     so a 12px gap on top of that reads as a gulf. 4px keeps the apparent spacing between
@@ -578,7 +603,7 @@ interface RouteHeaderProps {
   /** Whether this route's header is as wide as its `max-w-screen-sm` content column (`column`), as
    *  the pane pair's growing 768-to-1400px one (`wide`), or edge to edge (`full`). See
    *  `HeaderClaim.width`. Defaults to `full`, which is the plainest of the three. */
-  width?: "column" | "wide" | "full";
+  width?: "column" | "wide" | "full" | number;
 
   /** Route-specific center content — the pane's `space › tab` breadcrumb. Rendered in a `flex-1
    *  min-w-0` region so a long breadcrumb truncates instead of pushing the pill off the row. Empty on
@@ -601,6 +626,10 @@ interface RouteHeaderProps {
   /** Take the header row off the screen entirely — the pane's zen mode, and nothing else today. See
    *  `HeaderClaim.hidden` for what survives (the element, its inset, its reserved rule) and why. */
   hidden?: boolean;
+
+  /** An agent is starting on this screen (the bridge has not read its first screen yet). The mark
+   *  turns at the loading pace with three beads in four in the info colour. See `HeaderClaim.starting`. */
+  starting?: boolean;
 }
 
 /**
@@ -637,6 +666,7 @@ export function RouteHeader({
   rightTrail,
   override,
   hidden = false,
+  starting = false,
 }: RouteHeaderProps) {
   const slots = useContext(HeaderSlotContext);
   // Loud, not lenient. A <RouteHeader/> outside the host means a route was mounted with no header
@@ -651,9 +681,9 @@ export function RouteHeader({
   // effect, not a passive one: it lands in the same commit the portal's children do, before the
   // browser paints, so there is no frame in which the row's shape and its contents disagree.
   useLayoutEffect(() => {
-    claim(owner, { wordmark, width, override: overridden, hidden });
+    claim(owner, { wordmark, width, override: overridden, hidden, starting });
     return () => release(owner);
-  }, [claim, release, owner, wordmark, width, overridden, hidden]);
+  }, [claim, release, owner, wordmark, width, overridden, hidden, starting]);
 
   // The mark's tap. No deps: `onHome` is a new closure on every render and the shell reads this
   // through a ref at click time, so keeping it current costs one assignment and re-renders nothing.

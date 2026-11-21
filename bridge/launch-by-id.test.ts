@@ -1,11 +1,16 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtemp, readdir, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { realLinkDisk } from "./account-links.ts";
+import { signInFolder } from "./account-folder.ts";
+import { Accounts } from "./accounts-routes.ts";
+import { accountTest } from "./accounts-skip.ts";
+import { memoryAccountStore } from "./accounts-store.ts";
 import { AuditLog } from "./audit.ts";
 import { harnessLaunch } from "./harness-launch.ts";
-import { LAUNCH_RECEIPTS_FILE, LaunchReceiptStore, coerceLaunchReceipt, memoryLaunchReceipts } from "./launch-receipts.ts";
+import { LAUNCH_RECEIPTS_FILE, LaunchReceiptStore, coerceLaunchReceipt, isUnsettled, memoryLaunchReceipts } from "./launch-receipts.ts";
 import type { JsonObject } from "./json.ts";
 import { LEAD_ROW_HEADER, LEAD_ROW_MARK } from "./crew/launcher-rows.ts";
 import { LaunchWindow } from "./launch-window.ts";
@@ -327,6 +332,106 @@ describe("POST /api/launch — by id", () => {
   });
 });
 
+// A sign-in start (M101) runs in a folder the bridge owns, `sign-in` under its state folder: an agent
+// started only to log in must not ask about, or get trust for, home or a neighbouring pane's folder.
+describe("POST /api/launch — a sign-in start's folder", () => {
+  let state = "";
+  beforeEach(async () => {
+    state = await mkdtemp(join(tmpdir(), "collie-sign-in-"));
+  });
+  afterEach(async () => {
+    await rm(state, { recursive: true, force: true });
+  });
+
+  /** One shell pane the launch can open beside, and a multiplexer that records the tab's folder. */
+  async function beside(body: JsonObject, deps: LaunchDeps) {
+    const tabs: MuxTabRequest[] = [];
+    const mux = new FakeMux();
+    const createTab = (request: MuxTabRequest): Promise<MuxOutcome<MuxCreatedPane>> => {
+      tabs.push(request);
+      return Promise.resolve(muxOk({ paneId: "w1:p2", spaceId: "w1", spaceLabel: "s", tabId: "w1:t2", cwd: request.cwd ?? "/" }));
+    };
+    // SAFETY: `launch` reads only `paneId`, `workspaceId` and `cwd` off the beside pane.
+    const pane = { paneId: "w1:p1", workspaceId: "w1", cwd: "/home/op/pane" } as AgentView;
+    const withPane: Partial<StateEngine> = {
+      pokeNow: () => {},
+      current: () => ({ agents: [], shellPanes: [pane], workspaces: [], tabs: [], bridge: "connected" }),
+    };
+    // SAFETY: as engine() above, with one shell pane to launch beside.
+    const res = await launch(asMux(Object.assign(mux, { createTab })), withPane as StateEngine, post({ paneId: "w1:p1", ...body }),
+      new AuditLog(() => {}), null, "default", () => Promise.resolve([]), clock(), { harnesses: { launch: harnessLaunch }, home: "/home/op", ...deps });
+    return { status: res.status, tabs, mux };
+  }
+
+  test("with no folder named, it opens in <state>/sign-in, which the bridge made private and left empty", async () => {
+    const mux = new FakeMux();
+    const { status, body } = await run(mux, { harness: "claude", signIn: true }, { stateDir: state, fs: undefined, sessionFolder: "/home/op/projects/yt" });
+    expect(status).toBe(200);
+    expect(body?.ok).toBe(true);
+    const folder = join(state, "sign-in");
+    expect(signInFolder(state)).toBe(folder);
+    expect(mux.spaces.map((s) => s.cwd)).toEqual([folder]);
+    expect(mux.texts).toEqual([["w1:p1", "claude"]]);
+    const made = await stat(folder);
+    expect(made.isDirectory()).toBe(true);
+    if (process.platform !== "win32") expect(made.mode & 0o777).toBe(0o700);
+    expect(await readdir(folder)).toEqual([]);
+    // Started again with the folder there: no error, nothing written.
+    expect((await run(new FakeMux(), { harness: "claude", signIn: true }, { stateDir: state, fs: undefined })).status).toBe(200);
+    expect(await readdir(folder)).toEqual([]);
+  });
+
+  test("a folder the body names still wins, and nothing is made", async () => {
+    const mux = new FakeMux();
+    const { status } = await run(mux, { harness: "claude", signIn: true, cwd: "/home/op/src/app" }, { stateDir: state });
+    expect(status).toBe(200);
+    expect(mux.spaces.map((s) => s.cwd)).toEqual(["/home/op/src/app"]);
+    expect(await readdir(state)).toEqual([]);
+  });
+
+  test("beside a pane it does not take the pane's folder", async () => {
+    const out = await beside({ harness: "claude", signIn: true }, { stateDir: state, fs: undefined });
+    expect(out.status).toBe(200);
+    expect(out.tabs.map((t) => t.cwd)).toEqual([join(state, "sign-in")]);
+    // Any other start beside the same pane keeps the pane's folder.
+    const plain = await beside({ harness: "claude" }, { stateDir: state, fs: undefined });
+    expect(plain.tabs.map((t) => t.cwd)).toEqual(["/home/op/pane"]);
+  });
+
+  test("a start that is not a sign-in is as it was: session folder, then home", async () => {
+    const mux = new FakeMux();
+    await run(mux, { harness: "claude" }, { stateDir: state, sessionFolder: "/home/op/projects/yt" });
+    await run(mux, { harness: "claude", signIn: false }, { stateDir: state });
+    expect(mux.spaces.map((s) => s.cwd)).toEqual(["/home/op/projects/yt", homedir()]);
+    expect(await readdir(state)).toEqual([]);
+  });
+
+  test("with no state folder given, a sign-in start is as any other start", async () => {
+    const mux = new FakeMux();
+    await run(mux, { harness: "claude", signIn: true }, { sessionFolder: "/home/op/projects/yt" });
+    expect(mux.spaces.map((s) => s.cwd)).toEqual(["/home/op/projects/yt"]);
+  });
+
+  test("a folder that cannot be made is refused as launch.folder_missing, with nothing launched", async () => {
+    const folder = join(state, "sign-in");
+    await writeFile(folder, "in the way");
+    const mux = new FakeMux();
+    const out = await run(mux, { harness: "claude", signIn: true }, { stateDir: state, fs: undefined, sessionFolder: "/home/op/projects/yt" });
+    expect(out.status).toBe(400);
+    expect(out.body).toMatchObject({ ok: false, code: "launch.folder_missing", detail: { folder } });
+    expect(mux.spaces).toEqual([]);
+    expect(mux.texts).toEqual([]);
+  });
+
+  test("the folder never joins Recent", async () => {
+    const recorded: string[] = [];
+    const folders = { recordRecent: (f: string) => Promise.resolve(void recorded.push(f)) };
+    const { body } = await run(new FakeMux(), { harness: "claude", signIn: true }, { stateDir: state, fs: undefined, folders });
+    expect(body?.ok).toBe(true);
+    expect(recorded).toEqual([]);
+  });
+});
+
 /** A launch whose audit lines are kept, parsed. */
 async function audited(fake: FakeMux, body: JsonObject, deps: LaunchDeps = {}, headers: Record<string, string> = {}) {
   const lines: string[] = [];
@@ -517,7 +622,8 @@ describe("LaunchReceiptStore — the file", () => {
     expect(await readdir(dir)).toEqual([LAUNCH_RECEIPTS_FILE]);
     const again = new LaunchReceiptStore(dir, () => {});
     await again.load();
-    expect(again.get(ID)?.paneId).toBe("w1:p1");
+    const got = again.get(ID);
+    expect(got !== undefined && !isUnsettled(got) ? got.paneId : null).toBe("w1:p1");
     const mode = (await Bun.file(join(dir, LAUNCH_RECEIPTS_FILE)).stat()).mode & 0o777;
     // NTFS has no 0600 mode bits; on Windows the state folder's access list keeps the file private.
     if (process.platform !== "win32") expect(mode).toBe(0o600);
@@ -542,5 +648,174 @@ describe("GET /api/launchers — the harness list rides along", () => {
   test("without one: the body an older bridge sends, which is how the phone tells it apart", async () => {
     const res = await launchersRoute(() => Promise.resolve([]), null);
     expect(await res.json()).toEqual({ launchers: [], home: homedir() });
+  });
+});
+
+// ── An account on a launch (M101, ADR 0141) ─────────────────────────────────────────────────────
+//
+//   1. With no `account` and no `signIn`, the typed line is the line it always was, byte for byte.
+//   2. An added account types `NAME='<folder>' <binary>`; its pane is noted for the tag.
+//   3. An unknown id, or one of another agent, is refused before anything is created.
+//   4. A shell, a one-off run and a hand-written row never take an account; a recipe row does.
+
+describe("POST /api/launch — with an account", () => {
+  const ACCOUNT = "6f1c2a4e-3b5d-4c7e-9f00-112233445566";
+
+  async function accountsWith(rows: { harness: string; kind: "own" | "shared"; dir: string; id?: string }[] = []) {
+    const store = memoryAccountStore();
+    for (const r of rows) await store.add({ id: r.id ?? ACCOUNT, harness: r.harness, label: "Work", kind: r.kind, dir: r.dir, addedAt: 1, device: "pixel" });
+    return new Accounts({
+      store,
+      harnesses: { list: () => Promise.resolve([]), launch: harnessLaunch },
+      home: "/home/op",
+      env: {},
+      platform: "linux",
+      disk: realLinkDisk,
+    });
+  }
+
+  test("no account and no sign-in: the typed line is unchanged, with or without the service", async () => {
+    for (const accounts of [undefined, await accountsWith()]) {
+      const mux = new FakeMux();
+      expect((await run(mux, { harness: "claude", cwd: "/home/op/src/app" }, { accounts })).status).toBe(200);
+      expect(mux.texts).toEqual([["w1:p1", "claude"]]);
+    }
+  });
+
+  accountTest("an own account types the quoted folder before the binary, and the pane carries the account", async () => {
+    const accounts = await accountsWith([{ harness: "codex", kind: "own", dir: "/home/op/.codex-work" }]);
+    const mux = new FakeMux();
+    const { status } = await run(mux, { harness: "codex", account: ACCOUNT, cwd: "/home/op/src/app" }, { accounts });
+    expect(status).toBe(200);
+    expect(mux.texts).toEqual([["w1:p1", "CODEX_HOME='/home/op/.codex-work' codex"]]);
+    const started: AgentView = { paneId: "w1:p1", workspaceId: "w1", workspaceLabel: "app", workspaceNumber: 1, tabId: "w1:t1", agent: "codex", status: "idle", cwd: "/home/op/src/app", focused: false };
+    expect(accounts.paneAccount("default", started)).toEqual({ id: ACCOUNT, label: "Work" });
+    // Over the crew link (M101 spec 06, decision 5): the member types ITS OWN folder for its own id, and a
+    // folder the forwarded body names is never read.
+    const crewMux = new FakeMux();
+    const forwarded = { harness: "codex", account: ACCOUNT, cwd: "/home/op/src/app", path: "/tmp/elsewhere", dir: "/tmp/elsewhere", folder: "/tmp/elsewhere" };
+    expect((await run(crewMux, forwarded, { accounts, viaCrew: true })).status).toBe(200);
+    expect(crewMux.texts).toEqual([["w1:p1", "CODEX_HOME='/home/op/.codex-work' codex"]]);
+  });
+
+  test("an unknown id, another agent's id, no service, and Windows are refused before anything runs", async () => {
+    const accounts = await accountsWith([{ harness: "codex", kind: "own", dir: "/home/op/.codex-work" }]);
+    const cases: [JsonObject, LaunchDeps, number, "accounts.unknown" | "accounts.unavailable"][] = [
+      [{ harness: "codex", account: "6f1c2a4e-3b5d-4c7e-9f00-000000000000" }, { accounts }, 400, "accounts.unknown"],
+      [{ harness: "claude", account: ACCOUNT }, { accounts }, 400, "accounts.unknown"],
+      [{ harness: "codex", account: ACCOUNT }, {}, 404, "accounts.unavailable"],
+    ];
+    for (const [body, deps, status, code] of cases) {
+      const mux = new FakeMux();
+      const out = await run(mux, body, deps);
+      expect([out.status, out.body?.ok === false ? out.body.code : undefined]).toEqual([status, code]);
+      expect(mux.spaces).toEqual([]);
+    }
+    const windows = new Accounts({ store: memoryAccountStore(), harnesses: { list: () => Promise.resolve([]), launch: harnessLaunch }, home: "/home/op", env: {}, platform: "win32", disk: realLinkDisk });
+    const mux = new FakeMux();
+    expect((await run(mux, { harness: "codex", account: ACCOUNT }, { accounts: windows })).status).toBe(404);
+    expect(mux.spaces).toEqual([]);
+  });
+
+  test("an account never rides a shell, a one-off run or a hand-written row", async () => {
+    const accounts = await accountsWith([{ harness: "codex", kind: "own", dir: "/home/op/.codex-work" }]);
+    for (const body of [{ shell: true, account: ACCOUNT }, { run: "ls", account: ACCOUNT }, { command: "htop", account: ACCOUNT }, { account: ACCOUNT }, { harness: "codex", account: 7 }]) {
+      const mux = new FakeMux();
+      expect((await run(mux, body, { accounts })).status).toBe(400);
+      expect(mux.spaces).toEqual([]);
+    }
+  });
+
+  accountTest("a recipe row a phone added takes the account in front of its own line", async () => {
+    const accounts = await accountsWith([{ harness: "codex", kind: "own", dir: "/home/op/.codex-work" }]);
+    const recipe: Launcher = { command: "codex --search", label: "Codex search", source: "added", addedAs: "recipe", harness: "codex", kind: "agent", id: "r1" };
+    const mux = new FakeMux();
+    const res = await launch(asMux(mux), engine(), post({ command: "codex --search", account: ACCOUNT }), new AuditLog(() => {}), null, "default", () => Promise.resolve([recipe]), clock(), {
+      harnesses: { launch: harnessLaunch },
+      home: "/home/op",
+      fs: dirs(),
+      accounts,
+    });
+    expect(res.status).toBe(200);
+    expect(mux.texts).toEqual([["w1:p1", "CODEX_HOME='/home/op/.codex-work' codex --search"]]);
+  });
+
+  test("signIn with the harness alone types the Default start", async () => {
+    const mux = new FakeMux();
+    expect((await run(mux, { harness: "claude", signIn: true }, { accounts: await accountsWith() })).status).toBe(200);
+    expect(mux.texts).toEqual([["w1:p1", "claude"]]);
+  });
+  accountTest("Change login: on an account that reads signed in, the launch types the agent's own login menu, as Sign in again does", async () => {
+    const home = await mkdtemp(join(tmpdir(), "collie-change-login-"));
+    try {
+      // Claude Code has run in both folders: its state file is there (existence only).
+      await writeFile(join(home, ".claude.json"), "{}");
+      const work = join(home, ".claude-work");
+      await mkdir(work, { recursive: true });
+      await writeFile(join(work, ".claude.json"), "{}");
+      const store = memoryAccountStore();
+      await store.add({ id: ACCOUNT, harness: "claude", label: "Work", kind: "own", dir: work, addedAt: 1, device: "pixel" });
+      const signedIn = { code: 0, stdout: JSON.stringify({ loggedIn: true, email: "work@example.com", subscriptionType: "max" }), stderr: "" };
+      const accounts = new Accounts({
+        store,
+        status: () => Promise.resolve(signedIn),
+        harnesses: { list: () => Promise.resolve([{ id: "claude", label: "Claude Code", found: true }]), launch: harnessLaunch },
+        home,
+        env: {},
+        platform: "linux",
+        disk: realLinkDisk,
+      });
+      // The page read the list first, so the bridge holds "signed in".
+      await accounts.body();
+      for (const [body, line] of [
+        [{ harness: "claude", signIn: true }, "claude /login"],
+        [{ harness: "claude", account: ACCOUNT, signIn: true }, `CLAUDE_CONFIG_DIR='${work}' claude /login`],
+      ] as const) {
+        const mux = new FakeMux();
+        expect((await run(mux, body, { accounts })).status).toBe(200);
+        expect(mux.texts).toEqual([["w1:p1", line]]);
+      }
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+});
+
+// ── A start on a crew member with an account (M101 spec 06, decisions 1 and 5) ──────────────────
+//
+// The lead forwards the phone's launch body unchanged (bridge/crew/forward.ts), `account` with it. The
+// member resolves that id against ITS OWN accounts, never against a folder in the request, and refuses
+// an id it does not hold with the existing sentence. A sign-in start does not cross the link.
+
+describe("POST /api/launch — over the crew link, with an account", () => {
+  const ACCOUNT = "6f1c2a4e-3b5d-4c7e-9f00-112233445566";
+  const LEADS = "6f1c2a4e-3b5d-4c7e-9f00-998877665544";
+
+  async function memberAccounts() {
+    const store = memoryAccountStore();
+    await store.add({ id: ACCOUNT, harness: "codex", label: "Work", kind: "own", dir: "/home/op/.codex-work", addedAt: 1, device: "pixel" });
+    return new Accounts({ store, harnesses: { list: () => Promise.resolve([]), launch: harnessLaunch }, home: "/home/op", env: {}, platform: "linux", disk: realLinkDisk });
+  }
+
+  test("an id the member does not hold (the lead's own, or a folder) is refused with the existing sentence, nothing runs", async () => {
+    const accounts = await memberAccounts();
+    for (const account of [LEADS, "/home/op/.codex-work", "~/.codex-work"]) {
+      const mux = new FakeMux();
+      const out = await run(mux, { harness: "codex", account }, { accounts, viaCrew: true });
+      expect([out.status, out.body?.ok === false ? out.body.code : undefined]).toEqual([400, "accounts.unknown"]);
+      expect(mux.spaces).toEqual([]);
+    }
+  });
+
+  test("a sign-in start over the crew link is refused before anything runs; locally it still starts", async () => {
+    const accounts = await memberAccounts();
+    for (const body of [{ harness: "claude", signIn: true }, { harness: "codex", account: ACCOUNT, signIn: true }]) {
+      const mux = new FakeMux();
+      expect((await run(mux, body, { accounts, viaCrew: true })).status).toBe(400);
+      expect(mux.spaces).toEqual([]);
+      expect(mux.texts).toEqual([]);
+    }
+    const mux = new FakeMux();
+    expect((await run(mux, { harness: "claude", signIn: true }, { accounts })).status).toBe(200);
   });
 });

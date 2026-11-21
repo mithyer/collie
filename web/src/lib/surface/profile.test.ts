@@ -75,6 +75,7 @@ describe("every profile file", () => {
     expect(claude.idle.frame.prompt.pattern).toContain("(?<draft>");
     expect(claude.idle.placeholders.sgr).toBe(2);
     expect(claude.idle.placeholders.texts).toContain("Press up to edit queued messages");
+    expect(claude.idle.placeholders.texts).toContain("Resend your message to try again");
     expect(claude.idle.volatile.below.maxRows).toBe(8);
     expect(claude.keys.submit).toEqual(["Enter"]);
     expect(claude.keys.interrupt).toEqual(["Escape"]);
@@ -230,6 +231,12 @@ describe("the codex profile (M56 spec 13)", () => {
     expect(nameOf("  ⏵⏵ bypass permissions on (shift+tab to cycle) · 1 shell · ← 11 agents")).toBeNull();
     expect(nameOf("  CTX:8% CACHE:99% LIMITS 5h:9%/4h:21m 7d:70%/4d:06h")).toBeNull();
     expect(nameOf("  [Fable·medium] ~/projects/sample-workspace on main*")).toBeNull();
+  });
+
+  it("claude: the agents panel's rows are chrome, the mode row's hint is not (field case 2026-11-13)", () => {
+    const rows = parseProfile(rawClaude()).idle.volatile.below.footerRows!;
+    const chrome = rows.filter((row) => row.chrome === true).map((row) => row.name);
+    expect(chrome).toEqual(["agents-panel-main", "agents-panel-agent", "agents-panel-more", "agents-panel-manage-hint"]);
   });
 
   it("claude: the agents screen's key-hint row under its own box is another screen's, no conversation footer is (claude-lab--agents-screen)", () => {
@@ -512,7 +519,7 @@ const SPEC14_CASES: readonly Spec14Case[] = [
     binary: "grok",
     versionOutput: "1.0.46 (2765805b9442) [stable]\n",
     version: "1.0.46",
-    above: "1.0.52",
+    above: "1.0.78",
     takes: [
       { anchor: "top", row: "  ╭──────────────────────────────────╮" },
       { anchor: "top", row: "╭──────────────────────────────────" },
@@ -528,7 +535,9 @@ const SPEC14_CASES: readonly Spec14Case[] = [
     collapse: { text: "[Pasted 3003 chars]", group: "", value: "" },
     submit: ["Enter"],
     probeStatus: "provisional",
-    enterWhileRunning: undefined,
+    // Lab 2026-11-16 on Grok Build 1.0.77: the hint row reads `Enter:queue` in a turn, the text stood
+    // under `▾ Queued 1` over the box and ran after the turn.
+    enterWhileRunning: "queues",
   },
   {
     id: "agy",
@@ -875,8 +884,9 @@ describe("the frame schema of the interior walk (M56 spec 14)", () => {
     expect(failure(change(own, ["idle", "frame", "rows"], undefined)).path).toBe("idle.frame.ownPrompt");
     const pi = parseProfile(parseJsonObject(readFileSync(join(PROFILES_DIR, "pi.json"), "utf8"))!);
     expect(pi.idle.frame.ownPrompt).toBeUndefined();
-    // The rail layout (issue 747) names no glyph of its own: every row of it carries the rail.
-    expect(pi.idle.frameAlternates?.map((frame) => frame.ownPrompt)).toEqual([true, true, undefined]);
+    // The rail layout (issue 747) names no glyph of its own: every row of it carries the rail. Nor does
+    // the `/login` sign-in field, the first alternate.
+    expect(pi.idle.frameAlternates?.map((frame) => frame.ownPrompt)).toEqual([undefined, true, true, undefined]);
   });
 
   it("names a newline draft as the box's own lines (`draftLines`) on Muse alone, never on pi (#552)", () => {
@@ -922,9 +932,10 @@ describe("the frame schema of the interior walk (M56 spec 14)", () => {
 
   it("names the alternate frame shape in the path of a bad field", () => {
     const raw = parseJsonObject(readFileSync(join(PROFILES_DIR, "omp.json"), "utf8"))!;
-    expect(failure(change(raw, ["idle", "frameAlternates", 1, "bottom", "pattern"], "[unclosed")).path).toBe("idle.frameAlternates[1].bottom.pattern");
+    expect(failure(change(raw, ["idle", "frameAlternates", 2, "bottom", "pattern"], "[unclosed")).path).toBe("idle.frameAlternates[2].bottom.pattern");
     expect(failure(change(raw, ["idle", "frameAlternates"], "no list")).path).toBe("idle.frameAlternates");
-    expect(parseProfile(raw).idle.frameAlternates).toHaveLength(6);
+    // Six box shapes and the `/login` sign-in field.
+    expect(parseProfile(raw).idle.frameAlternates).toHaveLength(7);
   });
 
   it("omp 18.11 (issue 497): the chips of every symbol preset collapse, the Nerd Font pointer points, and a skill is listed under its namespace", () => {
@@ -1055,6 +1066,7 @@ describe("parseProfile names the failing field", () => {
     ["a footer row name used twice", ["idle", "volatile", "below", "footerRows", 1, "name"], "agents-panel-main", "idle.volatile.below.footerRows[1].name"],
     ["a footer row that is no expression", ["idle", "volatile", "below", "footerRows", 0, "pattern"], "[unclosed", "idle.volatile.below.footerRows[0].pattern"],
     ["a footer row that matches a blank row", ["idle", "volatile", "below", "footerRows", 0, "pattern"], "^\\s*$", "idle.volatile.below.footerRows[0].pattern"],
+    ["a footer row's chrome mark that is not true", ["idle", "volatile", "below", "footerRows", 0, "chrome"], false, "idle.volatile.below.footerRows[0].chrome"],
     ["other screens that are no list", ["idle", "volatile", "below", "otherScreens"], "enter to return", "idle.volatile.below.otherScreens"],
     ["an other screen with no name", ["idle", "volatile", "below", "otherScreens", 0, "name"], undefined, "idle.volatile.below.otherScreens[0].name"],
     ["an other screen row that is no expression", ["idle", "volatile", "below", "otherScreens", 0, "pattern"], "[unclosed", "idle.volatile.below.otherScreens[0].pattern"],

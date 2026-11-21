@@ -1,12 +1,13 @@
 import { Database } from "bun:sqlite";
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
-import { statSync } from "node:fs";
+import { realpathSync, statSync } from "node:fs";
 import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { agyJournal, AgyTranscriptSource, createAgyReducer, parseAgyTranscript } from "./agy.ts";
 import { NO_CURSOR } from "./cursor.ts";
+import { fileKey, type ProcReader } from "./proc-locks.ts";
 
 // Synthetic content in the native 1.4.4-1.4.8 wire schema: no user conversation or credentials.
 const ID = "11111111-2222-3333-4444-555555555555";
@@ -64,16 +65,37 @@ describe("AGY native steps", () => {
       kind: "tool",
       id: "call-1",
       name: "run_command",
+      summary: "pwd",
+      call: { kind: "execute", command: "pwd", exitCode: 0 },
       result: { text: "Command exited with code 0." },
     });
   });
 
-  test("renders compaction separately and native tool errors as failures", () => {
+  test("renders compaction separately, extracts non-zero execute exit codes and marks native tool errors", () => {
     const summary = step(23, field(30, field(5, "Earlier context.")));
+    const failedCmd = step(
+      132,
+      field(140, field(2, field(1, "Command exited with code 2.\n\nCommand output:\nfail"))),
+      field(
+        4,
+        message(
+          field(1, "call-2"),
+          field(2, "run_command"),
+          field(3, '{"CommandLine":"bun test","toolSummary":"Unit test execution"}'),
+        ),
+      ),
+    );
     const error = Buffer.concat([tool, field(31, field(2, "file does not exist"))]);
-    const entries = agyJournal([]).parse([row(3, 23, summary), row(4, 132, error)].join("\n"));
+    const entries = agyJournal([]).parse([row(3, 23, summary), row(4, 132, failedCmd), row(5, 132, error)].join("\n"));
     expect(entries[0]).toMatchObject({ role: "summary", parts: [{ kind: "text", text: "Earlier context." }] });
-    expect(entries[1]?.parts[0]).toMatchObject({ result: { text: "file does not exist", isError: true } });
+    expect(entries[1]?.parts[0]).toMatchObject({
+      kind: "tool",
+      id: "call-2",
+      name: "run_command",
+      summary: "bun test",
+      call: { kind: "execute", command: "bun test", description: "Unit test execution", exitCode: 2 },
+    });
+    expect(entries[2]?.parts[0]).toMatchObject({ result: { text: "file does not exist", isError: true } });
   });
 
   test("supports historical tool step_types (5,7,8,9,17,21,33) and plumbing step_types (90,98,101,139) with 0 unknowns", () => {
@@ -332,6 +354,91 @@ describe("AGY read-only source and exact discovery", () => {
     await writeFile(outside, "");
     expect(await agyJournal(root, () => Promise.resolve(`n${outside}\n`)).discover!("/cwd", hints)).toBeNull();
   });
+
+  test("binds the process's lock via /proc/locks when lsof fails (PrivateTmp sandbox)", async () => {
+    const root = await home();
+    const { db } = database(root);
+    db.close();
+    const lock = join(root, "presence", `${ID}.lock`);
+    await writeFile(lock, "");
+    const st = statSync(lock, { bigint: true });
+    const proc: ProcReader = {
+      flocks: async (pid) => (pid === 42 ? new Set([fileKey(st.dev, st.ino)]) : new Set()),
+    };
+    const failingFiles = () => Promise.reject(Object.assign(new Error("EACCES: permission denied"), { code: "EACCES" }));
+    const adapter = agyJournal(root, failingFiles, proc);
+    const hints = { processes: [{ pid: 42, argv: ["agy"] }] };
+    expect(await adapter.discover!("/cwd", hints)).toEqual({ kind: "id", value: ID });
+  });
+
+  test("fails closed when /proc/locks reports multiple presence locks or an outside lock", async () => {
+    const root = await home();
+    const foreign = await home();
+    const { db } = database(root);
+    db.close();
+    const lock1 = join(root, "presence", `${ID}.lock`);
+    const lock2 = join(root, "presence", `${OTHER}.lock`);
+    await writeFile(lock1, "");
+    await writeFile(lock2, "");
+    const st1 = statSync(lock1, { bigint: true });
+    const st2 = statSync(lock2, { bigint: true });
+
+    const multiProc: ProcReader = {
+      flocks: async (pid) => (pid === 42 ? new Set([fileKey(st1.dev, st1.ino), fileKey(st2.dev, st2.ino)]) : new Set()),
+    };
+    expect(
+      await agyJournal(root, () => Promise.resolve([]), multiProc).discover!("/cwd", {
+        processes: [{ pid: 42, argv: ["agy"] }],
+      }),
+    ).toBeNull();
+
+    const outside = join(foreign, "presence", `${ID}.lock`);
+    await writeFile(outside, "");
+    const stOutside = statSync(outside, { bigint: true });
+    const outsideProc: ProcReader = {
+      flocks: async (pid) => (pid === 42 ? new Set([fileKey(stOutside.dev, stOutside.ino)]) : new Set()),
+    };
+    expect(
+      await agyJournal(root, () => Promise.resolve([]), outsideProc).discover!("/cwd", {
+        processes: [{ pid: 42, argv: ["agy"] }],
+      }),
+    ).toBeNull();
+  });
+
+  test("falls back to openFiles (lsof) when /proc/locks is unavailable (non-Linux or empty)", async () => {
+    const root = await home();
+    const { db } = database(root);
+    db.close();
+    const lock = join(root, "presence", `${ID}.lock`);
+    await writeFile(lock, "");
+    const nonLinuxProc: ProcReader = {
+      flocks: async () => null,
+    };
+    const adapter = agyJournal(root, () => Promise.resolve([lock]), nonLinuxProc);
+    expect(await adapter.discover!("/cwd", { processes: [{ pid: 42, argv: ["agy"] }] })).toEqual({ kind: "id", value: ID });
+  });
+
+  test("binds the process's lock on BTRFS where stat dev and /proc/locks anon_dev differ", async () => {
+    const root = await home();
+    const { db } = database(root);
+    db.close();
+    const lock = join(root, "presence", `${ID}.lock`);
+    await writeFile(lock, "");
+    const st = statSync(lock, { bigint: true });
+    // Simulate BTRFS: stat.dev is subvolume anon_dev (e.g. 0:53), but /proc/locks reports filesystem superblock (0:36)
+    // and so does the mount table for the mount that holds the root.
+    const mountPoint = realpathSync(root).replaceAll(" ", "\\040");
+    const proc: ProcReader = {
+      flocks: async (pid) => (pid === 42 ? new Set([`0:36:${st.ino}`]) : new Set()),
+      mounts: async () => `61 1 0:36 /home ${mountPoint} rw,relatime shared:1 - btrfs /dev/sda1 rw\n`,
+    };
+    const adapter = agyJournal(root, () => Promise.reject(new Error("lsof unavailable")), proc);
+    const found = await adapter.discover!("/cwd", { processes: [{ pid: 42, argv: ["agy"] }] });
+    // The device split is only bridged for a file on an anonymous device (major 0, as btrfs and tmpfs
+    // report). A temp folder on a block device (CI's ext4) must find nothing instead.
+    const anonymous = ((st.dev >> 8n) & 0xfffn) === 0n && st.dev >> 32n === 0n;
+    expect(found).toEqual(anonymous ? { kind: "id", value: ID } : null);
+  });
 });
 
 describe("AGY plaintext transcript.jsonl fallback", () => {
@@ -349,11 +456,32 @@ describe("AGY plaintext transcript.jsonl fallback", () => {
         JSON.stringify({
           step_index: 1,
           type: "PLANNER_RESPONSE",
+          thinking: "Let me inspect /a.ts first.",
+          truncated_fields: ["thinking"],
           content: "Fallback answer",
-          tool_calls: [{ name: "view_file", args: { path: "/a.ts" } }],
+          tool_calls: [{ name: "read_file", args: { Path: '"/a.ts"', StartLine: "1", EndLine: "20" } }],
           created_at: "2026-10-21T00:00:01Z",
         }),
-        JSON.stringify({ step_index: 2, type: "GENERIC", content: "Tool output", created_at: "2026-10-21T00:00:02Z" }),
+        JSON.stringify({
+          step_index: 2,
+          type: "PLANNER_RESPONSE",
+          thinking: "Now run the command.",
+          content: "",
+          tool_calls: [
+            { name: "run_command", args: { CommandLine: '"ls -la"', toolSummary: '"List files"' } },
+            {
+              name: "invoke_subagent",
+              args: {
+                TypeName: '"research"',
+                Prompt: '"Investigate \\"\\\\n\\"\\n<truncated 120 bytes>',
+              },
+            },
+            { name: "run_command", args: { CommandLine: "true" } },
+            { name: "read_file", args: { Path: "123", StartLine: 1, EndLine: 20 } },
+          ],
+          created_at: "2026-10-21T00:00:02Z",
+        }),
+        JSON.stringify({ step_index: 3, type: "GENERIC", content: "Tool output", created_at: "2026-10-21T00:00:03Z" }),
       ].join("\n") + "\n",
     );
 
@@ -365,8 +493,46 @@ describe("AGY plaintext transcript.jsonl fallback", () => {
     expect(entries.map((e) => [e.uuid, e.role])).toEqual([
       ["agy-0", "user"],
       ["agy-1", "assistant"],
-      ["agy-2", "note"],
+      ["agy-2", "assistant"],
+      ["agy-3", "note"],
     ]);
     expect(entries[0]?.parts).toEqual([{ kind: "text", text: "Hello from fallback" }]);
+    expect(entries[1]?.parts).toEqual([
+      { kind: "thinking", text: "Let me inspect /a.ts first.", truncated: true },
+      { kind: "text", text: "Fallback answer" },
+      {
+        kind: "tool",
+        name: "read_file",
+        summary: "/a.ts",
+        call: { kind: "read", path: "/a.ts", range: [1, 20] },
+      },
+    ]);
+    expect(entries[2]?.parts).toEqual([
+      { kind: "thinking", text: "Now run the command." },
+      {
+        kind: "tool",
+        name: "run_command",
+        summary: "ls -la",
+        call: { kind: "execute", command: "ls -la", description: "List files" },
+      },
+      {
+        kind: "tool",
+        name: "invoke_subagent",
+        summary: 'Investigate "\\n" <truncated 120 bytes>',
+        call: { kind: "task", agent: "research", summary: 'Investigate "\\n" <truncated 120 bytes>' },
+      },
+      {
+        kind: "tool",
+        name: "run_command",
+        summary: "true",
+        call: { kind: "execute", command: "true" },
+      },
+      {
+        kind: "tool",
+        name: "read_file",
+        summary: "123",
+        call: { kind: "read", path: "123", range: [1, 20] },
+      },
+    ]);
   });
 });

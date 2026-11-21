@@ -6,6 +6,7 @@ import { parseAnsi } from "../ansi";
 import { lineText, splitLines, type Block, type StyledLine } from "../blocks";
 import { buildBlocks, withUnreadDialog } from "./index";
 import { museAdapter } from "./muse";
+import { detectNoEchoPrompt } from "../no-echo";
 import { adapterFor } from "./registry";
 import type { HarnessAdapter } from "./types";
 
@@ -251,6 +252,19 @@ const CARD_FIXTURES = {
       // field no grammar reads; the Marketplaces grammar does not claim it (no `Manage marketplaces`
       // title), so the card and its Escape are the way back to the tab.
       "claude--v2283-plugin-marketplaces-add-form--w82.txt",
+      // README: `/login` after a refused code (2.1.325), `OAuth error: … Press Enter to retry. Esc to
+      // cancel`. No input box and no grammar; the card's Escape is the way back.
+      "claude--v2325-login-bad-code--w61.txt",
+      // README: the first run's third-party list (2.1.325), `Using 3rd-party platforms`, no question and
+      // a `Foundry:` row under its options, so the method card declines. The card shows the screen;
+      // Esc does nothing on the first run, so its way out is the digit on the Keys tray.
+      "claude--v2325-first-run-thirdparty-methods--w61.txt",
+      // The first run's theme step (2.1.325) is not on this list: it lifts as a pointed list
+      // (first-run-theme.ts), so the card does not show on it.
+      // README: `/theme` in an onboarded session (2.1.325). The same list under a `Theme` title with
+      // `Enter to select · Esc to cancel`; it showed the card before `idle.dialogRows` and still does.
+      "claude--v2325-theme-command--w40.txt",
+      "claude--v2325-theme-command--w61.txt",
     ],
     notModals: [
       // corpus, DELIBERATE: a statusline printing numbered rows is refused by ADR 0048 step 4
@@ -532,5 +546,36 @@ describe("the card stays off the shell an agent exits to, and off its first fram
     expect(adapterFor(agent)!.composerReady!(lines)).toBe(false);
     expect(adapterFor(agent)!.modalOnScreen!(lines)).toBe(false);
     expect(cardOf(pass(agent, lines))).toBeNull();
+  });
+});
+
+describe("unread card: where it never shows (M102 spec 03, hard stops 6a and 6b)", () => {
+  // 6a: a permission prompt Collie has read keeps its own card. The unread card is only for a screen
+  // with no reading, so no captured permission prompt may also produce one.
+  // A capture's file name starts with its agent; two lab prefixes name a registered agent another way.
+  const PREFIX = new Map([
+    ["claude-lab", "claude"],
+    ["oc", "opencode"],
+  ]);
+  const agentOf = (name: string): string | undefined => {
+    const head = name.split("--")[0]!;
+    const agent = PREFIX.get(head) ?? head;
+    return AGENTS.find((known) => known === agent);
+  };
+  const PERMISSION = FIXTURES.filter((f) => f.includes("--permission-") && agentOf(f) !== undefined);
+  it("unread card: the captures hold permission prompts to check", () => {
+    expect(PERMISSION.length).toBeGreaterThan(3);
+  });
+  it.each(PERMISSION)("unread card: never over the read permission prompt in %s", (name) => {
+    const blocks = pass(agentOf(name)!, fixtureLines(name));
+    expect(cardOf(blocks)).toBeNull();
+  });
+
+  // 6b: a screen that asks for a secret drops "Send past this screen". The pane view decides it with the
+  // no-echo reader over the same rows the card shows (agent-chat's `unreadSecret`).
+  it("unread card: a password prompt the card shows is read as a secret prompt", () => {
+    const lines = linesOf("$ sudo systemctl restart demo\n[sudo] password for demo-user: ");
+    expect(detectNoEchoPrompt(lines)).not.toBeNull();
+    expect(detectNoEchoPrompt(linesOf("$ ls\nREADME.md\n$ "))).toBeNull();
   });
 });

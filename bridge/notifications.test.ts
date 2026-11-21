@@ -1,10 +1,15 @@
 import { describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
+import { ActivityLedger } from "./activity.ts";
 import {
   NotificationCoordinator,
   makeNotifySink,
   paneClears,
   paneTag,
+  pushName,
   type HerdSummary,
   type NotifyClock,
   type NotifySink,
@@ -503,6 +508,17 @@ describe("NotificationCoordinator — a finished pane you opened", () => {
     expect(sink.last).toMatchObject({ paneId: "p1", renotify: false, badge: 1 });
   });
 
+  test("retracts the alert of a pane that stopped on an error, as for a finished one, and still pushes it first (PR 787)", () => {
+    const { clock, sink, coord } = setup();
+    coord.onTransition(agentNamed("p1", "claude", "blocked", { blockedBy: "error" }), "working", "blocked");
+    clock.fireAll();
+    expect(sink.last).toMatchObject({ paneId: "p1", title: "claude needs you", renotify: true, badge: 1 });
+    coord.retractSeen([{ paneId: "p1", lastActiveAt: 20, lastSeenAt: 10 }]);
+    expect(sink.last).toMatchObject({ paneId: "p1" });
+    coord.retractSeen([{ paneId: "p1", lastActiveAt: 10, lastSeenAt: 20 }]);
+    expect(sink.events.at(-1)).toEqual({ kind: "clear" });
+  });
+
   test("clears the herd when it was the last alert, and cancels one still in its window", () => {
     const { clock, sink, coord } = setup();
     coord.onTransition(agent("p1", "done"), "working", "done");
@@ -931,5 +947,135 @@ describe("one notification per agent — ten sessions retracting at once", () =>
       expect(body.type).toBe("clear");
       expect(body.tags).toEqual(Array.from({ length: 10 }, (_, i) => paneTag(`collie:herd:s${i}`, "p1")));
     }
+  });
+});
+
+// ── Clear all (`POST /api/notifications/clear`) ───────────────────────────────────────────────────
+// One tap is what opening every pane does: every pane seen, every finished alert retracted the way any
+// retraction goes, a blocked alert kept. The route that composes it is in notifications-clear-route.test.ts.
+describe("clear all — the coordinator's half", () => {
+  test("retracts every finished alert, shown or still debouncing, and keeps the blocked one", () => {
+    const { clock, sink, coord } = setup();
+    coord.onTransition(agent("p1", "blocked"), "working", "blocked");
+    coord.onTransition(agent("p2", "done"), "working", "done");
+    clock.fireAll();
+    coord.onTransition(agent("p3", "done"), "working", "done"); // still in its window
+    coord.onTransition(agent("p4", "blocked"), "working", "blocked"); // still in its window
+    expect(clock.armed).toBe(2);
+    coord.retractFinished();
+    // The finished one in its window never fires; the blocked one in its window still does.
+    expect(clock.armed).toBe(1);
+    expect(sink.last).toMatchObject({ paneId: "p1", renotify: false, badge: 1 });
+    expect(coord.outstandingPaneIds()).toEqual(["p1"]);
+    clock.fireAll();
+    expect(coord.outstandingPaneIds()).toEqual(["p1", "p4"]);
+  });
+
+  test("a blocked alert whose pane finished inside the debounce goes with the pending finish", () => {
+    const { clock, sink, coord } = setup();
+    coord.onTransition(agent("p1", "blocked"), "working", "blocked");
+    clock.fireAll();
+    // Answered and finished, but the done alert is still in its window: the pane's latest status is done.
+    coord.onTransition(agent("p1", "done"), "blocked", "done");
+    expect(clock.armed).toBe(1);
+    coord.retractFinished();
+    expect(clock.armed).toBe(0);
+    expect(coord.outstandingPaneIds()).toEqual([]);
+    expect(sink.events.at(-1)).toEqual({ kind: "clear" });
+  });
+
+  test("a finished pane that is blocked again inside the debounce keeps its blocked timer", () => {
+    const { clock, sink, coord } = setup();
+    coord.onTransition(agent("p1", "done"), "working", "done");
+    clock.fireAll();
+    coord.onTransition(agent("p1", "blocked"), "done", "blocked");
+    coord.retractFinished();
+    expect(clock.armed).toBe(1);
+    clock.fireAll();
+    expect(sink.last).toMatchObject({ paneId: "p1", renotify: true });
+    expect(coord.outstandingPaneIds()).toEqual(["p1"]);
+  });
+
+  test("closes the summary when only finished alerts were out, and does nothing when none were", () => {
+    const { clock, sink, coord } = setup();
+    coord.retractFinished();
+    expect(sink.events).toEqual([]);
+    coord.onTransition(agent("p1", "done"), "working", "done");
+    clock.fireAll();
+    coord.retractFinished();
+    expect(sink.events.at(-1)).toEqual({ kind: "clear" });
+  });
+
+  test("one notification per agent: closes each finished pane's own and leaves the blocked pane's", () => {
+    const { clock, sink, coord } = setup({ blocked: true, done: true, individual: true });
+    coord.onTransition(agent("p1", "blocked"), "working", "blocked");
+    coord.onTransition(agent("p2", "done"), "working", "done");
+    coord.onTransition(agent("p3", "done"), "working", "done");
+    clock.fireAll();
+    const before = sink.events.length;
+    coord.retractFinished();
+    expect(sink.events.slice(before)).toEqual([
+      { kind: "clearPane", paneId: "p2" },
+      { kind: "clearPane", paneId: "p3" },
+    ]);
+    expect(coord.outstandingPaneIds()).toEqual(["p1"]);
+  });
+});
+
+describe("clear all — the seen ledger", () => {
+  test("marks every pane of the session seen, leaves when each last moved, and survives a reload", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "collie-clear-seen-"));
+    let now = 100;
+    const activity = new ActivityLedger({ stateDir: dir }, () => now);
+    try {
+      activity.ensure("default", "w1:p1");
+      activity.ensure("default", "w1:p2");
+      activity.ensure("work", "w2:p1");
+      now = 200;
+      activity.noteActive("default", "w1:p2");
+      now = 300;
+      expect(activity.noteAllSeen("default")).toEqual(["w1:p1", "w1:p2"]);
+      expect(activity.get("default", "w1:p1")).toEqual({ activeAt: 100, seenAt: 300 });
+      expect(activity.get("default", "w1:p2")).toEqual({ activeAt: 200, seenAt: 300 });
+      // Another session is its own key, stamped only when its own target is.
+      expect(activity.get("work", "w2:p1")).toEqual({ activeAt: 100, seenAt: 100 });
+      // A session with no panes is not created.
+      expect(activity.noteAllSeen("gone")).toEqual([]);
+      expect(activity.snapshot()).not.toHaveProperty("gone");
+
+      // The stamps are written like any other seen (ADR 0003), so a restart keeps the dots cleared.
+      await activity.flush();
+      const reloaded = new ActivityLedger({ stateDir: dir }, () => now);
+      await reloaded.load();
+      expect(reloaded.get("default", "w1:p2")).toEqual({ activeAt: 200, seenAt: 300 });
+      expect(reloaded.get("work", "w2:p1")).toEqual({ activeAt: 100, seenAt: 100 });
+      reloaded.stop();
+    } finally {
+      activity.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("pushName — the given name, never the terminal title", () => {
+  const base = { agent: "claude", kind: "agent" as const };
+
+  test("names a pane by the agent's own session title when nobody set a name (2026-11-13)", () => {
+    expect(pushName({ ...base, agentTitle: "Lodge Silverblue to NixOS migration", terminalTitle: "Reviewing the diff" })).toBe(
+      "Lodge Silverblue to NixOS migration",
+    );
+  });
+
+  test("keeps the order of the one name rule: Collie rename, person's name, tab, agent's title", () => {
+    const all = { ...base, paneLabel: "release", sessionName: "migrate", agentTitle: "Auto title", soleTabName: "work" };
+    expect(pushName(all)).toBe("release");
+    expect(pushName({ ...all, paneLabel: undefined })).toBe("migrate");
+    expect(pushName({ ...all, paneLabel: undefined, sessionName: undefined })).toBe("work");
+    expect(pushName({ ...all, paneLabel: undefined, sessionName: undefined, soleTabName: undefined })).toBe("Auto title");
+  });
+
+  test("never falls back to the terminal title, and strips control and bidi characters", () => {
+    expect(pushName({ ...base, terminalTitle: "cat ~/.ssh/id_ed25519" })).toBe("claude");
+    expect(pushName({ ...base, agentTitle: "‮evil‬ title" })).toBe("evil title");
   });
 });

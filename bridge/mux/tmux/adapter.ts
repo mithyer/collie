@@ -45,7 +45,7 @@
 // visible, less prominent, and never a claim about who wrote it.
 //
 // tmux's own default for the slot is the host name, which is why {@link programTitle} drops a title
-// equal to it: an untouched pane says nothing, and reporting "bluefin" would be noise.
+// equal to it: an untouched pane says nothing, and reporting "lodge" would be noise.
 
 import { declareCapabilities } from "../capabilities.ts";
 import { TMUX_LOGO_SVG } from "./logo.ts";
@@ -56,6 +56,7 @@ import {
   muxGone,
   muxOk,
   muxRefused,
+  muxUnconfirmed,
   muxUnsupported,
   muxUnreachable,
   requestedCwd,
@@ -79,6 +80,7 @@ import {
 import {
   resolveTmuxBinary,
   SpawnTmuxExec,
+  TIMED_OUT_CODE,
   tmuxServerArgs,
   tmuxServerLabel,
   type TmuxExec,
@@ -397,7 +399,7 @@ export class TmuxMux implements MuxAdapter {
       "-s",
       "\n",
     ];
-    const result = await this.attemptRun(args, text);
+    const result = await this.attemptWrite(args, text, (detail) => textUnconfirmed(paneId, detail));
     return result.ok ? muxAck() : result;
   }
 
@@ -409,7 +411,7 @@ export class TmuxMux implements MuxAdapter {
   async pasteText(paneId: string, text: string): Promise<MuxAck> {
     if (text.length === 0) return muxAck();
     const args = ["load-buffer", "-b", TYPE_BUFFER, "-", ";", "paste-buffer", "-d", "-p", "-b", TYPE_BUFFER, "-t", paneId];
-    const result = await this.attemptRun(args, text);
+    const result = await this.attemptWrite(args, text, (detail) => textUnconfirmed(paneId, detail));
     return result.ok ? muxAck() : result;
   }
 
@@ -438,12 +440,14 @@ export class TmuxMux implements MuxAdapter {
       translated.push(result.key);
     }
     if (translated.length === 0) return muxAck();
-    const result = await this.attemptRun(sendKeysArgs(paneId, translated, false));
+    const unconfirmed = (detail: string): MuxRefusalOutcome => keysUnconfirmed(paneId, detail);
+    const result = await this.attemptWrite(sendKeysArgs(paneId, translated, false), undefined, unconfirmed);
     if (result.ok) return muxAck();
     if (result.reason !== "refused" || !saysReadOnlyClient(result.detail)) return result;
     // tmux 3.7 picked a read-only client (Collie's own watcher) as the target client and sent
-    // nothing, so asking again with no client named cannot double-send.
-    const retry = await this.attemptRun(sendKeysArgs(paneId, translated, true));
+    // nothing, so asking again with no client named cannot double-send. A send that timed out never
+    // gets here: it may have landed, and asking again could press the keys twice.
+    const retry = await this.attemptWrite(sendKeysArgs(paneId, translated, true), undefined, unconfirmed);
     return retry.ok ? muxAck() : retry;
   }
 
@@ -623,10 +627,11 @@ export class TmuxMux implements MuxAdapter {
   private async created(args: readonly string[]): Promise<MuxOutcome<MuxCreatedPane>> {
     const guard = await this.refuseFatalSpawn();
     if (guard !== null) return guard;
-    const result = await this.attemptRun(args);
+    const result = await this.attemptCreate(args);
     if (!result.ok) return result;
     const created = parseCreated(result.value.stdout);
-    if (created === null) return muxRefused(`tmux created something and reported no pane id: ${result.value.stdout.trim()}`);
+    // Something was made and its identity is unknown: not a failure, the route looks (bridge/create-confirm.ts).
+    if (created === null) return muxUnconfirmed(`tmux created something and reported no pane id: ${result.value.stdout.trim()}`);
     return muxOk({
       paneId: created.paneId,
       spaceId: created.sessionId,
@@ -663,7 +668,27 @@ export class TmuxMux implements MuxAdapter {
     return muxRefused(fatalWindowSizeDetail(version));
   }
 
-  /** One tmux command, as the contract's outcome-or-refusal. A throw is `unreachable`, never a crash. */
+  /**
+   * A create's own run. One that ran out of its budget and was killed (`TIMED_OUT_CODE`) may still have
+   * made the window or the session, so it is `unconfirmed` and not a refusal, with the same sentence a
+   * refusal gave: the route looks in the snapshot before it says anything (bridge/create-confirm.ts).
+   */
+  private async attemptCreate(args: readonly string[]): Promise<MuxOutcome<TmuxRunResult>> {
+    let result: TmuxRunResult;
+    try {
+      result = await this.exec.run(args);
+    } catch (err) {
+      return muxUnreachable(err instanceof Error ? err.message : String(err));
+    }
+    const late = ranOutOfTime(result);
+    if (late !== null) return muxUnconfirmed(late);
+    return result.code === 0 ? muxOk(result) : refusalFor(result);
+  }
+
+  /**
+   * One tmux command, as the contract's outcome-or-refusal. A throw is `unreachable`, never a crash,
+   * and so is a run killed on its budget: a read or a rename that timed out changed nothing to look for.
+   */
   private async attemptRun(args: readonly string[], stdin?: string): Promise<MuxOutcome<TmuxRunResult>> {
     let result: TmuxRunResult;
     try {
@@ -671,6 +696,26 @@ export class TmuxMux implements MuxAdapter {
     } catch (err) {
       return muxUnreachable(err instanceof Error ? err.message : String(err));
     }
+    const late = ranOutOfTime(result);
+    if (late !== null) return muxUnreachable(late);
+    return result.code === 0 ? muxOk(result) : refusalFor(result);
+  }
+
+  /**
+   * One run that writes into a pane (M100 spec 03). A run killed on its time budget is no refusal:
+   * tmux may have taken the text or the keys before it hung, so it answers `unconfirmed` with the
+   * caller's sentence, and the Send Protocol's next read decides. Every other answer is
+   * {@link attemptRun}'s.
+   */
+  private async attemptWrite(args: readonly string[], stdin: string | undefined, unconfirmed: (detail: string) => MuxRefusalOutcome): Promise<MuxOutcome<TmuxRunResult>> {
+    let result: TmuxRunResult;
+    try {
+      result = await this.exec.run(args, stdin);
+    } catch (err) {
+      return muxUnreachable(err instanceof Error ? err.message : String(err));
+    }
+    const late = ranOutOfTime(result);
+    if (late !== null) return unconfirmed(late);
     return result.code === 0 ? muxOk(result) : refusalFor(result);
   }
 
@@ -703,6 +748,26 @@ export class TmuxMux implements MuxAdapter {
  * that has gone away, `no server running on …` for a tmux that is not there, and anything else —
  * `duplicate session: other` — is tmux understanding and saying no.
  */
+/**
+ * The one way a tmux run is read as killed on its time budget: the exec names the kill with
+ * {@link TIMED_OUT_CODE}. The detail is what tmux printed, or its exit. Null for a run that ended on its
+ * own. Every caller reads this: a create and a write answer `unconfirmed` with it, a read `unreachable`.
+ */
+function ranOutOfTime(result: TmuxRunResult): string | null {
+  if (result.code !== TIMED_OUT_CODE) return null;
+  return (result.stderr.trim() || result.stdout.trim()) || `tmux exited ${String(result.code)}`;
+}
+
+/** A text write tmux did not answer in time (M100 spec 03): it may still land. */
+function textUnconfirmed(paneId: string, detail: string): MuxRefusalOutcome {
+  return muxUnconfirmed(`tmux did not confirm the text written to ${paneId} in time (${detail}). It may still arrive, so it was not written again.`);
+}
+
+/** Keys tmux did not answer in time (M100 spec 03): they may still land. */
+function keysUnconfirmed(paneId: string, detail: string): MuxRefusalOutcome {
+  return muxUnconfirmed(`tmux did not confirm the keys on ${paneId} in time (${detail}). They may still arrive, so they were not sent again.`);
+}
+
 function refusalFor(result: TmuxRunResult): MuxRefusalOutcome {
   const detail = (result.stderr.trim() || result.stdout.trim()) || `tmux exited ${String(result.code)}`;
   if (saysMissing(detail)) return muxGone(detail);
@@ -879,6 +944,18 @@ function clientsToSwitch(listing: TmuxListing, sessionId: string): TmuxClient[] 
 
 type MutableMuxPane = { -readonly [K in keyof MuxPane]: MuxPane[K] };
 
+/**
+ * Whether a tmux session carries a name somebody chose. tmux names a session nobody named by a bare
+ * number (`0`, `1`, ...), the same on every machine, so a purely numeric name is not a name: two
+ * machines' `0` must never read as one space. A session the listing does not hold, or one with an empty
+ * name, fell back to its id.
+ */
+function tmuxSessionNamed(session: TmuxSession | undefined): boolean {
+  if (session === undefined) return false;
+  const name = session.name.trim();
+  return name.length > 0 && !/^\d+$/u.test(name);
+}
+
 /** One tmux pane record as a {@link MuxPane}. */
 
 /** A {@link MuxSpace} while it is being built, so an optional field is set only when present. */
@@ -898,6 +975,7 @@ function toMuxPane(
     paneId: raw.id,
     spaceId: raw.sessionId,
     spaceLabel: session !== undefined && session.name.length > 0 ? session.name : raw.sessionId,
+    spaceNamed: tmuxSessionNamed(session),
     spaceNumber: numberById.get(raw.sessionId) ?? 0,
     tabId: raw.windowId,
     cwd: raw.cwd,
@@ -945,7 +1023,7 @@ function toMuxPane(
 /**
  * What the pane's program printed into the title slot, or null when the slot says nothing.
  *
- * tmux seeds `pane_title` with the host name (probed: `bluefin` on an untouched pane), so a title
+ * tmux seeds `pane_title` with the host name (probed: `lodge` on an untouched pane), so a title
  * equal to the host is tmux's own default and not anybody's statement. Everything else is reported,
  * verbatim: the glyphs an agent puts in its own title (`✳ …`) are that agent's text, and trimming
  * them here would be Collie editing what a program said about itself.
@@ -988,8 +1066,8 @@ function windowLabel(window: TmuxWindow, panes: readonly TmuxPaneRecord[]): stri
 }
 
 /**
- * The last path segment of a pane's current directory — `/var/home/altan/playground/herdr-pouch` →
- * `herdr-pouch`, `/var/home/altan` → `altan`, `/` → `/`. `null` when tmux reported no path at all
+ * The last path segment of a pane's current directory — `/home/dev/playground/herdr-pouch` →
+ * `herdr-pouch`, `/home/dev` → `dev`, `/` → `/`. `null` when tmux reported no path at all
  * (an empty `#{pane_current_path}`, tmux's honest "I don't know").
  */
 function lastFolder(cwd: string): string | null {

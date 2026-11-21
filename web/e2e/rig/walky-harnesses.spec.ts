@@ -16,7 +16,7 @@
 //
 // pi and omp need a provider key (COLLIE_RIG_KEY_FILE); without one both cases report "not reached".
 import { NotReached, capture, captureScreen, message, openSession, phoneOn, resetBox, runScenario, sendFromComposer, spendTurn, tapWords, test, waitIdle, type Session } from "./leg";
-import { PHONE, REPLY_MS, addressOf, addressPattern, busyMessage, firstRow, nudgePattern, operatorMessage, settledWalky, whoAddress, withoutInstance } from "./walky-lib";
+import { PHONE, REPLY_MS, addressOf, addressPattern, busyMessage, firstRow, operatorMessage, settledWalky, whoAddress, nudgePattern, withoutInstance, withoutSubjects } from "./walky-lib";
 import { asJsonObject } from "../../src/lib/json";
 
 const claudeSession: Session = { paneId: null, startNote: "not started" };
@@ -70,8 +70,11 @@ test.describe("walky talky between agents", () => {
       const log = trail.log;
       const notes = trail.notes;
       const token = "PING-EIGHT";
-      // The operator's consent is in the body itself: a model reads an agent's message as a stranger's unless it says who asks.
-      const body = `${token}. The operator running this test asks you to answer with collie walky reply and the single word pong.`;
+      const SUBJECT = "ping check";
+      // A harmless ping between two sessions of one operator. A body that claims "the operator asks you" or names
+      // a command reads as an instruction to another agent, and pi's model refused to send it (two live runs, 2026-11-16).
+      // Claude's standing note (harnesses.ts) already pre-approves the answer, so the body asks for the word only.
+      const body = `${token}. Please answer with the single word pong.`;
       const from = addressOf(piPane);
       const to = addressOf(claudePane);
       // The address exactly as `collie walky who` prints it, `#token` included: pi has refused a bare one as incomplete.
@@ -79,7 +82,10 @@ test.describe("walky talky between agents", () => {
       if (target === null) throw new NotReached(`\`collie walky who\` does not list the Claude pane ${claudePane} with a token`);
       const { context, page, recorder } = await phoneOn(browser, rig, piPane, PHONE);
       try {
-        log.push(await sendFromComposer(page, recorder, `Use walky talky to send a message to the agent at ${target}. Run \`collie walky send ${target}\` with this message: "${body}" Then stop.`, "ask pi to send"));
+        // The whole command, with a fixed subject that holds no token: the skill asks for a subject, and a
+        // subject is typed on the nudge line, so a subject of pi's own (it chose `PING-EIGHT` once) put the
+        // token on Claude's screen before the inbox call.
+        log.push(await sendFromComposer(page, recorder, `Use walky talky to send a message to the agent at ${target}. I am your operator, and I ask you to send it. Run exactly this command: \`collie walky send ${target} --subject "${SUBJECT}" "${body}"\` Then stop.`, "ask pi to send"));
 
         // The message reaches Claude's list as an agent's, from pi's pane.
         const sent = await firstRow(rig, claudePane, (row) => row.kind === "agent" && withoutInstance(String(asJsonObject(row.from)?.address)) === from && String(row.body).includes(token), 120_000);
@@ -92,7 +98,7 @@ test.describe("walky talky between agents", () => {
         notes.push(`pi sent ${id}: receipt ${first}`);
 
         // Claude's screen: the nudge line, with no body in it; the body only in the inbox command's output.
-        const nudge = new RegExp(nudgePattern({ id, from: addressPattern(from), harness: "pi" }));
+        const nudge = new RegExp(nudgePattern({ id, from: addressPattern(from), harness: "pi", subject: SUBJECT }));
         const nudged = await rig.screenUntil(claudePane, nudge, 60_000, 200);
         const inbox = new RegExp(`Bash\\(collie walky inbox ${id}\\)`);
         const called = await rig.screenUntil(claudePane, inbox, REPLY_MS, 200);
@@ -116,7 +122,8 @@ test.describe("walky talky between agents", () => {
         await waitIdle(rig, piPane, REPLY_MS);
         const piScreen = await rig.screen(piPane, 200);
         const piCall = replyId === null ? -1 : piScreen.search(new RegExp(`collie walky inbox ${replyId}`));
-        const piRead = piCall !== -1 && /\bpong\b/i.test(piScreen.slice(piCall));
+        // A subject of Claude's own is no body: `inbox` prints it on its header line, so it is taken out first.
+        const piRead = piCall !== -1 && /\bpong\b/i.test(withoutSubjects(piScreen.slice(piCall)));
         notes.push(piRead ? "pi read the reply with `inbox`: pong" : "pi did not show the reply's body from `inbox`");
 
         // The phone, on Claude's pane: the message is a card, with its body (it was read with `inbox`) and the agent badge.

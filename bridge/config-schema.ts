@@ -223,7 +223,7 @@ export const CONFIG_SETTINGS: readonly ConfigSetting[] = [
     section: "bridge",
     kind: "bool",
     default: true,
-    doc: "Front every running session this collie discovers, not only the primary one.",
+    doc: "Front every running space this collie discovers, not only the primary one.",
     configField: "multiSession",
   },
   {
@@ -243,6 +243,15 @@ export const CONFIG_SETTINGS: readonly ConfigSetting[] = [
     default: true,
     doc: "Send from the phone through the bridge-side Send Protocol (probe, predicted-state check, key gate, receipt). Off turns sending text off; the keys still work.",
     configField: "sendProtocol",
+  },
+  {
+    key: "inside",
+    env: "COLLIE_INSIDE",
+    section: "bridge",
+    kind: "bool",
+    default: false,
+    doc: "Experimental (M99): the inside wire's switch. Unset, it is on while `collie harness link` has linked a harness on this machine, so a linked agent can take sends, asks and wake events as data. Off keeps the screen path for every session; on opens the socket with no link.",
+    configField: "inside",
   },
   {
     key: "walky",
@@ -750,6 +759,15 @@ export const CONFIG_SETTINGS: readonly ConfigSetting[] = [
     doc: "Where OpenClaw keeps its state. Empty follows OPENCLAW_STATE_DIR, else ~/.openclaw.",
     configField: "journalRoots",
   },
+  {
+    key: "mcode_root",
+    env: "COLLIE_MCODE_ROOT",
+    section: "journal",
+    kind: "roots",
+    default: [],
+    doc: "Where MiniMax Code keeps its dated session folders. Empty follows MINIMAX_DATA_DIR, else ~/.minimax/v2/sessions.",
+    configField: "journalRoots",
+  },
 
   // ── crew ───────────────────────────────────────────────────────────────────
   {
@@ -785,6 +803,15 @@ export const CONFIG_SETTINGS: readonly ConfigSetting[] = [
     kind: "bool",
     default: false,
     doc: "Keep this peer's own browser front door up. Peer mode only.",
+  },
+  {
+    key: "crew_trick_reads",
+    env: "COLLIE_CREW_TRICK_READS",
+    section: "crew",
+    kind: "enum",
+    values: ["on", "off"],
+    default: "",
+    doc: "Whether the lead's tricks may read files from this member's agent sessions. Empty follows device_header: on while it is off.",
   },
 
   // ── standby ────────────────────────────────────────────────────────────────
@@ -878,6 +905,15 @@ export const CONFIG_SETTINGS: readonly ConfigSetting[] = [
     default: "",
     doc: "The path Collie is mounted under when a proxy gives it one, such as /collie. Empty means the root.",
     configField: "basePath",
+  },
+  {
+    key: "auth_return",
+    env: "COLLIE_AUTH_RETURN",
+    section: "serve",
+    kind: "bool",
+    default: false,
+    doc: "Send /auth/ back to the app. Set it when your front door signs in on every path and serves nothing at /auth/.",
+    configField: "authReturn",
   },
   {
     key: "serve_mode",

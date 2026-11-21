@@ -22,6 +22,11 @@ import {
 import { WalkyService } from "./service.ts";
 import { RECEIPT_REASON_MAX } from "./types.ts";
 
+import { spaceOf } from "./space.ts";
+
+/** One unnamed space on one machine: every fixture pane shares it, and no rule reads it yet. */
+const SOLO_SPACE = spaceOf({ memberId: "local", spaceId: "w1", spaceLabel: "w1" });
+
 // File modes and Unix sockets are POSIX. Windows has no 0700 or 0600, so those checks sit in a test
 // that is skipped there, and the behaviour beside them still runs.
 const POSIX_ONLY = HOST.platform === "win32";
@@ -91,7 +96,7 @@ describe("the refusal counter", () => {
 
 describe("the refusals of a workspace scope (M75 spec 02)", () => {
   const AT = 1_786_000_000_000;
-  const pane = (paneId: string, label: string): WalkyPane => ({ session: "main", paneId, agent: true, harness: "agent-x", label, state: "idle", activeAt: null, instance: "aaaa", terminal: true, off: false });
+  const pane = (paneId: string, label: string): WalkyPane => ({ session: "main", paneId, agent: true, harness: "agent-x", label, state: "idle", activeAt: null, instance: "aaaa", terminal: true, off: false, space: SOLO_SPACE });
   const host = (panes: WalkyPane[]): WalkyHost => ({
     panes: () => panes,
     send: async (): Promise<SendResult> => ({ outcome: "sent" }),
@@ -119,7 +124,7 @@ describe("the refusals of a workspace scope (M75 spec 02)", () => {
   const phone = { kind: "operator" as const, label: "phone" };
 
   test("each text opens with a fixed key, so the counter keeps one line per kind, never one per word", () => {
-    expect(scopeIsMember("bluefin")).toBe("member word: `bluefin` is a member; write `bluefin/all` for its panes");
+    expect(scopeIsMember("lodge")).toBe("member word: `lodge` is a member; write `lodge/all` for its panes");
     expect(scopeEmpty("collie-workspace")).toBe("no panes in scope: none in `collie-workspace`, `collie walky who` shows the labels");
     expect(scopeTooWide(63, 50)).toBe("scope too wide: 63 panes, the most is 50");
     expect(HERE_FROM_PHONE).toBe("here from a phone: a phone has no workspace, name the folder");
@@ -148,11 +153,29 @@ describe("the refusals of a workspace scope (M75 spec 02)", () => {
     expect(await refusalOf(walky(many), "big", phone)).toMatchObject([{ target: "big", state: "refused", reason: scopeTooWide(51, 50) }]);
   });
 
-  test("`here` from the phone, and from a pane whose label names no folder, is refused", async () => {
+  test("`here` from the phone is refused; from a pane whose label names no folder it is that pane's space (M98)", async () => {
     const bare = pane("w1:p2", "w1:p2");
     const service = walky([pane("w1:p1", "repo#main"), bare]);
     expect(await refusalOf(service, "here", phone)).toMatchObject([{ target: "here", state: "refused", reason: HERE_FROM_PHONE }]);
-    expect(await refusalOf(service, "here", { kind: "agent", pane: bare })).toMatchObject([{ target: "here", state: "refused", reason: hereWithoutFolder("w1:p2") }]);
-    expect(service.refusals().counts).toEqual({ "here from a phone": 1, "here without a folder": 1 });
+    expect(await refusalOf(service, "here", { kind: "agent", pane: bare })).toMatchObject([{ target: "local/w1:p1", state: "accepted", via: "in" }]);
+    expect(service.refusals().counts).toEqual({ "here from a phone": 1 });
+  });
+
+  test("`here without a folder` is left for a message from a bridge before 1.29.0, which names no space", async () => {
+    const root = mkdtempSync(join(tmpdir(), "walky-refusals-scope-"));
+    roots.push(root);
+    const lead = new WalkyService({
+      log: new WalkyLog(join(root, "walky"), () => AT),
+      host: host([pane("w1:p1", "repo#main")]),
+      memberId: "desk",
+      enabled: () => true,
+      machine: "desk",
+      keyPem: () => null,
+      now: () => AT,
+      signerOlderThanSpace: (signer) => signer === "laptop",
+    });
+    const older = { v: 1 as const, id: "wt_aaaaaaaaaaa2", kind: "agent" as const, from: { memberId: "laptop", address: "laptop/w1:p9", harness: "agent-x", label: "w1:p9" }, to: "here", replyTo: null, at: AT, body: "hello", signer: "laptop", signature: "c2ln" };
+    expect(await lead.receive(older, "origin", false, "laptop")).toMatchObject([{ target: "here", state: "refused", reason: hereWithoutFolder("w1:p9") }]);
+    expect(lead.refusals().counts).toEqual({ "here without a folder": 1 });
   });
 });

@@ -121,7 +121,7 @@ describe("the herdr-core snapshot mapping", () => {
       ["t1", "claude", "blocked", "claude"],
       ["t2", "claude", "unknown", "claude"],
       ["t3", "shell", "unknown", "bash"],
-      ["t4", "codex", "unknown", "bash"],
+      ["t4", "codex", "blocked", "bash"],
       ["t5", "omp", "unknown", "omp"],
       ["t6", "shell", "unknown", "zsh"],
       ["t7", "codex", "idle", "omp"],
@@ -134,7 +134,7 @@ describe("the herdr-core snapshot mapping", () => {
     const snapshot = toSnapshot(
       [
         terminal({ address: "t1", name: "review", title: "✳ Reviewing the diff" }),
-        terminal({ address: "t2", title: "altan@bluefin:~/projects/x" }),
+        terminal({ address: "t2", title: "dev@lodge:~/projects/x" }),
       ],
       null,
       "/home/dev",
@@ -159,7 +159,7 @@ describe("status and app words", () => {
     ["working", "working"],
     ["blocked", "blocked"],
     ["done", "done"],
-    ["error", "unknown"],
+    ["error", "blocked"],
     ["", "unknown"],
   ])("%s reads as %s", (word, collie) => {
     expect(agentStatus(word)).toBe(collie);
@@ -179,22 +179,43 @@ describe("status and app words", () => {
 });
 
 describe("absoluteCwd", () => {
-  const home = "/home/altan";
+  const home = "/home/dev";
   test("an absolute path stays", () => {
     expect(absoluteCwd("/abs/dir", home)).toBe("/abs/dir");
   });
   test.if(sep === "\\")("a Windows drive path stays on Windows", () => {
-    expect(absoluteCwd("C:\\x", "C:\\Users\\altan")).toBe("C:\\x");
-    expect(absoluteCwd("C:/x", "C:\\Users\\altan")).toBe("C:/x");
+    expect(absoluteCwd("C:\\x", "C:\\Users\\dev")).toBe("C:\\x");
+    expect(absoluteCwd("C:/x", "C:\\Users\\dev")).toBe("C:/x");
   });
   test("~ and ~/x take the home folder", () => {
     expect(absoluteCwd("~", home)).toBe(home);
-    expect(absoluteCwd("~/x", `${home}/`)).toBe("/home/altan/x");
+    expect(absoluteCwd("~/x", `${home}/`)).toBe("/home/dev/x");
   });
   test("relative, ~user, empty and an unknown home are unknown", () => {
     expect(absoluteCwd("rel/dir", home)).toBe("");
     expect(absoluteCwd("~bob/x", home)).toBe("");
     expect(absoluteCwd("", home)).toBe("");
     expect(absoluteCwd("~/x", "")).toBe("");
+  });
+});
+
+describe("whether a space has a name of its own (M98)", () => {
+  const namedBy = (terminals: Parameters<typeof toSnapshot>[0]) => Object.fromEntries(toSnapshot(terminals, LAYOUT, "/home/dev").panes.map((pane) => [pane.paneId, pane.spaceNamed]));
+
+  test("only a space the layout document names is named", () => {
+    expect(namedBy([terminal({ address: "t1", labels: inSpace("spB", "tbB1") })])).toEqual({ t1: true });
+  });
+
+  test("a space named after a `where` label or a folder is not named", () => {
+    expect(
+      namedBy([
+        terminal({ address: "t1", labels: inSpace("spA", "tbA1", "collie-workspace / 1") }),
+        terminal({ address: "t2", labels: inSpace("spA", "tbA1"), foreground: { name: "bash", cwd: "/home/dev/repo" } }),
+      ]),
+    ).toEqual({ t1: false, t2: false });
+  });
+
+  test("a space the document does not know is not named, and neither is the implicit one", () => {
+    expect(namedBy([terminal({ address: "t1", labels: inSpace("spZ", "tbZ", "elsewhere / 1") }), terminal({ address: "t2", labels: {} })])).toEqual({ t1: false, t2: false });
   });
 });

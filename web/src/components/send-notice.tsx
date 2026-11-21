@@ -1,8 +1,9 @@
 import type { ReactNode } from "react";
 import { Icon } from "@/components/icons/icon";
 
-import { Notice } from "@/components/ui/notice";
-import { capSentence, noteKey, type SendNote, type SendReading, type SendReply } from "@/lib/send-protocol";
+import { Button } from "@/components/ui/button";
+import { Notice, NOTICE_ACTION } from "@/components/ui/notice";
+import { capSentence, noteKey, type NextStep, type SendNote, type SendReading, type SendReply, type StepButton } from "@/lib/send-protocol";
 import { shortHash, type Surface } from "@/lib/surface/surface";
 import { t as translate, tn, type MessageKey } from "@/lib/i18n";
 import type { ClearReason, ClearReceipt } from "@/lib/surface/clear";
@@ -19,10 +20,12 @@ export function answerSentence(reading: SendReading): string {
   const note =
     reading.cap === null
       ? translate(noteKey(reading.note))
-      : capSentence(reading.cap, (vars) => translate("composer.protocol.capConfirm", vars));
+      : capSentence(reading.cap, (vars) => translate("composer.protocol.capConfirmPast", vars));
   // A draft refusal already says what the screen held, and "The agent is working" already says the turn runs.
-  if (reading.surface === null || reading.note === "draft" || reading.note === "draftCommand" || reading.note === "agentBusy") return note;
-  return `${note} ${translate(`composer.surface.${reading.surface}`)}`;
+  if (reading.surface === null || reading.note === "draft" || reading.note === "draftCommand" || reading.note === "draftUnseen" || reading.note === "agentBusy") return note;
+  // What Collie saw comes first, then the verdict and its next step (M102 spec 02), so the sentence ends
+  // on what the person can do.
+  return `${translate(`composer.surface.${reading.surface}`)} ${note}`;
 }
 
 /** What the Send slot's notice says about the last send, and where it points. */
@@ -36,6 +39,35 @@ export interface SendRefusal {
   readonly screen: boolean;
   /** `neutral` for an outcome that is not a failure (a discard), `caution` for the rest. */
   readonly tone: "caution" | "neutral";
+  /** The step that gets the person on (M102 spec 02); null for a sentence the phone raised itself. */
+  readonly step?: NextStep | null;
+  /** The step is Send again and waits for the other send on this pane to end. */
+  readonly waits?: boolean;
+  /** The Surface revision the answer read; a waiting Send again turns on at a later one. */
+  readonly atRevision?: number;
+  /** A Stop's receipt, not a refused send (M102 spec 11): it stands under the password notice and in Type mode. */
+  readonly isReceipt?: boolean;
+}
+
+/** The words of each step that draws its own button (M102 spec 02). */
+const STEP_LABELS = {
+  sendAgain: "composer.step.sendAgain",
+  stop: "composer.step.stop",
+  emptyBox: "composer.step.emptyBox",
+  screen: "composer.controls.screen",
+} as const satisfies Record<StepButton, MessageKey>;
+
+/** The button word of a step, or null for a step whose button is the strip's, the card's or the field. */
+export function stepLabel(step: NextStep | null | undefined): string | null {
+  switch (step) {
+    case "sendAgain":
+    case "stop":
+    case "emptyBox":
+    case "screen":
+      return translate(STEP_LABELS[step]);
+    default:
+      return null;
+  }
 }
 
 /** The answers whose next move is to read the screen before anything else (the spec's "read the screen, then send again"). */
@@ -96,6 +128,8 @@ const CLEAR_REFUSALS = {
   pane_gone: "keys.clear.receipt.refused.paneGone",
   stale_screen: "keys.clear.receipt.refused.staleScreen",
   unsupported_build: "keys.clear.receipt.refused.unsupportedBuild",
+  // Another bridge writes into the pane (M102 spec 16): nothing was pressed, and a later tap can clear.
+  pane_busy: "keys.clear.receipt.refused.paneBusy",
 } as const satisfies Record<ClearReason, MessageKey>;
 
 /**
@@ -110,6 +144,62 @@ export function clearNotice(receipt: ClearReceipt): SendRefusal {
   return phoneRefusal(translate(CLEAR_REFUSALS[reason]), reason === "dialog_open");
 }
 
+const WAIT_WORDS = {
+  waits: "composer.step.sendAgainWaits",
+  ready: "composer.step.sendAgainReady",
+  awaiting: "cannotTell.waiting",
+} as const satisfies Record<"waits" | "ready" | "awaiting", MessageKey>;
+
+interface RefusalActionsProps {
+  /** The step's own button (M102 spec 02), first: the action that changes the situation. */
+  readonly step: { readonly word: string; readonly disabled: boolean; readonly onPress: () => void } | null;
+  /** A Send again that waits for another send: its reason while it is off, then that it turned on.
+   *  `awaiting`: it waits for the agent's own word on an `unknown` send, in the "cannot tell" card's words. */
+  readonly wait: "waits" | "ready" | "awaiting" | null;
+  readonly onCard: (() => void) | null;
+  readonly onScreen: (() => void) | null;
+  readonly onKeys: (() => void) | null;
+}
+
+/**
+ * The way on, as buttons in a stop card's notice (M102 spec 02): the step first, then the card (or, with
+ * no card, the Screen), then Open Keys, so a card holds at most two buttons plus the card and the Keys pad
+ * is never dropped. Each only where it can act; nothing at all renders no row. The reason a waiting Send
+ * again is off sits under the row, in a live region, so a screen reader hears when it turns on.
+ */
+export function RefusalActions({ step, wait, onCard, onScreen, onKeys }: RefusalActionsProps) {
+  if (step === null && onCard === null && onScreen === null && onKeys === null) return null;
+  return (
+    <span className="flex flex-wrap justify-end gap-1">
+      {step !== null && (
+        <Button variant="ghost" size="sm" className={NOTICE_ACTION} disabled={step.disabled} onClick={step.onPress}>
+          {step.word}
+        </Button>
+      )}
+      {onCard !== null && (
+        <Button variant="ghost" size="sm" className={NOTICE_ACTION} onClick={onCard}>
+          {translate("composer.send.dialogFirst")}
+        </Button>
+      )}
+      {onScreen !== null && (
+        <Button variant="ghost" size="sm" className={NOTICE_ACTION} onClick={onScreen}>
+          {translate("composer.controls.screen")}
+        </Button>
+      )}
+      {onKeys !== null && (
+        <Button variant="ghost" size="sm" className={NOTICE_ACTION} onClick={onKeys}>
+          {translate("composer.protocol.openKeys")}
+        </Button>
+      )}
+      {wait !== null && (
+        <span className="basis-full text-right text-[11px] text-muted-foreground" aria-live="polite">
+          {translate(WAIT_WORDS[wait])}
+        </span>
+      )}
+    </span>
+  );
+}
+
 /** The notice for an answer that did not send, from the bridge's reading of it. */
 export function readingRefusal(reading: SendReading): SendRefusal {
   return {
@@ -118,6 +208,8 @@ export function readingRefusal(reading: SendReading): SendRefusal {
     toCard: reading.toCard,
     screen: READ_THE_SCREEN.has(reading.note),
     tone: reading.note === "discarded" ? "neutral" : "caution",
+    step: reading.step,
+    waits: reading.waits,
   };
 }
 
@@ -176,6 +268,9 @@ export function refusalKey(refusal: SendRefusal, surface: Surface | null): strin
  *  adds the ✕ that hides the notice. */
 export function SendRefusalNotice({ refusal, action, onDismiss }: { refusal: SendRefusal; action?: ReactNode; onDismiss?: () => void }) {
   const icon = refusal.tone === "caution" ? <Icon name="warning" /> : <Icon name="ok" />;
+  // A screen reader hears the notice when it appears (M102, the chaos run): a refusal answers the person's
+  // own tap, so a caution interrupts; a neutral receipt (Stopped, Cleared, Discarded) waits its turn.
+  const announce = refusal.tone === "caution" ? "alert" : "status";
   const words = (
     <>
       <span data-slot="composer-refusal">{refusal.sentence}</span>
@@ -188,7 +283,7 @@ export function SendRefusalNotice({ refusal, action, onDismiss }: { refusal: Sen
   );
   if (onDismiss === undefined) {
     return (
-      <Notice tone={refusal.tone} variant="box" className="mb-2" icon={icon} action={action}>
+      <Notice tone={refusal.tone} variant="box" className="mb-2" icon={icon} action={action} announce={announce}>
         {words}
       </Notice>
     );
@@ -201,6 +296,7 @@ export function SendRefusalNotice({ refusal, action, onDismiss }: { refusal: Sen
       icon={icon}
       action={action}
       onDismiss={onDismiss}
+      announce={announce}
       dismissLabel={translate("composer.protocol.dismissNotice")}
     >
       {words}

@@ -322,8 +322,13 @@ function perturbations(rows: readonly StyledLine[], frame: Frame): Perturbation[
     { name: "box moved down one row", rows: at(frame.top, blankRow()), mustFind: true },
     { name: "a blank row under the box", rows: at(frame.bottom + 1, blankRow()), mustFind: true },
     { name: "top edge dropped", rows: without(frame.top), mustFind: false },
-    { name: "bottom edge dropped", rows: without(frame.bottom), mustFind: false },
-    { name: "one more status row", rows: at(frame.bottom + 1, styled(plainRun("  one more status row"))), mustFind: true },
+    // A sign-in field that wraps (`secret.wrap`, Claude Code's first run) is open: its last row is its
+    // last row of text, so a read without it shows a shorter mask. Left out here; the Send Protocol
+    // counts the mask's characters (secret-field.ts), so such a read never passes for the typed text.
+    ...(frame.secret?.wrap === true && frame.bottom > frame.interior.prompt ? [] : [{ name: "bottom edge dropped", rows: without(frame.bottom), mustFind: false }]),
+    // Claude's `/login` sign-in field (`secret`) runs to the end of the screen: Claude draws nothing
+    // under its `Esc to cancel`, so a row there is not its screen and losing the field is the safe read.
+    { name: "one more status row", rows: at(frame.bottom + 1, styled(plainRun("  one more status row"))), mustFind: frame.secret === undefined },
     { name: `re-wrapped at ${String(cols)} columns`, rows: rewrap(rows, frame, cols), mustFind: false },
   ];
   if (frame.top > 0) list.push({ name: "box moved up one row", rows: without(frame.top - 1), mustFind: true });
@@ -374,6 +379,8 @@ describe("perturbed fixtures", () => {
       const rows = fixtureRows(fixture);
       const dropped = [...rows.slice(0, pinned.bottom), ...rows.slice(pinned.bottom + 1)];
       const result = findInputFrame(dropped, IDLE);
+      // A wrapping sign-in field's last row is text, not an edge (see `perturbations`).
+      if (result?.secret?.wrap === true) continue;
       if (result !== null) expect(squash(result.interior.text), fixture).toBe(squash(pinned.text));
     }
   });
@@ -506,6 +513,21 @@ describe("findInputFrame", () => {
     // Typed text around the shape, or a quote inside it, is a draft.
     for (const draft of ['Try "fix lint errors" now', 'please Try "fix lint errors"', 'Try "a" and "b"', 'Try "unclosed', "Try fix lint errors"]) {
       expect(findInputFrame(lines(RULE, `❯ ${draft}`, RULE), IDLE)!.placeholder).toBe(false);
+    }
+  });
+
+  it("marks Claude Code's `Resend your message to try again` hint by its exact text on a plain-text read (herdr-core, 2.1.328)", () => {
+    // The text comes from the profile (`idle.placeholders.texts`), a whole-text match: other words and the
+    // same words with more typed after them are a draft.
+    const hint = "Resend your message to try again";
+    const live = findInputFrame(plainRows([RULE, `❯\u00a0${hint}`, RULE, "  ⏸ manual mode on · ? for shortcuts"]), IDLE)!;
+    expect(live.interior.text).toBe(hint);
+    expect(live.placeholder).toBe(true);
+    expect(live.anchorsHit).toContain("placeholder-text");
+    for (const draft of ["Resend your note to try again", `${hint} now please`, `please ${hint}`, "Resend your message"]) {
+      const frame = findInputFrame(plainRows([RULE, `❯\u00a0${draft}`, RULE]), IDLE)!;
+      expect(frame.placeholder, draft).toBe(false);
+      expect(frame.interior.text, draft).toBe(draft);
     }
   });
 

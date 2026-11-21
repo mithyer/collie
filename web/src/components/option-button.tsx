@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import type { ReactNode } from "react";
+import type { MouseEvent, ReactNode } from "react";
 import { Icon } from "@/components/icons/icon";
 
 import type { StyledLine } from "@/lib/blocks";
@@ -25,15 +25,20 @@ import { cn } from "@/lib/utils";
  *  - `busy`     — this option's keystroke is in flight: primary accent, and NOT dimmed even while the
  *                 button is disabled (the caller renders a spinner in the trailing slot), so the
  *                 pressed row stays visibly distinct while its siblings dim under `disabled`.
+ *  - `armed`:    the first tap of a second-tap confirm (the hill's Decision card, M96): the armed
+ *                 tint DESIGN.md §4 gives every armed control, `--destructive` at /40 and /10, with
+ *                 the label in the same ink. Colour only, so arming moves nothing (§2).
  */
-export type OptionTone = "default" | "selected" | "busy";
+export type OptionTone = "default" | "selected" | "busy" | "armed";
 
 /** Shared surface classes for a tappable option row. Applied verbatim in all three blocks. */
 export function optionSurface(tone: OptionTone): string {
   return cn(
     "flex w-full items-start gap-2 rounded-lg border px-2.5 py-1.5 text-left shadow-sm transition-all",
     "active:scale-[0.99]",
-    tone === "busy"
+    tone === "armed"
+      ? "border-destructive/40 bg-destructive/10 disabled:opacity-60"
+      : tone === "busy"
       ? "border-primary bg-primary/10" // in flight — accent, never dimmed (the spinner reads over it)
       : tone === "selected"
         ? "border-primary bg-primary/10 active:bg-primary/15 disabled:opacity-60"
@@ -51,7 +56,9 @@ export function KeyBadge({ children, tone = "default" }: { children: ReactNode; 
         "mt-px flex size-5 shrink-0 items-center justify-center rounded-md border text-[11px] font-semibold leading-none tabular-nums",
         tone === "default"
           ? "border-border bg-background text-muted-foreground"
-          : "border-primary/40 bg-primary/15 text-primary",
+          : tone === "armed"
+            ? "border-destructive/40 bg-destructive/15 text-destructive"
+            : "border-primary/40 bg-primary/15 text-primary",
       )}
     >
       {children}
@@ -95,6 +102,8 @@ export function PromptPanel({
   raw,
   rawMode = "reveal",
   wrap,
+  fit = false,
+  className,
   children,
 }: {
   ariaLabel: string;
@@ -106,6 +115,18 @@ export function PromptPanel({
    *  lines setting, so putting the buttons away keeps the mirror as it was. Default false, as
    *  RawMirror. */
   wrap?: boolean;
+  /** The card fits the dock's height (card-dock.tsx) instead of making the dock scroll. The panel
+   *  may shrink, and its one child that can takes the cut: the child marked `data-fit-shrink`, a box
+   *  with a `min-height` and a `max-height` whose first child is its scroller. Every other child
+   *  keeps its full height (a flex item never shrinks under its content by default). The dock reads
+   *  `data-fit` and those heights to size itself (card-dock.tsx `fitSize`). Only for a card that HAS
+   *  such a child; without one the
+   *  panel would shrink under its own rows. Off in the Terminal view, which scrolls the dock as
+   *  before. */
+  fit?: boolean;
+  /** A surface of the card's own over the panel's (the chat's trick approval card, ADR 0156): a tinted
+   *  background and a uniform border. Colour only; the panel keeps its shape. */
+  className?: string;
   children: ReactNode;
 }) {
   useLocale();
@@ -138,7 +159,12 @@ export function PromptPanel({
     <div
       role="group"
       aria-label={ariaLabel}
-      className="my-1.5 flex flex-col gap-1.5 rounded-xl border border-border bg-card p-1.5 shadow-sm"
+      data-fit={fit && !showRaw ? "" : undefined}
+      className={cn(
+        "my-1.5 flex flex-col gap-1.5 rounded-xl border border-border bg-card p-1.5 shadow-sm",
+        fit && !showRaw && "min-h-0",
+        className,
+      )}
     >
       {raw !== undefined && !showRaw && (
         <button
@@ -215,6 +241,8 @@ export function OptionButton({
   trailing,
   disabled,
   onClick,
+  className,
+  ...rest
 }: {
   tone?: OptionTone;
   keyLabel?: ReactNode;
@@ -222,10 +250,18 @@ export function OptionButton({
   description?: ReactNode;
   trailing?: ReactNode;
   disabled?: boolean;
-  onClick: () => void;
+  onClick: (event: MouseEvent<HTMLButtonElement>) => void;
+  /** Layout the caller adds to the surface: a tap floor, a centred label. Never a colour; the tone owns those. */
+  className?: string;
+  /** Names the button for a screen reader when its words say less than its state (an armed confirm). */
+  "aria-label"?: string;
+  "aria-describedby"?: string;
+  "data-slot"?: string;
+  /** The option's own handle, for a caller that holds several (the hill's Decision card). */
+  "data-intent"?: string;
 }) {
   return (
-    <button type="button" disabled={disabled} onClick={onClick} className={optionSurface(tone)}>
+    <button type="button" disabled={disabled} onClick={onClick} className={cn(optionSurface(tone), className)} {...rest}>
       {keyLabel === "" ? (
         // A row with no badge of its own (resume.ts's non-pointed session rows, ADR 0058) still
         // reserves the badge's own width, empty, so every row's label starts at the same column
@@ -236,7 +272,12 @@ export function OptionButton({
         <KeyBadge tone={tone}>{keyLabel}</KeyBadge>
       ) : null}
       <span className="min-w-0 flex-1">
-        <span className="font-content block break-words text-sm font-medium leading-snug text-foreground">
+        <span
+          className={cn(
+            "font-content block break-words text-sm font-medium leading-snug",
+            tone === "armed" ? "text-destructive" : "text-foreground",
+          )}
+        >
           {label}
         </span>
         {description ? (

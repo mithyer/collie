@@ -22,6 +22,12 @@ import type { ColumnRange } from "../column-range";
  */
 export interface PromptSubjectLine {
   segments: AnsiSegment[];
+  /**
+   * `warning` marks a row the dialog prints as a WARNING about the request, which the card draws in
+   * the caution tone: Claude's `│`-guttered rows under the dialog's last `╌` rule, such as
+   * "Dangerous rm operation not ruled out …". Absent on every other row. Display only.
+   */
+  tone?: "warning";
 }
 
 /** The single-choice dialog families a harness can report, discriminated by its footer hint bar.
@@ -126,11 +132,22 @@ export interface PromptModel {
    * and a run of blank rows is one. No row cap: the renderer bounds the height.
    *
    * Absent when the grammar found no top edge in reach, or nothing between the edge and the
-   * question. Display only: it plays no part in identity, `signature` already covers these rows.
+   * question. A dialog whose top edge is above the read gets the rows that are in it instead, and
+   * {@link subjectCut}. Display only: it plays no part in identity, `signature` already covers these rows.
    * The card used to leave the subject in the raw mirror above it, which the docked card (ADR 0059)
    * and the journal-based Chat view no longer show.
    */
   subject?: PromptSubjectLine[];
+  /**
+   * The dialog's top is ABOVE the read: its top edge, and maybe its header and the start of its
+   * command, scrolled off the screen (a command taller than the pane). {@link subject} then holds
+   * only the dialog's rows that ARE in the read, from the read's first row down to the question, or
+   * is absent when the question is the first thing in it. The card says the request starts above the
+   * screen. Display only, like `subject`: the ask still has no region (`askRegion: null`), and
+   * `signature` is what it was, so a tap goes the way it went before (the Ask route refuses it,
+   * bridge/surface/ask.ts `NO_EDGE_DETAIL`). Absent whenever the top edge is in the read.
+   */
+  subjectCut?: true;
   /**
    * The grammar's declared FACT that its pointed list clamps at both ends: Up on the first row and
    * Down on the last row leave the pointer where it is. The action layer then commits an edge row
@@ -182,6 +199,36 @@ export interface PromptModel {
    */
   askRegion?: string | null;
   /**
+   * The same rows as {@link askRegion}, from the dialog's own top edge to the footer, as LITERAL text:
+   * nothing held still. It is what a guarded key tap binds its first write to (the bridge's expected
+   * prompt), in place of {@link signature}, whose lookback reaches into the transcript. A row there
+   * that ticks (a tool's timer, a spinner, a clock) changed the bound region between the phone's read
+   * and the bridge's, and the bridge refused the tap. The rows are a suffix of `signature`'s rows,
+   * so the bridge finds them wherever it found `signature`, ending at the same row. A grammar may
+   * start them lower, below a row the dialog itself redraws (Claude's self-answer countdown): the
+   * phone has already compared the whole dialog by `askRegion`, and the bridge checks the rest.
+   *
+   * Its presence is also a fact the comparisons read: the rows under the edge hold what the dialog
+   * asks about. `promptsEqual` and the ask id (lib/surface/lift.ts) compare `askRegion` only then.
+   *
+   * Set only with a string {@link askRegion} whose rows under the edge hold the subject (a rule
+   * right above the question proves no frame), and never with {@link styledSignature} or
+   * {@link bindColumns}: those describe `signature`'s rows, so a model that carries one binds
+   * `signature` (harness/dialog-contract.ts).
+   */
+  bindRegion?: string;
+  /**
+   * The dialog's own rows as ORDERED LITERAL PARTS, when a row the dialog redraws by itself sits inside
+   * them (Claude's self-answer countdown): the rows from the edge down to that row, then the rows after
+   * it to the footer, which is {@link bindRegion}. The phone sends the list as `expected_prompt` and the
+   * bridge checks every part on its fresh read, in order, the last ending where a single region would,
+   * with only the left-out rows between them (bridge/prompt-binding.ts `verifyPromptParts`). So the
+   * subject is checked at the moment of the key, and only the moving clock is not. An older bridge
+   * refuses a list as a malformed `expected_prompt`, so it never types on a binding it cannot check.
+   * Absent when no such row is in the dialog: the single region is the whole binding.
+   */
+  bindParts?: string[];
+  /**
    * The canonical styled lines of the SAME rows as {@link signature} (`canonicalStyledLines`,
    * lib/styled-region.ts), as the wire value `encodeStyledRegion` builds: a `v1` format line, then
    * the lines, joined with "\n". Set ONLY by a grammar whose pointer, or any other state
@@ -216,6 +263,13 @@ export interface PromptModel {
    * with `tailLinesFor`, which adds one row of headroom. Absent means the default window, which every
    * other grammar binds; an older bridge ignores the field, keeps six rows and refuses the tap.
    *
+   * Three roads were refused (ADR 0108). Binding the rows down to the tail, clocks and all: the region
+   * changes every second and no tap ever lands. Raising the bridge's default window for everyone: the
+   * other harnesses' dialogs sit at the tail, so it buys them nothing and widens how far up a stale
+   * match may sit and still be accepted. Teaching the bridge to blank the clocks: the bridge holds no
+   * pane grammar, and a Hermes rule in it would be the first. Revisit if a second harness needs a window
+   * past 12 rows, or if Herdr grows a conditional write that checks the screen on its side.
+   *
    * Not part of identity: it counts chrome outside the dialog, which a status row that wraps may
    * move by one without the dialog changing at all.
    */
@@ -223,11 +277,13 @@ export interface PromptModel {
 }
 
 /**
- * Whether two derivations are the SAME on-screen prompt — not merely the same shape. `signature`
- * (the dialog's region text, incl. the subject above the options) is the decisive check: two edits to
- * the same file yield an identical family/question/labels but a different signature, so a stale tap on
- * one can't approve the other. The family/question/label checks stay as a cheap fast-path and to keep
- * the intent explicit. (`revision` is a stub, so this content comparison is the real freshness guard.)
+ * Whether two derivations are the SAME on-screen prompt — not merely the same shape. The dialog's own
+ * rows (`sameDialogRows`: the header, the subject or command, the question, the options with the
+ * pointer, the footer) are the decisive check: two edits to the same file, or two Bash commands, yield
+ * an identical family/question/labels but different rows, so a stale tap on one can't approve the
+ * other. The family/question/label checks stay as a cheap fast-path and to keep the intent explicit.
+ * This content comparison is the whole freshness guard: the race guard no longer refuses on a moved
+ * pane revision, because a row outside the dialog that ticks moves it (lib/harness/guard.ts).
  *
  * Part of the CONTRACT, not of any harness: the race guard (lib/dialog-guard.ts) compares whatever
  * adapter produced the block through exactly this function.
@@ -235,14 +291,14 @@ export interface PromptModel {
 export function promptsEqual(a: PromptModel, b: PromptModel): boolean {
   return (
     promptsSameIdentity(a, b) &&
-    a.signature === b.signature &&
+    sameDialogRows(a, b) &&
     // The feedback row's VISIBLE state, which the identity check deliberately ignores. A committing
     // digit must not fire across a change to it: focus decides whether that digit answers at all, and
     // text appearing in the box means someone at the terminal is typing into this very dialog.
     a.feedback?.focused === b.feedback?.focused &&
     a.feedback?.text === b.feedback?.text &&
     // The EXACT plan of every option, walk included. `promptsSameIdentity` ignores the arrow count
-    // (ADR 0080), so for a grammar that draws its pointer as a glyph the byte-faithful `signature`
+    // (ADR 0080), so for a grammar that draws its pointer as a glyph the byte-faithful dialog rows
     // already refuses a moved pointer. A grammar that draws it as a style only (opencode's chip
     // background) has the same text with the pointer anywhere, and the only trace of the pointer is
     // each option's plan. Without this line a stale tap on such a dialog would pass the entry guard.
@@ -251,6 +307,71 @@ export function promptsEqual(a: PromptModel, b: PromptModel): boolean {
     // trace of such a pointer; this is the other, and the one the bridge is handed to bind to.
     a.styledSignature === b.styledSignature
   );
+}
+
+/**
+ * Whether two derivations show the same dialog rows. Where the grammar found the dialog's own top edge
+ * AND rows under it that hold the subject (`bindRegion` set on both), it compares `askRegion`, the rows
+ * from that edge to the footer, byte for byte except the self-answer countdown the grammar holds still:
+ * the transcript above the edge is not the dialog, and a timer, spinner or clock there ticks while a
+ * subagent's dialog waits. Every other derivation compares the byte-faithful `signature`, lookback
+ * included, as before: with no edge, or with a rule right above the question, a subject above the rule
+ * would fall outside `askRegion`, and a successor with another command would compare equal. A pair
+ * where only one side carries `bindRegion` is two readings of the screen, never the same dialog.
+ *
+ * Those rows are compared with their RUNNING rows held still ({@link tickSteadySignature}): a spinner
+ * row or a running tool row above an unframed dialog ticks while the dialog waits, and the person
+ * could not answer until it stopped. Every other row, the command or file a subject names included,
+ * still compares byte for byte. The rows from the question down are compared exactly as well, by
+ * `promptsSameIdentity` (`coreSignature`, the labels), the option plans and the feedback state, so the
+ * hold reaches only the rows above the question.
+ */
+function sameDialogRows(a: PromptModel, b: PromptModel): boolean {
+  if (a.bindRegion !== undefined && b.bindRegion !== undefined) return a.askRegion === b.askRegion;
+  return a.bindRegion === b.bindRegion && sameUnframedRows(a.askRegion, b.askRegion) && sameUnframedRows(a.signature, b.signature);
+}
+
+/** Two optional runs of rows of an unframed dialog: equal as they are, or equal with their running
+ *  rows held still. Absent equals only absent, and `null` (no edge) only `null`. */
+function sameUnframedRows(a: string | null | undefined, b: string | null | undefined): boolean {
+  if (a === b) return true;
+  if (a === null || a === undefined || b === null || b === undefined) return false;
+  return tickSteadySignature(a) === tickSteadySignature(b);
+}
+
+/**
+ * A spinner glyph at a row's lead, followed by a word: a braille spinner frame (U+2801 to U+28FF), or
+ * one of the star frames a turn's spinner cycles through (`· ✢ ✳ ✶ ✻ ✽ *`). Not the `❯` pointer, not
+ * a tool row's `⏺`, not a list dash: those are not ticks.
+ */
+const SPINNER_LEAD = /^(\s*)[\u2801-\u28ff·✢✳✶✻✽*](?=\s+\p{L})/u;
+/** A bracket group right after an ellipsis: where a running row keeps its timer and its counters
+ *  (`Running… (4m 12s · timeout 10m)`, `Wibbling… (4s · ↓ 304 tokens)`). */
+const RUNNING_BRACKET = /(…|\.\.\.)(\s*)\(([^()]*)\)/gu;
+
+/**
+ * One row as the unframed comparison sees it, with what a running row redraws on its own held still.
+ * Two shapes, both harness-neutral:
+ *
+ *   - a SPINNER row, a spinner glyph at its lead then a word ("✻ Churned for 4s · done 12:15 AM",
+ *     "⠋ working 3s"): the glyph reads as `*` and every digit run as `0`;
+ *   - a RUNNING row, a bracket group right after an ellipsis ("⎿  Running… (4m 12s · timeout 10m)"):
+ *     the digit runs inside that group read as `0`, and nothing else on the row moves.
+ *
+ * Every other row is returned as it is, so a command, a file or a question that differs in a single
+ * character, a digit included ("kill 1234" against "kill 5678"), still differs. A row that changes
+ * its words, or gains or loses a spinner lead, still differs too. The bridge's own unframed compares
+ * hold the same kinds of row still (bridge/surface/protocol.ts `steadyRow`); this module imports
+ * nothing at runtime, so the rule is spelled here.
+ */
+function tickSteadyRow(row: string): string {
+  if (SPINNER_LEAD.test(row)) return row.replace(SPINNER_LEAD, "$1*").replace(/\d+/gu, "0");
+  return row.replace(RUNNING_BRACKET, (_all, ellipsis: string, gap: string, inner: string) => `${ellipsis}${gap}(${inner.replace(/\d+/gu, "0")})`);
+}
+
+/** A signature with each of its rows read by {@link tickSteadyRow}. Same row count, same order. */
+function tickSteadySignature(signature: string): string {
+  return signature.split("\n").map(tickSteadyRow).join("\n");
 }
 
 /**
@@ -320,7 +441,7 @@ export function identityDiff(a: PromptModel, b: PromptModel): string | null {
   if (!sameBindColumns(a.bindColumns, b.bindColumns)) return "bindColumns";
   // The arrow COUNT of a pointer walk is not compared (ADR 0080): a walk is a claim about where
   // the pointer stands, and the pointer is our own choreography's effect, which `coreSignature`
-  // already blanks. `promptsEqual` still compares the byte-faithful `signature`, which carries
+  // already blanks. `promptsEqual` still compares the byte-faithful dialog rows, which carry
   // the pointer, so a stale tap is refused at entry; only the mid-flight identity polls, which
   // watch the pointer arrive, stop caring where it stood.
   for (let i = 0; i < a.options.length; i++) {

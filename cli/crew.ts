@@ -61,6 +61,9 @@ import {
   type StandbyDevices,
 } from "../bridge/crew/standby-devices.ts";
 import { crewRuntimePath, parseMarker, rosterDrift } from "../bridge/crew/staleness.ts";
+import { StandbyTricksStore } from "../bridge/crew/standby-tricks.ts";
+import { StandbyHillStore } from "../bridge/crew/standby-hill.ts";
+import { writeAdoptMarker } from "../bridge/crew/carry-boot.ts";
 import { TrustStore, type TrustedMember, type TrustStoreData } from "../bridge/crew/trust-store.ts";
 import { deriveConfigRoot, discoverSessionSockets } from "../bridge/mux/herdr/sessions.ts";
 import { herdTagFor } from "../bridge/sessions.ts";
@@ -79,6 +82,8 @@ import {
   memberRePinLines,
   memberWarrantLines,
   pairingCollisionLines,
+  deputyTricksLines,
+  promoteTricksLines,
   peerWarrantLines,
   standbyDoorLines,
 } from "./crew-status-deputy.ts";
@@ -453,12 +458,12 @@ function publicFrontDoor(deps: CrewDeps): string | null {
  * **In https mode it is the front door, the same string `crew add` hands a peer** ({@link
  * derivedFrontDoor}): `https://<full-tailnet-name>`, or `<name>:<port>` when `COLLIE_SERVE_PORT`
  * moved it. A default https lead binds loopback and publishes only the front door, so the listener
- * port (8787) is not reachable from another machine, and a bare `bluefin` would be dialled there
+ * port (8787) is not reachable from another machine, and a bare `lodge` would be dialled there
  * (issue 334). The FULL name, not the short one: the certificate `tailscale serve` obtains names only
  * the full MagicDNS name, so the short form would fail the TLS check even where it resolves.
  *
  * **In http mode there is no TLS front door at all**, and the lead's own listener is what answers, so
- * the banner keeps the short MagicDNS name (`bluefin` resolves from any node through the search
+ * the banner keeps the short MagicDNS name (`lodge` resolves from any node through the search
  * domain, and is what a person can retype) on the default port, and appends `:<port>` only when this
  * lead moved off 8787. `COLLIE_PUBLIC_URL` wins over both, because it is the operator telling Collie
  * which ingress this machine actually publishes; its port is made explicit (443 for https, 80 for
@@ -481,7 +486,7 @@ export function joinHost(deps: CrewDeps): string | null {
   const name = tailnetName(deps.exec);
   if (name === null) return null;
   if (deps.ctx.serveMode === "https") return derivedFrontDoor(deps, name);
-  // The SHORT MagicDNS name: `bluefin`, not `bluefin.tail1234.ts.net`. MagicDNS puts the tailnet
+  // The SHORT MagicDNS name: `lodge`, not `lodge.tail1234.ts.net`. MagicDNS puts the tailnet
   // suffix in every node's search domain, so the short name resolves from any other node. If there is
   // no suffix to strip, the name is already as short as it gets.
   const short = name.split(".")[0];
@@ -821,7 +826,7 @@ async function resolveToken(deps: CrewDeps, address: string, given: string | und
  *
  * A second instance on the same box (`COLLIE_INSTANCE=hc`, `ctx.instance`) would join under the very
  * name its lead already shows for the box, and the lead now refuses that. So a named instance adds
- * its name: `bluefin-hc`. The unnamed instance keeps the bare hostname.
+ * its name: `lodge-hc`. The unnamed instance keeps the bare hostname.
  */
 export function joinLabel(deps: CrewDeps, flag: string | undefined): string | undefined {
   if (flag !== undefined && flag !== "") return flag;
@@ -1057,7 +1062,7 @@ export async function cmdJoin(deps: CrewDeps, args: readonly string[]): Promise<
   }
 
   // What was actually dialled, and therefore what this machine must remember: a peer dials its lead
-  // again on every poll, and a bare `bluefin` would send those dials to :443 over TLS the lead never
+  // again on every poll, and a bare `lodge` would send those dials to :443 over TLS the lead never
   // answers. The origin is stored, so the second dial goes where the first one succeeded.
   const dialed = `${origin.protocol}//${origin.host}`;
   const res = attempt.res;
@@ -1134,7 +1139,7 @@ export async function cmdJoin(deps: CrewDeps, args: readonly string[]): Promise<
   // be restarted from here, so the operator is told — it is the one remaining step of the join.
   deps.io.out(`  ONE STEP LEFT, on the lead (${parsed.leadMemberId}): \`collie restart\` there.`);
   deps.io.out("  Its roster now has this machine on disk, but its running process read that roster at");
-  deps.io.out("  boot — until it restarts, this machine's sessions do not appear on the phone.");
+  deps.io.out("  boot — until it restarts, this machine's spaces and agents do not appear on the phone.");
 
   // Clear BEFORE the restart: after it the herd push path is muted (peer mode), and a muted sink
   // drops a `clear` exactly as it drops an alert — so anything already on the phone would be stuck.
@@ -1156,7 +1161,7 @@ export async function cmdJoin(deps: CrewDeps, args: readonly string[]): Promise<
  *
  * Two defaults, and both only for an address that named no scheme: `https://`, as it always did, and
  * **port 8787** — the port a collie's own listener binds, and therefore the only thing `collie crew
- * join bluefin` can mean. A typed scheme or a typed port is taken as typed, so `host:port`,
+ * join lodge` can mean. A typed scheme or a typed port is taken as typed, so `host:port`,
  * `http://…` and `https://…` resolve exactly as they did before this default existed.
  *
  * The port is the reason a bare host is no longer :443. A lead's front door on :443 is a `tailscale
@@ -1400,7 +1405,7 @@ export async function cmdCrewStatus(deps: CrewDeps, args: readonly string[]): Pr
   for (const l of deposedLines(marker, deps.ctx.instance)) deps.io.out(l.text);
   const sideLines =
     data.lead === null
-      ? [...leadDeputyLines(data, deps.now()), ...pairingCollisionLines(marker, deps.now())]
+      ? [...leadDeputyLines(data, deps.now()), ...deputyTricksLines(marker, deps.now()), ...pairingCollisionLines(marker, deps.now())]
       : [
           ...leadContactLines(data, marker, deps.ctx.env, deps.now()),
           ...peerWarrantLines(data, marker, deps.now(), deps.ctx.instance),
@@ -2366,6 +2371,8 @@ export async function cmdCrewApprovePromote(deps: CrewDeps, args: readonly strin
   deps.io.out(`  expires ${new Date(approved.expiresAt).toISOString()}`);
   deps.io.out(`  Now run \`collie promote\` on "${approved.memberId}" within 10 minutes. Until it does, nothing`);
   deps.io.out("  has changed here: this is consent, not a handover.");
+  // §25: whether the tricks this lead runs come along, as the running lead last saw its deputy.
+  for (const l of promoteTricksLines(parseMarker(deps.files.read(crewRuntimePath(deps.ctx.stateDir))), approved.memberId)) deps.io.out(l.text);
   deps.io.out("  Nothing was sent to it and no secret is involved — the claim is already signed against a");
   deps.io.out(`  pinned certificate, so consent only has to name who may take over.`);
   deps.io.out("  Changed your mind? `collie crew approve-promote --cancel`.");
@@ -2374,6 +2381,32 @@ export async function cmdCrewApprovePromote(deps: CrewDeps, args: readonly strin
 }
 
 // ── promote (on the peer becoming lead) ──────────────────────────────────────
+
+/**
+ * Leave the copies of `lead`'s tricks and open Decisions this machine holds as its deputy (CREW_PROTOCOL
+ * §25) for the restart below: the bridge adopts them at its next boot, as the lead, before it builds its
+ * Hill and its tricks (bridge/crew/carry-boot.ts). This command writes only the marker that names the
+ * lead, because the bridge that runs now holds its own Hill in memory and would write over a merge.
+ * A machine that was not the deputy holds no copy, and nothing is said. Never fails the promote.
+ */
+async function startCarriedAtPromote(deps: CrewDeps, lead: string): Promise<void> {
+  const tricks = new StandbyTricksStore(deps.ctx.stateDir);
+  const hill = new StandbyHillStore(deps.ctx.stateDir);
+  const trickCount = (await tricks.load())?.from === lead ? (await tricks.ready()).length : 0;
+  const questions = (await hill.load())?.from === lead ? await hill.openCount() : 0;
+  if (trickCount === 0 && questions === 0) return;
+  try {
+    await writeAdoptMarker(deps.ctx.stateDir, { lead, by: "handover", at: deps.now() });
+  } catch (err) {
+    deps.io.err(`warn: could not leave "${lead}"'s tricks and open questions for the restart: ${err instanceof Error ? err.message : String(err)}`);
+    return;
+  }
+  const parts = [
+    ...(trickCount === 0 ? [] : [trickCount === 1 ? "1 trick" : `${String(trickCount)} tricks`]),
+    ...(questions === 0 ? [] : [questions === 1 ? "1 open question" : `${String(questions)} open questions`]),
+  ];
+  deps.io.out(`✓ "${lead}"'s ${parts.join(" and ")} come along: this machine takes them up when it restarts as the lead`);
+}
 
 /**
  * `collie promote` — §14, run on the peer that is to become lead.
@@ -2457,6 +2490,9 @@ export async function cmdPromote(deps: CrewDeps, args: readonly string[]): Promi
     current === null ? null : promoteSelf(current, roster, deps.now()),
   );
   if (promoted === null) return EXIT.FAIL;
+  // §25: this command is the person's own yes on this machine, as the takeover tap is. It leaves the
+  // copies of the old lead's tricks and open Decisions for the restart below, which adopts them.
+  await startCarriedAtPromote(deps, data.lead.memberId);
 
   // NOBODY ELSE IS SWEPT — §14.4/§14.5 (2026-08-12). A peer pins its CURRENT lead's certificate as
   // the sole anchor of its listener (`peerListenerTls`, bridge/crew/transport.ts), so a dial from a

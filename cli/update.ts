@@ -1,3 +1,4 @@
+import { linkedHarnesses } from "../bridge/inside/links.ts";
 import { basename, dirname, join } from "node:path";
 
 import { binaryName, collieBinary, HOST, type Host } from "../bridge/host.ts";
@@ -381,7 +382,14 @@ export function majorVerdict(installed: string | null, fetched: string | null): 
   return b > a ? "crosses" : "same";
 }
 
-/** `--major` anywhere in the verb's argv. The flag IS the consent — there is no prompt (ADR 0020). */
+/**
+ * `--major` anywhere in the verb's argv. The flag IS the consent — there is no prompt (ADR 0020).
+ *
+ * Why a flag and never a prompt: a Herdr plugin action runs with no TTY, and the phone banner has no
+ * terminal at all. A confirm that only a shell can answer would make a major unreachable from the
+ * surface that announces it. A flag is answerable from both. `crew update` is the opposite case on
+ * purpose: it rebuilds another machine, so it asks for a human at a terminal and has no `--yes`.
+ */
 export function wantsMajor(args: readonly string[]): boolean {
   return args.includes("--major");
 }
@@ -1133,7 +1141,7 @@ function nudgeHooks(deps: UpdateDeps, binary: string): void {
   if (r.stdout.trim() === STATUSLINE_LAG_WORD) {
     deps.io.out(
       "note: your wrapped statusLine points at an older collie binary;" +
-        " run `collie hooks install claude --statusline` to re-point it.",
+        " run `collie hooks install claude` to re-point it.",
     );
     return;
   }
@@ -1209,6 +1217,26 @@ function syncSkill(deps: UpdateDeps, binary: string, nudgeWhenOff = true): void 
   for (const line of syncLines(result)) deps.io.out(line);
 }
 
+/** The first build that knows `collie harness sync` (M99 spec 09). An older one has no `harness` verb. */
+const HARNESS_SYNC_SINCE = "1.29.0";
+
+/**
+ * THE PARTS FOLLOW THE UPDATE (M99 spec 09). After the skill sync, the NEW binary runs `collie harness
+ * sync`: each linked harness's part is rewritten with that build's, never over a newer one. Only when a
+ * harness is linked, and only through a build that knows the verb (its `--version` is read first: an
+ * older one does not know `harness` and would print its usage error). A running session keeps its copy until it reloads.
+ * Nothing here fails the update: a failure prints one note.
+ */
+export function syncLinks(deps: Pick<UpdateDeps, "ctx" | "files" | "exec" | "io">, binary: string): void {
+  if (linkedHarnesses(deps.ctx.env, deps.ctx.home, deps.files).length === 0) return;
+  const said = deps.exec.capture(binary, ["--version"], SKILL_SYNC_TIMEOUT_MS, undefined, ITS_OWN_ROOT);
+  const version = /\d+\.\d+\.\d+/u.exec(said.stdout)?.[0];
+  if (!said.found || said.code !== EXIT.OK || version === undefined || compareSemver(version, HARNESS_SYNC_SINCE) < 0) return;
+  const r = deps.exec.capture(binary, ["harness", "sync"], SKILL_SYNC_TIMEOUT_MS, undefined, ITS_OWN_ROOT);
+  for (const line of r.stdout.split("\n")) if (line.trim() !== "") deps.io.out(line);
+  if (!r.found || r.code !== EXIT.OK) deps.io.out("note: harness sync did not run; run `collie harness sync`.");
+}
+
 /**
  * The second half of `update`, run FROM THE CODE THAT WAS JUST FETCHED. `build` re-runs the version
  * gate (a half-bumped release can't go live) and recompiles both the binary and `web/dist`;
@@ -1240,6 +1268,7 @@ export async function cmdApplyUpdate(deps: UpdateDeps, args: readonly string[] =
   // `build` just wrote this binary from the code we are running, so it is the new list, not ours.
   nudgeHooks(deps, collieBinary(deps.ctx.root, deps.host));
   syncSkill(deps, collieBinary(deps.ctx.root, deps.host));
+  syncLinks(deps, collieBinary(deps.ctx.root, deps.host));
   return EXIT.OK;
 }
 
@@ -3301,6 +3330,13 @@ function handOff(
     // the whole guarantee. The runner is then in a unit of its own, and this process may exit —
     // which, as the main process of a service, is exactly what used to kill the client mid-flight
     // (`Exec.spawnDetached`, and ADR 0037).
+    //
+    // The cause is the launch, not `systemd-run`: `detached: true` gives a child a new SESSION, never
+    // a new cgroup, so the client stays in the caller's cgroup until it exits, and under the default
+    // `KillMode=control-group` a main process that exits takes the cgroup with it. Two narrower fixes
+    // were declined: `KillMode=process` on the launching unit fixes only the path that sets it, keeps
+    // the fragile shape and orphans build children; a poll loop on the runner unit costs more code and
+    // needs a timeout of its own, when the client's exit code already is the manager's answer.
     const client = deps.exec.runLogged(plan.command, {
       cwd: layout.installRoot,
       env: runnerEnvironment,
@@ -3485,6 +3521,7 @@ async function runApply(deps: UpdateDeps, a: ApplyArgs): Promise<number> {
     deps.io.out(`✓ ${verb} to ${a.version === "" ? a.to : a.version}`);
     nudgeHooks(deps, collieBinary(layout.currentLink, deps.host));
     syncSkill(deps, collieBinary(layout.currentLink, deps.host));
+    syncLinks(deps, collieBinary(layout.currentLink, deps.host));
     return EXIT.OK;
   }
   if (run.state === "rolled-back") {

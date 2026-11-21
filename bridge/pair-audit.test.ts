@@ -5,7 +5,15 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { formatAuditLine } from "./audit.ts";
-import { addressClass, NOT_PLACED, pairAuditEntry, pairRoute } from "./pair-audit.ts";
+import {
+  addressClass,
+  NOT_PLACED,
+  pairApproveAuditEntry,
+  pairAuditEntry,
+  pairRequestAuditEntry,
+  pairRequestRefusedAuditEntry,
+  pairRoute,
+} from "./pair-audit.ts";
 import { coercePending, filePairingIo, newPending, PairingStore } from "./pairing.ts";
 
 // The audit line of one pairing (bridge/pair-audit.ts): the route as an address class, the pane the code
@@ -25,7 +33,7 @@ describe("addressClass", () => {
       ["127.8.9.10", "loopback"],
       ["::1", "loopback"],
       ["::ffff:127.0.0.1", "loopback"],
-      ["100.64.0.8", "tailnet"],
+      ["100.64.10.8", "tailnet"],
       ["100.127.255.254", "tailnet"],
       ["fd7a:115c:a1e0::5", "tailnet"],
       ["[fd7a:115c:a1e0::5]:443", "tailnet"],
@@ -55,13 +63,13 @@ describe("addressClass", () => {
 
 describe("pairRoute", () => {
   test("a remote peer is its own class, and its X-Forwarded-For is the client's words, ignored", () => {
-    expect(pairRoute("100.64.0.8", false, "127.0.0.1")).toEqual({ route: "tailnet" });
+    expect(pairRoute("100.64.10.8", false, "127.0.0.1")).toEqual({ route: "tailnet" });
     expect(pairRoute("203.0.113.9", false, null)).toEqual({ route: "internet" });
   });
 
   test("behind a front door on this machine: loopback, and the class of the rightmost forwarded entry", () => {
-    expect(pairRoute("127.0.0.1", true, "203.0.113.9, 100.64.0.8")).toEqual({ route: "loopback", forwarded: "tailnet" });
-    expect(pairRoute("127.0.0.1", true, "100.64.0.8, ")).toEqual({ route: "loopback", forwarded: "tailnet" });
+    expect(pairRoute("127.0.0.1", true, "203.0.113.9, 100.64.10.8")).toEqual({ route: "loopback", forwarded: "tailnet" });
+    expect(pairRoute("127.0.0.1", true, "100.64.10.8, ")).toEqual({ route: "loopback", forwarded: "tailnet" });
     expect(pairRoute("::1", true, null)).toEqual({ route: "loopback" });
     // isLoopbackPeer reads an absent peer as loopback; the route follows it.
     expect(pairRoute(undefined, true, null)).toEqual({ route: "loopback" });
@@ -71,7 +79,7 @@ describe("pairRoute", () => {
 describe("the pairing's audit line", () => {
   test("label, route, forwarded class and the pane that made the code; no address", () => {
     const line = formatAuditLine(
-      pairAuditEntry("pixel", pairRoute("127.0.0.1", true, "100.64.0.8"), { session: "main", paneId: "w1:p3" }),
+      pairAuditEntry("pixel", pairRoute("127.0.0.1", true, "100.64.10.8"), { session: "main", paneId: "w1:p3" }),
       NOW,
     );
     expect(JSON.parse(line)).toEqual({
@@ -80,7 +88,7 @@ describe("the pairing's audit line", () => {
       device: "pixel",
       detail: { label: "pixel", route: "loopback", forwardedFrom: "tailnet", mintSession: "main", mintPane: "w1:p3" },
     });
-    expect(line).not.toContain("100.64.0.8");
+    expect(line).not.toContain("100.64.10.8");
   });
 
   test("a code from no placed pane says so", () => {
@@ -110,7 +118,7 @@ describe("the pairing's audit line", () => {
     const claimed = await new PairingStore(io, () => NOW + 1_000).claim(code, "pixel");
     if (!claimed.ok) throw new Error(`the claim failed: ${claimed.reason}`);
     expect(claimed.mintedIn).toEqual({ session: "main", paneId: "w1:p3" });
-    const entry = pairAuditEntry("pixel", pairRoute("127.0.0.1", true, "100.64.0.8"), claimed.mintedIn);
+    const entry = pairAuditEntry("pixel", pairRoute("127.0.0.1", true, "100.64.10.8"), claimed.mintedIn);
     for (const content of ["preview", "none"] as const) {
       const line = formatAuditLine(entry, NOW, content);
       expect(line).not.toContain(code);
@@ -152,3 +160,43 @@ describe("the pane on the pending code", () => {
     expect(claimed.ok && claimed.mintedIn).toBeNull();
   });
 });
+
+// ── Pairing with a phone (ADR 0139) ──────────────────────────────────────────────────────────
+
+describe("the pairing request's audit lines", () => {
+  test("a request names its route and nothing else", () => {
+    expect(JSON.parse(formatAuditLine(pairRequestAuditEntry({ route: "loopback", forwarded: "tailnet" }), NOW))).toEqual({
+      ts: new Date(NOW).toISOString(),
+      action: "pair-request",
+      detail: { route: "loopback", forwardedFrom: "tailnet" },
+    });
+    expect(JSON.parse(formatAuditLine(pairRequestAuditEntry({ route: "lan" }), NOW)).detail).toEqual({ route: "lan" });
+  });
+
+  test("an approval names the approver, the new label and both routes", () => {
+    const entry = pairApproveAuditEntry({
+      approver: "pixel",
+      label: "Chrome on Linux",
+      asker: { route: "tailnet" },
+      approverRoute: { route: "loopback", forwarded: "tailnet" },
+    });
+    expect(JSON.parse(formatAuditLine(entry, NOW))).toEqual({
+      ts: new Date(NOW).toISOString(),
+      action: "pair-approve",
+      device: "pixel",
+      detail: { approver: "pixel", label: "Chrome on Linux", route: "tailnet", approverRoute: "loopback", approverForwardedFrom: "tailnet" },
+    });
+  });
+
+  test("a refusal names its reason, and the approver when one answered", () => {
+    for (const reason of ["wrong-code", "refused", "expired", "rate"] as const) {
+      expect(JSON.parse(formatAuditLine(pairRequestRefusedAuditEntry(reason), NOW))).toEqual({
+        ts: new Date(NOW).toISOString(),
+        action: "pair-request-refused",
+        detail: { reason },
+      });
+    }
+    expect(JSON.parse(formatAuditLine(pairRequestRefusedAuditEntry("wrong-code", "pixel"), NOW)).device).toBe("pixel");
+  });
+});
+

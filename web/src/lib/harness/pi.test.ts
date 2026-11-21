@@ -45,8 +45,9 @@ describeAdapterConformance(piAdapter, {
 
 describe("pi adapter routing", () => {
   it("lifts every question screen the corpus proves, and no fewer", () => {
-    // The system-theme permission fixture joins the upstream corpus, and rpiv's eight screens (pi--v152-rpiv-*).
-    expect(lifted).toHaveLength(74);
+    // The system-theme permission fixture joins the upstream corpus, rpiv's eight screens (pi--v152-rpiv-*) are ours,
+    // and `/login` (2026-11-15) adds four method lists and six screens of its sign-in card.
+    expect(lifted).toHaveLength(84);
   });
 
   it.each([

@@ -6,7 +6,7 @@
 import { describe, expect, test } from "bun:test";
 import { STATUS_RANK } from "../../types.ts";
 import { HerdrCoreMux, HISTORY_READ_BUDGET_MS, OLDER_NOTE_BLOCKED, OLDER_NOTE_READING } from "./adapter.ts";
-import { DEFAULT_HC_TIMEOUT_MS, type WireRead } from "./client.ts";
+import { DEFAULT_HC_TIMEOUT_MS, HcTimeout, type WireRead } from "./client.ts";
 import { FakeHcCore, KEY_HOLD_MS, ManualClock } from "./fake-core.ts";
 
 interface Built {
@@ -369,6 +369,25 @@ describe("a slow history read holds the terminal's keys (M78 report 10, case 2; 
     expect(fake.historyReads("t1")).toBe(1);
   });
 
+  test("Load older on a pane whose program reports error reads history and carries no note: an error waits on no answer (PR 787)", async () => {
+    const { fake, adapter } = jam();
+    fake.slowHistoryReads("t1", { on: false });
+    fake.reportState("t1", "error");
+    const t1 = (await adapter.snapshot()).panes.find((p) => p.paneId === "t1");
+    expect(t1).toMatchObject({ status: "blocked", blockedBy: "error" });
+    const grid = await adapter.readGrid("t1", OLDER);
+    if (!grid.ok) throw new Error(grid.detail);
+    expect(grid.value.olderNote).toBeUndefined();
+    expect(grid.value.truncated).toBe(false);
+    expect(grid.value.text).toContain("earlier line 1");
+    expect(fake.historyReads("t1")).toBe(1);
+    // The bridge's hint still wins: a screen-detected dialog over the error is a question (server.ts paneReadHint).
+    const hinted = await adapter.readGrid("t1", { ...OLDER, hint: { blocked: true } });
+    if (!hinted.ok) throw new Error(hinted.detail);
+    expect(hinted.value.olderNote).toBe(OLDER_NOTE_BLOCKED);
+    expect(fake.historyReads("t1")).toBe(1);
+  });
+
   test("Load older whose hint says blocked starts no history read, so a pane the core reports working takes keys at once", async () => {
     // pi reports `working` while its dialog waits; the bridge's engine reads the screen's ask and says so.
     const { fake, adapter, lines } = jam();
@@ -432,7 +451,7 @@ describe("the size the last active viewer sets (HC_API.md, The terminal record)"
 });
 
 describe("a program's state words (HC_API.md, Status)", () => {
-  test("done is Collie's done, never idle; error is unknown, and the pane is still the agent", async () => {
+  test("done is Collie's done, never idle; error maps to blocked, and the pane is still the agent", async () => {
     const { fake, adapter } = build();
     const statuses = async (): Promise<string[]> => (await adapter.snapshot()).panes.filter((p) => p.paneId === "t1").map((p) => `${p.agent}:${p.status}`);
     for (const [state, expected] of [
@@ -440,14 +459,29 @@ describe("a program's state words (HC_API.md, Status)", () => {
       ["working", "claude:working"],
       ["done", "claude:done"],
       ["blocked", "claude:blocked"],
-      ["error", "claude:unknown"],
+      ["error", "claude:blocked"],
     ] as const) {
       fake.reportState("t1", state);
       expect(await statuses()).toEqual([expected]);
     }
   });
 
-  test("done and idle are two marks the phone ranks apart; error shares unknown's mark", () => {
+  test("error is blocked by an error (PR 787); a reported blocked is a question and carries no such mark", async () => {
+    const { fake, adapter } = build();
+    const t1 = async () => (await adapter.snapshot()).panes.find((p) => p.paneId === "t1");
+    fake.reportState("t1", "error");
+    expect(await t1()).toMatchObject({ agent: "claude", status: "blocked", blockedBy: "error" });
+    fake.reportState("t1", "blocked");
+    const asking = await t1();
+    expect(asking?.status).toBe("blocked");
+    expect(asking?.blockedBy).toBeUndefined();
+    for (const state of ["idle", "working", "done"] as const) {
+      fake.reportState("t1", state);
+      expect((await t1())?.blockedBy).toBeUndefined();
+    }
+  });
+
+  test("done and idle are two marks the phone ranks apart; error shares blocked's mark", () => {
     expect(STATUS_RANK.done).not.toBe(STATUS_RANK.idle);
     expect(Object.keys(STATUS_RANK).toSorted()).toEqual(["blocked", "done", "idle", "unknown", "working"]);
   });
@@ -517,5 +551,23 @@ describe("a core stop and start (HC_API.md, error kinds finished and unavailable
     expect(reason(await adapter.typeText("t1", "ls"))).toBe("refused");
     fake.shellsReady();
     expect((await adapter.typeText("t1", "ls")).ok).toBe(true);
+  });
+});
+
+// M100 spec 03, item 2: a text write the core did not answer in time may still land, as keys may.
+describe("a text write the core does not confirm in time", () => {
+  class LateCore extends FakeHcCore {
+    override async typeRaw(address: string, text: string): Promise<void> {
+      void address;
+      void text;
+      throw new HcTimeout("terminal.input", DEFAULT_HC_TIMEOUT_MS);
+    }
+  }
+
+  test("typeText answers unconfirmed, and says it may still arrive", async () => {
+    const adapter = new HerdrCoreMux(new LateCore(), "/home/dev");
+    const ack = await adapter.typeText("t2", "hello");
+    expect(reason(ack)).toBe("unconfirmed");
+    if (!ack.ok) expect(ack.detail).toContain("may still arrive");
   });
 });

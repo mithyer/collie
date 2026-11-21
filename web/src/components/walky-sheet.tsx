@@ -4,15 +4,18 @@ import { Icon } from "@/components/icons/icon";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { BottomSheet } from "@/components/ui/sheet";
+import { DeliverNowButton } from "@/components/walky-deliver-button";
+import { FeatureTokenChip } from "@/components/token-use-label";
 import { WalkyIdChip } from "@/components/walky-id-chip";
 import { useWalkyLive, useWalkyLog } from "@/components/walky-log";
 import { WalkyBodyText, sentTargetWords } from "@/components/walky-name-chip";
 import { WalkyIcon, WalkyOffIcon } from "@/components/walky-icon";
 import { Switch } from "@/components/ui/switch";
+import { useDeliverNow } from "@/hooks/use-deliver-now";
 import { useLocale } from "@/hooks/use-locale";
 import { clockTime, timeAgoShort } from "@/lib/format";
 import { t } from "@/lib/i18n";
-import { directionOf, isHeld, signerOf, stateWord, verifiedWord, type WalkyRow } from "@/lib/walky";
+import { directionOf, isHeld, ownerStateWord, signerOf, stateWord, verifiedWord, waitReasonOf, type DeliverNow, type WalkyRow } from "@/lib/walky";
 import { cn } from "@/lib/utils";
 import { senderNameOf } from "@/lib/walky-names";
 
@@ -40,6 +43,16 @@ import { senderNameOf } from "@/lib/walky-names";
 // and does not own that box, so it offers nothing here (the far pane's sheet has its Drop). The sheet
 // sends nothing itself: the caller's `onCancel` and `onDrop` post the routes and answer with a line to
 // show under the row, or null when the row's own receipt will say it on the next read.
+//
+// ── DELIVER NOW, FOR A LINKED SESSION (prototype) ─────────────────────────────
+// A pane whose session has the data transport is "linked" (`linked`, the pane read's field). A held RECEIVED row
+// of such a pane gets a third way out beside Drop: "Deliver now" hands the message to the agent as data, at
+// once, and leaves the box and its draft as they are. It is the person's own act, behind the same write gate
+// as Drop and Reply. `onDeliverNow` is the seam (`DeliverNow`, lib/walky.ts); without `linked` the sheet is
+// drawn as it always was. Offered only on a message that waits for the person's own unsent text: delivering into a running
+// turn is not this feature. Before the tap the row says where the message goes, what happens to the person's own
+// text and what the agent does, as a line under the buttons ("The agent gets it now and starts on it. Your text
+// stays in the box."). After the tap the row reads "Delivered. Your text is still in the box."
 //
 // ── A FOCUSED MESSAGE ─────────────────────────────────────────────────────────
 // A tap on a Chat card, or on an id chip, opens this sheet on ONE message (`focusId`): the sheet scrolls
@@ -76,6 +89,10 @@ interface WalkySheetProps {
    * a quiet machine or a pane that is no agent's: no switch.
    */
   onWalkyOff?: ((off: boolean) => Promise<string | null>) | undefined;
+  /** Whether this session has the data transport (the pane row's `linked`). Without it no row offers Deliver now. */
+  linked?: boolean | undefined;
+  /** Hand a held message to the agent as data, the draft untouched (the seam, `DeliverNow`). Absent: no Deliver now. */
+  onDeliverNow?: DeliverNow | undefined;
 }
 
 /**
@@ -94,7 +111,7 @@ function centreInScroller(el: HTMLElement): void {
   box.scrollTop += a.top - b.top - (box.clientHeight - a.height) / 2;
 }
 
-export function WalkySheet({ open, onClose, onReply, canReply, focusId = null, self, onCancel, onDrop, walkyOff = false, onWalkyOff }: WalkySheetProps) {
+export function WalkySheet({ open, onClose, onReply, canReply, focusId = null, self, onCancel, onDrop, walkyOff = false, onWalkyOff, linked = false, onDeliverNow }: WalkySheetProps) {
   useLocale();
   const log = useWalkyLog();
   const rows = log === null ? [] : newestFirst(log.rows);
@@ -128,6 +145,7 @@ export function WalkySheet({ open, onClose, onReply, canReply, focusId = null, s
                 onFocusId={(id) => setMoved({ from: focusId, id })}
                 onCancel={onCancel}
                 onDrop={onDrop}
+                deliver={linked ? onDeliverNow : undefined}
               />
             </li>
           ))}
@@ -149,7 +167,7 @@ const ASKED_HOLD_MS = 15_000;
  * a sweep late, and another hand (the session's own `collie walky on`) can change the flag meanwhile.
  * A failed call puts it back with a line.
  */
-function WalkyOffSwitch({ off, onChange }: { off: boolean; onChange: (off: boolean) => Promise<string | null> }) {
+export function WalkyOffSwitch({ off, onChange }: { off: boolean; onChange: (off: boolean) => Promise<string | null> }) {
   // The value asked for, and the row's value when it was asked: any move of the row ends the wait.
   const [asked, setAsked] = useState<{ value: boolean; from: boolean } | null>(null);
   const [busy, setBusy] = useState(false);
@@ -180,7 +198,11 @@ function WalkyOffSwitch({ off, onChange }: { off: boolean; onChange: (off: boole
         <span className="flex min-w-0 items-start gap-2">
           <Mark className="mt-0.5 size-4 shrink-0 text-muted-foreground" aria-hidden="true" />
           <span className="min-w-0">
-            <span className="block text-sm font-medium">{t("walky.off.label")}</span>
+            {/* The chip follows the label while it fits, else on a line of its own: the label is never cut for it. */}
+            <span className="flex flex-wrap items-center gap-x-1.5 gap-y-0.5 text-sm font-medium">
+              <span className="max-w-full min-w-0 truncate">{t("walky.off.label")}</span>
+              <FeatureTokenChip feature="walky-talky" />
+            </span>
             <span id={hintId} className="block text-xs leading-snug text-muted-foreground">
               {t("walky.off.hint")}
             </span>
@@ -208,6 +230,7 @@ function WalkyListRow({
   onFocusId,
   onCancel,
   onDrop,
+  deliver,
 }: {
   row: WalkyRow;
   self: string | undefined;
@@ -218,6 +241,8 @@ function WalkyListRow({
   onFocusId: (id: string) => void;
   onCancel: ((row: WalkyRow) => Promise<string | null>) | undefined;
   onDrop: ((row: WalkyRow) => Promise<string | null>) | undefined;
+  /** The seam, given only for a linked pane. */
+  deliver: DeliverNow | undefined;
 }) {
   const refused = row.receipt.state === "refused" || row.receipt.state === "expired";
   // The person reads names; the address and the id stay on the wire (lib/walky-names.ts).
@@ -236,6 +261,10 @@ function WalkyListRow({
   const [note, setNote] = useState<string | null>(null);
   // A row that left its held state settles the question: the note it earned goes with it.
   if (!held && note !== null) setNote(null);
+  // Deliver now: a held received row of a linked pane, behind the same write gate as Drop.
+  const deliverable = held && waitReasonOf(row.receipt) === "text" && canReply && deliver !== undefined;
+  const delivery = useDeliverNow(held, deliverable ? deliver : undefined);
+  const deliverAria = t("walky.sheet.deliverNowAria", { label: sender });
   const onTakeBack = async () => {
     if (takeBack === undefined || busy) return;
     setBusy(true);
@@ -284,11 +313,11 @@ function WalkyListRow({
           )}
         </p>
       )}
-      <div className="mt-1 flex items-center gap-2">
+      <div className={cn("mt-1 flex items-center gap-2", deliverable && "flex-wrap justify-end")}>
         {/* The state words are lower case (they also follow a colon in the composer's note), so the line capitalises its own first letter. */}
-        <p className="min-w-0 flex-1 text-[11px] text-muted-foreground first-letter:uppercase">
+        <p className={cn("min-w-0 text-[11px] text-muted-foreground first-letter:uppercase", deliverable ? "w-full" : "flex-1")}>
           <span data-slot="walky-state" className={cn(refused && "text-status-blocked")}>
-            {stateWord(row.receipt)}
+            {sent ? stateWord(row.receipt) : ownerStateWord(row.receipt)}
           </span>
           {!sent && ` · ${verifiedWord(row.receipt, signerOf(row))}`}
         </p>
@@ -316,7 +345,30 @@ function WalkyListRow({
             {t(cancels ? "walky.sheet.cancel" : "walky.sheet.drop")}
           </Button>
         )}
+        {deliverable && (
+          <DeliverNowButton
+            className="h-11 shrink-0"
+            busy={delivery.busy}
+            aria-label={deliverAria}
+            onClick={() => void delivery.run(row.id)}
+          />
+        )}
       </div>
+      {deliverable && (
+        <p data-slot="walky-deliver-help" className="mt-1 text-xs text-muted-foreground">
+          {t("walky.sheet.deliverHelp")}
+        </p>
+      )}
+      {delivery.error !== null && (
+        <p data-slot="walky-deliver-note" role="status" className="mt-1 text-[11px] text-status-blocked">
+          {delivery.error}
+        </p>
+      )}
+      {delivery.gone !== null && (
+        <p data-slot="walky-deliver-gone" role="status" className="mt-1 text-[11px] text-muted-foreground">
+          {delivery.gone}
+        </p>
+      )}
       {note !== null && (
         <p data-slot="walky-takeback-note" role="status" className="mt-1 text-[11px] text-muted-foreground">
           {note}

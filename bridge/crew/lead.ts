@@ -84,6 +84,82 @@ export interface PeerMemory {
 
 const FRESH: PeerMemory = { body: null, incompatibleRuns: 0, probeAfter: 0 };
 
+/**
+ * How long after a phone last named a member's NON-primary session the sweep keeps fetching that
+ * session's own spaces and tabs (issue 785).
+ *
+ * ── WHY A SECOND DIAL EXISTS AT ALL ──────────────────────────────────────────
+ * The sweep asks every member for {@link SWEEP_VIEW}: every session's panes, but the spaces and tabs of
+ * the member's PRIMARY session only, because a snapshot has one `workspaces` and one `tabs` list and
+ * the member fills them from the session it was asked about. Narrowing cannot recover another
+ * session's lists from that body, and space and tab ids collide across Herdr sessions, so the phone
+ * showed the primary's Spaces over the other session's panes. The member already answers
+ * `?session=<name>` with that session's own lists, so the lead asks for them, with no wire change.
+ *
+ * ── WHY ON DEMAND, AND WHY ON THE SWEEP ──────────────────────────────────────
+ * Not every session on every sweep: a member with five sessions would cost five extra dials every
+ * 1.5 s for lists nobody looks at. And never inside the phone's request: the lead answers the poll from
+ * its cache (§10.1), and a handler that dials would let a phone poll make the lead reach a machine.
+ * So a request that names such a session leaves a note ({@link CrewLead.merge}), and the sweep fetches
+ * what is noted, concurrently with that member's own dial and on the same per-call budget, so the
+ * member's share of the sweep still ends within one budget. The first poll after a switch is served
+ * the old way, and the next sweep, 1.5 s later, brings the session's own lists.
+ *
+ * Fifteen seconds is ten phone polls: a phone that keeps looking keeps the note warm, and a phone
+ * that left stops costing a dial soon after.
+ */
+export const SESSION_TOPOLOGY_DEMAND_MS = 15_000;
+
+/**
+ * How old a fetched session's spaces and tabs may be and still be served (issue 785).
+ *
+ * While a phone looks, they are re-fetched on every sweep, so they are as fresh as the member's body.
+ * A failed re-fetch keeps the last good lists, as a failed sweep keeps the last good body (§10.2), but
+ * only up to this age: past it the merge serves today's body again rather than lists that may no
+ * longer match the panes beside them. It also lets a phone that comes back within a minute see the
+ * right Spaces on its first poll.
+ */
+export const SESSION_TOPOLOGY_MAX_AGE_MS = 60_000;
+
+/** One member session's own spaces and tabs, fetched for a request that named it (issue 785). */
+export interface SessionTopology {
+  readonly workspaces: PeerSnapshotBody["workspaces"];
+  readonly tabs: PeerSnapshotBody["tabs"];
+  /** This lead's clock when the answer arrived. A peer's clock is never read (§10.2). */
+  readonly at: number;
+}
+
+/**
+ * The member session whose own spaces and tabs a request needs, or `undefined` when the cached body
+ * already holds the right ones. **Pure.**
+ *
+ * Only a session the member itself PUBLISHES, that is reachable, and that is not its primary. A name
+ * the member never listed is never dialled: the phone's `?session=` is a string from a URL, and only
+ * the member's own registry turns it into a session (§4). The primary is the sweep body's own, and a
+ * member with one session therefore never costs a second dial.
+ */
+export function topologySessionOf(body: PeerSnapshotBody | null, view: SnapshotView): string | undefined {
+  if (body === null) return undefined;
+  const named = view.session;
+  if (named === undefined || named === "") return undefined;
+  const session = body.sessions.find((s) => s.name === named);
+  if (session === undefined || session.reachable !== true) return undefined;
+  const primary = (body.sessions.find((s) => s.isPrimary === true) ?? body.sessions[0])?.name;
+  return named === primary ? undefined : named;
+}
+
+/**
+ * A member body with one session's own spaces and tabs in place of the primary's. **Pure.** No
+ * topology, or no body, is the body as it is, which is today's answer.
+ */
+export function withSessionTopology(
+  body: PeerSnapshotBody | null,
+  topology: SessionTopology | undefined,
+): PeerSnapshotBody | null {
+  if (body === null || topology === undefined) return body;
+  return { ...body, workspaces: topology.workspaces, tabs: topology.tabs };
+}
+
 /** No member is owed the proof — every lead that never took over, which is almost all of them. */
 const EMPTY_PENDING: ReadonlySet<string> = new Set<string>();
 
@@ -298,6 +374,11 @@ export interface CrewLeadDeps {
    * which is every lead that has never named a deputy and every test that is not about the copy.
    */
   readonly launchersCopy?: LaunchersCopyDistribution;
+  /**
+   * The §25 copies to the DEPUTY: the tricks this lead runs and its open Decisions. Absent ⇒ none, which
+   * is every lead that has never named a deputy and every test that is not about them.
+   */
+  readonly carry?: readonly CarryDistribution[];
   readonly now?: () => number;
   /**
    * Where a `[crew]` line goes. Defaults to `console.log`, which is the bridge's journal.
@@ -358,6 +439,23 @@ export interface LaunchersCopyDistribution {
   current(): Promise<{ readonly rows: readonly CopiedRow[]; readonly digest: string } | null>;
   /** Deliver it. `no_route` is a deputy that predates the route (404). */
   push(link: CrewLink, rows: readonly CopiedRow[]): Promise<LaunchersCopyAnswer>;
+}
+
+/**
+ * One §25 copy to the DEPUTY (CREW_PROTOCOL §25): the tricks this lead runs, or its open Decisions.
+ *
+ * The launchers copy's discipline, on the same sweep: the distribution reads the deputy's own report off
+ * the snapshot answer and decides itself whether anything must go (`carry-sync.ts`). This class only
+ * schedules it, one at a time and off the tick, and stops asking a deputy whose build has no route (404)
+ * until it reconnects or names another release.
+ */
+export interface CarryDistribution {
+  /** A word for the journal: `tricks copy`, `hill copy`. */
+  readonly name: string;
+  /** The deputy this lead has designated, or `null`. Read through the store, never captured. */
+  deputy(): string | null;
+  /** One sync, given the deputy's snapshot answer. `no_route` is a deputy before the routes. */
+  sync(link: CrewLink, body: JsonValue): Promise<"idle" | "done" | "no_route" | "failed">;
 }
 
 /** What the sweep needs to state a release and hand out a turn (§20, M16/04). */
@@ -492,6 +590,10 @@ export class CrewLead {
    * them until the next connect, which is a failed sweep answer or a new version on one (ADR 0127).
    */
   private readonly copyRouteMissing = new Set<string>();
+  /** §25: `<name>:<member>` of a copy whose route that deputy lacks, until it reconnects. */
+  private readonly carryRouteMissing = new Set<string>();
+  /** §25: the copies with a sync in flight, by name. One at a time each. */
+  private readonly carrying = new Set<string>();
   /** Per member: when its backoff was last cleared by contact, and how many times running (M20/02). */
   private readonly contactResets = new Map<string, { at: number; count: number }>();
   /**
@@ -513,6 +615,15 @@ export class CrewLead {
   private readonly dialGenerations = new Map<string, number>();
   /** Per member: when {@link staleDial} last wrote its line. See {@link STALE_DIAL_LOG_REPEAT_MS}. */
   private readonly staleLogged = new Map<string, number>();
+  /**
+   * Per member, per non-primary session: when a request last named it (issue 785). Written only by
+   * {@link CrewLead.merge}, read by the sweep, and bounded by the sessions the member publishes.
+   */
+  private readonly topologyAsked = new Map<string, Map<string, number>>();
+  /** Per member, per non-primary session: its own spaces and tabs, last good. See {@link SessionTopology}. */
+  private readonly topologies = new Map<string, Map<string, SessionTopology>>();
+  /** Per member: the sessions whose last topology fetch failed, so the journal gets one line per change. */
+  private readonly topologyFailing = new Map<string, Set<string>>();
 
   constructor(private readonly deps: CrewLeadDeps) {
     this.now = deps.now ?? Date.now;
@@ -580,6 +691,9 @@ export class CrewLead {
         this.contactResets.delete(id);
         this.dialGenerations.delete(id);
         this.staleLogged.delete(id);
+        this.topologyAsked.delete(id);
+        this.topologies.delete(id);
+        this.topologyFailing.delete(id);
         this.deps.onPeerGone?.(id);
       }
 
@@ -610,14 +724,24 @@ export class CrewLead {
       // The dial each member is about to make, claimed BEFORE the call and carried beside the answer
       // — the link's `runAtStart`. See {@link CrewLead.dialGenerations}.
       const dialled = new Map(due.map((link) => [link.memberId, this.nextDialGeneration(link.memberId)]));
-      const outcomes = await sweepPeers(due, (link) =>
-        this.deps.snapshot(link, SWEEP_VIEW, opts.freshPreflight === true || this.verdictMissing(link.memberId, follow), {
-          leadRelease,
-          leadLine,
-          turn: follow?.turns.turnFor(link.memberId) ?? null,
-          walkyAck: this.deps.walkyAck?.(link.memberId) ?? null,
-        }),
-      );
+      // Issue 785: a non-primary session a phone is looking at gets its own spaces and tabs, dialled
+      // BESIDE the member's own dial and awaited with it, so the member's share of the sweep still ends
+      // within one call budget. Empty for a member with one session and for every unwatched one. The
+      // member's own dial is issued FIRST, so on a cold link it is the one that takes the bootstrap
+      // credit (§10.5) and the topology dial runs on the strict budget.
+      const topologyAsks = new Map(due.map((link) => [link.memberId, this.topologyWanted(link.memberId, now)]));
+      const outcomes = await sweepPeers(due, async (link) => {
+        const [outcome] = await Promise.all([
+          this.deps.snapshot(link, SWEEP_VIEW, opts.freshPreflight === true || this.verdictMissing(link.memberId, follow), {
+            leadRelease,
+            leadLine,
+            turn: follow?.turns.turnFor(link.memberId) ?? null,
+            walkyAck: this.deps.walkyAck?.(link.memberId) ?? null,
+          }),
+          this.fetchTopologies(link, topologyAsks.get(link.memberId) ?? []),
+        ]);
+        return outcome;
+      });
       // Every member whose answer survived the fence. The dropped ones are removed from `outcomes`
       // too, so nothing downstream — the leg fold, the warrant push, the pairing sync — can reach an
       // answer this lead has already decided not to believe.
@@ -660,6 +784,7 @@ export class CrewLead {
         else this.muxAsked.delete(memberId);
         // A dropped link ends the connect a launcher copy's 404 was learned on: the next one asks again.
         if (!outcome.ok) this.copyRouteMissing.delete(memberId);
+        if (!outcome.ok) this.forgetCarryRoutes(memberId);
         // §18.10: this member follows somebody else. Handed straight over — a lead that has been
         // deposed stops sweeping, so there is nothing here to back off or remember.
         if (!outcome.ok && outcome.state === "conflicted") {
@@ -725,6 +850,9 @@ export class CrewLead {
       await this.guarded("warrant distribution", () => this.distributeWarrant(folded, outcomes));
       await this.guarded("pairing sync", async () => this.distributePairing(folded, outcomes));
       await this.guarded("launcher copy", async () => this.distributeLaunchersCopy(folded, outcomes));
+      for (const distribution of this.deps.carry ?? []) {
+        await this.guarded(distribution.name, async () => this.distributeCarry(distribution, folded, outcomes));
+      }
     } catch (err) {
       // Defensive: nothing above is supposed to reject. If something does, the crew degrades to
       // "stale" rather than taking the lead's poll loop down with it.
@@ -994,6 +1122,40 @@ export class CrewLead {
     })();
   }
 
+  /** Forget every §25 404 learned from `memberId`: a new connect or a new build asks again. */
+  private forgetCarryRoutes(memberId: string): void {
+    for (const key of this.carryRouteMissing) if (key.endsWith(`:${memberId}`)) this.carryRouteMissing.delete(key);
+  }
+
+  /**
+   * Keep one §25 copy on the deputy current (CREW_PROTOCOL §25). To the deputy and to nobody else, off
+   * the tick and never awaited, one sync in flight per copy. Whether anything is sent is the
+   * distribution's own decision, read off the deputy's report in this very answer.
+   */
+  private distributeCarry(distribution: CarryDistribution, due: readonly CrewLink[], outcomes: Map<string, PeerOutcome<unknown>>): void {
+    if (this.carrying.has(distribution.name)) return;
+    const deputy = distribution.deputy();
+    if (deputy === null || this.carryRouteMissing.has(`${distribution.name}:${deputy}`)) return;
+    const link = due.find((l) => l.memberId === deputy);
+    const outcome = outcomes.get(deputy);
+    if (link === undefined || outcome === undefined || !outcome.ok) return;
+    this.carrying.add(distribution.name);
+    void (async () => {
+      try {
+        // SAFETY: `value` is that member's HTTP body after `res.json()`, a JsonValue by construction, the
+        // same cast and the same reason as `parsePairingReport`'s; the distribution re-checks every field.
+        const answer = await distribution.sync(link, outcome.value as JsonValue);
+        if (answer !== "no_route") return;
+        this.carryRouteMissing.add(`${distribution.name}:${deputy}`);
+        this.log(`[crew] ${deputy}: keeps no ${distribution.name} (an older Collie), so it cannot resume them after a takeover; not sent again until it reconnects`);
+      } catch (err) {
+        console.warn(`[crew] ${distribution.name} failed: ${err instanceof Error ? err.message : String(err)}`);
+      } finally {
+        this.carrying.delete(distribution.name);
+      }
+    })();
+  }
+
   /**
    * Deliver one warrant, off the tick and never awaited — the same discipline {@link probe} follows,
    * for the same reason: a sweep must cost one strict budget no matter what else it decided to do.
@@ -1105,6 +1267,7 @@ export class CrewLead {
     this.muxAsked.delete(memberId);
     // A new build may have the launcher-copy route a 404 said it lacked (ADR 0127 point 5).
     this.copyRouteMissing.delete(memberId);
+    this.forgetCarryRoutes(memberId);
     this.log(`[crew] ${memberId}: now runs ${version} (was ${before}), asking its hello again`);
   }
 
@@ -1342,12 +1505,125 @@ export class CrewLead {
    * `narrowPeerBody`, and this is its only call site — the merge narrows, nothing else does.
    */
   merge(local: SnapshotResponse, plan: SnapshotPlan): SnapshotResponse {
+    const now = this.now();
     return mergeSnapshot(local, {
       self: this.selfWithMux(),
-      peers: this.contributions().map((c) =>
-        Object.assign({}, c, { body: narrowPeerBody(c.body, plan.peer(c.state.memberId)) }),
-      ),
-      now: this.now(),
+      peers: this.contributions().map((c) => {
+        const view = plan.peer(c.state.memberId);
+        const topology = this.sessionTopology(c.state.memberId, c.body, view, now);
+        return Object.assign({}, c, { body: withSessionTopology(narrowPeerBody(c.body, view), topology) });
+      }),
+      now,
     });
+  }
+
+  /**
+   * The named session's own spaces and tabs for one member, if this lead holds them fresh, and a note
+   * that a phone is looking at that session (issue 785). **It never dials:** the note is read by the
+   * next sweep, see {@link SESSION_TOPOLOGY_DEMAND_MS}. `undefined` is today's answer, the primary's
+   * lists from the sweep body, which is what the first poll after a switch and a failed fetch get.
+   */
+  private sessionTopology(
+    memberId: string,
+    body: PeerSnapshotBody | null,
+    view: SnapshotView,
+    now: number,
+  ): SessionTopology | undefined {
+    const session = topologySessionOf(body, view);
+    if (session === undefined) return undefined;
+    const asked = this.topologyAsked.get(memberId) ?? new Map<string, number>();
+    asked.set(session, now);
+    this.topologyAsked.set(memberId, asked);
+    const held = this.topologies.get(memberId)?.get(session);
+    if (held === undefined || now - held.at > SESSION_TOPOLOGY_MAX_AGE_MS) return undefined;
+    return held;
+  }
+
+  /**
+   * The sessions of one member whose topology this sweep fetches, and the cleanup of what no longer
+   * counts: a note older than {@link SESSION_TOPOLOGY_DEMAND_MS}, lists older than
+   * {@link SESSION_TOPOLOGY_MAX_AGE_MS}, and anything about a session the member no longer publishes
+   * as a reachable non-primary one. Checked against the body this lead holds now, so a session that
+   * went away is not dialled into a 404.
+   */
+  private topologyWanted(memberId: string, now: number): string[] {
+    const body = this.memory.get(memberId)?.body ?? null;
+    const stillOne = (session: string) => topologySessionOf(body, { session, widen: false }) === session;
+    const held = this.topologies.get(memberId);
+    for (const [session, topology] of held ?? []) {
+      if (now - topology.at > SESSION_TOPOLOGY_MAX_AGE_MS || !stillOne(session)) held?.delete(session);
+    }
+    if (held?.size === 0) this.topologies.delete(memberId);
+    const asked = this.topologyAsked.get(memberId);
+    if (asked === undefined) return [];
+    const wanted: string[] = [];
+    for (const [session, at] of asked) {
+      if (now - at > SESSION_TOPOLOGY_DEMAND_MS || !stillOne(session)) {
+        asked.delete(session);
+        this.topologyFailing.get(memberId)?.delete(session);
+        continue;
+      }
+      wanted.push(session);
+    }
+    if (asked.size === 0) this.topologyAsked.delete(memberId);
+    return wanted;
+  }
+
+  /**
+   * Fetch each named session's own spaces and tabs from one member, concurrently, on the ordinary
+   * per-call budget (issue 785). **Never throws and never touches the member's health:** this is a
+   * second look at a machine the sweep's own dial already judges, so only that dial reaches the
+   * registry, the backoff and the notifier.
+   *
+   * No follow header and no walky ack ride it. A dial without them is one the member already reads as
+   * "nothing is being asked" (the lead drops its release header during its own run, §20), so the
+   * update turn and the walky report keep exactly one carrier, the sweep's own dial.
+   *
+   * A failed or unparseable answer keeps the last good lists (up to their age) and writes one journal
+   * line when the session starts failing and one when it answers again, never one per sweep.
+   */
+  private async fetchTopologies(link: CrewLink, sessions: readonly string[]): Promise<void> {
+    if (sessions.length === 0) return;
+    const memberId = link.memberId;
+    await Promise.all(
+      sessions.map(async (session) => {
+        this.noteTopologyResult(memberId, session, await this.fetchTopology(link, session));
+      }),
+    );
+  }
+
+  /** One session's fetch, banked on success. Answers `null` on success and the reason otherwise. */
+  private async fetchTopology(link: CrewLink, session: string): Promise<string | null> {
+    try {
+      const outcome = await this.deps.snapshot(link, { session, widen: false });
+      if (!outcome.ok) return outcome.reason;
+      // SAFETY: a peer's HTTP body after `res.json()`, a JsonValue by construction — the same cast
+      // and reason as `foldPeerMemory`'s. `parsePeerSnapshot` re-checks and caps every list.
+      const parsed = parsePeerSnapshot(outcome.value as JsonValue);
+      if (parsed === null) return "the answer was not a snapshot";
+      const held = this.topologies.get(link.memberId) ?? new Map<string, SessionTopology>();
+      held.set(session, { workspaces: parsed.workspaces, tabs: parsed.tabs, at: this.now() });
+      this.topologies.set(link.memberId, held);
+      return null;
+    } catch (err) {
+      return err instanceof Error ? err.message : String(err);
+    }
+  }
+
+  /** One journal line per change of a session's topology fetch, failing or answering again. */
+  private noteTopologyResult(memberId: string, session: string, failure: string | null): void {
+    const failing = this.topologyFailing.get(memberId) ?? new Set<string>();
+    if (failure === null) {
+      if (!failing.delete(session)) return;
+      if (failing.size === 0) this.topologyFailing.delete(memberId);
+      this.log(`[crew] ${memberId}: session "${session}" spaces and tabs answer again`);
+      return;
+    }
+    if (failing.has(session)) return;
+    failing.add(session);
+    this.topologyFailing.set(memberId, failing);
+    this.log(
+      `[crew] ${memberId}: could not fetch session "${session}" spaces and tabs (${failure}); serving the last good ones, else the primary session's`,
+    );
   }
 }

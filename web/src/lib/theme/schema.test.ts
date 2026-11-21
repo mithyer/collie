@@ -11,6 +11,7 @@ import {
   setsOptionalToken,
   SHIPPED_THEME_IDS,
   THEME_TOKENS,
+  CHARACTER_MOTIONS,
   THEME_VERSION,
   THEME_VERSIONS_READ,
   ANSI_BRIGHT_LUMINANCE,
@@ -35,6 +36,7 @@ import {
   type Theme,
 } from "./schema";
 import { GLYPH_SET_IDS } from "../glyph-sets";
+import { resolveMarkId } from "../mark";
 import { MARK_IDS } from "../mark-ids";
 import {
   ANSI_KEYS,
@@ -74,7 +76,7 @@ describe("the token list", () => {
     expect(new Set(THEME_TOKENS).size).toBe(43);
     expect(THEME_TOKENS).not.toContain("popover");
     expect(THEME_TOKENS).not.toContain("radius");
-    expect(THEME_VERSION).toBe(4);
+    expect(THEME_VERSION).toBe(5);
     expect(SHIPPED_THEME_IDS).toEqual(["collie", "nightwatch", "daylight", "harbour"]);
   });
 });
@@ -169,10 +171,10 @@ describe("parseTheme", () => {
   });
 
   it("names an unknown version", () => {
-    const r = refusals(parseTheme(file({ version: 5 }), CAP));
+    const r = refusals(parseTheme(file({ version: 6 }), CAP));
     expect(r.map((x) => x.code)).toEqual(["version"]);
-    expect(r[0]?.detail).toContain("version 5");
-    expect(r[0]?.detail).toContain("reads version 1, 2, 3 and 4");
+    expect(r[0]?.detail).toContain("version 6");
+    expect(r[0]?.detail).toContain("reads version 1, 2, 3, 4 and 5");
     expect(codes(parseTheme(file({ version: "1" }), CAP))).toEqual(["version version"]);
   });
 
@@ -320,7 +322,7 @@ describe("parseTheme", () => {
 
   it("collects every refusal in one pass", () => {
     const raw = JSON.stringify({
-      version: 5,
+      version: 6,
       id: "Bad Id",
       name: "",
       author: 4,
@@ -602,8 +604,8 @@ function v2(extra: JsonObject): string {
 }
 
 describe("versions", () => {
-  it("reads versions 1, 2, 3 and 4, and hands back the lowest version that holds the content", () => {
-    expect(THEME_VERSIONS_READ).toEqual([1, 2, 3, 4]);
+  it("reads versions 1, 2, 3, 4 and 5, and hands back the lowest version that holds the content", () => {
+    expect(THEME_VERSIONS_READ).toEqual([1, 2, 3, 4, 5]);
     const one = parseTheme(file({}), CAP);
     const twoPlain = parseTheme(v2({}), CAP);
     const twoWithSurface = parseTheme(v2({ surface: { radius: "soft" } }), CAP);
@@ -892,7 +894,7 @@ describe("the ground and the band in the contrast report", () => {
   });
 });
 
-// ── Schema version 3: the optional tokens (pane-active, tab-active) ───────────────────────────
+// ── Schema version 3: the optional tokens (pane-active, tab-active, find) ───────────────────────────
 
 describe("the optional tokens", () => {
   const collie = parseTheme(read("src/themes/collie.json"), { ...CAP, allowReservedId: true });
@@ -900,9 +902,9 @@ describe("the optional tokens", () => {
   const base = collie.theme;
 
   it("are appended after the 43, so the order of every earlier file holds", () => {
-    expect(OPTIONAL_THEME_TOKENS).toEqual(["pane-active", "tab-active"]);
+    expect(OPTIONAL_THEME_TOKENS).toEqual(["pane-active", "tab-active", "find"]);
     expect(ALL_THEME_TOKENS.slice(0, 43)).toEqual([...THEME_TOKENS]);
-    expect(ALL_THEME_TOKENS).toHaveLength(45);
+    expect(ALL_THEME_TOKENS).toHaveLength(46);
   });
 
   it("are read from a version 3 file, and the theme is handed back as version 3", () => {
@@ -978,6 +980,24 @@ describe("the optional tokens", () => {
     expect(contrastReport(base, base).some((f) => f.check.startsWith("tab-active"))).toBe(true);
   });
 
+  it("reads find with an alpha from a version 3 file and refuses it in version 2", () => {
+    const ok = parseTheme(file({ version: 3, light: { find: "oklch(0.879 0.169 91.605 / 0.7)" } }), CAP);
+    expect(ok.ok && ok.theme.light?.find).toBe("oklch(0.879 0.169 91.605 / 0.7)");
+    expect(ok.ok && versionOf(ok.theme)).toBe(3);
+    expect(codes(parseTheme(file({ version: 2, dark: { find: "#ffcc00" } }), CAP))).toEqual(["version dark.find"]);
+  });
+
+  it("measures the page ink on the find ground over the page, only in a half that sets it", () => {
+    const theme: Theme = { version: 3, id: "a", name: "A", light: { find: "#1111118c" }, dark: { find: "oklch(0.769 0.188 70.08 / 0.4)" } };
+    const checks = contrastReport(theme, base).filter((f) => f.check === "foreground on find");
+    expect(checks.map((f) => `${f.half} ${f.floor}`).toSorted()).toEqual(["dark 4.5", "light 4.5"]);
+    expect(checks.find((f) => f.half === "dark")?.pass).toBe(true);
+    // the default pair of Collie's own file passes in both halves
+    const own = contrastReport(base, base).filter((f) => f.check === "foreground on find");
+    expect(own.map((f) => f.pass)).toEqual([true, true]);
+    expect(contrastReport({ version: 1, id: "a", name: "A", light: { background: "#ffffff" } }, base).some((f) => f.check === "foreground on find")).toBe(false);
+  });
+
   it("measures an optional token only in a half that sets it", () => {
     const theme: Theme = { version: 3, id: "a", name: "A", light: { "pane-active": "#fafafa" } };
     const checks = contrastReport(theme, base).filter((f) => f.check.startsWith("pane-active"));
@@ -987,11 +1007,58 @@ describe("the optional tokens", () => {
   });
 });
 
+// ── Schema version 5: whether the header character moves ───────────────────────────────────────────
+
+describe("the characterMotion key", () => {
+  it("is a closed list of two words, moves first", () => {
+    expect(CHARACTER_MOTIONS).toEqual(["moves", "still"]);
+  });
+
+  it.each(CHARACTER_MOTIONS)("reads %s from a version 5 file, and hands the theme back as version 5", (characterMotion) => {
+    const result = parseTheme(file({ version: 5, characterMotion }), CAP);
+    expect(result.ok && result.theme.characterMotion).toBe(characterMotion);
+    expect(result.ok && result.theme.version).toBe(5);
+    expect(result.ok && versionOf(result.theme)).toBe(5);
+  });
+
+  it("lifts a theme above one that sets a character", () => {
+    const result = parseTheme(file({ version: 5, character: "pixel", characterMotion: "still" }), CAP);
+    expect(result.ok && versionOf(result.theme)).toBe(5);
+  });
+
+  it("is refused in a file that says version 1 to 4, with the same words the character uses", () => {
+    for (const version of [1, 2, 3, 4]) {
+      const result = parseTheme(file({ version, characterMotion: "still" }), CAP);
+      expect(codes(result)).toEqual(["version characterMotion"]);
+      expect(refusals(result)[0]?.detail).toBe(`A file with "characterMotion" must say version 5. This one says version ${version}.`);
+    }
+  });
+
+  it.each([["Still"], ["off"], [""], [false], [0], [null], [["still"]]])("refuses %j and names the two words", (characterMotion) => {
+    const result = parseTheme(file({ version: 5, characterMotion }), CAP);
+    expect(codes(result)).toEqual(["character characterMotion"]);
+    expect(refusals(result)[0]?.detail).toBe('"characterMotion" must be one of: moves, still.');
+  });
+
+  it("is a known key: a file without it carries no key and keeps its lowest version", () => {
+    const plain = parseTheme(file({ version: 5 }), CAP);
+    expect(plain.ok && "characterMotion" in plain.theme).toBe(false);
+    expect(plain.ok && plain.theme.version).toBe(1);
+  });
+
+  it("round-trips: what a theme with it exports reads back the same", () => {
+    const result = parseTheme(file({ version: 5, characterMotion: "still" }), CAP);
+    if (!result.ok) throw new Error("refused");
+    const again = parseTheme(JSON.stringify(result.theme), CAP);
+    expect(again.ok && again.theme).toEqual(result.theme);
+  });
+});
+
 // ── Schema version 4: the header character ─────────────────────────────────────────────────────────
 
 describe("the character key", () => {
-  it("is a closed list of eight words, collie first", () => {
-    expect(MARK_IDS).toEqual(["collie", "kawaii", "kawaii-tilt", "pixel", "glass", "glass-front", "sheep", "owl"]);
+  it("is a closed list of ten words, collie first, then its two coats", () => {
+    expect(MARK_IDS).toEqual(["collie", "collie-collar", "collie-blaze", "kawaii", "kawaii-tilt", "pixel", "glass", "glass-front", "sheep", "owl"]);
   });
 
   it.each(MARK_IDS)("reads %s from a version 4 file, and hands the theme back as version 4", (character) => {
@@ -999,6 +1066,14 @@ describe("the character key", () => {
     expect(result.ok && result.theme.character).toBe(character);
     expect(result.ok && result.theme.version).toBe(4);
     expect(result.ok && versionOf(result.theme)).toBe(4);
+  });
+
+  it("resolves a version 4 theme with character collie-blaze to collie-blaze, and the version stays 4", () => {
+    const result = parseTheme(file({ version: 4, character: "collie-blaze" }), CAP);
+    if (!result.ok) throw new Error("refused");
+    expect(knownCharacter(result.theme)).toBe("collie-blaze");
+    expect(resolveMarkId({ device: undefined, trial: null, active: result.theme })).toBe("collie-blaze");
+    expect(versionOf(result.theme)).toBe(4);
   });
 
   it("lifts a theme that sets a character above one that sets an optional token", () => {
@@ -1017,7 +1092,7 @@ describe("the character key", () => {
   it.each([["Kawaii"], ["kawaii_tilt"], ["Kawaii-Tilt"], [""], [3], [null], [["pixel"]], [{ id: "pixel" }]])("refuses %j as a character, and names the list", (character) => {
     const result = parseTheme(file({ version: 4, character }), CAP);
     expect(codes(result)).toEqual(["character character"]);
-    expect(refusals(result)[0]?.detail).toBe('"character" must be one of: collie, kawaii, kawaii-tilt, pixel, glass, glass-front, sheep, owl.');
+    expect(refusals(result)[0]?.detail).toBe('"character" must be one of: collie, collie-collar, collie-blaze, kawaii, kawaii-tilt, pixel, glass, glass-front, sheep, owl.');
   });
 
   it("reports the version and the word together, so one round trip fixes both", () => {
@@ -1302,7 +1377,7 @@ describe("a decoration word this Collie does not know", () => {
     ["an unknown word in the ground's word form", { version: 4, surface: { ground: "stars" } }, "surface surface.ground"],
     ["an unknown word of another surface part", { version: 2, surface: { radius: "blobby" } }, "surface surface.radius"],
     ["an unknown top-level key", { version: 4, icons: "tabler" }, "unknown-key icons"],
-    ["an unknown version", { version: 5, glyphs: "tabler" }, "version version"],
+    ["an unknown version", { version: 6, glyphs: "tabler" }, "version version"],
     ["a colour that is not one", { version: 4, glyphs: "tabler", light: { background: "papaya" } }, "value light.background"],
   ])("still refuses %s", (_what, extra, code) => {
     expect(codes(parseTheme(file(extra), CAP))).toEqual([code]);

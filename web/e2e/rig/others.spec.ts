@@ -16,8 +16,9 @@ import { randomUUID } from "node:crypto";
 import { chmodSync, existsSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
-import { devices, type Page } from "@playwright/test";
+import { devices, type Locator, type Page } from "@playwright/test";
 
+import { ARM_DWELL_MS } from "../../src/lib/arm";
 import { asJsonObject, asJsonString } from "../../src/lib/json";
 import { SETUPS, harnessDirs, type HarnessId } from "./harnesses";
 import {
@@ -284,10 +285,14 @@ for (const harness of ["pi", "omp"] as const) {
           await page.goto(`/pane/${encodeURIComponent(pane)}`);
           const loadOlder = page.getByRole("button", { name: message("chat.scrollback.loadOlder"), exact: true });
           await expect(loadOlder).toBeAttached({ timeout: 20_000 });
-          await loadOlder.scrollIntoViewIfNeeded();
-          const pin = page.getByRole("button", { name: new RegExp(`^${message("chat.pin.label")}:`) });
-          const row = await loadOlder.boundingBox();
-          const pinBox = (await pin.isVisible().catch(() => false)) ? await pin.boundingBox() : null;
+          await loadOlder.scrollIntoViewIfNeeded({ timeout: 10_000 });
+          // The pin by its slot, not by its "Your prompt:" name: while the reader moves it is a held or a
+          // reported prompt, or "Asked further back" (no such name), and it changes between two calls.
+          // Each box is read once and never waited for: a pin that unmounts between a visibility check
+          // and a box read made `boundingBox` wait for the whole test timeout (6 and 12 min, 2026-11-18).
+          const pin = page.locator('[data-slot="prompt-pin"]');
+          const row = await boxOf(loadOlder);
+          const pinBox = await boxOf(pin);
           const covered = row !== null && pinBox !== null && pinBox.y < row.y + row.height && row.y < pinBox.y + pinBox.height;
           // Nothing covers the row's centre: the tap lands on the Load older button itself.
           const hit =
@@ -312,9 +317,9 @@ for (const harness of ["pi", "omp"] as const) {
           // and the pin, shown now that the reader is below the first prompt, must not sit over it.
           await page.waitForTimeout(500);
           const rowAgain = (await loadOlder.count()) > 0;
-          if (rowAgain) await loadOlder.scrollIntoViewIfNeeded().catch(() => undefined);
-          const rowBox = rowAgain ? await loadOlder.boundingBox() : null;
-          const pinNow = (await pin.isVisible().catch(() => false)) ? await pin.boundingBox() : null;
+          if (rowAgain) await loadOlder.scrollIntoViewIfNeeded({ timeout: 5000 }).catch(() => undefined);
+          const rowBox = rowAgain ? await boxOf(loadOlder) : null;
+          const pinNow = await boxOf(pin);
           const coveredAfter = rowBox !== null && pinNow !== null && pinNow.y < rowBox.y + rowBox.height && rowBox.y < pinNow.y + pinNow.height;
           trail.notes.push(`after the tap: pin ${pinNow === null ? "not shown" : "shown"}, Load older row ${rowAgain ? (coveredAfter ? "covered by the pin" : "clear of the pin") : "gone (no older turns left)"}`);
           return { verdict: !covered && !coveredAfter && hit.includes(message("chat.scrollback.loadOlder")) && grew ? "pass" : "fail", taps: 1, minTaps: 1, note: trail.notes.join("; "), captures: trail.captures };
@@ -324,6 +329,11 @@ for (const harness of ["pi", "omp"] as const) {
       });
     });
   });
+}
+
+/** One read of an element's box, never a wait: an element that is gone reads `null` after a second. */
+function boxOf(locator: Locator) {
+  return locator.boundingBox({ timeout: 1000 }).catch(() => null);
 }
 
 /**
@@ -402,8 +412,22 @@ async function pickerByKeys(harness: HarnessId, plan: Plan, rig: Rig, page: Page
   const commits: TapLog[] = [];
   for (const key of plan.commitKeys) {
     const was = await rig.tail(pane, 40);
+    // While the unread-dialog card shows, the pad's Enter asks a second tap (0821f50be), and a second tap inside
+    // ARM_DWELL_MS keeps the arm and sends nothing: tap, wait past the dwell, tap the armed key. With no card (pi on
+    // herdr-core reads its screen), Enter is one tap.
+    const cardShows =
+      key === "Enter" &&
+      (await page
+        .getByRole("group", { name: message("unreadDialog.caption") })
+        .isVisible()
+        .catch(() => false));
+    if (cardShows) {
+      log.push(await tap(recorder, page.getByRole("button", { name: key, exact: true }).last(), `Keys: ${key} (arm)`, { expectAnswer: false }));
+      await page.waitForTimeout(ARM_DWELL_MS + 100);
+    }
+    const target = cardShows ? page.getByRole("button", { name: message("keys.pad.tapAgain", { key }), exact: true }).last() : page.getByRole("button", { name: key, exact: true }).last();
     // `.last()`: the unread-dialog card carries an Esc of its own above the Keys board.
-    const t = await tap(recorder, page.getByRole("button", { name: key, exact: true }).last(), `Keys: ${key} (commit)`);
+    const t = await tap(recorder, target, `Keys: ${key} (commit)`);
     log.push(t);
     commits.push(t);
     const moved = (await rig.until(() => rig.tail(pane, 40), (text) => text !== was, 4000)) !== null;

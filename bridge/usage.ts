@@ -4,22 +4,25 @@
 // ── WHERE THE NUMBERS COME FROM ───────────────────────────────────────────────────────────────────
 //
 // Claude Code hands its statusLine command a JSON document on every assistant message: the context
-// window's `used_percentage`, and for a Pro or Max account the 5-hour and 7-day `rate_limits`. Collie
-// holds no model key and reads no credential, so it does not ask the vendor for these. It asks the
-// agent: `collie hooks install claude` wraps the operator's OWN statusLine command, and the wrapper
-// (`collie beacon statusline`, cli/statusline.ts) writes the three numbers to one small file here
-// before it runs the operator's command and passes its output through untouched. Since 2026-10-24 the
-// context number also comes from the session transcript through the beacon hooks, with no statusLine
-// (`cli/context-reading.ts`), and the wrap is opt-in. Since 2026-10-24 the 5-hour and 7-day windows
-// come first from the vendor's usage endpoint with the operator's own login (bridge/account-windows.ts,
-// .adr/0118); a wrapped statusLine is the second road.
+// window's `used_percentage`, and for a Pro or Max account its `rate_limits`. Collie holds no model
+// key, so for these numbers it asks the agent and not the vendor: `collie hooks install claude` wraps the operator's OWN statusLine command (by default since
+// 2026-11-13), and the wrapper (`collie beacon statusline`, cli/statusline.ts) writes the numbers to
+// one small file here before it runs the operator's command and passes its output through untouched.
+// Since 2026-10-24 the context number also comes from the session transcript through the beacon hooks
+// (`cli/context-reading.ts`), and since 2026-11-13 always against the window size the wrapped
+// statusLine stated. With no wrap (none on Windows, none where no statusLine is configured, or the
+// operator said `--no-statusline`) nothing states the window, and the session shows its token count.
+// The account windows are a separate road. Since 2026-10-24 they come first from the vendor's usage
+// endpoint, asked with the login the harness keeps on this machine, read for one request and never
+// stored (bridge/account-windows.ts, .adr/0118); a wrapped statusLine is the second road.
 //
 // OTHER HARNESSES WRITE NO FILE, so since 2026-10-25 their context comes from the journal: the cache
 // probe that already reads the session log for the prompt-cache chip also names the tokens the last
 // turn carried and, where it can, the model's window (bridge/cache/tracker.ts § context). Codex's log
 // names the window itself; pi, Oh My Pi and OpenCode take it from the harness's own model catalog on
-// disk (bridge/journal/model-window.ts). No window, no context: a model no catalog names has no
-// context dot, and the model label still draws. A usage file's context, where one exists, wins.
+// disk (bridge/journal/model-window.ts). No window, no percentage: since 2026-11-13 a model no catalog
+// names shows the token count alone (`contextTokens`), as a Claude session with no stated window does.
+// A usage file's context, where one exists, wins.
 //
 // ONE FILE PER SESSION, named by a digest of the harness session id, never by the pane: the pane
 // already knows its session (`agentSession`, from Herdr or the beacon), and a session id cannot be
@@ -30,8 +33,8 @@
 //
 // Numbers only, plus an optional absolute `configDir` that scopes which local Claude credential
 // directory `AccountWindows` polls for that session (`configDir` is never sent in `usageAt`). The
-// record carries no text the phone draws: the window labels are the bridge's own
-// (`5h`, `7d`), a percentage is clamped to 0 to 100, and anything else in the file is ignored. A file
+// record carries no free text the phone draws: a window's key and label are cleaned and capped, and
+// since 2026-11-15 they are the harness's own words (`7d:opus`, `Opus`), not a fixed pair; a percentage is clamped to 0 to 100, and anything else in the file is ignored. A file
 // that does not parse, is too large or is from a newer schema is ABSENT, and an absent reading draws
 // nothing. A window whose `resetsAt` has passed is dropped, as Claude Code drops it: the number
 // belonged to a window that is over.
@@ -46,6 +49,7 @@ import { isAbsolute, join } from "node:path";
 import { asJsonNumber, asJsonObject, asJsonString, parseJsonObject } from "../web/src/lib/json.ts";
 import type { JsonValue } from "./json.ts";
 import type { AgentView } from "./types.ts";
+import type { UsageSeen } from "./usage-seen.ts";
 
 /** The directory's name under the state dir, beside `beacons/`. */
 export const USAGE_SUBDIR = "usage";
@@ -64,17 +68,87 @@ export const USAGE_MAX_AGE_MS = 8 * 24 * 60 * 60 * 1000;
 /** How many files the directory may hold before the oldest go, whatever their age. */
 export const USAGE_FILES_MAX = 512;
 
-/** The subscription windows, by the label the phone draws. The bridge's words, never the file's. */
-export const USAGE_WINDOWS = ["5h", "7d"] as const;
-export type UsageWindow = (typeof USAGE_WINDOWS)[number];
+/** The five-hour window's key. Its meaning never changes: an older crew member sends it, and the phone words it. */
+export const WINDOW_5H = "5h";
+/** The seven-day window's key, as {@link WINDOW_5H}. */
+export const WINDOW_7D = "7d";
+/** The prefix of a weekly window scoped to a model: `7d:opus`. */
+const SCOPED_PREFIX = `${WINDOW_7D}:`;
 
-/** One subscription window's reading. */
+/** The most windows one reading holds. A strange answer does not fill the tag. */
+export const READING_WINDOWS_MAX = 8;
+/** The longest window key or label a reading carries. */
+const WINDOW_TEXT_MAX = 64;
+
+/**
+ * One subscription window's reading. `window` is the harness's own window as an open string (no closed
+ * list, since 2026-11-15): `5h` and `7d` keep their meaning, `7d:<scope>` is a weekly window scoped to a
+ * model, a length such as `30d` is a window of another length, and `spend` is a gateway spend limit. The
+ * field keeps its name because an older crew member sends it and an older phone reads it: that phone
+ * skips a key it does not know.
+ */
 export interface UsageLimit {
-  window: UsageWindow;
+  window: string;
   /** Percent of the window used, 0 to 100. */
   used: number;
   /** When the window resets, epoch ms. Absent when the harness did not say. */
   resetsAt?: number;
+  /** The harness's own name for a scoped window (`Opus`), cleaned. Absent when it has none. */
+  label?: string;
+}
+
+/** Text from a reading, made safe to draw: control characters out, trimmed, at most 64 characters. Undefined when nothing is left. */
+export function cleanWindowText(text: string): string | undefined {
+  // SAFETY: the class is control characters on purpose; text from the wire must not carry them.
+  // eslint-disable-next-line no-control-regex
+  const clean = text.replace(/[\u0000-\u001f\u007f]/g, "").trim().slice(0, WINDOW_TEXT_MAX);
+  return clean === "" ? undefined : clean;
+}
+
+/** A window key as a record may hold it: a non-empty string, cleaned, at most 64 characters. */
+export function asWindowKey(value: JsonValue | undefined): string | undefined {
+  const text = asJsonString(value);
+  return text === undefined ? undefined : cleanWindowText(text);
+}
+
+/** The key of a weekly window scoped to the model the vendor names `label`: `7d:` and the label in lower case, spaces as `-`. */
+export function scopedWindowKey(label: string): string {
+  const scope = label.toLowerCase().replace(/\s+/g, "-");
+  return `${SCOPED_PREFIX}${scope}`.slice(0, WINDOW_TEXT_MAX);
+}
+
+/** One window's reading, with `resetsAt` and `label` present only when given (an absent key, never `undefined`). */
+export function makeLimit(window: string, used: number, resetsAt?: number, label?: string): UsageLimit {
+  const limit: UsageLimit = { window, used };
+  if (resetsAt !== undefined) limit.resetsAt = resetsAt;
+  if (label !== undefined) limit.label = label;
+  return limit;
+}
+
+/** How a window is sorted: `5h`, then `7d`, then the rest. */
+function windowRank(window: string): number {
+  return window === WINDOW_5H ? 0 : window === WINDOW_7D ? 1 : 2;
+}
+
+/** The name a window sorts by within the rest: its label, else its key. */
+function windowName(limit: UsageLimit): string {
+  return (limit.label ?? limit.window).toLowerCase();
+}
+
+/**
+ * A reading's windows in the order they are drawn: `5h`, `7d`, then the rest by label (else key), with a
+ * key seen twice kept once (the first) and at most {@link READING_WINDOWS_MAX}.
+ */
+export function orderedLimits(limits: readonly UsageLimit[]): UsageLimit[] {
+  const seen = new Set<string>();
+  const unique = limits.filter((limit) => {
+    if (seen.has(limit.window)) return false;
+    seen.add(limit.window);
+    return true;
+  });
+  return unique
+    .toSorted((a, b) => windowRank(a.window) - windowRank(b.window) || windowName(a).localeCompare(windowName(b)) || a.window.localeCompare(b.window))
+    .slice(0, READING_WINDOWS_MAX);
 }
 
 /**
@@ -82,9 +156,16 @@ export interface UsageLimit {
  * when the harness did not report it. A pane whose harness reports nothing carries no `usage` key.
  */
 export interface PaneUsage {
-  /** Percent of the context window used, 0 to 100. */
+  /** Percent of the context window used, 0 to 100. Only where the harness stated the window. */
   context?: number;
-  /** The windows still running, in {@link USAGE_WINDOWS} order. Absent rather than empty. */
+  /**
+   * The tokens in the context: input, cache creation and cache read of the newest request, as the
+   * harness counts its own context share. The phone draws it in place of {@link context} when that is
+   * absent, because no window was stated to divide by (.adr/0115, amended 2026-11-13). Absent when
+   * unknown, never a placeholder.
+   */
+  contextTokens?: number;
+  /** The windows still running, in {@link orderedLimits} order. Absent rather than empty. */
   limits?: UsageLimit[];
   /**
    * The running total of what the session this pane shows has cost, in US dollars (never a count of
@@ -107,11 +188,19 @@ export interface UsageRecord extends PaneUsage {
   /** Epoch ms of the write; with kept `limits`, of the write that reported them. */
   at: number;
   /**
-   * The session's context window in tokens, as its SessionStart hook said (`cli/context-reading.ts`).
-   * A writer's note to the next writer, never drawn: {@link usageAt} leaves it out. Absent when the
-   * start named no model, and then the transcript reading writes no context.
+   * The session's context window in tokens, as Claude Code's statusLine document states it
+   * (`context_window.context_window_size`), the only window the transcript reading divides by
+   * (`cli/context-reading.ts`). A writer's note to the next writer, never drawn: {@link usageAt} leaves
+   * it out. Absent when no wrapped statusLine has run, and then the transcript reading writes no context.
    */
   window?: number;
+  /**
+   * Who gave {@link window}: always {@link WINDOW_BY_STATUSLINE}. Builds before 2026-11-13 also wrote a
+   * window from a table of model ids (`opus`, `fable`, `other`) or none at all, and those windows were
+   * wrong (a 1M session read against 400k or 200k): {@link parseUsageRecord} drops such a window and the
+   * context counted against it. A writer's note, never drawn.
+   */
+  windowBy?: string;
   /**
    * The non-default `CLAUDE_CONFIG_DIR` this session runs under, as its hooks or statusLine reported.
    * A note for the bridge to align account windows and statusLine limits per account; {@link usageAt}
@@ -122,6 +211,21 @@ export interface UsageRecord extends PaneUsage {
 
 /** The largest window a record may name. A bound on a strange file, not a model's window. */
 const WINDOW_MAX = 100_000_000;
+
+/** `windowBy` of a window the statusLine document stated. */
+export const WINDOW_BY_STATUSLINE = "statusline";
+
+/** A token count as a record may hold it: a whole number of tokens, zero or more, within the window bound. */
+export function asTokenCount(value: JsonValue | undefined): number | undefined {
+  const n = asJsonNumber(value);
+  return n !== undefined && Number.isInteger(n) && n >= 0 && n <= WINDOW_MAX ? n : undefined;
+}
+
+/** A window size as a record may hold it: a whole positive number of tokens within the bound. */
+export function asWindowSize(value: JsonValue | undefined): number | undefined {
+  const n = asJsonNumber(value);
+  return n !== undefined && Number.isInteger(n) && n > 0 && n <= WINDOW_MAX ? n : undefined;
+}
 
 function hasControlChar(text: string): boolean {
   for (let i = 0; i < text.length; i++) {
@@ -193,26 +297,37 @@ export function parseUsageRecord(text: string): UsageRecord | null {
   const harness = asJsonString(root.harness);
   if (at === undefined || harness === undefined) return null;
   const record: UsageRecord = { schemaVersion: USAGE_SCHEMA_VERSION, harness: harness.slice(0, 32), at };
+  // A window the statusLine did not state came from an older build's guess, and so did the context
+  // counted against it: neither is kept. A context with no window at all is the statusLine's own percent.
+  const guessed = root.window !== undefined && asJsonString(root.windowBy) !== WINDOW_BY_STATUSLINE;
   const context = asPercent(root.context);
-  if (context !== undefined) record.context = context;
+  if (context !== undefined && !guessed) record.context = context;
+  // The count stands on its own: no window was needed to take it.
+  const tokens = asTokenCount(root.contextTokens);
+  if (tokens !== undefined) record.contextTokens = tokens;
   const cost = asCost(root.cost);
   if (cost !== undefined) record.cost = cost;
-  const size = asJsonNumber(root.window);
-  if (size !== undefined && Number.isInteger(size) && size > 0 && size <= WINDOW_MAX) record.window = size;
+  const size = asWindowSize(root.window);
+  if (size !== undefined && !guessed) {
+    record.window = size;
+    record.windowBy = WINDOW_BY_STATUSLINE;
+  }
   const dir = asJsonString(root.configDir);
   if (dir !== undefined && dir.length <= 4096 && !hasControlChar(dir) && isAbsolute(dir)) {
     record.configDir = dir;
   }
   const rows = Array.isArray(root.limits) ? root.limits.map(asJsonObject) : [];
   const limits: UsageLimit[] = [];
-  for (const window of USAGE_WINDOWS) {
-    const entry = rows.find((row) => row !== undefined && asJsonString(row.window) === window);
-    const used = asPercent(entry?.used);
-    if (entry === undefined || used === undefined) continue;
-    const resetsAt = asEpochMs(entry.resetsAt);
-    limits.push(resetsAt === undefined ? { window, used } : { window, used, resetsAt });
+  for (const row of rows) {
+    const window = asWindowKey(row?.window);
+    const used = asPercent(row?.used);
+    if (row === undefined || window === undefined || used === undefined) continue;
+    const resetsAt = asEpochMs(row.resetsAt);
+    const labelText = asJsonString(row.label);
+    limits.push(makeLimit(window, used, resetsAt, labelText === undefined ? undefined : cleanWindowText(labelText)));
   }
-  if (limits.length > 0) record.limits = limits;
+  const ordered = orderedLimits(limits);
+  if (ordered.length > 0) record.limits = ordered;
   return record;
 }
 
@@ -223,10 +338,16 @@ export function parseUsageRecord(text: string): UsageRecord | null {
 export function usageAt(record: UsageRecord, now: number): PaneUsage | undefined {
   const usage: PaneUsage = {};
   if (record.context !== undefined) usage.context = record.context;
+  if (record.contextTokens !== undefined) usage.contextTokens = record.contextTokens;
   const limits = (record.limits ?? []).filter((limit) => limit.resetsAt === undefined || limit.resetsAt > now);
   if (limits.length > 0) usage.limits = limits;
   if (record.cost !== undefined) usage.cost = record.cost;
-  return usage.context === undefined && usage.limits === undefined && usage.cost === undefined ? undefined : usage;
+  return hasReading(usage) ? usage : undefined;
+}
+
+/** Whether a reading holds anything the phone draws. */
+function hasReading(usage: PaneUsage): boolean {
+  return usage.context !== undefined || usage.contextTokens !== undefined || usage.limits !== undefined || usage.cost !== undefined;
 }
 
 /** The disk, as the tracker needs it. A seam, so the rules are testable with no temp files. */
@@ -291,6 +412,19 @@ export interface JournalContext {
   cost?(sessionKey: string): number | undefined;
 }
 
+/** The windows {@link UsageTracker} takes from the held records, and when the newest of those records was written. */
+interface NewestLimits {
+  limits: UsageLimit[];
+  at: number | undefined;
+}
+
+/**
+ * The folder of the added account a pane runs under (bridge/accounts-routes.ts `folderOf`), cleaned, or
+ * undefined for the Default and for a pane that reported a folder no account holds. `scope` is the
+ * mux session's name, as the launch note is keyed. A seam, so usage needs no accounts code.
+ */
+export type PaneAccountFolder = (pane: AgentView, scope: string) => string | undefined;
+
 /** How often the directory is swept for old files. */
 const PRUNE_EVERY_MS = 60 * 60 * 1000;
 
@@ -307,6 +441,8 @@ export class UsageTracker {
   private readonly held = new Map<string, Held>();
   /** The session ids each mux session's last poll named, so one session's poll forgets only its own. */
   private readonly scopes = new Map<string, Set<string>>();
+  /** The harnesses each mux session's last refresh named folders for, so a harness whose last pane left is told so. */
+  private readonly folderScopes = new Map<string, Set<string>>();
   private lastPrune = 0;
 
   constructor(
@@ -315,7 +451,18 @@ export class UsageTracker {
     private readonly now: () => number = Date.now,
     private readonly account?: AccountLimits,
     private readonly journal?: JournalContext,
+    private readonly seen?: UsageSeen,
+    private readonly accountFolder?: PaneAccountFolder,
   ) {}
+
+  /**
+   * The config folder a pane runs under: the one its session reported, else the folder of the pane's
+   * added account (a pane started with an account whose agent has not reported, or never does).
+   * Undefined is the default folder.
+   */
+  private folderOf(pane: AgentView, record: UsageRecord | null | undefined, scope: string): string | undefined {
+    return record?.configDir ?? this.accountFolder?.(pane, scope);
+  }
 
   /** The session id a pane's usage is keyed by, or null for a pane with no id-kind session. */
   private static sessionOf(pane: AgentView): string | null {
@@ -350,13 +497,36 @@ export class UsageTracker {
         this.held.set(session, { mtime, record: text === null ? null : parseUsageRecord(text) });
       }),
     );
-    const claudeDirs = new Set<string>();
-    for (const session of sessions) {
-      const record = this.held.get(session)?.record;
-      if (record?.harness === "claude" && record.configDir !== undefined) claudeDirs.add(record.configDir);
-    }
-    this.account?.observeConfigDirs?.("claude", claudeDirs, scope);
+    this.observeFolders(panes, scope);
     await this.prune();
+  }
+
+  /**
+   * Tell the account windows which non-default folders have live panes in `scope`, per harness, so an
+   * added account's windows are asked for and a closed one's stop. Every harness with an agent pane
+   * here is named, with an empty set when none of its panes runs under another folder, and so is every
+   * harness named last time whose panes have all gone: its empty set is what stops a closed folder.
+   */
+  private observeFolders(panes: readonly AgentView[], scope: string): void {
+    const observe = this.account?.observeConfigDirs?.bind(this.account);
+    if (observe === undefined) return;
+    const byHarness = new Map<string, Set<string>>();
+    for (const name of this.folderScopes.get(scope) ?? []) byHarness.set(name, new Set());
+    const withPanes = new Set<string>();
+    for (const pane of panes) {
+      if (pane.kind === "shell") continue;
+      const session = UsageTracker.sessionOf(pane);
+      const record = session === null ? null : (this.held.get(session)?.record ?? null);
+      const harness = pane.agent || record?.harness;
+      if (harness === undefined || harness === "") continue;
+      withPanes.add(harness);
+      const dirs = byHarness.get(harness) ?? new Set<string>();
+      byHarness.set(harness, dirs);
+      const dir = this.folderOf(pane, record, scope);
+      if (dir !== undefined) dirs.add(dir);
+    }
+    this.folderScopes.set(scope, withPanes);
+    for (const [harness, dirs] of byHarness) observe(harness, dirs, scope);
   }
 
   /**
@@ -375,39 +545,44 @@ export class UsageTracker {
    * and the window (pi, OMP, Codex, OpenCode; .adr/0115 amended 2026-10-25). The cost follows the
    * same rule: the file's (Claude's statusLine), else the journal's sum (pi, OMP, OpenCode).
    */
-  get(pane: AgentView): PaneUsage | undefined {
+  get(pane: AgentView, scope = ""): PaneUsage | undefined {
     const session = UsageTracker.sessionOf(pane);
     const record = session === null ? null : (this.held.get(session)?.record ?? null);
     const now = this.now();
     const harness = pane.kind === "shell" ? undefined : pane.agent || record?.harness;
     // The journal fills what the usage file leaves out: the file's own context and cost win.
-    const overlay: PaneUsage = {};
-    const journalContext = record?.context === undefined ? this.journalContext(pane) : undefined;
-    if (journalContext !== undefined) overlay.context = journalContext;
+    const overlay: PaneUsage = record?.context === undefined && record?.contextTokens === undefined ? this.journalContext(pane) : {};
     const journalCost = record?.cost === undefined ? this.journalCost(pane) : undefined;
     if (journalCost !== undefined) overlay.cost = journalCost;
-    const configDir = record?.configDir;
+    const configDir = harness === undefined || harness === "" ? record?.configDir : this.folderOf(pane, record, scope);
     const account = harness === undefined || harness === "" ? undefined : this.account?.limits(harness, configDir);
     if (account !== undefined && account.length > 0) {
       const base: UsageRecord = record ?? { schemaVersion: USAGE_SCHEMA_VERSION, harness: harness ?? "", at: now };
+      this.seen?.record(base.harness, configDir, account, now);
       return usageAt({ ...base, ...overlay, limits: account }, now);
     }
-    if (record === null) return overlay.context === undefined && overlay.cost === undefined ? undefined : overlay;
-    const held = record.limits === undefined ? record : { ...record, limits: this.newestLimits(record.harness, now, configDir) };
-    return usageAt({ ...held, ...overlay }, now);
+    if (record === null) return hasReading(overlay) ? overlay : undefined;
+    if (record.limits === undefined) return usageAt({ ...record, ...overlay }, now);
+    const newest = this.newestLimits(record.harness, now, configDir);
+    if (newest.at !== undefined) this.seen?.record(record.harness, configDir, newest.limits, newest.at);
+    return usageAt({ ...record, ...overlay, limits: newest.limits }, now);
   }
 
   /**
-   * The pane's context from the journal, as a percentage, or undefined: no reading, no window, or a
-   * shell pane. Keyed by the session ref's value of either kind, as the cache chip is.
+   * The pane's context from the journal: a percentage when the log or the catalog named the window,
+   * else the token count alone; nothing with no reading or for a shell pane. Keyed by the session
+   * ref's value of either kind, as the cache chip is.
    */
-  private journalContext(pane: AgentView): number | undefined {
-    if (this.journal === undefined || pane.kind === "shell") return undefined;
+  private journalContext(pane: AgentView): PaneUsage {
+    if (this.journal === undefined || pane.kind === "shell") return {};
     const key = pane.agentSession?.value;
-    if (key === undefined || key === "") return undefined;
+    if (key === undefined || key === "") return {};
     const reading = this.journal.context(key);
-    if (reading?.window === undefined || reading.window <= 0) return undefined;
-    return contextPercent(reading.tokens, reading.window);
+    if (reading === undefined) return {};
+    const tokens = asTokenCount(Math.round(reading.tokens));
+    const overlay: PaneUsage = tokens === undefined ? {} : { contextTokens: tokens };
+    if (reading.window !== undefined && reading.window > 0) overlay.context = contextPercent(reading.tokens, reading.window);
+    return overlay;
   }
 
   /** The pane's session cost from the journal, in dollars, or undefined: none summed, or a shell pane. */
@@ -418,9 +593,12 @@ export class UsageTracker {
     return this.journal.cost(key);
   }
 
-  /** Per window, the limit from the newest held record of `harness` and `configDir` that carries it unexpired. */
-  private newestLimits(harness: string, now: number, configDir?: string): UsageLimit[] {
-    const newest = new Map<UsageWindow, { at: number; limit: UsageLimit }>();
+  /**
+   * Per window, the limit from the newest held record of `harness` and `configDir` that carries it
+   * unexpired, and when the newest of those records was written (undefined with no window).
+   */
+  private newestLimits(harness: string, now: number, configDir?: string): NewestLimits {
+    const newest = new Map<string, { at: number; limit: UsageLimit }>();
     for (const { record } of this.held.values()) {
       if (record === null || record.harness !== harness || record.configDir !== configDir) continue;
       for (const limit of record.limits ?? []) {
@@ -429,10 +607,8 @@ export class UsageTracker {
         if (best === undefined || record.at > best.at) newest.set(limit.window, { at: record.at, limit });
       }
     }
-    return USAGE_WINDOWS.flatMap((window) => {
-      const best = newest.get(window);
-      return best === undefined ? [] : [best.limit];
-    });
+    const best = [...newest.values()];
+    return { limits: orderedLimits(best.map((entry) => entry.limit)), at: best.length === 0 ? undefined : Math.max(...best.map((entry) => entry.at)) };
   }
 
   /** Remove readings past {@link USAGE_MAX_AGE_MS}, then the oldest past {@link USAGE_FILES_MAX}. */
@@ -454,5 +630,28 @@ export class UsageTracker {
         // A file that will not go is tried again at the next sweep.
       }
     }
+  }
+
+  // ── Accounts (M101): the config folder a session reported, for the account tag and found folders ──
+
+  /**
+   * The config folder the pane's session reported, raw: a string for a non-default folder, `null` when
+   * the session's record names none (the default), `undefined` when no record is held for it yet.
+   */
+  reportedConfigDir(pane: AgentView): string | null | undefined {
+    const session = UsageTracker.sessionOf(pane);
+    const record = session === null ? undefined : this.held.get(session)?.record;
+    if (record === undefined || record === null) return undefined;
+    return record.configDir ?? null;
+  }
+
+  /** Every non-default config folder a held session reported, raw, with its harness. */
+  reportedConfigDirs(): { harness: string; dir: string }[] {
+    const out: { harness: string; dir: string }[] = [];
+    for (const { record } of this.held.values()) {
+      if (record?.configDir === undefined) continue;
+      if (!out.some((r) => r.harness === record.harness && r.dir === record.configDir)) out.push({ harness: record.harness, dir: record.configDir });
+    }
+    return out;
   }
 }

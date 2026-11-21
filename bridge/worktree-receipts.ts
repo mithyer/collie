@@ -7,8 +7,9 @@ import type { WorktreeCreateResponse } from "./types.ts";
 
 // ── One receipt per phone request, so a retried create never makes a second worktree (ADR 0089) ──
 //
-// A worktree create can take a minute: Herdr runs `git worktree add`, opens a workspace, and the
-// bridge may then wait for the new shell and type a launcher into it. A phone on a train loses that
+// A worktree create can take a minute: the bridge runs `git worktree add` (bridge/worktree-add.ts, ADR
+// 0126), asks the multiplexer to open the folder as a space, and may then wait for the new shell and
+// type a launcher into it. A phone on a train loses that
 // reply all the time. The operator taps again, and without a receipt the second tap is a second
 // worktree on a second branch, or a refusal because the path is taken, while the first one sits
 // there unseen.
@@ -116,6 +117,15 @@ export interface ReceiptSurface<R extends { requestId: string }, A> {
   inflight(requestId: string): Promise<A> | undefined;
   /** Mark `answer` as the request in flight for `requestId` until it settles. */
   track(requestId: string, answer: Promise<A>): void;
+}
+
+/**
+ * A surface that can also take a receipt back out. A route that writes a receipt BEFORE it acts
+ * (a launch, M100 spec 04) forgets it when the act did not happen, so the same id may run again.
+ */
+export interface ForgettingReceiptSurface<R extends { requestId: string }, A> extends ReceiptSurface<R, A> {
+  /** Take the receipt under `requestId` out. A receipt that is not there is nothing to do. */
+  forget(requestId: string): Promise<void>;
 }
 
 /** What the worktree route needs of the store. `bridge/server.ts` holds this, never the class. */
@@ -284,6 +294,37 @@ export class ReceiptFileStore<R extends { requestId: string }, A> implements Rec
     this.running.track(requestId, answer);
   }
 
+  /** Take one receipt out, and write the file when there was one. Never throws, as {@link record} does not. */
+  async forget(requestId: string): Promise<void> {
+    if (this.get(requestId) === undefined) return;
+    this.receipts = this.receipts.filter((r) => r.requestId !== requestId);
+    try {
+      await this.save();
+    } catch (err) {
+      this.warn(`[${this.tag}] could not save ${this.file}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  /**
+   * Change receipts in place: `change` answers the receipt to keep for each one, and the file is written
+   * only when one of them changed. Returns how many did. Never throws.
+   */
+  async amend(change: (receipt: R) => R): Promise<number> {
+    let changed = 0;
+    this.receipts = this.receipts.map((receipt) => {
+      const next = change(receipt);
+      if (next !== receipt) changed += 1;
+      return next;
+    });
+    if (changed === 0) return 0;
+    try {
+      await this.save();
+    } catch (err) {
+      this.warn(`[${this.tag}] could not save ${this.file}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    return changed;
+  }
+
   /** Queue one write of whatever the list holds when its turn comes. */
   private save(): Promise<void> {
     const run = this.queue.then(() => this.write());
@@ -310,7 +351,7 @@ export class WorktreeReceiptStore extends ReceiptFileStore<WorktreeReceipt, Work
  * A store with no file: the default when the server is built without one, which is every test that
  * builds a server by hand. Replays work for the life of the process and are lost on restart.
  */
-export function memoryReceipts<R extends { requestId: string }, A>(): ReceiptSurface<R, A> {
+export function memoryReceipts<R extends { requestId: string }, A>(): ForgettingReceiptSurface<R, A> {
   let receipts: R[] = [];
   const running = new Inflight<A>();
   return {
@@ -321,6 +362,10 @@ export function memoryReceipts<R extends { requestId: string }, A>(): ReceiptSur
     },
     inflight: (requestId) => running.get(requestId),
     track: (requestId, answer) => running.track(requestId, answer),
+    forget: (requestId) => {
+      receipts = receipts.filter((r) => r.requestId !== requestId);
+      return Promise.resolve();
+    },
   };
 }
 

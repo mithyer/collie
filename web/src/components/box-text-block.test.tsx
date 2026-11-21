@@ -1,9 +1,14 @@
-import { act, render, screen, within } from "@testing-library/react";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 
 import { BoxTextBlock } from "@/components/box-text-block";
 import type { BoxTextModel } from "@/lib/blocks";
+import { detectSignInCard } from "@/lib/harness/sign-in-card";
+import { idleFor, rowsOf } from "@/test/surface-corpus";
 
 const DEVICE = "https://example.awsapps.com/start/#/device";
 const CODED = "https://example.awsapps.com/start/#/device?user_code=ABCD-EFGH";
@@ -110,6 +115,19 @@ describe("BoxTextBlock", () => {
     expect(screen.getByText(/<b>bold<\/b> javascript:alert\(1\)/u)).toBeInTheDocument();
   });
 
+  it("links an https address and a loopback http one; any other plain-http address stays text", () => {
+    const loopback = ["http://localhost:54545/launch", "http://127.0.0.1:8080/cb", "http://[::1]:9/x"];
+    const remote = "http://example.com/login";
+    const mixed: BoxTextModel = {
+      title: "Login",
+      phase: "filled",
+      text: [...loopback.map((address) => [plain("Or open "), link(address)]), [link(remote)], [link(CODED)]],
+    };
+    render(<BoxTextBlock boxText={mixed} />);
+    expect(screen.getAllByRole("link").map((a) => a.getAttribute("href"))).toEqual([...loopback, CODED]);
+    expect(screen.getByText(remote)).toBeInTheDocument();
+  });
+
   it("shows the box's printed title and the waiting line, with no link and no button, before the command prints", () => {
     render(<BoxTextBlock boxText={WAITING} />);
     const card = screen.getByRole("group", { name: "Login output" });
@@ -157,5 +175,115 @@ describe("BoxTextBlock", () => {
     } finally {
       __resetLocale();
     }
+  });
+});
+
+describe("BoxTextBlock — a sign-in card (Change login, M101)", () => {
+  const ADDRESS = "https://claude.com/cai/oauth/authorize?code=true&state=XXXX";
+  const SIGN_IN: BoxTextModel = {
+    title: "Login",
+    phase: "filled",
+    text: [[plain("Browser didn't open? Use the url below to sign in (c to copy)")], [], [link(ADDRESS)], [], [plain("Paste code here if prompted >")]],
+  };
+  const HOSTS = ["claude.com", "platform.claude.com"];
+
+  it("opens a listed https address through one primary button, a plain link with no opener and no referrer", () => {
+    render(<BoxTextBlock boxText={SIGN_IN} signInHosts={HOSTS} />);
+    const open = screen.getByRole("link", { name: "Open sign-in page" });
+    expect(open).toHaveAttribute("href", ADDRESS);
+    expect(open).toHaveAttribute("rel", "noopener noreferrer");
+    expect(open).toHaveAttribute("target", "_blank");
+    // The address in the rows is text now: the button is the one way to open it.
+    expect(screen.getAllByRole("link")).toHaveLength(1);
+    expect(screen.getByText(ADDRESS)).toBeInTheDocument();
+  });
+
+  it("an address on a host the adapter does not list is text to copy, shown once, with no link", () => {
+    const other: BoxTextModel = { ...SIGN_IN, text: [[link("https://example.com/oauth?state=X")]] };
+    render(<BoxTextBlock boxText={other} signInHosts={HOSTS} />);
+    expect(screen.queryByRole("link")).toBeNull();
+    expect(screen.getByText("Copy this address into your browser if you trust it.")).toBeInTheDocument();
+    expect(screen.getAllByText("https://example.com/oauth?state=X")).toHaveLength(1);
+  });
+
+  it("without hosts the card is drawn as before, its links live", () => {
+    render(<BoxTextBlock boxText={SIGN_IN} />);
+    expect(screen.queryByRole("link", { name: "Open sign-in page" })).toBeNull();
+    expect(screen.getByRole("link", { name: ADDRESS })).toHaveAttribute("href", ADDRESS);
+  });
+});
+
+// CALM LOAD (row 18): the hosts come from a read that ends after the card's first frame. While it is in
+// flight the button's row is held open at the button's height with nothing live in it; the read then fills
+// it or closes it with `Collapse`.
+describe("BoxTextBlock, a sign-in card while its hosts are read", () => {
+  const ADDRESS = "https://claude.com/cai/oauth/authorize?code=true&state=XXXX";
+  const SIGN_IN: BoxTextModel = {
+    title: "Login",
+    phase: "filled",
+    text: [[plain("Use the url below to sign in")], [link(ADDRESS)], [plain("Paste code here if prompted >")]],
+  };
+  const HOSTS = ["claude.com"];
+  const reserved = () => document.querySelector('[data-slot="sign-in-pending"]');
+  const opener = () => screen.queryByRole("link", { name: "Open sign-in page" });
+
+  it("holds the button's row on the first frame, with no live button in it, and the read fills it", () => {
+    const { rerender } = render(<BoxTextBlock boxText={SIGN_IN} signInPending />);
+    const held = reserved();
+    expect(held).not.toBeNull();
+    expect(held).toHaveClass("h-11", "w-full");
+    expect(held).toHaveAttribute("aria-hidden", "true");
+    expect(opener()).toBeNull();
+    // The box was open on the first frame, so it is part of it and nothing eased in.
+    expect(document.querySelector('[data-slot="collapse"]')).toHaveAttribute("data-state", "open");
+
+    rerender(<BoxTextBlock boxText={SIGN_IN} signInHosts={HOSTS} />);
+    expect(opener()).toHaveAttribute("href", ADDRESS);
+    expect(opener()).toHaveAttribute("rel", "noopener noreferrer");
+    expect(reserved()).toBeNull();
+    expect(document.querySelectorAll('[data-slot="collapse"]')).toHaveLength(1);
+  });
+
+  it("a read that lists no host closes the held row, and the card is as before", async () => {
+    const { rerender } = render(<BoxTextBlock boxText={SIGN_IN} signInPending />);
+    expect(reserved()).not.toBeNull();
+    rerender(<BoxTextBlock boxText={SIGN_IN} />);
+    await waitFor(() => expect(reserved()).toBeNull());
+    expect(opener()).toBeNull();
+    expect(screen.getByRole("link", { name: ADDRESS })).toHaveAttribute("href", ADDRESS);
+  });
+
+  it("a read that lists the host but not this address still fills the row with the copy block", () => {
+    const { rerender } = render(<BoxTextBlock boxText={SIGN_IN} signInPending />);
+    rerender(<BoxTextBlock boxText={SIGN_IN} signInHosts={["example.org"]} />);
+    expect(reserved()).toBeNull();
+    expect(opener()).toBeNull();
+    expect(screen.getByText("Copy this address into your browser if you trust it.")).toBeInTheDocument();
+  });
+
+  it("holds nothing while the card is not waiting on that read, and draws no extra box", () => {
+    render(<BoxTextBlock boxText={SIGN_IN} />);
+    expect(reserved()).toBeNull();
+    expect(document.querySelector('[data-slot="collapse"]')).toBeNull();
+  });
+
+  it("with the hosts already known on the first frame the button is there at once, not eased in", () => {
+    render(<BoxTextBlock boxText={SIGN_IN} signInHosts={HOSTS} />);
+    expect(opener()).toHaveAttribute("href", ADDRESS);
+    expect(document.querySelector('[data-slot="collapse"]')).toHaveAttribute("data-state", "open");
+  });
+});
+
+describe("BoxTextBlock, omp's sign-in card from its capture", () => {
+  const PANES = join(import.meta.dirname, "..", "fixtures", "panes");
+
+  it("keeps omp's local shortcut, http://localhost:<port>/launch, a link beside the https sign-in address", () => {
+    const rows = rowsOf(readFileSync(join(PANES, "omp--v18-6-1-login-url--w61.txt"), "utf8"));
+    const card = detectSignInCard(rows, idleFor("omp")!);
+    expect(card).not.toBeNull();
+    render(<BoxTextBlock boxText={card!.model} />);
+    const hrefs = screen.getAllByRole("link").map((a) => a.getAttribute("href") ?? "");
+    expect(hrefs[0]).toMatch(/^https:\/\//u);
+    expect(hrefs.some((href) => /^http:\/\/localhost:\d+\/launch$/u.test(href))).toBe(true);
   });
 });

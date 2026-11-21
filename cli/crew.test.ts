@@ -1,5 +1,16 @@
-import { describe, expect, test } from "bun:test";
+import { afterAll, describe, expect, test } from "bun:test";
+import { existsSync } from "node:fs";
+import { readFile } from "node:fs/promises";
 import { join } from "node:path";
+import { carryAll, machine, putOnTrick, removeCarryDirs } from "../bridge/crew/carry-fixtures.ts";
+import { crewRuntimePath, formatMarker, NO_RUNTIME_FACTS } from "../bridge/crew/staleness.ts";
+import { StandbyTricksStore } from "../bridge/crew/standby-tricks.ts";
+import { parseHillList, StandbyHillStore } from "../bridge/crew/standby-hill.ts";
+import { decision } from "../bridge/hill/fixtures.ts";
+import { adoptAtBoot, readAdoptMarker } from "../bridge/crew/carry-boot.ts";
+import { hillDir, HillStore } from "../bridge/hill/store.ts";
+import { switchesPath } from "../bridge/tricks/paths.ts";
+import { parseSwitches } from "../bridge/tricks/switches.ts";
 
 import { AuditLog, type AuditEntry } from "../bridge/audit.ts";
 import {
@@ -17,7 +28,7 @@ import {
   type TrustStoreData,
   type TrustStoreIo,
 } from "../bridge/crew/trust-store.ts";
-import { capture, CONFIG, context, fakeExec, fakeFiles, fakeOps, ROOT } from "./fakes.ts";
+import { capture, CONFIG, context, fakeExec, fakeFiles, fakeOps, ROOT, STATE } from "./fakes.ts";
 import { EXIT, type Io } from "./io.ts";
 import {
   cmdJoin,
@@ -425,7 +436,7 @@ describe("enrollUrl", () => {
     expect(enrollUrl("http://desk:8787")).toBe("http://desk:8787/crew/v1/enroll");
   });
 
-  // The port default is what makes `collie crew join bluefin` a whole command. It applies ONLY to an
+  // The port default is what makes `collie crew join lodge` a whole command. It applies ONLY to an
   // address that named neither a scheme nor a port — anything the operator spelled is taken as spelt,
   // so a script written against 1.0.0 keeps dialling exactly where it always did.
   test("a typed port and a typed scheme both win over the defaults", () => {
@@ -740,8 +751,8 @@ describe("collie join", () => {
 
   test("a portless --address is refused with this machine's own port, before anything is read or stored", async () => {
     const h = harness(null, [jsonReply(ENROLLED, 200, "desk")]);
-    expect(await cmdJoin(h.deps, [...joinArgs, "--address", "100.64.0.9"])).toBe(EXIT.USAGE);
-    expect(text(h.io)).toContain('--address "100.64.0.9"');
+    expect(await cmdJoin(h.deps, [...joinArgs, "--address", "192.0.2.9"])).toBe(EXIT.USAGE);
+    expect(text(h.io)).toContain('--address "192.0.2.9"');
     expect(text(h.io)).toContain("there is no port");
     expect(text(h.io)).toContain("try --address <host>:8787");
     // Nothing happened: no dial, no store, no token read.
@@ -758,20 +769,20 @@ describe("collie join", () => {
   test("`--address https://host:8787` still works, and the lead receives `host:8787`", async () => {
     // It worked in 1.15.2, so a patch must not break it: the prefix (and one trailing slash) is
     // stripped, and the scheme form is never stored or sent.
-    for (const given of ["https://100.64.0.9:8787", "https://100.64.0.9:8787/", "HTTPS://100.64.0.9:8787"]) {
+    for (const given of ["https://192.0.2.9:8787", "https://192.0.2.9:8787/", "HTTPS://192.0.2.9:8787"]) {
       const h = harness(null, [jsonReply(ENROLLED, 200, "desk")]);
       expect(await cmdJoin(h.deps, [...joinArgs, "--address", given])).toBe(EXIT.OK);
-      expect(JSON.parse(h.requests[0]!.body).address).toBe("100.64.0.9:8787");
+      expect(JSON.parse(h.requests[0]!.body).address).toBe("192.0.2.9:8787");
     }
   });
 
   test("an https:// address with no port, a path, or an http:// scheme is refused", async () => {
     for (const [given, why] of [
-      ["https://100.64.0.9", "there is no port"],
-      ["https://100.64.0.9/", "there is no port"],
-      ["https://100.64.0.9:8787/x", "never a path"],
-      ["http://100.64.0.9:8787", "a scheme"],
-      ["http://100.64.0.9", "a scheme"],
+      ["https://192.0.2.9", "there is no port"],
+      ["https://192.0.2.9/", "there is no port"],
+      ["https://192.0.2.9:8787/x", "never a path"],
+      ["http://192.0.2.9:8787", "a scheme"],
+      ["http://192.0.2.9", "a scheme"],
     ] as const) {
       const h = harness(null, [jsonReply(ENROLLED, 200, "desk")]);
       expect(await cmdJoin(h.deps, [...joinArgs, "--address", given])).toBe(EXIT.USAGE);
@@ -784,8 +795,8 @@ describe("collie join", () => {
 
   test("a host:port --address is accepted and handed to the lead as typed", async () => {
     const h = harness(null, [jsonReply(ENROLLED, 200, "desk")]);
-    expect(await cmdJoin(h.deps, [...joinArgs, "--address", "100.64.0.9:8787"])).toBe(EXIT.OK);
-    expect(JSON.parse(h.requests[0]!.body).address).toBe("100.64.0.9:8787");
+    expect(await cmdJoin(h.deps, [...joinArgs, "--address", "192.0.2.9:8787"])).toBe(EXIT.OK);
+    expect(JSON.parse(h.requests[0]!.body).address).toBe("192.0.2.9:8787");
   });
 
   test("no --address at all is the derived host:port, unchecked and unchanged", async () => {
@@ -1489,14 +1500,14 @@ describe("collie crew status — what an unreachable LEAD is told to do", () => 
   });
 
   test("a PEER row with no port gets the same remedy, in the refusal's own words (issue 334)", async () => {
-    const h = harness(leadStore({ peers: [member({ memberId: "nas", address: "100.64.0.9" })] }), [
+    const h = harness(leadStore({ peers: [member({ memberId: "nas", address: "192.0.2.9" })] }), [
       new Error("no route to host"),
     ]);
     expect(await cmdCrewStatus(h.deps, [])).toBe(EXIT.OK);
     expect(text(h.io)).toContain("there is no port");
     expect(text(h.io)).toContain("a portless address dials :443");
     // The port is filled in, not left as a placeholder.
-    expect(text(h.io)).toContain("collie crew set-address nas 100.64.0.9:8787");
+    expect(text(h.io)).toContain("collie crew set-address nas 192.0.2.9:8787");
     expect(text(h.io)).toContain("(8787 unless that machine set COLLIE_PORT)");
     expect(text(h.io)).not.toContain("<host:port>");
   });
@@ -2901,5 +2912,88 @@ describe("collie crew status — the machine list delta", () => {
     const h = harness(lead(), [], { exec: fakeExec({ absent: ["hc", "herdr", "ssh"] }), ops: nasFrom("herdr-core") });
     await cmdCrewStatus(h.deps, ["--no-probe"]);
     expect(h.io.stdout.some((l) => l.includes("no longer lists") || l.includes("not in this crew:"))).toBe(false);
+  });
+});
+
+describe("the lead's tricks at a handover (CREW_PROTOCOL §25)", () => {
+  afterAll(removeCarryDirs);
+  const leadWithTwo = () => leadStore({ peers: [member({ memberId: "nas" }), member({ memberId: "laptop" })] });
+
+  function markerFiles(fact: { member: string; state: "current" | "behind" | "older"; tricks: number } | null) {
+    const marker = { ...NO_RUNTIME_FACTS, bootedAt: T0, pid: 1, mode: "lead" as const, roster: [], build: null, checkpointedAt: T0 };
+    const written = formatMarker(fact === null ? marker : { ...marker, deputyTricks: { ...fact, at: T0 } });
+    return fakeFiles({ [HERDR_SOCKET]: "", [crewRuntimePath(STATE)]: written });
+  }
+
+  test("approve-promote on the deputy says the tricks come along with its promote", async () => {
+    const h = harness(leadWithTwo(), [], { files: markerFiles({ member: "nas", state: "current", tricks: 3 }) });
+    expect(await cmdCrewApprovePromote(h.deps, ["nas"])).toBe(EXIT.OK);
+    expect(text(h.io)).toContain('"nas" holds a copy of the 3 tricks this lead runs; `collie promote` there starts them again.');
+  });
+
+  test("approve-promote on another member warns that the tricks stay behind", async () => {
+    const h = harness(leadWithTwo(), [], { files: markerFiles({ member: "nas", state: "current", tricks: 1 }) });
+    expect(await cmdCrewApprovePromote(h.deps, ["laptop"])).toBe(EXIT.OK);
+    expect(text(h.io)).toContain(`"laptop" is not this crew's deputy, so it holds no copy of the 1 trick this lead runs.`);
+  });
+
+  test("approve-promote on an older or a behind deputy says what does not start", async () => {
+    const older = harness(leadWithTwo(), [], { files: markerFiles({ member: "nas", state: "older", tricks: 2 }) });
+    await cmdCrewApprovePromote(older.deps, ["nas"]);
+    expect(text(older.io)).toContain(`"nas" runs an older Collie and keeps no copy of the 2 tricks this lead runs; they do not start there.`);
+    const behind = harness(leadWithTwo(), [], { files: markerFiles({ member: "nas", state: "behind", tricks: 2 }) });
+    await cmdCrewApprovePromote(behind.deps, ["nas"]);
+    expect(text(behind.io)).toContain(`"nas" is still taking its copy of the 2 tricks this lead runs; a trick it lacks does not start there.`);
+  });
+
+  test("no fact and no tricks: approve-promote says nothing about tricks", async () => {
+    for (const files of [markerFiles(null), markerFiles({ member: "nas", state: "current", tricks: 0 })]) {
+      const h = harness(leadWithTwo(), [], { files });
+      await cmdCrewApprovePromote(h.deps, ["nas"]);
+      expect(text(h.io)).not.toContain("trick");
+    }
+  });
+
+  test("promote on the deputy writes only the marker: no switch and no Hill file while the old bridge runs", async () => {
+    const lead = await machine("lead");
+    await putOnTrick(lead, { id: "legs", name: "Leg day", auto: true });
+    const deputy = await machine("deputy");
+    await carryAll(lead, new StandbyTricksStore(deputy.stateDir));
+    const list = parseHillList({ seq: 1, on: true, decisions: [JSON.parse(JSON.stringify(decision("dc_carried00001")))], closed: [], tricks: {} });
+    if (list === null) throw new Error("bad list");
+    await new StandbyHillStore(deputy.stateDir).applyList({ from: "desk", crewId: CREW.crewId, list });
+    const h = harness(peerStore(), [jsonReply({ demoted: "desk", roster: [] }, 200, "desk")], {
+      ctx: context({ COLLIE_CREW_TIMEOUT_MS: "60000" }, { socket: HERDR_SOCKET, stateDir: deputy.stateDir, configDir: deputy.configDir }),
+    });
+    expect(await cmdPromote(h.deps, [])).toBe(EXIT.OK);
+    expect(text(h.io)).toContain(`✓ "desk"'s 1 trick and 1 open question come along: this machine takes them up when it restarts as the lead`);
+    // The bridge that runs now holds its own Hill in memory: this command writes neither file.
+    expect(existsSync(switchesPath(deputy.stateDir))).toBe(false);
+    expect(existsSync(join(hillDir(deputy.stateDir), "decisions.json"))).toBe(false);
+    expect(await readAdoptMarker(deputy.stateDir)).toMatchObject({ lead: "desk", by: "handover" });
+    // The restart is that boot: it adopts both, by handover.
+    const lines: AuditEntry[] = [];
+    const tricks = new StandbyTricksStore(deputy.stateDir);
+    const hill = new StandbyHillStore(deputy.stateDir);
+    await adoptAtBoot({ stateDir: deputy.stateDir, configDir: deputy.configDir, tricks, hill, leads: true, self: "laptop", machine: "laptop", now: () => T0, audit: (e) => void lines.push(e), log: () => {}, followSkill: null });
+    const switches = parseSwitches(await readFile(switchesPath(deputy.stateDir), "utf8")).switches;
+    expect(switches.on.get("legs")).toMatchObject({ by: "handover", from: "desk", auto: true });
+    expect(new HillStore(hillDir(deputy.stateDir)).get("dc_carried00001")?.state).toBe("open");
+    // What the promote brought is audited on this machine, by handover, as the tap's is by takeover.
+    expect(lines.map((l) => [l.action, l.detail?.from, l.detail?.by])).toEqual([
+      ["tricks.carried", "desk", "handover"],
+      ["hill.carried", "desk", "handover"],
+    ]);
+    expect(lines[0]?.detail).toMatchObject({ started: ["legs"], failed: [] });
+    expect(lines[1]?.detail).toMatchObject({ open: 1, closed: 0, dropped: 0 });
+    expect(await new StandbyTricksStore(deputy.stateDir).load()).toBeNull();
+    expect(await new StandbyHillStore(deputy.stateDir).load()).toBeNull();
+    expect(await readAdoptMarker(deputy.stateDir)).toBeNull();
+  });
+
+  test("promote on a machine with no copy says nothing about tricks", async () => {
+    const h = harness(peerStore(), [jsonReply({ demoted: "desk", roster: [] }, 200, "desk")]);
+    expect(await cmdPromote(h.deps, [])).toBe(EXIT.OK);
+    expect(text(h.io)).not.toContain("tricks here");
   });
 });

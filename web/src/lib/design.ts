@@ -1,11 +1,12 @@
 import { useSyncExternalStore } from "react";
 
-import { asJsonObject, asJsonString, parseJsonObject, type JsonValue } from "@/lib/json";
+import { asJsonBoolean, asJsonObject, asJsonString, parseJsonObject, type JsonValue } from "@/lib/json";
 import { OPERATOR_FONT_PREFIX, type OperatorFontFace } from "@/lib/operator-fonts";
 import { SHIPPED_FONTS, isShippedFont, type ShippedFont } from "@/lib/shipped-fonts";
+import { isMarkId, type MarkId } from "@/lib/mark-ids";
 import { DEFAULT_THEME_ID, isThemeId } from "@/lib/theme/schema";
 
-// The device's own look — its face, its colour theme, its math engine — and the shape is an OBJECT on
+// The device's own look — its face, its colour theme, its math engine, its header character — and the shape is an OBJECT on
 // purpose.
 //
 // WHY AN OBJECT FOR ONE FIELD. This is the seed of theming: an accent colour, a density, a corner
@@ -14,8 +15,8 @@ import { DEFAULT_THEME_ID, isThemeId } from "@/lib/theme/schema";
 // migration when the first one grew a sibling. One key that already parses as a record costs
 // nothing today and is the difference between adding a field and adding a store.
 //
-// THE FACE IS A CLASS, NOT A PROPERTY. Nothing in this file knows what Space Grotesk's fallback
-// stack is, or Aldrich's, or the system one — index.css owns all three under `:root.font-*`, and
+// THE FACE IS A CLASS, NOT A PROPERTY. Nothing in this file knows what any face's fallback stack is
+// (seven faces ship, `lib/shipped-fonts.ts`); index.css owns every stack under `:root.font-*`, and
 // this module only ever swaps which class is on <html>. That is what keeps the pre-paint script
 // (public/theme-init.js, which cannot import anything) and the app agreeing about the same values:
 // they agree on a KEY NAME and a CLASS NAME, and neither carries a font list. `design.test.ts`
@@ -64,6 +65,22 @@ export interface DesignPrefs {
    * what a device that never chose stores.
    */
   math?: Exclude<MathEngine, "off">;
+  /**
+   * The header character this device chose (Settings > Appearance > Character, ADR 0136 amended
+   * 2026-11-12). Absent means "From the theme": the worn theme's `character`, else Collie
+   * (`lib/mark.ts` is the one place that decides). Like `math`, the default is the absence of the
+   * field, so a device that goes back to "From the theme" stores what a device that never chose
+   * stores. Device-local: it is never sent to the bridge. Validated by `isMarkId` on every read.
+   */
+  mark?: MarkId;
+  /**
+   * Whether the header character moves at rest, as this device chose it (Settings > Appearance >
+   * Character, "Character moves"). Absent means the switch was never touched: the worn theme's
+   * `characterMotion` decides, else it moves (`lib/mark-motion.ts` is the one place that decides).
+   * Unlike `mark`, both values are stored, because `false` and `true` are each a choice that must win
+   * over a theme once made. Device-local: never sent to the bridge.
+   */
+  markMoves?: boolean;
 }
 
 /** The math renderers a device may choose. `off` is the default and is never stored. */
@@ -135,6 +152,9 @@ function load(): DesignPrefs {
     // The retired shipped id: `collie` now wears that look. Drop the field and write it back, once.
     const kept: DesignPrefs = { font: parsed.font };
     if (parsed.operatorFont !== undefined) kept.operatorFont = parsed.operatorFont;
+    if (parsed.math !== undefined) kept.math = parsed.math;
+    if (parsed.mark !== undefined) kept.mark = parsed.mark;
+    if (parsed.markMoves !== undefined) kept.markMoves = parsed.markMoves;
     localStorage.setItem(STORAGE_KEY, JSON.stringify(kept));
     return kept;
   } catch {
@@ -167,6 +187,10 @@ export function parseDesignPrefs(raw: string): DesignPrefs {
   if (theme !== undefined && isThemeId(theme) && theme !== DEFAULT_THEME_ID) next.theme = theme;
   const math = asJsonString(doc.math);
   if (math !== undefined && isMathEngine(math) && math !== "off") next.math = math;
+  const mark = asJsonString(doc.mark);
+  if (mark !== undefined && isMarkId(mark)) next.mark = mark;
+  const markMoves = asJsonBoolean(doc.markMoves);
+  if (markMoves !== undefined) next.markMoves = markMoves;
   return next;
 }
 
@@ -226,6 +250,8 @@ export function setDesignFont(font: string, face?: OperatorFontFace): void {
   // survives a change of face, and so does the math engine.
   if (prefs.theme !== undefined) next.theme = prefs.theme;
   if (prefs.math !== undefined) next.math = prefs.math;
+  if (prefs.mark !== undefined) next.mark = prefs.mark;
+  if (prefs.markMoves !== undefined) next.markMoves = prefs.markMoves;
   prefs = next;
   persist();
   applyFontClass(prefs.font);
@@ -243,6 +269,8 @@ export function setDesignTheme(id: string): void {
   if (prefs.operatorFont !== undefined) next.operatorFont = prefs.operatorFont;
   if (id !== DEFAULT_THEME_ID) next.theme = id;
   if (prefs.math !== undefined) next.math = prefs.math;
+  if (prefs.mark !== undefined) next.mark = prefs.mark;
+  if (prefs.markMoves !== undefined) next.markMoves = prefs.markMoves;
   prefs = next;
   persist();
   for (const fn of listeners) fn();
@@ -258,7 +286,37 @@ export function setDesignMath(engine: string): void {
   if (prefs.operatorFont !== undefined) next.operatorFont = prefs.operatorFont;
   if (prefs.theme !== undefined) next.theme = prefs.theme;
   if (engine !== "off") next.math = engine;
+  if (prefs.mark !== undefined) next.mark = prefs.mark;
+  if (prefs.markMoves !== undefined) next.markMoves = prefs.markMoves;
   prefs = next;
+  persist();
+  for (const fn of listeners) fn();
+}
+
+/**
+ * Choose the header character. `null` is "From the theme" and is the absence of the field (see
+ * {@link DesignPrefs.mark}); every other field is kept as it is. The type admits only a real id, so
+ * there is nothing to ignore here: a caller with a string asks `isMarkId` first.
+ */
+export function setDesignMark(mark: MarkId | null): void {
+  const next: DesignPrefs = { font: prefs.font };
+  if (prefs.operatorFont !== undefined) next.operatorFont = prefs.operatorFont;
+  if (prefs.theme !== undefined) next.theme = prefs.theme;
+  if (prefs.math !== undefined) next.math = prefs.math;
+  if (mark !== null) next.mark = mark;
+  if (prefs.markMoves !== undefined) next.markMoves = prefs.markMoves;
+  prefs = next;
+  persist();
+  for (const fn of listeners) fn();
+}
+
+/**
+ * Say whether the header character moves at rest. Both values are stored (see
+ * {@link DesignPrefs.markMoves}): from the first touch the device's switch wins over a theme. Every
+ * other field is kept as it is.
+ */
+export function setDesignMarkMoves(moves: boolean): void {
+  prefs = { ...prefs, markMoves: moves };
   persist();
   for (const fn of listeners) fn();
 }

@@ -1,5 +1,6 @@
 // Bring the rig up before the first case: the scratch Herdr, the bridge from this checkout, one
 // paired device. Names the run, so every case writes into the same results folder.
+import { RIG_DATA } from "./rig-data";
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { join, resolve } from "node:path";
@@ -9,8 +10,11 @@ import { P, memGuard, readRun } from "./rig-lib";
 
 const WEB = resolve(import.meta.dirname, "..", "..");
 
-/** Name the run and bring one leg's rig up: `up` for the solo leg, `up --crew` for the crew leg (crew-setup.ts). */
-export async function startRun(crew: boolean): Promise<void> {
+/**
+ * Name the run and bring one leg's rig up: `up` for the solo leg, `up --crew` for the crew leg (crew-setup.ts).
+ * `upArgs` are more flags for `up` (the chaos leg's `--second-bridge`, chaos-setup.ts).
+ */
+export async function startRun(crew: boolean, upArgs: readonly string[] = []): Promise<void> {
   if (!existsSync(join(WEB, "dist", "index.html"))) {
     throw new Error("no web/dist in this checkout: run `bun run build` in web/ first (the bridge serves that bundle)");
   }
@@ -33,8 +37,9 @@ export async function startRun(crew: boolean): Promise<void> {
     return plan === undefined ? [] : [tierLine(plan)];
   });
   console.log(`model tiers: ${lines.join("; ")}`);
+  console.log(`data path: ${RIG_DATA ? "on (COLLIE_RIG_DATA=1): the bridges open the inside socket, Claude Code loads the Collie mod" : "off"}`);
   if (reuse) return;
-  execFileSync("bun", [join(WEB, "e2e", "rig", "rig.ts"), "up", ...(crew ? ["--crew"] : [])], { cwd: WEB, stdio: "inherit", timeout: crew ? 300_000 : 120_000 });
+  execFileSync("bun", [join(WEB, "e2e", "rig", "rig.ts"), "up", ...(crew ? ["--crew"] : []), ...upArgs], { cwd: WEB, stdio: "inherit", timeout: crew ? 300_000 : 120_000 });
 }
 
 export default async function globalSetup(): Promise<void> {

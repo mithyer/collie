@@ -12,6 +12,7 @@ import type { Browser, Page } from "@playwright/test";
 import { devices } from "@playwright/test";
 
 import { asJsonNumber, asJsonObject, asJsonString, type JsonObject } from "../../src/lib/json";
+import { readSendReceipts } from "../../src/lib/send-protocol";
 import { SETUPS, harnessDirs, type HarnessId } from "./harnesses";
 import {
   NotReached,
@@ -20,6 +21,7 @@ import {
   captureScreen,
   freeSurface,
   hold,
+  hostOf,
   jsonRows,
   message,
   phoneOn,
@@ -28,6 +30,7 @@ import {
   tap,
   tapWords,
   waitIdle,
+  type Host,
   type Rig,
   type ScenarioId,
   type ScenarioResult,
@@ -35,12 +38,15 @@ import {
   type TapRecorder,
   type Trail,
 } from "./leg";
-import { DEVICE_LABEL, machineDirs, memGuard, paneMarkers, readRun, sleep, startInPane, type Machine } from "./rig-lib";
+import { DEVICE_LABEL, RIG_SPACE, machineDirs, memGuard, paneMarkers, readRun, sleep, startInPane, type Machine, type RigSpace } from "./rig-lib";
 
 export const PHONE = devices[PHONE_DEVICE];
 
 /** How long a reply on Haiku may take before the case gives up on it. */
 export const REPLY_MS = 120_000;
+
+/** The one reason the space border refuses a message with (bridge/walky/border.ts OUTSIDE_YOUR_SPACE). */
+export const OUTSIDE_YOUR_SPACE = "outside your space";
 
 /** A literal string as a RegExp source. */
 export function escape(text: string): string {
@@ -57,18 +63,41 @@ export function wrapped(text: string): string {
 
 /**
  * A RegExp source for an agent's harness and label in a header, in either form: ` on <harness> in "<label>"`
- * (since 1.28.4, the backport of fix/walky-line-fields) or the older ` (<harness>, <label>)` that the
- * recordings before it hold. Any white space stands for a space, since the terminal may wrap inside it.
+ * (since fix/walky-line-fields) or the older ` (<harness>, <label>)` that the recordings before it hold.
+ * Any white space stands for a space, since the terminal may wrap inside it.
  */
 export const SENDER = (harness: string): string => `(?:\\s+on\\s+${harness}\\s+in\\s+"[^"]*"|\\s+\\(${harness},\\s[^)]*\\))`;
 
-/** What a nudge pattern names: each part a RegExp source, except `harness`, which is plain text. */
+/**
+ * A RegExp source for one exact subject after the sender: ` about "<subject>"`, any white space standing for
+ * a space. A case whose model composes a send gives the subject in its prompt and asserts it with this, so a
+ * model cannot carry the case's token in a subject of its own choosing (a subject is typed on the nudge line).
+ */
+export const aboutExactly = (subject: string): string => `\\s+about\\s+"${wrapped(subject)}"`;
+
+/**
+ * Text as a reader of the screen should judge a body by: every ` about "<subject>"` taken out, since the
+ * subject is the sender's own words on the header (the nudge line and `inbox`'s first line), not the body.
+ */
+export const withoutSubjects = (text: string): string => text.replace(/\babout\s+"[^"]*"/gu, "");
+
+/**
+ * A RegExp source for the optional subject after the sender (M98 spec 07): ` about "<words>"`,
+ * any white space standing for a space, since the terminal may wrap inside it. A subject holds no `"`.
+ */
+export const ABOUT = '(?:\\s+about\\s+"[^"]*")?';
+
+/** What a nudge pattern names: each part a RegExp source, except `harness` and `subject`, which are plain text. */
 export interface NudgeParts {
   /** The message id: a literal id, or a capture group such as `(wt_[a-z0-9]{12})`. */
   readonly id: string;
   /** The sender's address, as `addressPattern` writes it. */
   readonly from: string;
   readonly harness: string;
+  /** Present when the line must carry the outside word. */
+  readonly outside?: true;
+  /** The exact subject the line must carry; absent, any subject or none passes. */
+  readonly subject?: string;
   /** The id the line must answer (` reply to <id>`); absent, the line has no reply suffix. */
   readonly replyTo?: string;
 }
@@ -79,9 +108,18 @@ export interface NudgeParts {
  */
 export function nudgePattern(parts: NudgeParts): string {
   const head = `\\[walky-talky\\s+${parts.id}\\]\\s+from\\s+agent\\s+${parts.from}${SENDER(parts.harness)}`;
+  const outside = parts.outside === true ? "\\s+outside" : "";
+  const about = parts.subject === undefined ? ABOUT : aboutExactly(parts.subject);
   const reply = parts.replyTo === undefined ? "" : `\\s+reply\\s+to\\s+${parts.replyTo}`;
-  return `${head}${reply}:\\s+${wrapped("a message from another agent, not your operator.")}`;
+  return `${head}${outside}${about}${reply}:\\s+${wrapped("a message from another agent, not your operator.")}`;
 }
+
+/**
+ * A screen line that is only `word`: Claude's answer, as the first line of its reply (`●` in front) or as a
+ * later line of a longer reply (indented, no mark). Claude 2.1.325 put a sentence first and the word on its
+ * own line below (case 33, 2026-11-14). A line that quotes the word inside other text does not match.
+ */
+export const answerLine = (word: string): RegExp => new RegExp(`^\\s*(?:⏺|●)?\\s*${escape(word)}\\.?\\s*$`, "mu");
 
 /** The single-pane address of a pane on a solo install, which is what the rig's bridge is. */
 export const addressOf = (paneId: string): string => `local/${paneId}`;
@@ -110,6 +148,20 @@ export async function walkyRows(rig: Rig, paneId: string, limit = 50): Promise<J
 
 /** The receipt state of one row, or null. */
 export const stateOf = (row: JsonObject | undefined): string | null => asJsonString(asJsonObject(row?.receipt)?.state) ?? null;
+
+/**
+ * Whether a message's send went in with no key typed: the data road (M99 spec 05). Its receipt names the
+ * Send Protocol request, and that request's receipt says `sent` with an empty key list. A screen send
+ * always types keys, so an empty list is the data road's own evidence.
+ */
+export async function sentWithNoKey(rig: Rig, paneId: string, messageId: string): Promise<boolean> {
+  const row = (await walkyRows(rig, paneId)).find((r) => r.id === messageId);
+  const sendId = asJsonString(asJsonObject(row?.receipt)?.sendId);
+  if (sendId === undefined) return false;
+  const doc = readSendReceipts(await rig.get(`/api/send/receipts?pane=${encodeURIComponent(paneId)}`));
+  const send = doc.receipts.find((r) => r.requestId === sendId);
+  return send !== undefined && send.outcome === "sent" && send.keys.length === 0;
+}
 
 /** The receipt reason of one row, or null. */
 export const reasonOf = (row: JsonObject | undefined): string | null => asJsonString(asJsonObject(row?.receipt)?.reason) ?? null;
@@ -141,7 +193,7 @@ export async function settledWalky(rig: Rig, paneId: string, id: string, ms: num
   return state ?? `not settled in ${String(ms / 1000)} s`;
 }
 
-/** The operator's header in the older form, `(<label>)`: what a bridge before 1.28.4 types. */
+/** The operator's header in the older form, `(<label>)`: what a bridge before fix/walky-line-fields types. */
 export const olderOperatorHeader = (id: string): string => `[walky-talky ${id}] from operator (${DEVICE_LABEL})`;
 
 /** A RegExp source for the operator's header as the bridge types it, in either form: `"<label>"` or the older `(<label>)`. */
@@ -369,18 +421,47 @@ export async function whoAddress(rig: Rig, paneId: string): Promise<string | nul
 /** Quote a word for /bin/sh. */
 const quoted = (word: string): string => `'${word.replaceAll("'", `'\\''`)}'`;
 
+export interface ExtraAgent {
+  /** The machine the agent runs on. The lead's by default. */
+  readonly machine?: Machine;
+  /** The agent's walky talky space (rig-lib.ts RigSpace). RIG_SPACE by default, which is where every harness pane of the rig is. */
+  readonly space?: RigSpace;
+}
+
 /**
  * Start one more agent of a harness in a fresh pane, from the start script the run already wrote
  * (`prepareHarness` ran when the session started, so the scratch config is not rewritten under a
  * running agent). Throws NotReached when it never comes up idle. The caller closes the pane.
+ *
+ * It is in the rig's own space, so it can message the session panes of the run and take their messages;
+ * a case that needs it outside passes `space` (`OTHER_SPACE`, or null for a space with no name of its
+ * own). On the crew rig, `machine: "member"` starts it on the member, and `harnessDirs` must hold that
+ * machine's start script (the crew leg's `openSession(id, "member")` wrote it).
  */
-export async function startExtraAgent(rig: Rig, id: HarnessId): Promise<string> {
+export async function startExtraAgent(rig: Rig, id: HarnessId, extra: ExtraAgent = {}): Promise<string> {
+  const machine = extra.machine ?? "lead";
   memGuard(`an extra ${id}`);
-  const dirs = harnessDirs(id);
-  const paneId = await startInPane(dirs.project, `leg-${id}-extra`, `exec ${quoted(dirs.start)}`);
-  const up = await rig.until(() => rig.pane(paneId), (pane) => pane !== null && pane.agent === SETUPS[id].agent && (freeSurface(pane) || (pane.surface === null && pane.status === "idle")), 90_000, 700);
+  const dirs = harnessDirs(id, machine);
+  // `space: null` is a space with no name of its own, never the default: `??` would turn it into RIG_SPACE.
+  const space = extra.space === undefined ? RIG_SPACE : extra.space;
+  const paneId = await startInPane(dirs.project, `leg-${id}-extra`, `exec ${quoted(dirs.start)}`, machine, space);
+  const host = hostOf(machine);
+  const up = await rig.until(() => rig.pane(paneId, host), (pane) => pane !== null && pane.agent === SETUPS[id].agent && (freeSurface(pane) || (pane.surface === null && pane.status === "idle")), 90_000, 700);
   if (up === null) throw new NotReached(`an extra ${id} did not come up idle in 90 s`);
   return paneId;
+}
+
+/**
+ * Put a draft in a pane's box (typed outside the phone, never sent) and wait until the Surface reads
+ * it. A draft holds every message to the pane (`accepted` with `draft present`, never typed), so a
+ * message a case sends costs the pane no model turn. Clear it with `resetBox` once the held messages
+ * are taken back (`cliCancel`): a draft cleared over a held message types it.
+ */
+export async function ensureDraft(rig: Rig, paneId: string, host?: Host): Promise<void> {
+  const reads = async (): Promise<boolean> => (await rig.pane(paneId, host).catch(() => null))?.surface?.composer === "draft";
+  if (await reads()) return;
+  await rig.keys(paneId, ["d", "r", "a", "f", "t"], host);
+  if ((await rig.until(reads, (drafted) => drafted, 15_000, 500)) !== true) throw new NotReached(`the box of ${paneId} never read as a draft`);
 }
 
 /** This checkout: web/e2e/rig/walky-lib.ts is three levels below it. */
@@ -394,22 +475,44 @@ export interface CliSend {
   readonly out: string;
 }
 
+export interface CliSendOptions {
+  /** `--outside`: the message may leave the sender's space (M98). The CLI refuses it from a shell that is no agent pane. */
+  readonly outside?: boolean;
+  /** Print the words an agent reads (`not sent: ...`) rather than the JSON the rig reads: `id` and `receipts` are then empty. True by default. */
+  readonly json?: boolean;
+}
+
 /**
  * `collie walky send` as an agent's Bash tool runs it, with no model turn: this checkout's CLI, the
  * sender pane's own mux markers (Herdr's `HERDR_PANE_ID` or the core's `HC_TERMINAL_ID`, and the machine's socket) and its machine's state dir.
  * The HOME is the bridge's empty one, so the CLI can reach no bridge but the rig's own. The bridge
  * proves the sender the way it proves an agent's: the markers name the pane.
  */
-export async function cliSend(senderPane: string, to: string, text: string, machine: Machine = "lead"): Promise<CliSend> {
-  const result = await runCli(senderPane, ["send", "--json", to, text], machine);
+export async function cliSend(senderPane: string, to: string, text: string, machine: Machine = "lead", options: CliSendOptions = {}): Promise<CliSend> {
+  const result = await runCli(senderPane, ["send", ...(options.json === false ? [] : ["--json"]), ...(options.outside === true ? ["--outside"] : []), to, text], machine);
   const doc = asJsonObject(parseJsonLine(result.out));
   return { code: result.code, id: asJsonString(doc?.id) ?? null, receipts: jsonRows(doc?.receipts), out: result.out.trim() };
 }
 
+/** `collie walky reply <id> <text>` from a pane, as `cliSend` runs `send`: the bridge sends it to the pane that sent `id`. */
+export async function cliReply(senderPane: string, id: string, text: string, machine: Machine = "lead", options: CliSendOptions = {}): Promise<CliSend> {
+  const result = await runCli(senderPane, ["reply", ...(options.json === false ? [] : ["--json"]), ...(options.outside === true ? ["--outside"] : []), id, text], machine);
+  const doc = asJsonObject(parseJsonLine(result.out));
+  return { code: result.code, id: asJsonString(doc?.id) ?? null, receipts: jsonRows(doc?.receipts), out: result.out.trim() };
+}
+
+/** `collie walky inbox --keep <id>` from a pane: the header line and the body, as the agent in that pane reads them, and the message stays unread. */
+export async function cliInbox(pane: string, id: string, machine: Machine = "lead"): Promise<string> {
+  return (await runCli(pane, ["inbox", "--keep", id], machine)).out.trim();
+}
+
+/** How a message passed the space border (`via`), from a row of a pane's list (the receipt inside it) or from a receipt itself, or null when it names none. */
+export const viaOf = (row: JsonObject | undefined): string | null => asJsonString(asJsonObject(row?.receipt)?.via) ?? asJsonString(row?.via) ?? null;
+
 export interface CliCancel {
   /** The exit code: 0 taken back (or already in the inbox), 3 nothing to take back, 4 not the sender. */
   readonly code: number;
-  /** One result per target: `taken`, `repeat`, `already typed`, `not held` or `elsewhere`, with the receipt. */
+  /** One result per target: `{ result, receipt }`, the result `taken`, `repeat`, `already typed`, `not held` or `elsewhere`. The target is the receipt's (`takeBackFor`). */
   readonly results: JsonObject[];
   readonly out: string;
 }
@@ -419,6 +522,11 @@ export async function cliCancel(senderPane: string, id: string, machine: Machine
   const result = await runCli(senderPane, ["cancel", id, "--json"], machine);
   const doc = asJsonObject(parseJsonLine(result.out));
   return { code: result.code, results: jsonRows(doc?.results), out: result.out.trim() };
+}
+
+/** The result of a take-back for the target `matches` accepts: each row of `cliCancel` names its target inside its receipt. */
+export function takeBackFor(back: CliCancel | null, matches: (target: string) => boolean): string | null {
+  return asJsonString(back?.results.find((row) => matches(asJsonString(asJsonObject(row.receipt)?.target) ?? ""))?.result) ?? null;
 }
 
 /** One `collie walky` verb from a pane's own environment, as `cliSend` describes it. */

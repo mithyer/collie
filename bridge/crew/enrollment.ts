@@ -5,6 +5,7 @@ import {
   hashToken,
   isMemberId,
   mintIdentity,
+  isReservedMemberId,
   mintMemberId,
   slugifyMemberId,
   normalizeFingerprint,
@@ -312,8 +313,8 @@ export interface EnrollRefusal {
   readonly refused: "label_taken";
   /** The name the joiner asked for, as it typed it. */
   readonly label: string;
-  /** Who holds it: the lead's own display name, or an enrolled member's id. */
-  readonly takenBy: "lead" | "member";
+  /** Who holds it: the lead's own display name, an enrolled member's id, or the address grammar (`local`, `all`, `here`). */
+  readonly takenBy: "lead" | "member" | "reserved";
   /** The sentence the wire carries. It names the taken name and says to pass `--label`. */
   readonly message: string;
 }
@@ -331,8 +332,8 @@ export function isEnrollRefusal(value: CrewChange<EnrollResponse> | EnrollRefusa
 
 /**
  * Does `label` collide with the lead's display name or an enrolled member's id? Compared as typed
- * (case-insensitive) and as the member id it would become, so `Bluefin` and `bluefin!` are both the
- * lead's `bluefin`. An unusable label (no letters or digits) mints a random id and collides with nothing.
+ * (case-insensitive) and as the member id it would become, so `Lodge` and `lodge!` are both the
+ * lead's `lodge`. An unusable label (no letters or digits) mints a random id and collides with nothing.
  */
 function labelRefusal(data: TrustStoreData, label: string, leadName: string): EnrollRefusal | null {
   const typed = label.trim();
@@ -348,6 +349,10 @@ function labelRefusal(data: TrustStoreData, label: string, leadName: string): En
     return refuse("lead", "the lead");
   }
   if (slug === null) return null;
+  // A1: a word the address grammar keeps is no machine's name (identity.ts `RESERVED_MEMBER_IDS`).
+  if (isReservedMemberId(slug)) {
+    return { refused: "label_taken", label: typed, takenBy: "reserved", message: `the name "${typed}" is a word Collie's addresses keep for themselves. Pass --label <another name>.` };
+  }
   if (slug === data.self.memberId) return refuse("lead", "the lead");
   const holder = data.peers.find((p) => p.memberId === slug);
   return holder === undefined ? null : refuse("member", `the member "${holder.memberId}"`);
@@ -366,7 +371,7 @@ function labelRefusal(data: TrustStoreData, label: string, leadName: string): En
  * invite the operator minted by hand.
  *
  * **A new member whose label is the lead's display name, or an enrolled member's id, is refused**
- * (1.25.0) rather than suffixed: before, `bluefin` twice became `bluefin` and `bluefin-x7k2`, and the
+ * (1.25.0) rather than suffixed: before, `lodge` twice became `lodge` and `lodge-x7k2`, and the
  * operator could not tell which row was which machine. The invite is spent either way.
  */
 export function enrollPeer(
@@ -379,14 +384,16 @@ export function enrollPeer(
 ): CrewChange<EnrollResponse> | EnrollRefusal | null {
   if (data.crew === null) return null;
   const existing = data.peers.find((p) => p.fingerprint === req.fingerprint);
-  // A name is never made unique by a silent suffix: two machines both called `bluefin` is the
+  // A name is never made unique by a silent suffix: two machines both called `lodge` is the
   // confusion this refuses (1.25.0). A re-join (same fingerprint) keeps its own id and is not asked.
   if (existing === undefined && req.label !== null) {
     const refusal = labelRefusal(data, req.label, leadName);
     if (refusal !== null) return refusal;
   }
   const taken = new Set(data.peers.map((p) => p.memberId).concat(data.self.memberId));
-  const memberId = existing?.memberId ?? mintMemberId(req.label, taken, random);
+  // A machine enrolled under a reserved id before the rule (A1) re-joins under a fresh one.
+  const kept = existing !== undefined && !isReservedMemberId(existing.memberId) ? existing.memberId : undefined;
+  const memberId = kept ?? mintMemberId(req.label, taken, random);
   const member: TrustedMember = {
     memberId,
     fingerprint: req.fingerprint,
@@ -406,7 +413,7 @@ export function enrollPeer(
   return {
     next: {
       ...data,
-      peers: [...data.peers.filter((p) => p.memberId !== memberId), member],
+      peers: [...data.peers.filter((p) => p.memberId !== memberId && p.fingerprint !== req.fingerprint), member],
     },
     result: {
       protocol: CREW_PROTOCOL_VERSION,

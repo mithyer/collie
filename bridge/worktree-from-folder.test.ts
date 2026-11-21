@@ -3,6 +3,10 @@ import { mkdir, mkdtemp, readdir, realpath, rm, symlink } from "node:fs/promises
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { realLinkDisk } from "./account-links.ts";
+import { Accounts } from "./accounts-routes.ts";
+import { accountTest } from "./accounts-skip.ts";
+import { memoryAccountStore } from "./accounts-store.ts";
 import { AuditLog } from "./audit.ts";
 import type { JsonObject, JsonValue } from "./json.ts";
 import { harnessLaunch } from "./harness-launch.ts";
@@ -131,7 +135,11 @@ const clock = () => {
   };
 };
 
-async function create(mux: FakeMux, body: JsonObject, extra: { choices?: ReturnType<typeof memoryWorktreeChoices>; receipts?: ReturnType<typeof memoryWorktreeReceipts> } = {}) {
+async function create(
+  mux: FakeMux,
+  body: JsonObject,
+  extra: { choices?: ReturnType<typeof memoryWorktreeChoices>; receipts?: ReturnType<typeof memoryWorktreeReceipts>; accounts?: Accounts } = {},
+) {
   const res = await createWorktreeAt(
     asMux(mux),
     engine(),
@@ -146,10 +154,12 @@ async function create(mux: FakeMux, body: JsonObject, extra: { choices?: ReturnT
       choices: extra.choices,
       harnesses: { launch: harnessLaunch },
       wait: clock(),
+      accounts: extra.accounts,
     },
   );
-  // SAFETY: createWorktreeAt wrote this body as a WorktreeCreateResponse.
-  return { status: res.status, body: (await res.json()) as WorktreeCreateResponse };
+  // SAFETY: createWorktreeAt wrote this body as a WorktreeCreateResponse, or a plain-text 400 (a bad
+  // body) that reads as `null` here; only the status of that one is looked at.
+  return { status: res.status, body: (await res.json().catch(() => null)) as WorktreeCreateResponse };
 }
 
 describe("GET /api/worktree/plan", () => {
@@ -219,9 +229,19 @@ describe("POST /api/worktree", () => {
     const { body } = await create(mux, { cwd: join(repo, "sub"), branch: "fix-tabs", base: { kind: "default" } });
     expect(body.ok).toBe(true);
     const folder = join(home, ".herdr", "worktrees", "app", "fix-tabs");
-    expect(mux.spaces).toEqual([{ cwd: folder, label: "fix-tabs" }]);
+    expect(mux.spaces).toEqual([{ cwd: folder, label: "fix-tabs", worktree: { repoRoot: repo } }]);
     expect(await git(folder, "symbolic-ref", "--short", "HEAD")).toBe("fix-tabs");
     expect(await git(folder, "rev-parse", "HEAD")).toBe(await git(repo, "rev-parse", "main"));
+  });
+
+  test("a create from inside a linked worktree hands the adapter the MAIN checkout, not the linked one (issue 732)", async () => {
+    const mux = new FakeMux();
+    const inside = join(home, "trees", "side");
+    const { body } = await create(mux, { cwd: inside, branch: "from-side", base: { kind: "default" } });
+    expect(body.ok).toBe(true);
+    expect(mux.spaces).toHaveLength(1);
+    expect(mux.spaces[0]?.worktree).toEqual({ repoRoot: repo });
+    expect(mux.spaces[0]?.worktree?.repoRoot).not.toBe(inside);
   });
 
   test("Other folder makes the checkout in the checked child of the parent", async () => {
@@ -272,6 +292,18 @@ describe("POST /api/worktree", () => {
     });
   });
 
+  accountTest("an account on a branch types its start line in the new folder; an account alone is refused (M101)", async () => {
+    const store = memoryAccountStore();
+    const id = "6f1c2a4e-3b5d-4c7e-9f00-112233445566";
+    await store.add({ id, harness: "codex", label: "Work", kind: "own", dir: "/srv/codex-work", addedAt: 1, device: "pixel" });
+    const accounts = new Accounts({ store, harnesses: { list: () => Promise.resolve([]), launch: harnessLaunch }, home, env: {}, platform: "linux", disk: realLinkDisk });
+    const mux = new FakeMux();
+    const { body } = await create(mux, { cwd: repo, branch: "acct-a", harness: "codex", account: id }, { accounts });
+    expect(body).toMatchObject({ ok: true, launcherStarted: true });
+    expect(mux.texts).toEqual([["w7:p1", "CODEX_HOME='/srv/codex-work' codex"]]);
+    expect((await create(new FakeMux(), { cwd: repo, branch: "acct-b", account: id }, { accounts })).status).toBe(400);
+  });
+
   test("a create that worked is remembered for the repo; a refusal is not", async () => {
     const choices = memoryWorktreeChoices();
     await mkdir(join(home, "plain", "side"), { recursive: true });
@@ -292,8 +324,8 @@ describe("POST /api/worktree", () => {
     // The folder exists now; the rule accepts it because it is this repo's worktree, and git adds nothing.
     expect((await create(mux, body)).body).toMatchObject({ ok: true, pane: { cwd: folder } });
     expect(mux.spaces).toEqual([
-      { cwd: folder, label: "feat-y" },
-      { cwd: folder, label: "feat-y" },
+      { cwd: folder, label: "feat-y", worktree: { repoRoot: repo } },
+      { cwd: folder, label: "feat-y", worktree: { repoRoot: repo } },
     ]);
   });
 

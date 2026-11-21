@@ -6,10 +6,12 @@ Every glyph the app draws is named by what it means. A theme's `glyphs` picks th
 them (ADR 0137). A family with no fitting glyph for a key draws the lucide one, shown as `(lucide)`.
 Phosphor's three sets share one map; the fill and duotone files add `-fill` and `-duotone`.
 
-326 keys.
+337 keys.
 
 Phosphor Fill draws these keys in the regular weight, so a cross stays a cross and an empty or
-not-started state stays empty: `action-check`, `action-x`, `answered`, `clear`, `close`, `confirm`, `copied`, `copy-failed`, `dismiss`, `done`, `mod-icon-check`, `mod-icon-x`, `mod-step-done`, `mod-step-failed`, `mod-step-todo`, `ok`, `plan-done`, `plan-pending`, `remove`, `selected`, `sent-ok`, `update-step-done`, `update-step-failed`, `update-step-skipped`, `voice-setup`, `zoom-out`.
+not-started state stays empty: `action-check`, `action-x`, `answered`, `clear`, `close`, `confirm`, `copied`, `copy-failed`, `decision-dismissed`, `dismiss`, `done`, `mod-icon-check`, `mod-icon-x`, `mod-step-done`, `mod-step-failed`, `mod-step-todo`, `ok`, `plan-done`, `plan-pending`, `remove`, `selected`, `sent-ok`, `update-step-done`, `update-step-failed`, `update-step-skipped`, `voice-setup`, `zoom-out`.
+
+These keys are solid in every set: `Icon` fills the lucide and iconoir glyph, and phosphor draws the fill file in all three weights: `stop`.
 
 ## Belt
 
@@ -29,7 +31,9 @@ not-started state stays empty: `action-check`, `action-x`, `answered`, `clear`, 
 | `action-x` | a program action drawn as an X | `X` | `x` | `xmark` |
 | `harness-compact` | compact the context (agent command) | `Shrink` | `arrows-in` | `compress` |
 | `harness-effort` | set effort (agent command) | `Gauge` | `gauge` | `dashboard-speed` |
+| `harness-history` | branch from an earlier prompt (agent command) | `History` | `clock-counter-clockwise` | `clock-rotate-right` |
 | `harness-model` | pick the model (agent command) | `Cpu` | `cpu` | `cpu` |
+| `harness-plan` | plan mode on, off or read (agent command) | `ListTree` | `tree-view` | `view-structure-down` |
 | `harness-resume` | resume an earlier session (agent command) | `History` | `clock-counter-clockwise` | `clock-rotate-right` |
 | `harness-tree` | session tree (agent command) | `ListTree` | `tree-view` | `view-structure-down` |
 | `jobs` | running jobs | `Timer` | `timer` | `timer` |
@@ -173,9 +177,14 @@ not-started state stays empty: `action-check`, `action-x`, `answered`, `clear`, 
 | `archived` | an archived item | `Archive` | `archive` | `archive` |
 | `back` | go back | `ArrowLeft` | `arrow-left` | `arrow-left` |
 | `crew` | the crew of machines | `Network` | `network` | `network` |
+| `decision-dismissed` | a Decision that was dismissed | `X` | `x` | `xmark` |
+| `decision-superseded` | a Decision a newer one replaced | `RefreshCw` | `arrows-clockwise` | `refresh-double` |
+| `decision-withdrawn` | a Decision its poster took back | `ArrowLeft` | `arrow-left` | `arrow-left` |
 | `empty-state` | nothing to show here | `Inbox` | `tray` | `drawer` |
 | `files` | files | `ListTree` | `tree-view` | `view-structure-down` |
 | `hand` | which hand holds the phone | `Hand` | `hand` | `drag-hand-gesture` |
+| `hill` | the Hill, where Decisions wait | `Mountain` | `mountains` | (lucide) |
+| `hill-now` | the Hill while a `now` Decision is open | `MountainSnow` | `mountains` | (lucide) |
 | `launch` | launch an agent | `Play` | `play` | `play` |
 | `messages` | messages | `MessagesSquare` | `chats` | `multi-bubble` |
 | `needs-you` | only panes that need me | `CircleDot` | `radio-button` | `one-point-circle` |
@@ -187,6 +196,7 @@ not-started state stays empty: `action-check`, `action-x`, `answered`, `clear`, 
 | `pane-nav-left` | pane navigation left | `ArrowLeft` | `arrow-left` | `arrow-left` |
 | `pane-nav-right` | pane navigation right | `ArrowRight` | `arrow-right` | `arrow-right` |
 | `pane-nav-up` | pane navigation up | `ArrowUp` | `arrow-up` | `arrow-up` |
+| `recommended` | the option the poster recommends | `Star` | `star` | `star` |
 | `reopen` | reopen a closed conversation | `RotateCcw` | `arrow-counter-clockwise` | `undo-circle` |
 | `settings` | settings | `Settings` | `gear` | `settings` |
 | `sidebar-hide` | hide the sidebar | `PanelLeftClose` | `sidebar-simple` | `sidebar-collapse` |
@@ -194,6 +204,7 @@ not-started state stays empty: `action-check`, `action-x`, `answered`, `clear`, 
 | `space-next` | next space | `ChevronDown` | `caret-down` | `nav-arrow-down` |
 | `space-prev` | previous space | `ChevronUp` | `caret-up` | `nav-arrow-up` |
 | `tab-dashboard` | Dashboard tab | `Rows3` | `rows` | `table-rows` |
+| `tricks` | Collie tricks, the small add-ons a person switches on | `Puzzle` | `puzzle-piece` | `puzzle` |
 | `wide-layout` | wide layout | `PanelLeft` | `sidebar` | `layout-left` |
 | `zoom-in` | zoom in | `Plus` | `plus` | `plus` |
 | `zoom-out` | zoom out | `Minus` | `minus` | `minus` |
@@ -339,6 +350,8 @@ not-started state stays empty: `action-check`, `action-x`, `answered`, `clear`, 
 | --- | --- | --- | --- | --- |
 | `branch` | a git branch | `GitBranch` | `git-branch` | `git-branch` |
 | `detached-head` | HEAD is on a commit, not a branch | `GitCommitHorizontal` | `git-commit` | `git-commit` |
+| `image-next` | the next picture in the picture sheet | `ChevronRight` | `caret-right` | `nav-arrow-right` |
+| `image-prev` | the previous picture in the picture sheet | `ChevronLeft` | `caret-left` | `nav-arrow-left` |
 | `scroll-hint-left` | more content to the left | `ChevronLeft` | `caret-left` | `nav-arrow-left` |
 | `scroll-hint-right` | more content to the right | `ChevronRight` | `caret-right` | `nav-arrow-right` |
 | `search` | search | `Search` | `magnifying-glass` | `search` |

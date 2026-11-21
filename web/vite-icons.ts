@@ -108,9 +108,10 @@ const RELEASE_MANIFEST: ChannelManifest = {
   ],
 };
 
-// Same dark polarity as the release tiles (vite.config.ts's long comment above `icons` explains
-// why the tile must stay dark) — only the paint and the name change, so an operator who installs
-// both a release and a dev build still recognises the app family at a glance.
+// The dev tiles turn the release tile round: an orange ground and the mark in the release tile's
+// dark paper colour (the collie-brand ship script bakes them). The mark, the frame and the name's
+// stem are the release set's, so an operator who installs both a release and a dev build still
+// recognises the app family, and tells the two apart by the whole tile.
 const DEV_MANIFEST: ChannelManifest = {
   name: "Collie (dev)",
   short_name: "Collie dev",
@@ -126,8 +127,8 @@ export function manifestFor(channel: Channel): ChannelManifest {
   return channel === "dev" ? DEV_MANIFEST : RELEASE_MANIFEST;
 }
 
-/** The states playground wears its own red set — no manifest, no service worker, so just the
- *  three direct `<link>` tags playground.html carries. */
+/** The dev pages (the design reference) wear their own red set — no manifest, no
+ *  service worker, so just the three direct `<link>` tags design.html carries. */
 export const PLAYGROUND_ICON_LINKS: readonly IconLink[] = [
   { rel: "icon", type: "image/svg+xml", href: "/favicon-playground.svg" },
   { rel: "shortcut icon", href: "/favicon-playground.ico" },
@@ -145,12 +146,13 @@ function channelIconFiles(channel: Channel): string[] {
 
 // The playground's own files, by the same derivation from PLAYGROUND_ICON_LINKS, plus its HTML
 // entry and a wildcard for any asset named after it — the playground never builds into `dist`
-// today (it's a dev-only Vite server, see playground.html's own header), but a precache ignore
+// today (it's a dev-only Vite server, see design.html's own header), but a precache ignore
 // list is cheap insurance against that changing silently.
 function playgroundFiles(): string[] {
   return [
     ...PLAYGROUND_ICON_LINKS.map((link) => link.href.replace(/^\//, "")),
     "playground.html",
+    "design.html",
     "playground-*",
   ];
 }

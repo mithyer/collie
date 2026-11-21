@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { parseUsageRecord, usageFileName } from "../bridge/usage.ts";
-import type { JsonObject } from "../bridge/json.ts";
+import type { JsonObject, JsonValue } from "../bridge/json.ts";
 import type { Environment } from "./context.ts";
 import { context, fakeFiles, STATE } from "./fakes.ts";
 import { EXIT } from "./io.ts";
@@ -142,12 +142,84 @@ describe("usageFromStatusLine", () => {
         harness: "claude",
         at: NOW,
         context: 42,
+        window: 200_000,
+        windowBy: "statusline",
         limits: [
           { window: "5h", used: 23.5, resetsAt: 1_800_003_600_000 },
           { window: "7d", used: 41.2, resetsAt: 1_800_500_000_000 },
         ],
       },
     });
+  });
+
+  test("the 2026-11-13 report: a Fable session on a 1M window keeps Claude Code's own 22, and the 1M it divides by", () => {
+    // The `context_window` shape Claude Code 2.1.323 writes (code.claude.com/docs/en/statusline): 222,200 input tokens of 1M.
+    const context_window = {
+      total_input_tokens: 222_200,
+      total_output_tokens: 277,
+      context_window_size: 1_000_000,
+      used_percentage: 22,
+      remaining_percentage: 78,
+      current_usage: { input_tokens: 2, cache_creation_input_tokens: 1_913, cache_read_input_tokens: 220_285, output_tokens: 277 },
+    };
+    const model = { id: "claude-fable-5-2", display_name: "Fable 5.2" };
+    expect(usageFromStatusLine(payload({ model, context_window }), NOW)?.record).toMatchObject({ context: 22, contextTokens: 222_200, window: 1_000_000, windowBy: "statusline" });
+  });
+
+  test("the count is current_usage's input, cache creation and cache read; none while current_usage is null", () => {
+    const counted = (context_window: JsonObject) => usageFromStatusLine(payload({ context_window }), NOW)?.record.contextTokens;
+    // Before the first answer and after /compact, 2.1.323 sends `current_usage: null` and `total_input_tokens: 0`.
+    expect(counted({ total_input_tokens: 0, context_window_size: 1_000_000, used_percentage: null, current_usage: null })).toBeUndefined();
+    expect(counted({ total_input_tokens: 150_010, context_window_size: 200_000 })).toBeUndefined();
+    expect(counted({ current_usage: { input_tokens: 10, cache_creation_input_tokens: 20_000, cache_read_input_tokens: 130_000, output_tokens: 900 } })).toBe(150_010);
+    expect(counted({ current_usage: { input_tokens: 10, cache_read_input_tokens: 130_000 } })).toBeUndefined();
+    expect(counted({ current_usage: { input_tokens: -1, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 } })).toBeUndefined();
+  });
+
+  test("takes the size of the context window the document states, and nothing for a size that is not a whole positive number", () => {
+    const sized = (context_window_size: JsonValue) => usageFromStatusLine(payload({ context_window: { used_percentage: 59, context_window_size } }), NOW)?.record;
+    expect(sized(400_000)).toMatchObject({ context: 59, window: 400_000, windowBy: "statusline" });
+    expect(sized(1_000_000)).toMatchObject({ window: 1_000_000, windowBy: "statusline" });
+    for (const bad of [0, -5, 1.5, "400000", null, Number.MAX_SAFE_INTEGER]) {
+      const record = sized(bad);
+      expect(record?.window).toBeUndefined();
+      expect(record?.windowBy).toBeUndefined();
+    }
+    const none = usageFromStatusLine(payload({ context_window: { used_percentage: 59 } }), NOW)?.record;
+    expect(none?.window).toBeUndefined();
+  });
+
+  test("a plan that reports only seven_day yields one window", () => {
+    const one = usageFromStatusLine(payload({ rate_limits: { seven_day: { used_percentage: 12, resets_at: 1_800_500_000 } } }), NOW);
+    expect(one?.record.limits).toEqual([{ window: "7d", used: 12, resetsAt: 1_800_500_000_000 }]);
+  });
+
+  test("reads every rate_limits key that has a used_percentage: the gateway spend limit is spend, an unknown key keeps its own", () => {
+    const limits = usageFromStatusLine(
+      payload({
+        rate_limits: {
+          spend_limit: { used_percentage: 61, resets_at: 1_800_900_000, used_usd: 6.1, limit_usd: 10, period: "month" },
+          seven_day_opus: { used_percentage: 9 },
+          seven_day: { used_percentage: 41.2 },
+          five_hour: { used_percentage: 23.5 },
+          no_number: { resets_at: 5 },
+          "bad key\u0007": { used_percentage: 1 },
+          note: "text",
+        },
+      }),
+      NOW,
+    )?.record.limits;
+    expect(limits).toEqual([
+      { window: "5h", used: 23.5 },
+      { window: "7d", used: 41.2 },
+      { window: "seven_day_opus", used: 9 },
+      { window: "spend", used: 61, resetsAt: 1_800_900_000_000 },
+    ]);
+  });
+
+  test("holds at most eight windows", () => {
+    const rate_limits: JsonObject = Object.fromEntries(Array.from({ length: 12 }, (_, i) => [`w${String(i)}`, { used_percentage: i }]));
+    expect(usageFromStatusLine(payload({ rate_limits }), NOW)?.record.limits).toHaveLength(8);
   });
 
   test("an API-key session has no windows; a null early percentage is no number", () => {
@@ -227,15 +299,15 @@ describe("collie beacon statusline", () => {
     expect(parseUsageRecord(custom.files.entries.get(usagePath)?.text ?? "")?.configDir).toBeUndefined();
   });
 
-  test("merges into a file the beacon wrote: the window it noted and the context stay unless this reading has its own", async () => {
+  test("merges into a file on disk: the stated window stays unless this reading states its own size, and the context stays unless it has its own", async () => {
     const { d, files } = deps({ stdin: JSON.stringify(payload({ context_window: { used_percentage: null } })) });
-    files.write(usagePath, JSON.stringify({ schemaVersion: 1, harness: "claude", at: NOW - 1, context: 17, window: 1_000_000 }));
+    files.write(usagePath, JSON.stringify({ schemaVersion: 1, harness: "claude", at: NOW - 1, context: 17, window: 1_000_000, windowBy: "statusline" }));
     await cmdBeaconStatusline(d, [token]);
     const merged = parseUsageRecord(files.entries.get(usagePath)?.text ?? "");
-    expect(merged).toMatchObject({ context: 17, window: 1_000_000, at: NOW });
+    expect(merged).toMatchObject({ context: 17, window: 1_000_000, windowBy: "statusline", at: NOW });
     expect(merged?.limits).toHaveLength(2);
     await cmdBeaconStatusline({ ...d, readStdin: () => Promise.resolve(JSON.stringify(payload())) }, [token]);
-    expect(parseUsageRecord(files.entries.get(usagePath)?.text ?? "")).toMatchObject({ context: 42, window: 1_000_000 });
+    expect(parseUsageRecord(files.entries.get(usagePath)?.text ?? "")).toMatchObject({ context: 42, window: 200_000, windowBy: "statusline" });
   });
 
   test("outside a multiplexer it writes nothing and still runs the command", async () => {

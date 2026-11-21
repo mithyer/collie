@@ -22,6 +22,7 @@ interface Prefs {
   updates: boolean;
   cache: boolean;
   machines: boolean;
+  decisions: boolean;
 }
 
 // The control sends ONE key per toggle, so a patch is a partial of the same contract — which is
@@ -31,7 +32,7 @@ let currentPrefs: Prefs;
 
 beforeEach(() => {
   lastPatch = undefined;
-  currentPrefs = { blocked: true, done: false, individual: true, updates: true, cache: false, machines: true };
+  currentPrefs = { blocked: true, done: false, individual: true, updates: true, cache: false, machines: true, decisions: true };
   server.use(
     http.get("/api/notifications/prefs", () => HttpResponse.json(currentPrefs)),
     http.post<never, Partial<Prefs>>("/api/notifications/prefs", async ({ request }) => {
@@ -45,7 +46,7 @@ beforeEach(() => {
 describe("NotifyPrefsControl", () => {
   test("renders the fetched prefs onto the switches", async () => {
     render(<NotifyPrefsControl />);
-    const needs = await screen.findByRole("switch", { name: /needs input/i });
+    const needs = await screen.findByRole("switch", { name: /needs you/i });
     const finished = await screen.findByRole("switch", { name: /finished/i });
     const updates = await screen.findByRole("switch", { name: /app updates/i });
     expect(needs).toBeChecked(); // blocked default on
@@ -81,7 +82,7 @@ describe("NotifyPrefsControl", () => {
     const individual = await screen.findByRole("switch", { name: /one notification per agent/i });
     const names = screen.getAllByRole("switch").map((s) => s.getAttribute("aria-label"));
     const at = names.indexOf("One notification per agent");
-    expect(names.slice(at - 2, at)).toEqual(["Needs input", "Finished"]);
+    expect(names.slice(at - 2, at)).toEqual(["Needs you", "Finished"]);
     expect(screen.getByText(/each agent that needs you gets its own notification/i)).toBeInTheDocument();
     await waitFor(() => expect(individual).not.toBeDisabled());
     expect(individual).toBeChecked();
@@ -98,7 +99,7 @@ describe("NotifyPrefsControl", () => {
       http.post("/api/notifications/prefs", () => new HttpResponse(null, { status: 500 })),
     );
     render(<NotifyPrefsControl />);
-    const needs = await screen.findByRole("switch", { name: /needs input/i });
+    const needs = await screen.findByRole("switch", { name: /needs you/i });
     expect(needs).toBeChecked();
 
     await user.click(needs); // optimistic → off, POST 500 → revert to on
@@ -110,7 +111,7 @@ describe("NotifyPrefsControl", () => {
 describe("NotifyPrefsControl — the fourth switch and the panes it watches", () => {
   const ENTRIES: CacheWatchListEntry[] = [
     { id: "e1", label: "web-worker" },
-    { id: "e2", label: "backend", host: "minibuch" },
+    { id: "e2", label: "backend", host: "workshop" },
   ];
 
   beforeEach(() => {
@@ -125,7 +126,7 @@ describe("NotifyPrefsControl — the fourth switch and the panes it watches", ()
 
   test("renders six switch rows, the cache warning last so its watched panes sit under it", async () => {
     render(<NotifyPrefsControl />);
-    expect(await screen.findByRole("switch", { name: /needs input/i })).toBeInTheDocument();
+    expect(await screen.findByRole("switch", { name: /needs you/i })).toBeInTheDocument();
     expect(screen.getByRole("switch", { name: /finished/i })).toBeInTheDocument();
     expect(screen.getByRole("switch", { name: /one notification per agent/i })).toBeInTheDocument();
     expect(screen.getByRole("switch", { name: /app updates/i })).toBeInTheDocument();
@@ -145,6 +146,21 @@ describe("NotifyPrefsControl — the fourth switch and the panes it watches", ()
 
     await waitFor(() => expect(lastPatch).toEqual({ machines: false }));
     await waitFor(() => expect(machines).not.toBeChecked());
+  });
+
+  // A `now` Decision on the Hill rings the phone (bridge/hill/push.ts). Default on, its own switch.
+  test("the Decisions switch is on by default, sits above the cache switch, and POSTs {decisions: false}", async () => {
+    const user = userEvent.setup();
+    render(<NotifyPrefsControl />);
+    const decisions = await screen.findByRole("switch", { name: /decisions that need you now/i });
+    await waitFor(() => expect(decisions).toBeChecked());
+    const switches = screen.getAllByRole("switch");
+    expect(switches.indexOf(decisions)).toBe(switches.length - 2);
+
+    await user.click(decisions);
+
+    await waitFor(() => expect(lastPatch).toEqual({ decisions: false }));
+    await waitFor(() => expect(decisions).not.toBeChecked());
   });
 
   test("toggling the fourth switch POSTs {cache: true}", async () => {
@@ -171,7 +187,7 @@ describe("NotifyPrefsControl — the fourth switch and the panes it watches", ()
 
     expect(await screen.findByText("web-worker")).toBeInTheDocument();
     expect(screen.getByText("backend")).toBeInTheDocument();
-    expect(screen.getByText("minibuch")).toBeInTheDocument();
+    expect(screen.getByText("workshop")).toBeInTheDocument();
     expect(screen.getAllByRole("button", { name: /stop watching/i })).toHaveLength(2);
   });
 

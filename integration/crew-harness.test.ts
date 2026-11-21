@@ -7,10 +7,11 @@ import { dirname, join } from "node:path";
 import { createServer } from "node:net";
 
 import { HOST } from "../bridge/host.ts";
+import { writeTricksFeature } from "../bridge/tricks/feature-switch.ts";
 import type { JsonValue } from "../bridge/json.ts";
 import { EXIT } from "../cli/io.ts";
 import { askSocket, cmdWalkySend, cmdWalkyStatus, type WalkyDeps } from "../cli/walky.ts";
-import { asJsonObject, asJsonString } from "../web/src/lib/json.ts";
+import { asJsonObject, asJsonString, parseJsonObject, type JsonObject } from "../web/src/lib/json.ts";
 import type { AskReply } from "../web/src/lib/surface/ask.ts";
 import { signMessage } from "../bridge/walky/canonical.ts";
 import { walkySocketPath } from "../bridge/walky/socket.ts";
@@ -125,6 +126,23 @@ let root: string;
  * about them look identical. That is what let the beta.9 bug ship. `node:http` performs no content
  * decoding, so the assertion "encoding claimed ⟺ bytes gzipped" is actually decidable.
  */
+// The runner's PATH in `GET /api/tricks` (int/1.29.0, d4de087c0), through the running bridge: only the
+// host's own CLI (its local read credential) gets `path`; a paired phone's reply has no such key.
+describe("the tricks list: the runner's PATH for the local CLI only, through a real request", () => {
+  test("a phone-style request gets no `path`, and the local CLI request gets it", async () => {
+    // The bridge names the PATH only once its tricks folder exists (service.ts `folderExists`).
+    mkdirSync(join(lead.home, ".config", "collie", "tricks"), { recursive: true });
+    const local = async (): Promise<JsonObject | undefined> => parseJsonObject(await (await lead.localApi("/api/tricks?bound=1")).text());
+    await waitFor(async () => asJsonString((await local())?.path) !== undefined, 10_000, () => "the local CLI read never carried `path`");
+    expect((await local())?.path).toBe(process.env.PATH ?? "");
+    const phone = await fetch(`${lead.origin()}/api/tricks?bound=1`, { headers: await lead.pairingAuth() });
+    expect(phone.status).toBe(200);
+    const body = parseJsonObject(await phone.text());
+    expect(body).toBeDefined();
+    expect(body !== undefined && "path" in body).toBe(false);
+  });
+});
+
 async function rawGet(
   target: string,
   headers: Record<string, string>,
@@ -153,6 +171,14 @@ async function rawGet(
     req.on("error", reject);
   });
 }
+
+/**
+ * The one named space every fake Herdr workspace carries (M98). A walky talky message from an agent
+ * reaches only the panes of its own space, so the cases that send between machines need their panes in
+ * one space, and a named one: an unnamed space belongs to one machine and never joins another's. The
+ * border cases below sign a message from another space by hand.
+ */
+const SHARED_SPACE = "work";
 
 /** One end of the crew: a scratch state dir, a fake Herdr, and a child bridge we can respawn. */
 class Instance {
@@ -184,7 +210,7 @@ class Instance {
   startHerdr(): void {
     this.herdr = startFakeHerdr({
       socketPath: this.socketPath,
-      workspaceLabel: this.name,
+      workspaceLabel: SHARED_SPACE,
       panes: [{ paneId: this.paneId, tabId: "t1", workspaceId: "w1", label: this.name, text: this.paneText }],
     });
   }
@@ -316,11 +342,29 @@ class Instance {
     return { authorization: `Bearer ${this.pairedToken}`, origin: this.origin() };
   }
 
-  /** A GET or other READ of this instance's `/api/*`, carrying its local credential. */
+  /**
+   * A GET or other READ of this instance's `/api/*`, as a paired device: the pairing token, and no
+   * `Origin` unless the caller sets one. A paired device, not the local key, because the local key
+   * reads no screen or message (bridge/local-key.ts) and most of these reads are panes, the crew and
+   * the walky list.
+   */
   async api(path: string, init: RequestInit = {}): Promise<Response> {
+    const headers = new Headers(init.headers);
+    headers.set("authorization", await this.pairedBearer());
+    return fetch(`${this.origin()}${path}`, { ...init, headers });
+  }
+
+  /** A READ of this instance's `/api/*` with the host's local key, exactly as the CLI sends it. */
+  async localApi(path: string, init: RequestInit = {}): Promise<Response> {
     const headers = new Headers(init.headers);
     for (const [name, value] of Object.entries(await this.localAuth())) headers.set(name, value);
     return fetch(`${this.origin()}${path}`, { ...init, headers });
+  }
+
+  /** The `Authorization` value of {@link pairingAuth}, claiming the token first if need be. */
+  private async pairedBearer(): Promise<string> {
+    await this.pairingAuth();
+    return `Bearer ${this.pairedToken ?? ""}`;
   }
 
   /** A write to this instance's `/api/*`, carrying a real pairing token and a same-origin `Origin`. */
@@ -511,11 +555,25 @@ describe("solo zero-tax, measured rather than inferred", () => {
     const packed = await fetch(`${base}${CREW_HELLO_PATH}`);
     expect(packed.status).toBe(unknown.status);
     expect(packed.headers.get("x-crew-protocol")).toBeNull();
-    // Today's codes, WITH the host's own read credential (ADR 0086): reads need the pairing token,
-    // and a drill that sends none would measure the gate and not the routes.
+    // Today's codes, WITH a credential (ADR 0086): reads need the pairing token, and a drill that
+    // sends none would measure the gate and not the routes. The host's local key reads the snapshot
+    // and the config, and no pane (bridge/local-key.ts); a paired device reads all three.
+    expect((await lead.localApi(`/api/snapshot`)).status).toBe(200);
+    expect((await lead.localApi(`/api/config`)).status).toBe(200);
+    const paneByKey = await lead.localApi(`/api/pane/${encodeURIComponent(lead.paneId)}`);
+    expect(paneByKey.status).toBe(403);
+    expect(asJsonString(parseJsonObject(await paneByKey.text())?.code)).toBe("local.no_text");
     expect((await lead.api(`/api/snapshot`)).status).toBe(200);
     expect((await lead.api(`/api/config`)).status).toBe(200);
     expect((await lead.api(`/api/pane/${encodeURIComponent(lead.paneId)}`)).status).toBe(200);
+  });
+
+  test("the host's local key gets a text-free snapshot: no title, no ask, no held send", async () => {
+    const byKey = parseJsonObject(await (await lead.localApi(`/api/snapshot`)).text());
+    const panes = Array.isArray(byKey?.agents) ? byKey.agents : [];
+    expect(panes.length).toBeGreaterThan(0);
+    const allowed = ["paneId", "kind", "agent", "hasSession", "status", "host", "session", "model", "workspaceLabel", "workspaceNumber", "lastActiveAt"];
+    for (const p of panes) for (const key of Object.keys(parseJsonObject(JSON.stringify(p)) ?? {})) expect(allowed).toContain(key);
   });
 
   test("with no credential every read is 403 but health, and a wrong one is no better", async () => {
@@ -578,6 +636,80 @@ describe("solo zero-tax, measured rather than inferred", () => {
 });
 
 // ── Enrollment over the real transport ───────────────────────────────────────
+
+// Agent views, lead addition 1 (review 9): who may switch a view and send from one, as REAL requests to a
+// running bridge. A send with a `view` field and the switch need a paired device's own token with write
+// access; the host's local credential and no credential are refused before any body is read. A request
+// that passes the gates reaches the view service, which answers with its own code: proof the gate let it
+// through and nothing else did. Nothing reaches the pane on any of them.
+describe("agent views: the write gate, through real requests (lead addition 1)", () => {
+  const session = "local/w1:p1";
+  const sendBody = JSON.stringify({ id: "view-gate-000001", pane: "w1:p1", text: "hello", view: { trick: "morph", session } });
+  const switchBody = JSON.stringify({ trick: "morph", session, on: true });
+  // Tricks as a whole are off by default, and the view service refuses `trick_off` before it looks for the trick. These tests
+  // prove the write gate for an UNKNOWN trick, so the switch is on for the block and back off after it.
+  beforeAll(() => {
+    writeTricksFeature(lead.stateDir, true);
+  });
+  afterAll(() => {
+    writeTricksFeature(lead.stateDir, false);
+  });
+  const post = (path: string, body: string, headers: Record<string, string>): Promise<Response> =>
+    fetch(`${lead.origin()}${path}`, { method: "POST", headers: { "content-type": "application/json", ...headers }, body });
+
+  test("no credential and the host's local credential are refused 401 or 403 on the send and the switch, and nothing is typed", async () => {
+    const writes = lead.herdr!.writes.length;
+    for (const path of ["/api/send", "/api/trick-views/switch"]) {
+      const body = path === "/api/send" ? sendBody : switchBody;
+      const none = await post(path, body, { origin: lead.origin() });
+      expect([401, 403], `${path} with no credential`).toContain(none.status);
+      const local = await post(path, body, { ...(await lead.localAuth()), origin: lead.origin() });
+      expect(local.status, `${path} with the local credential`).toBe(403);
+    }
+    expect(lead.herdr!.writes.length).toBe(writes);
+  });
+
+  test("a paired device's token passes both gates and reaches the view service, which answers with its own code", async () => {
+    const writes = lead.herdr!.writes.length;
+    const auth = await lead.pairingAuth();
+    const sent = await post("/api/send", sendBody, auth);
+    expect(sent.status).toBe(409);
+    // No trick named `morph` is installed here: the service's gate answers, after both route gates.
+    expect(await sent.json()).toMatchObject({ view: true, code: "no_trick" });
+    const switched = await post("/api/trick-views/switch", switchBody, auth);
+    expect(switched.status).toBe(409);
+    expect(await switched.json()).toMatchObject({ view: true, code: "no_trick" });
+    expect(lead.herdr!.writes.length).toBe(writes);
+  });
+
+  test("rule 12 (review 9, the index.ts wiring): the view service's refusal reaches the bridge's audit.log with the trick, the reason and the address", async () => {
+    const auth = await lead.pairingAuth();
+    const before = readFileSync(join(lead.stateDir, "audit.log"), "utf8").split("\n").length;
+    expect((await post("/api/trick-views/switch", switchBody, auth)).status).toBe(409);
+    let line: JsonObject | undefined;
+    await waitFor(
+      () => {
+        const lines = readFileSync(join(lead.stateDir, "audit.log"), "utf8").split("\n").slice(before - 1).filter((raw) => raw.trim() !== "");
+        line = lines.map((raw) => parseJsonObject(raw)).find((parsed) => parsed?.action === "trick.view.refused");
+        return Promise.resolve(line !== undefined);
+      },
+      10_000,
+      "no trick.view.refused line in audit.log",
+    );
+    // The address is the pane's, with its instance token; the device is the paired one.
+    expect(line).toMatchObject({ action: "trick.view.refused", device: "drill", detail: { trick: "morph", reason: "no_trick", switch: true, address: expect.stringMatching(/^local\/w1:p1#[a-z0-9]+$/u) } });
+  });
+
+  test("the list and a picture take the read gate: no credential and the local key are refused, a paired device reads, and an unknown picture is 404", async () => {
+    expect([401, 403]).toContain((await fetch(`${lead.origin()}/api/trick-views`)).status);
+    expect((await lead.localApi("/api/trick-views")).status).toBe(403);
+    expect((await lead.api("/api/trick-views")).status).toBe(200);
+    const path = "/api/trick-views/media/vs_aaaaaaaaaaaaaaaa/vm_aaaaaaaaaaaaaaaa";
+    expect([401, 403]).toContain((await fetch(`${lead.origin()}${path}`)).status);
+    expect((await lead.localApi(path)).status).toBe(403);
+    expect((await lead.api(path)).status).toBe(404);
+  });
+});
 
 describe("invite → join, end to end", () => {
   let token = "";
@@ -785,6 +917,8 @@ describe("the lead speaks for the crew", () => {
   test("a proxied pane read is byte-identical and keeps its ETag and its 304", async () => {
     const peerId = peer.store()!.self.memberId;
     const path = `/api/pane/${encodeURIComponent(peer.paneId)}?host=${peerId}`;
+    // The lead's local key never reads a member's pane: the refusal comes before the forward.
+    expect((await lead.localApi(path)).status).toBe(403);
     const first = await lead.api(path);
     expect(first.status).toBe(200);
     const etag = first.headers.get("etag");
@@ -812,7 +946,8 @@ describe("the lead speaks for the crew", () => {
     // agree — which is what the original bug violated, and what is asserted below in both directions.
     const peerId = peer.store()!.self.memberId;
     const url = `${lead.origin()}/api/pane/${encodeURIComponent(peer.paneId)}?host=${peerId}`;
-    const auth = await lead.localAuth();
+    const { authorization } = await lead.pairingAuth();
+    const auth = { authorization: authorization ?? "" };
     // Read at the WIRE, via `node:http`: `fetch` inflates a gzip body for us and leaves the header
     // on, which is precisely the confusion that hid the original bug — under `fetch` a lying header
     // and an honest one are indistinguishable. `rawGet` decodes nothing.
@@ -911,7 +1046,15 @@ describe("walky talky across the crew (CREW_PROTOCOL §21)", () => {
       10_000,
       "the lead's who never listed the member's pane",
     );
-    expect(await walky(peer, { op: "who" })).toMatchObject({ ok: true, note: expect.stringContaining("run `collie walky who` on the lead (") });
+    // A member asks its lead (M98 spec 04): its own list holds the lead's pane too, and no note says to go elsewhere.
+    await waitFor(
+      async () => JSON.stringify(await walky(peer, { op: "who" })).includes(`"${leadId}/${lead.paneId}#`),
+      10_000,
+      "the member's who never listed the lead's pane",
+    );
+    const memberWho = await walky(peer, { op: "who" });
+    expect(memberWho).toMatchObject({ ok: true, targets: expect.arrayContaining([expect.objectContaining({ address: expect.stringContaining(`${peerId}/${peer.paneId}`) })]) });
+    expect(asJsonObject(memberWho)?.note).toBeUndefined();
 
     // The lead to the member: signed by the lead, so the member verifies the origin too.
     const down = await operatorSend(lead, { id: "wt_crewdown0001", to: `${peerId}/${peer.paneId}`, body: "from the lead" });
@@ -1822,6 +1965,18 @@ describe("the standby door and the takeover (RFC §6/§7/§9)", () => {
   const standby = (path: string, init: RequestInit = {}) =>
     fetch(`http://127.0.0.1:${standbyPort}${path}`, init);
   /**
+   * What a phone does before it taps: read the page and take the mark of the lists it showed off the
+   * button (`data-seen`). The tap sends it back in `x-collie-carried`, and the door refuses a missing
+   * or stale one with 409 (`CARRIED_CHANGED`).
+   */
+  async function shownMark(): Promise<string> {
+    const html = await (await standby("/standby")).text();
+    const button = html.match(/<button\b[^>]*\bid="go"[^>]*>/)?.[0] ?? "";
+    const mark = button.match(/\bdata-seen="([^"]*)"/)?.[1];
+    expect({ button, mark }).toEqual({ button: expect.stringContaining('id="go"'), mark: expect.any(String) });
+    return mark!;
+  }
+  /**
    * `GET /crew/v1/hello` at a peer, dialled as the LEAD does it — the exact bytes the lead's own
    * `crew status` reads its answers off. Two factors: the lead's certificate at the handshake and the
    * crew secret in the header.
@@ -2141,7 +2296,9 @@ describe("the standby door and the takeover (RFC §6/§7/§9)", () => {
     const html = await (await standby("/standby")).text();
     expect(html).toContain("Take over");
     expect(html).toContain(`has not called this machine for`);
-    expect(html).toContain(`<button id="go" type="button">Take over</button>`);
+    // The button, by its id and its words: the attribute list is not pinned, because the page adds
+    // marks to it (the `data-seen` mark of the lists shown, which the tap must send back).
+    expect(html).toMatch(/<button\b[^>]*\bid="go"[^>]*>Take over<\/button>/);
     // One witness exists, so the page says who will be asked rather than the two-machine warning.
     expect(html).toContain("ask 1 other machine whether it has called");
   }, 60_000);
@@ -2169,12 +2326,32 @@ describe("the standby door and the takeover (RFC §6/§7/§9)", () => {
     expect(witness.store()!.lead!.memberId).toBe(idOf(hq));
   }, 30_000);
 
+  test("a tap with a stale or missing mark is refused with 409, and nothing is taken over", async () => {
+    const shown = await shownMark();
+    for (const stale of [`${shown}-stale`, "t:-;h:999999", null]) {
+      const headers = new Headers({ authorization: `Bearer ${TOKEN}` });
+      if (stale !== null) headers.set("x-collie-carried", stale);
+      const res = await standby("/standby/takeover", { method: "POST", headers });
+      expect({ status: res.status, answer: await res.json() }).toEqual({
+        status: 409,
+        answer: { ok: false, message: "The list changed. Read it again.", changed: true },
+      });
+    }
+    // Still a deputy: it follows the old lead, holds no crown, and its process did not restart.
+    const kept = aide.store()!;
+    expect(kept.lead?.memberId).toBe(idOf(hq));
+    expect(kept.warrant).not.toBeNull();
+    expect(aide.proc!.exitCode).toBeNull();
+    expect(witness.store()!.lead!.memberId).toBe(idOf(hq));
+  }, 30_000);
+
   test("the takeover: the witness re-pins, and the deputy commits LAST", async () => {
     const aideId = idOf(aide);
     const hqId = idOf(hq);
+    // As a phone does: the mark the page showed rides the tap.
     const res = await standby("/standby/takeover", {
       method: "POST",
-      headers: { authorization: `Bearer ${TOKEN}` },
+      headers: { authorization: `Bearer ${TOKEN}`, "x-collie-carried": await shownMark() },
     });
     // Asserted WITH the body: every refusal here is a sentence, and a bare status would hide the one
     // fact a failure needs (which of RFC §7's steps said no).
@@ -2327,7 +2504,9 @@ describe("walky talky in a crew of four, on the real wire", () => {
   function startLiveHerdr(at: Instance, label = at.name): void {
     at.herdr = startFakeHerdr({
       socketPath: at.socketPath,
-      workspaceLabel: at.name,
+      // The old member predates walky talky: it keeps a space of its own, so `here` never lists it and the
+      // cases about it stay about the lead's `older member` refusal.
+      workspaceLabel: at === wo ? at.name : SHARED_SPACE,
       panes: [
         {
           paneId: at.paneId,
@@ -2377,8 +2556,10 @@ describe("walky talky in a crew of four, on the real wire", () => {
   ];
 
   /** An agent's send from `from`'s pane over `from`'s own walky socket, the way `collie walky send` does it. */
-  const agentSend = (from: Instance, id: string, to: string, body: string): Promise<JsonValue> =>
-    walky(from, { op: "send", id, to, body, replyTo: null, markers: markersOf(from) });
+  const agentSend = (from: Instance, id: string, to: string, body: string, outside = false): Promise<JsonValue> => {
+    const request = { op: "send", id, to, body, replyTo: null, markers: markersOf(from) };
+    return walky(from, outside ? { ...request, outside } : request);
+  };
 
   /** Every line the bridge typed into `at`'s pane, whole, in order. */
   const typedLines = (at: Instance): string[] =>
@@ -2421,7 +2602,7 @@ describe("walky talky in a crew of four, on the real wire", () => {
   let lastStamp = 0;
   async function postAsMember(
     member: Instance,
-    fields: { id: string; to: string; body: string; at: number; address?: string },
+    fields: { id: string; to: string; body: string; at: number; address?: string; outside?: boolean; space?: string },
   ): Promise<{ status: number; body: JsonValue }> {
     const store = member.store()!;
     const memberId = store.self.memberId;
@@ -2432,7 +2613,8 @@ describe("walky talky in a crew of four, on the real wire", () => {
       v: 1,
       id: fields.id,
       kind: "agent",
-      from: { memberId, address: fields.address ?? self ?? `${memberId}/${member.paneId}`, harness: "claude", label: "drill" },
+      // An agent's message names its space (M98): the shared one the panes sit in, unless a case signs another.
+      from: { memberId, address: fields.address ?? self ?? `${memberId}/${member.paneId}`, harness: "claude", label: "drill", space: { key: fields.space ?? SHARED_SPACE, named: true, label: fields.space ?? SHARED_SPACE } },
       to: fields.to,
       replyTo: null,
       at: fields.at,
@@ -2440,7 +2622,8 @@ describe("walky talky in a crew of four, on the real wire", () => {
       signer: null,
       signature: null,
     };
-    const payload = JSON.stringify(signMessage(unsigned, store.self.keyPem, memberId));
+    const message: WalkyMessage = fields.outside === true ? { ...unsigned, outside: true } : unsigned;
+    const payload = JSON.stringify(signMessage(message, store.self.keyPem, memberId));
     // Strictly increasing, so the request-signature monotonicity rule (§8.6) cannot refuse two probes in one millisecond.
     lastStamp = Math.max(Date.now(), lastStamp + 1);
     const res = await fetch(`${wl.origin()}${CREW_WALKY_PATH}`, {
@@ -2495,7 +2678,8 @@ describe("walky talky in a crew of four, on the real wire", () => {
       v: 1,
       id,
       kind: "agent",
-      from: { memberId, address: paneOf(from), harness: "claude", label: "drill" },
+      // An agent's message names its space (M98): the shared one its pane sits in.
+      from: { memberId, address: paneOf(from), harness: "claude", label: "drill", space: { key: SHARED_SPACE, named: true, label: SHARED_SPACE } },
       to,
       replyTo: null,
       at: Date.now(),
@@ -2548,10 +2732,18 @@ describe("walky talky in a crew of four, on the real wire", () => {
     const listed = JSON.stringify(await walky(wl, { op: "who" }));
     // Each one with its pane's instance token: the members send it on their snapshots.
     for (const m of [wl, wa, wb, wo]) expect(listed).toMatch(new RegExp(`"address":"${paneOf(m)}#[a-z0-9]{4}"`, "u"));
-    // A member lists its own pane only: the roster is the lead's, and the note says which command reaches it.
+    // A member asks its lead for the crew's panes (M98 spec 04): it lists all four, its own first and as it
+    // is now, and the note that sent it to the lead is gone.
     for (const m of [wa, wb]) {
-      const own = await walky(m, { op: "who" });
-      expect(own).toMatchObject({ ok: true, targets: [{ address: tokened(m) }], note: expect.stringContaining(`run \`collie walky who\` on the lead (${idOf(wl)})`) });
+      const crew = await walky(m, { op: "who", markers: markersOf(m) });
+      const rows = asJsonObject(crew)?.targets;
+      const addresses = (Array.isArray(rows) ? rows : []).map((row) => asJsonString(asJsonObject(row)?.address));
+      expect(addresses[0]).toMatch(new RegExp(`^${paneOf(m)}#[a-z0-9]{4}$`, "u"));
+      for (const other of [wl, wa, wb, wo]) expect(addresses.some((address) => address?.startsWith(`${paneOf(other)}#`))).toBe(true);
+      expect(addresses).toHaveLength(4);
+      expect(asJsonObject(crew)?.note).toBeUndefined();
+      // Asked from its pane, the bridge adds the asking pane's own space for the CLI; every row carries its space.
+      expect(crew).toMatchObject({ ownSpace: { key: SHARED_SPACE, named: true }, targets: expect.arrayContaining([expect.objectContaining({ space: expect.objectContaining({ key: SHARED_SPACE }) })]) });
     }
   }, 60_000);
 
@@ -2621,7 +2813,7 @@ describe("walky talky in a crew of four, on the real wire", () => {
     const line = lines[0];
     // Hardening A: ONE line, the header and the nudge. The body reaches the agent as `collie walky inbox <id>`.
     expect(line).toMatch(new RegExp(`\\[walky-talky ${id}\\] from agent ${paneOf(wl)}#[a-z0-9]{4} on claude in "`, "u"));
-    expect(line).toContain(`${NUDGE_MARK} Read it: collie walky inbox ${id}. Reply: collie walky reply ${id} "<text>"`);
+    expect(line.endsWith(`${NUDGE_MARK} Read it: collie walky inbox ${id}`)).toBe(true);
     expect(line).not.toContain(body);
     expect(line).not.toContain("\n");
     expect(JSON.stringify(wa.herdr!.writes)).not.toContain(body);
@@ -2687,7 +2879,7 @@ describe("walky talky in a crew of four, on the real wire", () => {
 
   test("a scope send (M75) from a member's pane reaches the lead's pane in that folder and comes back `delivered`, and `here` from the lead reaches the member", async () => {
     // The lead's pane and A's share the folder label `scope-ws#main` (beforeAll); B's and the old member's do
-    // not. It runs before the phone-reply case, which stops A mid-send and leaves a draft in A's box.
+    // not, and a folder scope reaches only the sender's own space. It runs before the phone-reply case, which stops A mid-send and leaves a draft in A's box.
     await waitFor(
       async () => {
         const listed = JSON.stringify(await walky(wl, { op: "who" }));
@@ -2719,11 +2911,20 @@ describe("walky talky in a crew of four, on the real wire", () => {
     expect(typedFor(wa, up)).toEqual([]);
     expect(typedFor(wb, up)).toEqual([]);
 
-    // Lead to member: `here` from the lead's pane is its folder without itself, so A's pane, checked by A.
+    // Lead to member: `here` from the lead's pane is its space on every machine without itself (M98), so A's
+    // pane and B's, each checked by its own bridge. The old member sits in a space of its own.
     const down = "wt_scopedown001";
-    const back = await agentSend(wl, down, "here", "to my siblings in scope-ws");
-    expect(back).toMatchObject({ ok: true, receipts: [{ id: down, target: paneOf(wa), by: idOf(wa), verified: "origin" }] });
+    const back = await agentSend(wl, down, "here", "to my siblings in the space");
+    expect(readReceiptsAnswer(back)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ id: down, target: paneOf(wa), by: idOf(wa), verified: "origin" }),
+        expect.objectContaining({ id: down, target: paneOf(wb), by: idOf(wb), verified: "origin" }),
+      ]),
+    );
+    expect(readReceiptsAnswer(back)).toHaveLength(2);
     await settled(wa, down);
+    await settled(wb, down);
+    expect(typedFor(wb, down)).toHaveLength(1);
     expect(await walky(wa, { op: "status", id: down })).toMatchObject({ ok: true, receipts: [{ target: paneOf(wa), state: "delivered" }], message: { to: "here" } });
     // A's report carries the outcome to the lead's parent.
     await waitFor(
@@ -2740,7 +2941,8 @@ describe("walky talky in a crew of four, on the real wire", () => {
     // lane older than M75, which answered the bare `bad request` before it looked at the markers. Here a
     // stand-in for it is asked first, A's bridge (not B's pane) second, B's own bridge third. B sends: the
     // A-lead pair is spent by the cases around this one (6 per 10 minutes, either direction), so B's pane
-    // joins the folder for this case only, on another branch: `here` is the folder on any branch.
+    // joins the folder for this case only, on another branch. Since M98 `here` is the sender's space, so the label
+    // no longer decides who is reached; the case keeps it to prove that it does not.
     paneLabels.set(wb, "scope-ws#side");
     const listsB = async (label: string): Promise<boolean> => JSON.stringify(await walky(wl, { op: "who" })).includes(`"label":"${label}"`);
     await waitFor(() => listsB("scope-ws#side"), 20_000, async () => `the lead's who never listed B in the scope: ${JSON.stringify(await walky(wl, { op: "who" }))}`);
@@ -2768,7 +2970,7 @@ describe("walky talky in a crew of four, on the real wire", () => {
       expect(await cmdWalkySend(cli, ["here", "to my siblings in scope-ws, from member b"])).toBe(EXIT.OK);
       expect(captured.err).toEqual([]);
       expect(captured.out.slice(0, 2)).toEqual([id, "to here"]);
-      // The lead resolved `here` from B's label: its own pane and A's, never B's.
+      // The lead resolved `here` as B's space (M98): its own pane and A's, never B's, and not the old member's.
       const onLead = async () => walky(wl, { op: "status", id });
       await waitFor(
         async () => readReceiptsAnswer(await onLead()).filter((r) => r.state === "delivered").length === 2,
@@ -2924,19 +3126,54 @@ describe("walky talky in a crew of four, on the real wire", () => {
     expect(typedFor(wl, idLead)).toHaveLength(1);
   }, 60_000);
 
-  test("an agent may not broadcast and may not message its own pane, at its own bridge and at the lead", async () => {
+  test("an agent may not broadcast without the outside flag and may not message its own pane, at its own bridge and at the lead", async () => {
     // At the sender's bridge, over its socket.
-    expect(await agentSend(wa, "wt_broadcast001", "all", "to everyone")).toMatchObject({ ok: true, receipts: [{ state: "refused", reason: "only the operator may broadcast" }] });
-    expect(await agentSend(wa, "wt_broadcast002", `${idOf(wb)}/all`, "to one machine")).toMatchObject({ ok: true, receipts: [{ state: "refused", reason: "only the operator may broadcast" }] });
+    expect(await agentSend(wa, "wt_broadcast001", "all", "to everyone")).toMatchObject({ ok: true, receipts: [{ state: "refused", reason: "outside your space" }] });
+    expect(await agentSend(wa, "wt_broadcast002", `${idOf(wb)}/all`, "to one machine")).toMatchObject({ ok: true, receipts: [{ state: "refused", reason: "outside your space" }] });
     expect(await agentSend(wa, "wt_ownpane00001", paneOf(wa), "to myself")).toMatchObject({ ok: true, receipts: [{ state: "refused", reason: "that is your own pane" }] });
     // At the lead, for a sender that skipped its own checks: the refusal does not depend on the sender's honesty.
     const wire = await postAsMember(wa, { id: "wt_broadcast003", to: "all", body: "to everyone, by hand", at: Date.now() });
-    expect(wire).toMatchObject({ status: 200, body: { receipts: [{ id: "wt_broadcast003", state: "refused", reason: "only the operator may broadcast", by: idOf(wl), verified: "origin" }] } });
+    expect(wire).toMatchObject({ status: 200, body: { receipts: [{ id: "wt_broadcast003", state: "refused", reason: "outside your space", by: idOf(wl), verified: "origin" }] } });
     const own = await postAsMember(wa, { id: "wt_ownpane00002", to: paneOf(wa), body: "to myself, by hand", at: Date.now() });
     expect(own).toMatchObject({ status: 200, body: { receipts: [{ id: "wt_ownpane00002", state: "refused", reason: "that is your own pane", by: idOf(wl) }] } });
     for (const id of ["wt_broadcast001", "wt_broadcast002", "wt_broadcast003", "wt_ownpane00001", "wt_ownpane00002"]) {
       for (const at of [wl, wa, wb, wo]) expect(typedFor(at, id)).toEqual([]);
     }
+  }, 60_000);
+
+  test("an agent's broadcast with the outside flag is delivered across the crew; panes of its own space pass as `in`, so no nudge says outside (M98)", async () => {
+    const id = "wt_outsideall01";
+    const sent = await agentSend(wa, id, "all", "to everyone, on purpose", true);
+    // The sender's own bridge hands it to the lead, whose legs answer: the lead's pane and B's, and the
+    // old member refused by the lead (it predates walky talky). The sender and the two panes share the one space, so the
+    // border checks the space before the flag and every leg passes as `in`, not `outside`.
+    expect(readReceiptsAnswer(sent)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ target: paneOf(wl), state: "accepted", via: "in" }),
+        expect.objectContaining({ target: paneOf(wb), state: "accepted", via: "in" }),
+        expect.objectContaining({ target: `${idOf(wo)}/all`, state: "refused", reason: "older member" }),
+      ]),
+    );
+    await settled(wl, id);
+    await settled(wb, id);
+    // The receivers are of the sender's space, so the nudge carries no outside word.
+    for (const at of [wl, wb]) {
+      expect(typedFor(at, id)[0]).toContain(`"${NUDGE_MARK}`);
+      expect(typedFor(at, id)[0]).not.toContain(`" outside`);
+    }
+    // Not the sender's own pane.
+    expect(typedFor(wa, id)).toEqual([]);
+  }, 60_000);
+
+  test("a direct message from another space is refused by the pane's own bridge, and passes with the outside flag (M98)", async () => {
+    // Signed by hand as a member whose pane is in a space the target is not in: the receiving bridge decides, not the sender.
+    const refused = await postAsMember(wa, { id: "wt_borderdeny01", to: paneOf(wb), body: "from another space", at: Date.now(), space: "elsewhere" });
+    expect(refused).toMatchObject({ status: 200, body: { receipts: [{ id: "wt_borderdeny01", target: paneOf(wb), state: "refused", reason: "outside your space", by: idOf(wb) }] } });
+    expect(typedFor(wb, "wt_borderdeny01")).toEqual([]);
+    const passed = await postAsMember(wa, { id: "wt_borderpass01", to: paneOf(wb), body: "from another space, said outside", at: Date.now(), space: "elsewhere", outside: true });
+    expect(passed).toMatchObject({ status: 200, body: { receipts: [{ id: "wt_borderpass01", target: paneOf(wb), state: "accepted", by: idOf(wb) }] } });
+    await settled(wb, "wt_borderpass01");
+    expect(typedFor(wb, "wt_borderpass01")[0]).toContain(`" outside${NUDGE_MARK}`);
   }, 60_000);
 
   test("the phone reads a member pane's list through the lead, from the member's own log, and replies to a message in it", async () => {
@@ -3051,4 +3288,100 @@ describe("walky talky in a crew of four, on the real wire", () => {
       async () => `B still reports ${JSON.stringify(await reportOf())}`,
     );
   }, 90_000);
+});
+
+// ── Issue 785: a member's second Herdr session, browsed through the lead ─────
+// A member that runs two Herdr sessions with different spaces. The lead's sweep body holds both
+// sessions' panes but the primary's spaces and tabs only, so the lead fetches the named session's own
+// lists. Asserted through the real lead's `/api/snapshot`, the request the phone makes.
+
+describe("a member's second Herdr session shows its own spaces through the lead (issue 785)", () => {
+  let ml: Instance;
+  let mm: Instance;
+  let personal: FakeHerdr | undefined;
+
+  beforeAll(async () => {
+    ml = new Instance("slead", "w1:p1", "");
+    // Multi-session on, for this member only: every other block here pins it off.
+    mm = new Instance("twosess", "w1:p2", "", { COLLIE_MULTI_SESSION: "1" });
+    ml.startHerdr();
+    mm.herdr = startFakeHerdr({
+      socketPath: mm.socketPath,
+      workspaceLabel: "Work",
+      panes: [{ paneId: "w1:p2", tabId: "t1", workspaceId: "w1", label: "work pane", text: "" }],
+    });
+    // Herdr's layout for a named session: `<configRoot>/sessions/<name>/herdr.sock`. Ids collide
+    // with the default session's on purpose, as they do in Herdr.
+    const personalSocket = join(mm.configRoot, "sessions", "personal", "herdr.sock");
+    mkdirSync(dirname(personalSocket), { recursive: true });
+    personal = startFakeHerdr({
+      socketPath: personalSocket,
+      workspaceLabel: "Personal",
+      panes: [{ paneId: "w1:p2", tabId: "t1", workspaceId: "w1", label: "personal pane", text: "" }],
+    });
+    await Promise.all([ml.start(), mm.start()]);
+    const invited = await verb(ml, (d) => cmdCrewInvite(d, ["--label", mm.name]));
+    expect(invited.code).toBe(EXIT.OK);
+    const token = invited.out.split("\n")[0]!.trim();
+    const joined = await verb(mm, (d) =>
+      cmdJoin(d, [`http://127.0.0.1:${ml.port}`, token, "--insecure", "--address", `127.0.0.1:${mm.port}`]),
+    );
+    expect(joined.code).toBe(EXIT.OK);
+    // Nothing restarts the LEAD after an enrollment lands (§8.2's note): the operator's step, here the harness's.
+    await ml.restart();
+  }, 120_000);
+
+  afterAll(async () => {
+    if (process.env.COLLIE_HARNESS_DEBUG === "1") {
+      for (const i of [ml, mm]) console.log(`\n──── ${i?.name} ────\n${i?.log}`);
+    }
+    await Promise.all([ml?.stop(), mm?.stop()]);
+    ml?.herdr?.stop();
+    mm?.herdr?.stop();
+    personal?.stop();
+  });
+
+  interface Topology {
+    sessions?: Array<{ name: string; host?: string }>;
+    workspaces?: Array<{ label?: string; host?: string }>;
+    agents?: Array<{ workspaceLabel?: string; host?: string }>;
+  }
+
+  /** The member's spaces and its panes' space labels, as the lead serves them for one session. */
+  async function memberView(session: string): Promise<{ spaces: string[]; panes: string[] }> {
+    const memberId = mm.store()!.self.memberId;
+    const res = await ml.api(`/api/snapshot?host=${encodeURIComponent(memberId)}&session=${encodeURIComponent(session)}`);
+    // SAFETY: the handler emits its body `satisfies SnapshotResponse` (server.ts); `Topology` is a
+    // structural subset of it with every field optional.
+    const body = (await res.json()) as Topology;
+    return {
+      spaces: (body.workspaces ?? []).filter((w) => w.host === memberId).map((w) => w.label ?? ""),
+      panes: (body.agents ?? []).filter((p) => p.host === memberId).map((p) => p.workspaceLabel ?? ""),
+    };
+  }
+
+  test("the primary session shows its spaces, and the second session shows its own", async () => {
+    const memberId = () => mm.store()!.self.memberId;
+    await waitFor(
+      async () => {
+        const res = await ml.api("/api/snapshot");
+        // SAFETY: as in memberView.
+        const body = (await res.json()) as Topology;
+        return (body.sessions ?? []).some((s) => s.host === memberId() && s.name === "personal");
+      },
+      30_000,
+      async () => `the lead never listed the member's second session:\n${mm.log}`,
+    );
+    expect(await memberView("default")).toEqual({ spaces: ["Work"], panes: ["Work"] });
+    // The phone keeps polling the session it switched to; the sweep after its first poll brings the
+    // session's own lists, and the pane list was right from the start.
+    await waitFor(
+      async () => (await memberView("personal")).spaces.join() === "Personal",
+      15_000,
+      async () => `the lead kept serving ${JSON.stringify(await memberView("personal"))}`,
+    );
+    expect(await memberView("personal")).toEqual({ spaces: ["Personal"], panes: ["Personal"] });
+    // And the primary is still the primary's.
+    expect(await memberView("default")).toEqual({ spaces: ["Work"], panes: ["Work"] });
+  }, 60_000);
 });

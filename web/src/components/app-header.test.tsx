@@ -2,10 +2,11 @@ import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 import { createMemoryRouter, Outlet, RouterProvider, useLocation } from "react-router";
-import type { ComponentProps, ReactElement } from "react";
+import { useState, type ComponentProps, type ReactElement } from "react";
 
 import { server } from "@/test/setup";
 import { collieMark, markIsLive, markPaper, markState } from "@/test/collie-mark";
+import { __resetAuthedUrls } from "@/lib/authed-url";
 import { __resetOperatorCommands, loadOperatorCommands } from "@/lib/operator-config";
 import { ROOT_ROUTE_ID, type HomeData } from "@/lib/loaders";
 import { AppHeaderHost, RouteHeader, SettingsGear } from "./app-header";
@@ -207,6 +208,35 @@ describe("the header — the one shared shell", () => {
 // The header mark agrees with the ConnectionBanner by construction — it reads the SAME shared-clock
 // signals: it gallops only once trouble is sustained (≥4s, the flicker fix), and rests muted once lost
 // (≥15s). Fake timers drive the wall-clock hooks (Vitest advances Date.now with them).
+// A ROUTE CAN SAY AN AGENT IS STARTING (`RouteHeader`'s `starting`, a claim like the others): the one
+// mark turns at the loading pace with three beads in four in the info colour, and rests again when the
+// route stops saying it.
+describe("the header — a route's starting claim", () => {
+  beforeEach(() => __resetConnectionHealth());
+
+  it("turns the mark with most of its beads in the info colour, and lets go when the claim does", async () => {
+    const user = userEvent.setup();
+    function Route() {
+      const [starting, setStarting] = useState(false);
+      return (
+        <>
+          <button type="button" onClick={() => setStarting((on) => !on)}>flip</button>
+          <Header bridge="connected" error={false} starting={starting} onHome={() => {}} />
+        </>
+      );
+    }
+    const { container } = renderHeader(<Route />);
+    expect(markState(container)).toBe("rest");
+    await user.click(screen.getByRole("button", { name: "flip" }));
+    expect(markState(container)).toBe("loading");
+    expect(collieMark(container)?.style.getPropertyValue("--mark-bead-1")).toBe("var(--status-info)");
+    expect(screen.getByRole("button", { name: "Starting…" })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "flip" }));
+    expect(markState(container)).toBe("rest");
+    expect(collieMark(container)?.style.getPropertyValue("--mark-bead-1")).toBe("");
+  });
+});
+
 describe("the header — the dog keys on trouble/lost, not the first not-live frame", () => {
   beforeEach(() => {
     vi.useFakeTimers();
@@ -287,7 +317,7 @@ describe("the header — a quiet crew member is not the phone's connection", () 
 
   it("stays at rest with an unreachable peer in the roster and a healthy lead", () => {
     const roster: ServerSummary[] = [
-      { id: "bluefin", name: "bluefin", isLead: true, reachable: true, protocol: "ok", lastSeenAt: 100_000 },
+      { id: "lodge", name: "lodge", isLead: true, reachable: true, protocol: "ok", lastSeenAt: 100_000 },
       { id: "workshop", name: "workshop", isLead: false, reachable: false, protocol: "ok", lastSeenAt: 1_000 },
     ];
     renderHeader(
@@ -394,6 +424,74 @@ describe("the header — the stacked identity", () => {
     expect(container.querySelector('img[src*="logo"]')).toBeNull();
   });
 
+  // THE MARK'S PLACE (calm load). The name and the mark's path arrive in one /api/config answer, and the
+  // mark's bytes need a second read that ends after the first paint. Until it lands the header holds a
+  // box of the picture's exact size, gap and alignment, so the word beside it never moves. jsdom has no
+  // layout, so the cases read the DOM: what stands before the box, what stands after it, and its size
+  // classes, then the same three facts on the image that replaces it.
+  describe("holds the mark's place while its bytes are read", () => {
+    const BOX = ["mr-1", "inline-block", "size-[1.15em]", "align-[-0.2em]"];
+    const config = (logo: boolean) => {
+      const base = { name: "reference", capabilities: {}, unsupportedKeys: [], notes: {} };
+      const mux = logo ? { ...base, logoUrl: "/api/mux/logo.svg" } : base;
+      return http.get("/api/config", () => HttpResponse.json({ push: false, vapidPublicKey: "", mux }));
+    };
+    /** What sits on each side of the element in the "on <mux>" line, as text. */
+    const neighbours = (el: Element | null) => [el?.previousSibling?.textContent, el?.nextSibling?.textContent];
+
+    beforeEach(() => __resetAuthedUrls());
+
+    it("draws an empty box of the final size where the image will stand, then swaps the image in without moving the word", async () => {
+      let release: () => void = () => undefined;
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      server.use(
+        config(true),
+        http.get("/api/mux/logo.svg", async () => {
+          await gate;
+          return new HttpResponse("<svg/>", { headers: { "content-type": "image/svg+xml" } });
+        }),
+      );
+      const { container } = renderHeader(<Header bridge="connected" error={false} wordmark rightTrail={<SettingsGear />} />);
+      await waitFor(() => expect(screen.getByText(/^on /)).toBeInTheDocument());
+
+      // First paint with the name: the box is there, the picture is not.
+      const hold = container.querySelector('[data-slot="mux-logo-hold"]');
+      expect(hold).not.toBeNull();
+      expect(container.querySelector("img[src^='blob:']")).toBeNull();
+      for (const cls of BOX) expect(hold?.classList.contains(cls)).toBe(true);
+      expect(hold?.getAttribute("aria-hidden")).toBe("true");
+      const before = neighbours(hold);
+      expect(before).toEqual([" ", "reference"]);
+      expect(screen.getByText("on reference")).toBeInTheDocument();
+
+      release();
+      await waitFor(() => expect(container.querySelector("img[src^='blob:']")).not.toBeNull());
+      const logo = container.querySelector("img[src^='blob:']");
+      // The image carries the box's own classes and stands between the same two words.
+      for (const cls of BOX) expect(logo?.classList.contains(cls)).toBe(true);
+      expect(neighbours(logo)).toEqual(before);
+      expect(container.querySelector('[data-slot="mux-logo-hold"]')).toBeNull();
+    });
+
+    it("lets the box go once, when the read fails", async () => {
+      server.use(config(true), http.get("/api/mux/logo.svg", () => new HttpResponse(null, { status: 404 })));
+      const { container } = renderHeader(<Header bridge="connected" error={false} wordmark rightTrail={<SettingsGear />} />);
+      await waitFor(() => expect(screen.getByText(/^on /)).toBeInTheDocument());
+      await waitFor(() => expect(container.querySelector('[data-slot="mux-logo-hold"]')).toBeNull());
+      expect(container.querySelector("img[src^='blob:']")).toBeNull();
+      expect(screen.getByText("on reference")).toBeInTheDocument();
+    });
+
+    it("draws no box when the bridge named no mark", async () => {
+      server.use(config(false));
+      const { container } = renderHeader(<Header bridge="connected" error={false} wordmark rightTrail={<SettingsGear />} />);
+      await waitFor(() => expect(screen.getByText("on reference")).toBeInTheDocument());
+      expect(container.querySelector('[data-slot="mux-logo-hold"]')).toBeNull();
+    });
+  });
+
   // THE SHAPE. The two runs used to share one line, so the brand's ~55px came out of the
   // multiplexer name's budget and the name was what got the ellipsis — the operator's screenshot
   // had it down to a single letter. Stacked, they no longer compete — and the brand sits in a
@@ -433,7 +531,7 @@ describe("the header — the stacked identity", () => {
   });
 
   // THE BRAND NEVER GIVES WAY (2026-10-07). On a Pixel in airplane mode the dashboard row held the
-  // mark, the identity, a saved-copy badge, the "bluefin" and "default" chips and the gear, and the
+  // mark, the identity, a saved-copy badge, the "lodge" and "default" chips and the gear, and the
   // identity was the one thing allowed to shrink: it came out ~20px wide, "C." over "o". The row now
   // gives the shrink to the RIGHT cluster. jsdom lays nothing out, so a 390px viewport cannot be
   // measured here; what is pinned is the full right cluster at that width and the classes that
@@ -453,7 +551,7 @@ describe("the header — the stacked identity", () => {
         ),
       );
       const roster: ServerSummary[] = [
-        { id: "bluefin", name: "bluefin", isLead: true, reachable: true, protocol: "ok", lastSeenAt: 100_000 },
+        { id: "lodge", name: "lodge", isLead: true, reachable: true, protocol: "ok", lastSeenAt: 100_000 },
         { id: "workshop", name: "workshop", isLead: false, reachable: true, protocol: "ok", lastSeenAt: 100_000 },
       ];
       const { container } = renderHeader(
@@ -477,7 +575,7 @@ describe("the header — the stacked identity", () => {
 
       // The right cluster is FULL: both chips and the gear are in it.
       const right = container.querySelector<HTMLElement>('[data-slot="header-right"]');
-      const host = screen.getByRole("button", { name: /bluefin/ });
+      const host = screen.getByRole("button", { name: /lodge/ });
       const session = screen.getByRole("button", { name: /default/ });
       const gear = screen.getByRole("button", { name: "Settings" });
       for (const el of [host, session, gear]) expect(right?.contains(el)).toBe(true);
@@ -624,6 +722,7 @@ const SettingsLikeRoute = () => (
 );
 // The pane's shape, as a fourth type: `width="wide"` rather than the dashboard's `column`.
 const WideRoute = () => <HoistedRoute name="wide" width="wide" onHome={() => {}} />;
+const GridRoute = () => <HoistedRoute name="grid" width={1248} onHome={() => {}} />;
 
 function renderHoisted(initialEntry = "/") {
   const router = createMemoryRouter(
@@ -642,6 +741,7 @@ function renderHoisted(initialEntry = "/") {
           { path: "pane", element: <PaneRoute /> },
           { path: "settings", element: <SettingsLikeRoute /> },
           { path: "wide", element: <WideRoute /> },
+          { path: "grid", element: <GridRoute /> },
         ],
       },
     ],
@@ -779,6 +879,18 @@ describe("the ONE header — hoisted above the outlet", () => {
     expect(header?.className).not.toContain("max-w-screen-sm");
     await go("/settings");
     expect(header?.className).toContain("max-w-screen-sm");
+  });
+
+  it("gives a numeric claim exactly that many px, centred: the large-screen dashboard's grid (ADR 0158)", async () => {
+    const { container, go } = renderHoisted();
+    const header = container.querySelector("header")!;
+    await go("/grid");
+    expect(header.style.maxWidth).toBe("1248px");
+    expect(header.className).toContain("mx-auto");
+    expect(header.className).not.toContain("max-w-screen-sm");
+    await go("/settings");
+    expect(header.style.maxWidth).toBe("");
+    expect(header.className).toContain("max-w-screen-sm");
   });
 
   it("gives the wide claim the md column, not the sm one the other routes take", async () => {

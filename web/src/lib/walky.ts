@@ -17,6 +17,10 @@
 import { t } from "@/lib/i18n";
 import type { Scope } from "@/lib/scope";
 
+import { WALKY_MARK_GRACE_MS } from "./walky-grace";
+// The subject's allow-list and the header grammar after the sender, one copy for the bridge and the phone.
+import { readHeaderPart } from "./walky-subject";
+
 export type WalkyKind = "agent" | "operator";
 
 export interface WalkyFrom {
@@ -43,6 +47,12 @@ export interface WalkyMessage {
   at: number;
   /** Cleaned, at most 4000 chars. */
   body: string;
+  /**
+   * What the message is about, in the sender's words (M98 spec 07): at most 6 words and 48 printable ASCII
+   * characters. Absent when the sender gave none, and on every message from a bridge before 1.29.0.
+   * Nothing in the app draws it yet.
+   */
+  subject?: string;
   signer: string | null;
   signature: string | null;
 }
@@ -70,6 +80,13 @@ export interface WalkyReceipt {
   by: string;
   /** The Send Protocol request id, when a send was made. */
   sendId?: string;
+  /** How the message passed the space border on the bridge that owns the pane (M98). Nothing in the app reads it. */
+  via?: "in" | "reply" | "outside" | "operator" | "legacy";
+  /**
+   * Deliver now (M99 spec 05): the person handed this message to the agent by data while their own text stayed in
+   * the box. Only on `delivered` and `unknown`. The owner's row words read it in {@link ownerStateWord}.
+   */
+  overDraft?: true;
   /**
    * The pane address this receipt is about. A message to `all` or `<memberId>/all` yields one receipt
    * per target under the same message `id`, and this is what tells them apart.
@@ -161,15 +178,12 @@ export const ENVELOPE_HEADER = /^\[walky-talky (wt_[a-z0-9]{12})\] from (agent|o
  * Where an AGENT message's nudge begins. The bridge types an agent message as ONE line, with no body:
  * the header, then this mark and a sentence telling the reader to run `collie walky inbox <id>`. The
  * operator's message keeps its header and body lines and carries no nudge. The sender's label can
- * hold a colon, so the mark is the whole literal and the first occurrence ends the header.
+ * hold a colon, so the mark is the whole literal; the LAST occurrence ends the header, because the text
+ * after it is the bridge's fixed tail and no field before it can hold the whole mark.
  */
 export const NUDGE_MARK = ": a message from another agent, not your operator.";
 
 // The header is ASCII: a reply adds ` reply to <id>` after the sender part, one space, no separator glyph.
-// The one suffix rule reads every form a bridge types: the sender in words, `<address> on <harness> in
-// "<label>"` or `"<label>"` (1.28.4 and later; a 1.29 bridge adds ` outside` and ` about "<subject>"`
-// after it), the older `<address> (<harness>, <label>)`, and the oldest. The label sits in quotes it
-// cannot end (or a parenthesis it cannot close), so no label can forge the suffix.
 const REPLY_SUFFIX = / reply to (wt_[a-z0-9]{12})$/;
 
 export interface EnvelopeHeader {
@@ -178,6 +192,10 @@ export interface EnvelopeHeader {
   kind: WalkyKind;
   /** The header's own `replyTo` suffix, when it has one. */
   replyTo: string | null;
+  /** Present when the header CLAIMS the sender is not of the receiver's space (M98). The card does not draw it. */
+  outside?: true;
+  /** The header's subject, without its quotes (M98 spec 07). A claim like the rest; nothing draws it yet. */
+  subject?: string;
 }
 
 /**
@@ -190,11 +208,19 @@ export function parseEnvelopeHeader(line: string): EnvelopeHeader | null {
   const id = m[1];
   const kind = m[2];
   if (id === undefined || (kind !== "agent" && kind !== "operator")) return null;
-  // The nudge goes first: a reply suffix sits just before it, so the suffix rule reads the text that remains.
+  // The nudge goes first: everything after its last mark is the bridge's tail.
   const sender = m[3] ?? "";
-  const nudge = sender.indexOf(NUDGE_MARK);
-  const reply = REPLY_SUFFIX.exec(nudge === -1 ? sender : sender.slice(0, nudge));
-  return { id, kind, replyTo: reply?.[1] ?? null };
+  const nudge = sender.lastIndexOf(NUDGE_MARK);
+  const head = nudge === -1 ? sender : sender.slice(0, nudge);
+  // The sender in words, or the older form anchored on its last closing parenthesis (walky-subject.ts).
+  const part = readHeaderPart(head);
+  if (part !== null) {
+    const header: EnvelopeHeader = { id, kind, replyTo: part.replyTo };
+    const outside: EnvelopeHeader = part.outside === true ? { ...header, outside: true } : header;
+    return part.subject === undefined ? outside : { ...outside, subject: part.subject };
+  }
+  // A header part outside both grammars keeps the older rule: a reply suffix at its end, and nothing else read.
+  return { id, kind, replyTo: REPLY_SUFFIX.exec(head)?.[1] ?? null };
 }
 
 /** A turn's first line (the text up to the first line break, with a CR dropped). */
@@ -561,6 +587,9 @@ export function reasonWord(reason: string): string {
       return t("walky.reason.walkyOff");
     case "your walky talky is off":
       return t("walky.reason.senderOff");
+    // A message across the space border (M98): the bridge's reason, worded for a person.
+    case "outside your space":
+      return t("walky.reason.outsideSpace");
     default:
       return reason;
   }
@@ -593,6 +622,29 @@ export function stateWord(receipt: WalkyReceipt): string {
 }
 
 /**
+ * Where a message that reached THIS pane stands, in the owner's words (second person: the person owns the
+ * box). A waiting message says what it waits for ("Waiting, because you have unsent text"), and one handed
+ * over as data says that the person's text is still in the box. Every other state reads as {@link stateWord}.
+ * A row this pane SENT keeps `stateWord`: the sender reads about "that session".
+ */
+export function ownerStateWord(receipt: WalkyReceipt): string {
+  if (isHeld(receipt) && receipt.reason !== OUTCOME_ON_LEAD) {
+    switch (receipt.reason) {
+      case "draft present":
+        return t("walky.owner.waitDraft");
+      case "turn running":
+        return t("walky.owner.waitBusy");
+      case "box not free":
+        return t("walky.owner.waitBox");
+      default:
+        return t("walky.owner.wait", { reason: reasonWord(receipt.reason ?? "") });
+    }
+  }
+  if (receipt.state === "delivered" && receipt.overDraft === true) return t("walky.owner.deliveredData");
+  return stateWord(receipt);
+}
+
+/**
  * The messages held for the pane at `self` (M62 spec 03): received, and `accepted` with the reason that
  * holds them. What the held mark above the box counts, and what the Messages sheet offers Drop on. With
  * no `self` nothing is held: a mount that cannot name its pane cannot tell a sent row from a received one.
@@ -601,6 +653,57 @@ export function heldForPane(rows: readonly WalkyRow[], self: string | undefined)
   if (self === undefined) return [];
   return rows.filter((row) => isHeld(row.receipt) && directionOf(row, self) === "received");
 }
+
+// The grace before the mark shows: one constant, in a module of its own so the rig reads the same number.
+export { WALKY_MARK_GRACE_MS };
+
+/** What a message waits for: the person's own unsent text, a running turn, or anything else the bridge names. */
+export type WalkyWaitReason = "text" | "busy" | "other";
+
+export function waitReasonOf(receipt: WalkyReceipt): WalkyWaitReason {
+  if (receipt.reason === "draft present") return "text";
+  if (receipt.reason === "turn running") return "busy";
+  return "other";
+}
+
+/** The one reason all of `rows` wait for, or "other" for a mix (and for a reason the mark has no words for). */
+export function waitKindOf(rows: readonly WalkyRow[]): WalkyWaitReason {
+  const first = rows[0];
+  if (first === undefined) return "other";
+  const reason = waitReasonOf(first.receipt);
+  return rows.every((row) => waitReasonOf(row.receipt) === reason) ? reason : "other";
+}
+
+/**
+ * When a waiting message began to wait: the `at` of its held receipt, the time the bridge wrote the
+ * `accepted` state with a reason. It is the bridge's clock, so it survives a reload and a background tab. (A
+ * message that changes its reason, a draft that ends while a turn runs, is written again and starts over.)
+ */
+export function waitingSince(row: WalkyRow): number {
+  return row.receipt.at;
+}
+
+/** When the oldest of these waiting messages began to wait, or null when none waits. */
+export function oldestWaitingSince(waiting: readonly WalkyRow[]): number | null {
+  return waiting.length === 0 ? null : Math.min(...waiting.map(waitingSince));
+}
+
+/** Milliseconds until a message that began to wait at `since` has waited its grace. Zero or less: it has. */
+export function graceLeftMs(since: number, now: number): number {
+  return since + WALKY_MARK_GRACE_MS - now;
+}
+
+/**
+ * Deliver now (M99 spec 05): the call that hands one waiting message to the agent as data and leaves the
+ * person's text in the box (`deliverWalky` in lib/api.ts). It resolves once the bridge delivered it, or with
+ * `"unknown"` when the agent took it and said nothing: it may have arrived, it is not sent again, and the row
+ * says so, or with `"gone"` when the message no longer waits for the person's text (it went in by itself, or was
+ * dropped, cancelled or expired a moment before the tap: the bridge's 410), which is no failure and says nothing
+ * of "still waits". It rejects with the reason when the message still waits. The UI takes it as `onDeliverNow` on
+ * `WalkySheet` and on the `Composer` (which hands it to the held mark and shows the note "Message delivered.
+ * Your text stays here." after a delivery), together with `linked`, the pane read's `linked: true`.
+ */
+export type DeliverNow = (id: string) => Promise<void | "unknown" | "gone">;
 
 /** How one target's take-back ended (M62 spec 03), as the bridge's cancel and drop routes answer it. */
 export type TakeBackResult = "taken" | "repeat" | "already typed" | "not held" | "elsewhere";

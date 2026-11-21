@@ -20,9 +20,8 @@
 //     the grammar declared `clampedEnds`, even that gap is covered: the commit batch is `[Up, Enter]`
 //     on the first row and `[Down, Enter]` on the last (`commitKeysFor`, ADR 0080 point 6).
 //
-// All flows start with the same guard as their siblings: a FRESH pane read, the unconditional
-// revision check, and a re-derivation THROUGH THE PANE'S ADAPTER compared against what the user
-// tapped. The mid-flight polls re-derive the same way, against `promptsSameIdentity` — the feedback
+// All flows start with the same guard as their siblings: a FRESH pane read and a re-derivation
+// THROUGH THE PANE'S ADAPTER compared against what the user tapped (no revision check). The mid-flight polls re-derive the same way, against `promptsSameIdentity` — the feedback
 // flow moves the pointer and fills the input by design, so `promptsEqual` would reject its own work.
 
 import { FEEDBACK_MAX_LENGTH, fillAnswerField, type FieldAccess } from "./answer-field";
@@ -149,7 +148,7 @@ async function walkVerifyCommit(
 
   const guarded = await guardDialog(target(args));
   if (!guarded.ok) return withWhy(guarded.result, "entry");
-  const walked = await sendBoundKeys(args, plan.walk, guarded.region, guarded.styled, guarded.columns, guarded.tail);
+  const walked = await sendBoundKeys(args, plan.walk, guarded.region, guarded.styled, guarded.columns, guarded.tail, guarded.parts);
   if (walked.status !== "sent") return withWhy(walked, "bridge");
 
   const landed = (m: PromptModel) => {
@@ -224,7 +223,7 @@ export async function submitPromptFeedback(
 
   // Bind this write to the guarded region. It moves focus, so the steps after it must re-derive
   // rather than reuse this binding.
-  const focus = await sendBoundKeys(args, [row.key], guarded.region, guarded.styled, guarded.columns, guarded.tail);
+  const focus = await sendBoundKeys(args, [row.key], guarded.region, guarded.styled, guarded.columns, guarded.tail, guarded.parts);
   if (focus.status !== "sent") return focus;
 
   // The field must be FOCUSED, and STILL EMPTY, before anything is typed. Focus alone is not enough:

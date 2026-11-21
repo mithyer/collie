@@ -1,11 +1,17 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { hasResizeObserver } from "@/lib/env";
+import { aHoldIsActive } from "@/lib/hold-flag";
 
 interface UseAutoScrollOptions {
   /** Px distance from the bottom still considered "at bottom". */
   offset?: number;
   /** Any value that changes when new content is appended — drives the auto-scroll effect. */
   dep?: unknown;
+  /**
+   * Room the caller keeps clear below the last line, in px (a floating tag over the tail, #759). Padding
+   * is no size change the observers below see, so a change re-pins a list that is following the tail.
+   */
+  reserve?: number;
   /** Fires when the at-bottom state changes — lets a parent follow live output or freeze it. */
   onAtBottomChange?: (atBottom: boolean) => void;
 }
@@ -15,7 +21,7 @@ interface UseAutoScrollOptions {
 export function useAutoScroll<T extends HTMLElement = HTMLDivElement>(
   options: UseAutoScrollOptions = {},
 ) {
-  const { offset = 24, dep, onAtBottomChange } = options;
+  const { offset = 24, dep, reserve = 0, onAtBottomChange } = options;
   const scrollRef = useRef<T>(null);
   const [isAtBottom, setIsAtBottom] = useState(true);
   const autoScroll = useRef(true);
@@ -30,7 +36,8 @@ export function useAutoScroll<T extends HTMLElement = HTMLDivElement>(
 
   const pinToBottom = useCallback(() => {
     const el = scrollRef.current;
-    if (!el || !autoScroll.current) return;
+    // A finger holds a yes in this list (lib/hold-flag.ts): the card stays where the finger is.
+    if (!el || !autoScroll.current || aHoldIsActive()) return;
     el.scrollTo({ top: el.scrollHeight, behavior: "auto" });
   }, []);
 
@@ -103,7 +110,7 @@ export function useAutoScroll<T extends HTMLElement = HTMLDivElement>(
   // the live tail without a flash of the oldest scrollback. Yields if the user has scrolled away.
   useLayoutEffect(() => {
     pinToBottom();
-  }, [dep, pinToBottom]);
+  }, [dep, reserve, pinToBottom]);
 
   // Re-pin when the container OR its content resizes while we're following.
   // - Container: a shrinking viewport (keys dock, on-screen keyboard) pushes the tail below the fold.

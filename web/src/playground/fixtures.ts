@@ -1,8 +1,9 @@
-// Fixture data for the states playground — a believable herd, four rosters, three panes, so the page
+// Fixture data for the design reference — a believable herd, four rosters, three panes, so the page
 // shows what Collie looks like on a working day instead of on a two-row test snapshot.
 //
-// DEV-ONLY, like the rest of `src/playground/`: this module is only ever reached from
-// `playground.html`, which is not a build input.
+// DEV-ONLY, like the rest of `src/playground/`: this module is reached from `design.html`, which is
+// not a build input, from rounds under `src/pick/rounds/`, and from the website's app screens, which import it by name
+// (`@/playground/fixtures`): keep the module's path and its exports' names.
 //
 // ── The rules this file keeps ────────────────────────────────────────────────────────────────────
 //
@@ -56,6 +57,7 @@ import type {
 // `node:fs` — the playground's mirror is therefore the exact screen the grammar tests run against,
 // escape sequences and all, rather than a re-typed approximation of one.
 import claudePermissionBash from "@/fixtures/panes/claude--permission-bash.txt?raw";
+import claudePermissionCutTop from "@/fixtures/panes/claude--v2322-permission-bash-cut-top--w160.txt?raw";
 import claudeWorking from "@/fixtures/panes/claude--working.txt?raw";
 import claudeModelPicker from "@/fixtures/panes/claude-lab--menu-model-picker-v2300--w119.txt?raw";
 import claudeHeadsUp from "@/fixtures/panes/claude--v2302-heads-up-above-box--w142.txt?raw";
@@ -149,7 +151,7 @@ export const spacesWithWorktrees: WorkspaceView[] = [
 
 export const spaces: WorkspaceView[] = [
   { workspaceId: "w1", number: 1, label: "collie", focused: true, activeTabId: "w1:t1", tabCount: 3, paneCount: 4 },
-  { workspaceId: "w2", number: 2, label: "sprqvntrs-api", focused: false, activeTabId: "w2:t1", tabCount: 3, paneCount: 4 },
+  { workspaceId: "w2", number: 2, label: "example-api", focused: false, activeTabId: "w2:t1", tabCount: 3, paneCount: 4 },
   { workspaceId: "w3", number: 3, label: "nixcfg", focused: false, activeTabId: "w3:t1", tabCount: 2, paneCount: 3 },
   { workspaceId: "w4", number: 4, label: "blog", focused: false, activeTabId: "w4:t1", tabCount: 2, paneCount: 2 },
 ];
@@ -239,13 +241,13 @@ const needsYou: AgentView[] = [
   {
     paneId: "w2:p3",
     workspaceId: "w2",
-    workspaceLabel: "sprqvntrs-api",
+    workspaceLabel: "example-api",
     workspaceNumber: 2,
     tabId: "w2:t1",
     tabLabel: "fix-deploy",
     agent: "codex",
     status: "blocked",
-    cwd: "/home/you/src/sprqvntrs-api",
+    cwd: "/home/you/src/example-api",
     focused: false,
     hasSession: true,
     hint: "asked you a question and is waiting for the answer",
@@ -280,13 +282,13 @@ const readyUnseen: AgentView[] = [
   {
     paneId: "w2:p4",
     workspaceId: "w2",
-    workspaceLabel: "sprqvntrs-api",
+    workspaceLabel: "example-api",
     workspaceNumber: 2,
     tabId: "w2:t3",
     tabLabel: "billing-webhooks",
     agent: "claude",
     status: "done",
-    cwd: "/home/you/src/sprqvntrs-api",
+    cwd: "/home/you/src/example-api",
     focused: false,
     hasSession: true,
     sessionName: "billing webhooks",
@@ -339,13 +341,13 @@ const working: AgentView[] = [
   {
     paneId: "w2:p1",
     workspaceId: "w2",
-    workspaceLabel: "sprqvntrs-api",
+    workspaceLabel: "example-api",
     workspaceNumber: 2,
     tabId: "w2:t2",
     tabLabel: "migrate-users",
     agent: "codex",
     status: "working",
-    cwd: "/home/you/src/sprqvntrs-api",
+    cwd: "/home/you/src/example-api",
     focused: false,
     terminalTitle: "running drizzle-kit generate",
     lastActiveAt: TS - 4 * MIN,
@@ -388,13 +390,13 @@ const working: AgentView[] = [
   {
     paneId: "w2:p2",
     workspaceId: "w2",
-    workspaceLabel: "sprqvntrs-api",
+    workspaceLabel: "example-api",
     workspaceNumber: 2,
     tabId: "w2:t3",
     tabLabel: "billing-webhooks",
     agent: "claude",
     status: "working",
-    cwd: "/home/you/src/sprqvntrs-api",
+    cwd: "/home/you/src/example-api",
     focused: false,
     hasSession: true,
     terminalTitle: "waiting on CI",
@@ -461,13 +463,13 @@ const resting: AgentView[] = [
   {
     paneId: "w2:p5",
     workspaceId: "w2",
-    workspaceLabel: "sprqvntrs-api",
+    workspaceLabel: "example-api",
     workspaceNumber: 2,
     tabId: "w2:t3",
     tabLabel: "billing-webhooks",
     agent: "shell",
     status: "unknown",
-    cwd: "/home/you/src/sprqvntrs-api",
+    cwd: "/home/you/src/example-api",
     focused: false,
     kind: "shell",
     paneLabel: "logs",
@@ -1064,6 +1066,34 @@ export const paneBlocked: PaneFixture = {
   },
 };
 
+/**
+ * Blocked on a permission whose command is taller than the screen (Claude Code 2.1.322, constructed):
+ * the dialog's top is above the read, so the card shows the rows that are on it, says the start is
+ * above the screen, and draws the "Dangerous rm operation" warning in the caution ink.
+ */
+export const paneBlockedCutTop: PaneFixture = {
+  pane: needsYou[0]!,
+  text: claudePermissionCutTop,
+  revision: 813,
+  surface: {
+    revision: 813,
+    turn: "idle",
+    modal: {
+      ask: {
+        id: "playground-ask-cut",
+        kind: "permission",
+        options: [
+          { id: "1", label: "Yes" },
+          { id: "2", label: "No" },
+        ],
+        channel: "keys",
+        hash: "0000000001",
+      },
+    },
+    composer: "unknown",
+  },
+};
+
 /** Mid-tool-run, with the ANSI the mirror actually has to colour. */
 export const paneWorking: PaneFixture = {
   pane: working[0]!,
@@ -1288,7 +1318,7 @@ export function paneCache(overrides: Partial<PaneCache> & { state: PaneCache["st
  */
 export const watchedPanes: CacheWatchListEntry[] = [
   { id: "b7f1c2a9", label: "collie · next", session: "next", paneId: "%1" },
-  { id: "3d90ee14", label: "infra · claude", host: "minibuch", paneId: "w2:p1" },
+  { id: "3d90ee14", label: "infra · claude", host: "workshop", paneId: "w2:p1" },
 ];
 
 /** One pane's place in the list: off, watchable, with the bridge's own 300-second window. */
@@ -1383,3 +1413,84 @@ export function manySubagents(n: number): PaneSubagent[] {
     spawnDepth: 1,
   }));
 }
+
+// ── The session switcher's crew (M97) ──────────────────────────────────────────────────────────────
+//
+// Fourteen session rows on a crew of two machines: the lead with its repo open and two worktree
+// workers beside it, the member with its own spaces, bare shells on both, and one pinned row. The list
+// the session filter is drawn over (playground `#switcher`), and the one the playground round flips the
+// filter's switches on. Paths are made up; nothing here is a real checkout.
+
+const SWITCHER_REPO = "/home/you/projects/collie-workspace";
+
+function switcherRow(over: Partial<AgentView> & Pick<AgentView, "paneId" | "workspaceId" | "workspaceLabel" | "workspaceNumber">): AgentView {
+  return {
+    tabId: `${over.workspaceId}:t1`,
+    agent: "claude",
+    status: "idle",
+    cwd: SWITCHER_REPO,
+    focused: false,
+    lastActiveAt: TS - 10 * MIN,
+    lastSeenAt: TS - 5 * MIN,
+    ...over,
+  };
+}
+
+const switcherSpace = (host: string, workspaceId: string, number: number, label: string, over: Partial<WorkspaceView> = {}): WorkspaceView => ({
+  workspaceId,
+  number,
+  label,
+  focused: false,
+  activeTabId: `${workspaceId}:t1`,
+  tabCount: 1,
+  paneCount: 1,
+  host,
+  ...over,
+});
+
+const switcherAgents: AgentView[] = [
+  switcherRow({ paneId: "w1:p1", host: "lodge", workspaceId: "w1", workspaceLabel: "collie-workspace", workspaceNumber: 1, paneLabel: "release notes", status: "working", gitHead: { kind: "branch", name: "main" } }),
+  switcherRow({ paneId: "w1:p2", host: "lodge", workspaceId: "w1", workspaceLabel: "collie-workspace", workspaceNumber: 1, paneLabel: "triage 1.29", status: "blocked", gitHead: { kind: "branch", name: "main" } }),
+  switcherRow({ paneId: "w2:p1", host: "lodge", workspaceId: "w2", workspaceLabel: "fix-748", workspaceNumber: 2, paneLabel: "sheet drag glitch", status: "working", cwd: "/home/you/projects/fix-748", gitHead: { kind: "branch", name: "fix/748-sheet" } }),
+  switcherRow({ paneId: "w3:p1", host: "lodge", workspaceId: "w3", workspaceLabel: "session-filter", workspaceNumber: 3, paneLabel: "the filter in the switcher", cwd: "/home/you/projects/session-filter", gitHead: { kind: "branch", name: "feat/session-filter" } }),
+  switcherRow({ paneId: "w3:p2", host: "lodge", workspaceId: "w3", workspaceLabel: "session-filter", workspaceNumber: 3, agent: "codex", paneLabel: "review", lastActiveAt: TS - 2 * MIN, cwd: "/home/you/projects/session-filter", gitHead: { kind: "branch", name: "feat/session-filter" } }),
+  switcherRow({ paneId: "w4:p1", host: "lodge", workspaceId: "w4", workspaceLabel: "collie-website", workspaceNumber: 4, agent: "pi", paneLabel: "hero copy", cwd: "/home/you/projects/collie-website", gitHead: { kind: "branch", name: "main" } }),
+  switcherRow({ paneId: "w1:p1", host: "workshop", workspaceId: "w1", workspaceLabel: "collie-next", workspaceNumber: 1, paneLabel: "deputy rebuild", status: "working", cwd: "/home/you/apps/collie-next" }),
+  switcherRow({ paneId: "w1:p2", host: "workshop", workspaceId: "w1", workspaceLabel: "collie-next", workspaceNumber: 1, agent: "omp", paneLabel: "nix flake check", cwd: "/home/you/apps/collie-next" }),
+  switcherRow({ paneId: "w2:p1", host: "workshop", workspaceId: "w2", workspaceLabel: "showreel", workspaceNumber: 2, paneLabel: "render plates", status: "blocked", cwd: "/tmp/showreel" }),
+  switcherRow({ paneId: "w3:p1", host: "workshop", workspaceId: "w3", workspaceLabel: "collie-hc", workspaceNumber: 3, agent: "opencode", paneLabel: "core leg", cwd: "/home/you/apps/collie-next" }),
+];
+
+const switcherShells: AgentView[] = [
+  switcherRow({ paneId: "w1:p9", host: "lodge", workspaceId: "w1", workspaceLabel: "collie-workspace", workspaceNumber: 1, agent: "shell", kind: "shell", status: "unknown", paneLabel: "dev server" }),
+  switcherRow({ paneId: "w4:p9", host: "lodge", workspaceId: "w4", workspaceLabel: "collie-website", workspaceNumber: 4, agent: "shell", kind: "shell", status: "unknown", cwd: "/home/you/projects/collie-website" }),
+  switcherRow({ paneId: "w1:p9", host: "workshop", workspaceId: "w1", workspaceLabel: "collie-next", workspaceNumber: 1, agent: "shell", kind: "shell", status: "unknown", paneLabel: "journal", cwd: "/home/you/apps/collie-next" }),
+  switcherRow({ paneId: "w2:p9", host: "workshop", workspaceId: "w2", workspaceLabel: "showreel", workspaceNumber: 2, agent: "shell", kind: "shell", status: "unknown", cwd: "/tmp/showreel" }),
+];
+
+const switcherServers: ServerSummary[] = [
+  { id: "lodge", name: "lodge", isLead: true, reachable: true, protocol: "ok", lastSeenAt: TS },
+  { id: "workshop", name: "workshop", isLead: false, reachable: true, protocol: "ok", lastSeenAt: TS },
+];
+
+/** The switcher's fourteen rows on two machines, with the snapshot facts the sheet is handed beside them. */
+export const switcherCrew = {
+  agents: switcherAgents,
+  shellPanes: switcherShells,
+  servers: switcherServers,
+  workspaces: [
+    switcherSpace("lodge", "w1", 1, "collie-workspace", { repoRoot: SWITCHER_REPO, isWorktree: false }),
+    switcherSpace("lodge", "w2", 2, "fix-748", { repoRoot: SWITCHER_REPO, isWorktree: true }),
+    switcherSpace("lodge", "w3", 3, "session-filter", { repoRoot: SWITCHER_REPO, isWorktree: true }),
+    switcherSpace("lodge", "w4", 4, "collie-website"),
+    switcherSpace("workshop", "w1", 1, "collie-next"),
+    switcherSpace("workshop", "w2", 2, "showreel"),
+    switcherSpace("workshop", "w3", 3, "collie-hc"),
+  ] satisfies WorkspaceView[],
+  sessions: [
+    { name: "default", isPrimary: true, reachable: true, agents: 6, working: 2, blocked: 1, host: "lodge" },
+    { name: "default", isPrimary: true, reachable: true, agents: 4, working: 1, blocked: 1, host: "workshop" },
+  ] satisfies SessionSummary[],
+  /** The pinned row: the lead's blocked triage pane. */
+  pinned: switcherAgents[1]!,
+};

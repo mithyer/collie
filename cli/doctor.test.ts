@@ -12,13 +12,18 @@ import { serializeTrustStore, TrustStore, type TrustStoreData, type TrustStoreIo
 import { fakeBeaconReader, FAKE_BEACON_NOW, type FakeBeacon } from "../bridge/beacon/fake.ts";
 import { BEACON_SCHEMA_VERSION } from "../bridge/beacon/types.ts";
 import type { JsonObject } from "../bridge/json.ts";
+import { localSnapshotView } from "../bridge/local-key.ts";
 import { FakeDurableProgram, SOCKET_ONLY_SKIP } from "../bridge/mux/durable/fixture.ts";
 import { SYSTEM_PROBE, type SocketProbe } from "../bridge/mux/durable/client.ts";
+import { hookTargetFileName, hookTargetsDir } from "../bridge/beacon/hook-targets.ts";
+import { linkRecordPath, partsRoot } from "../bridge/inside/links.ts";
+import { claudePartDir, linkFindings, marketplaceText } from "./harness-link.ts";
 import { BEACON_HOOKS } from "./beacon.ts";
 import { durableFindings } from "./durable-findings.ts";
 import type { CliContext } from "./context.ts";
 import {
   accountWindowsFinding,
+  statusLineWrap,
   cmdDoctor,
   type DoctorDeps,
   type Finding,
@@ -53,7 +58,7 @@ import type { BinaryRead } from "../bridge/surface/binary-version.ts";
 import { loadProfiles } from "../web/src/lib/surface/profile.ts";
 import type { HarnessFinding, ReadHarness } from "./harness-findings.ts";
 import type { PairedDevice } from "../bridge/pairing.ts";
-import { POWERSHELL_UTF8 } from "./sys.ts";
+import { POWERSHELL_UTF8, realFiles } from "./sys.ts";
 import { collieBinary } from "./unit.ts";
 import {
   configFilePaths,
@@ -161,6 +166,8 @@ function healthyFiles(): SeededFiles {
 }
 
 /** One `sends-<harness>` row per harness with a profile (M71 spec 01), there whether or not a send ran. */
+/** The link rows (M99 spec 09), one per harness, in the order `collie harness status` lists them. */
+const LINK_CHECKS = ["link-claude", "link-pi", "link-omp", "link-opencode"];
 const SENDS_CHECKS = [...loadProfiles().keys()].map((id) => `sends-${id}`);
 
 /** Where the bridge keeps its paired devices, under the fake state dir. */
@@ -434,6 +441,7 @@ describe("collie doctor — the contract", () => {
       // Windows only, and this suite runs on the real host.
       ...(HOST.platform === "win32" ? ["windows-task", "windows-long-paths", "secrets-private"] : []),
       "beacon-hooks-claude",
+      "statusline-claude",
       "beacons",
       "skill-walky-talky",
       "account-windows",
@@ -446,6 +454,7 @@ describe("collie doctor — the contract", () => {
       "integration-grok",
       "integration-hermes",
       "integration-kiro",
+      "integration-mcode",
       "integration-muse",
       "integration-openclaw",
       "integration-opencode",
@@ -459,6 +468,8 @@ describe("collie doctor — the contract", () => {
       "cache-claims",
       "cache-rules",
       "cache-env",
+      // One row per harness for the data path (M99 spec 09); none linked here.
+      ...LINK_CHECKS,
       ...SENDS_CHECKS,
       "holds",
       "restart-pending",
@@ -1466,15 +1477,15 @@ describe("collie doctor — the crew checks", () => {
   });
 
   test("member-reach: a silent peer with a portless address gets the exact set-address command", async () => {
-    const portless = leadStore({ peers: [member({ memberId: "laptop", address: "100.64.0.9" })] });
+    const portless = leadStore({ peers: [member({ memberId: "laptop", address: "192.0.2.9" })] });
     const { byCheck } = await findings(
       harness(portless, [new Error("connection refused")], { files: { ...healthyFiles(), ...markerFile(portless) } }),
     );
     const f = byCheck.get("member-reach");
     expect(f?.detail).toContain(
-      "laptop at 100.64.0.9 — ",
+      "laptop at 192.0.2.9 — ",
     );
-    expect(f?.detail).toContain("→ `collie crew set-address laptop 100.64.0.9:8787` (8787 unless that machine set COLLIE_PORT)");
+    expect(f?.detail).toContain("→ `collie crew set-address laptop 192.0.2.9:8787` (8787 unless that machine set COLLIE_PORT)");
     // The generic remedy is still there for the rest.
     expect(f?.remedy).toContain("collie crew set-address <member> <host:port>");
   });
@@ -1961,6 +1972,7 @@ describe("the finding set is scoped by the chosen multiplexer", () => {
       "mux",
       ...(HOST.platform === "win32" ? ["windows-task", "windows-long-paths", "secrets-private"] : []),
       "beacon-hooks-claude",
+      "statusline-claude",
       "beacons",
       "skill-walky-talky",
       "account-windows",
@@ -1970,6 +1982,8 @@ describe("the finding set is scoped by the chosen multiplexer", () => {
       "cache-claims",
       "cache-rules",
       "cache-env",
+      // One row per harness for the data path (M99 spec 09); none linked here.
+      ...LINK_CHECKS,
       ...SENDS_CHECKS,
       "holds",
       "restart-pending",
@@ -2182,6 +2196,7 @@ describe("beacon-hooks-claude", () => {
 
 describe("skill-walky-talky", () => {
   const SKILL = join(HOME, ".claude", "skills", "collie-walky-talky", "SKILL.md");
+  // An installed copy from a build before format 2 (before the skill taught the hill and tricks).
   const STAMP = "<!-- collie-skill walky-talky v1 collie 0.0.1 -->";
 
   test("no install anywhere is OK, because nothing writes the skill unless the operator asks", async () => {
@@ -2228,6 +2243,30 @@ describe("skill-walky-talky", () => {
     expect(finding.detail).toContain(pi);
     expect(finding.remedy).toContain("collie skill install all");
     expect(finding.remedy).toContain("by hand");
+  });
+});
+
+// Review 9 R8: the Morph skill an earlier build installed tells agents to obey `[morph ` heads. This build
+// cannot remove it (its skill code no longer knows the skill); doctor names each copy and the steps.
+describe("skill-old-morph", () => {
+  const FILE = join(HOME, ".claude", "skills", "collie-morph", "SKILL.md");
+  const AGENTS = join(HOME, ".config", "opencode", "AGENTS.md");
+  const BLOCK = "<!-- collie:morph v1 begin -->\n# Morph\n<!-- collie:morph v1 end -->\n";
+
+  test("no old copy writes no row: a machine that never had Morph reads as before", async () => {
+    expect((await findings(harness(null))).byCheck.has("skill-old-morph")).toBe(false);
+  });
+
+  test("a stamped file and a block each warn, with the manual steps; a person's own file of that name is not named", async () => {
+    const files = { ...healthyFiles(), [FILE]: "---\nname: collie-morph\n---\n<!-- collie-skill morph v1 collie 1.29.0 -->\n", [AGENTS]: `# mine\n${BLOCK}` };
+    const finding = (await findings(harness(null, [], { files }))).byCheck.get("skill-old-morph")!;
+    expect(finding.status).toBe("warn");
+    expect(finding.detail).toContain("claude, opencode");
+    expect(finding.detail).toContain("[morph");
+    expect(finding.remedy).toContain(`delete the folder ${join(HOME, ".claude", "skills", "collie-morph")}`);
+    expect(finding.remedy).toContain(`in ${AGENTS}, delete the lines from`);
+    const own = (await findings(harness(null, [], { files: { ...healthyFiles(), [FILE]: "# my own morph notes\n" } }))).byCheck;
+    expect(own.has("skill-old-morph")).toBe(false);
   });
 });
 
@@ -2333,12 +2372,21 @@ describe("beacons", () => {
 
   test("an empty directory on a platform with no start-time probe says no agent writes one here (M80 spec 11)", async () => {
     const h = harness(null);
-    h.deps = { ...h.deps, host: hostFor("win32") };
+    h.deps = { ...h.deps, host: hostFor("freebsd") };
     const finding = (await findings(h)).byCheck.get("beacons")!;
     expect(finding.status).toBe("skipped");
     expect(finding.detail).toContain("on this platform");
     expect(finding.detail).not.toContain("not yet");
     expect(finding.detail).not.toContain("written one yet");
+    expect(finding.remedy).toContain("Windows");
+  });
+
+  test("Windows has the probe now, so an empty directory there waits for the first hook like Linux (#798)", async () => {
+    const h = harness(null);
+    h.deps = { ...h.deps, host: hostFor("win32") };
+    const finding = (await findings(h)).byCheck.get("beacons")!;
+    expect(finding.detail).not.toContain("on this platform");
+    expect(finding.detail).toContain("no agent has written one yet");
   });
 
   test("an agent that has ended leaves an expired beacon, and that is still `ok`", async () => {
@@ -2565,6 +2613,25 @@ describe("collie doctor — a packaged install", () => {
     const f = (await findings(harness(null, [ownSnapshot({ restartNeeded: true })]))).byCheck.get("restart-pending");
     expect(f?.status).toBe("skipped");
     expect(f?.detail).toContain("records no version");
+  });
+
+  // The bridge answers its own local key a text-free view of the snapshot (bridge/local-key.ts). The
+  // restart row must read the same from it as from the phone's body.
+  test("`restart-pending` reads the same off the local key's view as off the full snapshot", async () => {
+    const full = {
+      agents: [{ paneId: "w1:p1", kind: "agent", agent: "claude", status: "blocked", terminalTitle: "a title an agent wrote", asks: [{ question: "Delete it?" }] }],
+      shellPanes: [],
+      sessions: [],
+      update: { restartNeeded: true, restartCommand: "systemctl --user restart collie", current: "1.5.2", latest: null, installKind: "packaged" },
+    };
+    const run = async (body: JsonObject): Promise<string> => {
+      const h = systemOwned({}, [], [new Response(JSON.stringify(body), { status: 200 })]);
+      await cmdDoctor(h.deps, []);
+      return h.io.stdout.join("\n");
+    };
+    const said = await run(full);
+    expect(said).toContain("nothing restarted it");
+    expect(await run(localSnapshotView(full))).toBe(said);
   });
 
   test("a linked clone still gets every one of those answers the old way", async () => {
@@ -2953,7 +3020,9 @@ describe("plain output parity (M43 spec 04, wrapped at 80 by M71 spec 03)", () =
   // spec 02 (no screen row: a harness with no receipt has none) (the healthy solo fixture, then a config.toml
   // secret the mode rule could not tighten). M71 spec 03 moved it once more: rows wrap at 80 columns, so a
   // long detail continues under the value column. M79 spec 02 turned integration-omp ok: pi's adapter
-  // finds its own session now, so an omp pane needs no Herdr hook. The
+  // finds its own session now, so an omp pane needs no Herdr hook. M99 spec 09 added the four
+  // `link-*` rows, none linked in this fixture. MiniMax Code (mcode) added its `integration-mcode`
+  // row and a twelfth `sends-*` row, and its root is one more in the journal-roots count. The
   // `secrets-private` line is Windows-only: on a POSIX host it does not exist at all.
   test("the plain doctor output on a POSIX host matches the golden, wrapped at 80 columns", async () => {
     const out = `${await render()}---\n${await render(blocked())}`;
@@ -3528,5 +3597,194 @@ describe("the telemetry row (M86 spec 01)", () => {
     const { byCheck } = await findings(h);
     expect(byCheck.get("telemetry")?.detail).toContain("as this shell sees it");
     expect(byCheck.has("telemetry-switch")).toBe(false);
+  });
+});
+
+// ── link-* (M99 spec 09) ─────────────────────────────────────────────────────
+// One row per harness, read from the parts folder and its link records alone: no harness runs.
+
+describe("the link rows (M99 spec 09)", () => {
+  const made: string[] = [];
+  afterEach(() => {
+    for (const dir of made.splice(0)) rmSync(dir, { recursive: true, force: true });
+  });
+  function lab(options: { readonly version?: string; readonly managed?: string } = {}) {
+    const root = mkdtempSync(join(tmpdir(), "collie-doctor-link-"));
+    made.push(root);
+    const home = join(root, "home");
+    const managed = join(root, "managed.json");
+    if (options.managed !== undefined) writeFileSync(managed, options.managed);
+    const ctx = context({ HOME: home }, { home });
+    const deps = { ctx, files: realFiles, managedSettings: managed, version: options.version };
+    /** Write a linked Claude part of `version`, as `collie harness link claude` leaves it. */
+    const linkClaude = (version: string): void => {
+      const dir = claudePartDir(ctx);
+      mkdirSync(join(dir, ".claude-plugin"), { recursive: true });
+      writeFileSync(join(dir, ".claude-plugin", "plugin.json"), JSON.stringify({ name: "collie", version }));
+      writeFileSync(join(dir, ".claude-plugin", "marketplace.json"), marketplaceText());
+      writeFileSync(linkRecordPath(ctx.env, home, "claude"), JSON.stringify({ harness: "claude", version, at: 1 }));
+    };
+    return { deps, linkClaude };
+  }
+  const row = (rows: readonly Finding[], check: string) => rows.find((f) => f.check === check);
+
+  test("not linked: ok, one row per harness", () => {
+    const rows = linkFindings(lab().deps, () => null);
+    expect(rows.map((f) => [f.check, f.status])).toEqual([
+      ["link-claude", "ok"],
+      ["link-pi", "ok"],
+      ["link-omp", "ok"],
+      ["link-opencode", "ok"],
+    ]);
+  });
+
+  test("linked with this build's part: ok, the version named", () => {
+    const r = lab({ version: "1.29.0" });
+    r.linkClaude("1.29.0");
+    expect(row(linkFindings(r.deps, () => "2.1.330"), "link-claude")).toMatchObject({ status: "ok", detail: "linked, plugin 1.29.0" });
+  });
+
+  test("a part older than the bridge: warn, with the verb that writes this build's", () => {
+    const r = lab({ version: "1.29.0" });
+    r.linkClaude("1.28.0");
+    expect(row(linkFindings(r.deps, () => null), "link-claude")).toMatchObject({ status: "warn", remedy: "`collie harness link claude` writes this build's plugin" });
+  });
+
+  test("blocked by policy: warn", () => {
+    const r = lab({ version: "1.29.0", managed: '{"allowManagedHooksOnly":true}' });
+    r.linkClaude("1.29.0");
+    const found = row(linkFindings(r.deps, () => null), "link-claude");
+    expect(found?.status).toBe("warn");
+    expect(found?.detail).toContain("blocked by policy");
+  });
+
+  test("link-folder: only once something is linked; it compares the bridge's folder with this shell's", () => {
+    const r = lab({ version: "1.29.0" });
+    expect(linkFindings(r.deps, () => null).map((f) => f.check)).not.toContain("link-folder");
+    r.linkClaude("1.29.0");
+    const ctx = r.deps.ctx;
+    // No bridge running: skipped.
+    expect(row(linkFindings(r.deps, () => null), "link-folder")?.status).toBe("skipped");
+    const target = join(hookTargetsDir(ctx.env, ctx.home), hookTargetFileName(ctx.stateDir));
+    mkdirSync(join(target, ".."), { recursive: true });
+    const record = (parts?: string) => JSON.stringify({ schemaVersion: 1, stateDir: ctx.stateDir, pid: 1, pidStartTime: null, bootedAt: 1, parts });
+    // An older bridge names no folder.
+    writeFileSync(target, record());
+    expect(row(linkFindings(r.deps, () => null), "link-folder")?.status).toBe("skipped");
+    writeFileSync(target, record(partsRoot(ctx.env, ctx.home)));
+    expect(row(linkFindings(r.deps, () => null), "link-folder")?.status).toBe("ok");
+    // A unit written before the folder moved: the bridge reads the default, this shell another.
+    writeFileSync(target, record("/elsewhere/collie/inside"));
+    const moved = row(linkFindings(r.deps, () => null), "link-folder");
+    expect(moved?.status).toBe("warn");
+    expect(moved?.detail).toContain("the bridge does not see the link");
+  });
+
+  test("a harness version not verified for the data path: warn", () => {
+    const r = lab({ version: "1.29.0" });
+    r.linkClaude("1.29.0");
+    const found = row(linkFindings(r.deps, () => "2.1.300"), "link-claude");
+    expect(found?.status).toBe("warn");
+    expect(found?.detail).toContain("Claude Code 2.1.300 is not verified for the data path");
+  });
+});
+
+describe("statusline-claude: does Claude Code state the context window (.adr/0115, amended 2026-11-13)", () => {
+  const posix = hostFor("linux");
+  const own = "bash /home/pat/.claude/statusline-command.sh";
+  const wrapped = `/opt/collie/bin/collie beacon statusline ${Buffer.from(own, "utf8").toString("base64url")} # collie-statusline v1`;
+  /** The row for a settings file's TEXT (null: no file). */
+  const rowFor = (text: string | null, platform: "linux" | "win32" = "linux", installed = true) => {
+    const files = fakeFiles(text === null ? {} : { [SETTINGS]: text });
+    return statusLineWrap({ ctx: context({}, {}), files, host: platform === "linux" ? posix : hostFor("win32") }, installed);
+  };
+  const row = (settings: JsonObject, platform: "linux" | "win32" = "linux", installed = true) => rowFor(JSON.stringify(settings), platform, installed);
+
+  test("a plain statusLine is a hint, with the install and its undo; never an error", () => {
+    const [finding] = row({ statusLine: { type: "command", command: own } });
+    expect(finding?.status).toBe("warn");
+    expect(finding?.detail).toContain("token count, not a percent");
+    expect(finding?.remedy).toContain("`collie hooks install claude`");
+    expect(finding?.remedy).toContain("--no-statusline");
+  });
+
+  test("a wrapped statusLine, none at all, and Windows are ok, and say what the phone shows", () => {
+    expect(row({ statusLine: { type: "command", command: wrapped } })[0]).toMatchObject({ status: "ok", remedy: null });
+    expect(row({})[0]?.detail).toContain("no statusLine configured, and Collie adds none");
+    expect(row({ statusLine: { type: "command", command: own } }, "win32")[0]).toMatchObject({ status: "ok" });
+    expect(row({ statusLine: { type: "command", command: own } }, "win32")[0]?.detail).toContain("token count");
+  });
+
+  test("no row without the hooks, and a file that does not parse is not this row's to judge", () => {
+    expect(row({ statusLine: { type: "command", command: own } }, "linux", false)).toEqual([]);
+    expect(rowFor("{ // a comment\n }")[0]?.status).toBe("ok");
+  });
+});
+
+// ── The local key's snapshot view (bridge/local-key.ts) prints what the full snapshot prints ─────
+
+describe("doctor over the local key's view of the snapshot", () => {
+  // Every field the phone gets, with text in the ones the view leaves out: a title, an ask, a held send.
+  const pane = (over: JsonObject): JsonObject => ({
+    paneId: "w1:p1",
+    workspaceId: "w1",
+    workspaceLabel: "collie",
+    workspaceNumber: 1,
+    tabId: "w1:t1",
+    agent: "claude",
+    status: "idle",
+    cwd: "/home/someone/private-project",
+    focused: false,
+    kind: "agent",
+    terminalTitle: "a title an agent wrote",
+    agentTitle: "Fixing the build",
+    subtitle: "leak.person@example.org",
+    asks: [{ id: "a1", question: "Shall I delete the production database now?" }],
+    held: [{ requestId: "r1", text: "push it to main" }],
+    ...over,
+  });
+  const FULL: JsonObject = {
+    bridge: "connected",
+    agents: [
+      pane({ paneId: "w1:p1", hasSession: true }),
+      pane({ paneId: "w1:p2", hasSession: false }),
+      pane({ paneId: "w2:p1", agent: "codex", hasSession: false }),
+      pane({ paneId: "w2:p2", agent: "pi", status: "working" }),
+    ],
+    shellPanes: [pane({ paneId: "w3:p1", agent: "shell", kind: "shell" })],
+    workspaces: [],
+    tabs: [],
+    sessions: [{ name: "default", isPrimary: true, reachable: true, agents: 4, working: 1, blocked: 0 }],
+    update: { restartNeeded: false, current: "1.5.2", latest: null },
+    ts: 1_800_000_000_000,
+  };
+
+  async function plain(body: JsonObject, args: string[] = []): Promise<string> {
+    const h = harness(null);
+    const base = h.deps.fetch;
+    h.deps = {
+      ...h.deps,
+      fetch: async (url, init) => {
+        if (url.endsWith("/api/snapshot")) return new Response(JSON.stringify(body), { status: 200 });
+        return await base(url, init);
+      },
+    };
+    await cmdDoctor(h.deps, args);
+    return h.io.stdout.join("\n");
+  }
+
+  // `collie update --check` (and the phone's preflight behind it) reads doctor's `--json` findings
+  // (`doctorCheck`, cli/update-check.ts), so the same findings from either body is the same preflight.
+  test("the --json findings the update preflight reads are the same", async () => {
+    const said = await plain(FULL, ["--json"]);
+    expect(said).toContain("agent-sessions");
+    expect(await plain(localSnapshotView(FULL), ["--json"])).toBe(said);
+  });
+
+  test("the history rows (agent-sessions, integration-*) print the same, line for line", async () => {
+    const said = await plain(FULL);
+    // The fixture reaches the rows that read panes: a journalled pane with no session is named.
+    expect(said).toContain("w1:p2 (claude)");
+    expect(await plain(localSnapshotView(FULL))).toBe(said);
   });
 });

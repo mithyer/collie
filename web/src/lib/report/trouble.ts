@@ -59,6 +59,7 @@ const REASONS = {
   unreadable: "count",
   // unknown: Collie lost track of its own send
   crash: "count",
+  interrupted: "count",
   lost_lock: "count",
   no_evidence: "count",
   // the guard did its job, or the state is the person's
@@ -71,9 +72,18 @@ const REASONS = {
   turn_running: "ignore",
   steer_unsupported: "ignore",
   steer_not_allowed: "ignore",
+  bad_head: "ignore",
+  stale_view: "ignore",
+  no_secret_field: "ignore",
+  // the agent's own answer to a code, shown already
+  code_rejected: "ignore",
   // a dialog on screen, shown already
   dialog_open: "ignore",
   dialog_after_enter: "ignore",
+  // an override that met a menu: the person's own word was refused on a screen Collie could not read
+  menu_open: "count",
+  // an override typed with no Enter: the person's own Enter is the plan, not a failure (M102 spec 12)
+  override: "ignore",
 } as const satisfies Record<SendReason, "count" | "ignore">;
 
 /** One settled send as the rule reads it: the request id, the outcome and reason, and when it ended. */

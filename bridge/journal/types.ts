@@ -10,6 +10,7 @@
 
 import type { CacheProbe, ChoiceOnly } from "../cache/engine.ts";
 import type { Cursor, ReadSince } from "./cursor.ts";
+import type { NameReading } from "../session-title.ts";
 import type { RowReducer } from "./reduce.ts";
 import type { ToolCall } from "./tool-call.ts";
 
@@ -64,6 +65,12 @@ export type TranscriptPart =
        * fill this leaves it absent.
        */
       call?: ToolCall;
+      /**
+       * Calls a script inside this call made that draw no card of their own: today the background
+       * subagents pi records in a result's `nestedCalls` (journal/pi.ts, #795). The Agents list
+       * counts the ongoing ones; Chat draws only the call that holds them.
+       */
+      nested?: Extract<TranscriptPart, { kind: "tool" }>[];
       result?: {
         text: string;
         truncated?: boolean;
@@ -343,6 +350,21 @@ export interface JournalAdapter {
    * first message. It says nothing about the cache. Never throws; the same tail read as `cacheProbe`.
    */
   choiceProbe?(ref: AgentSessionRef): Promise<ChoiceOnly | null>;
+  /**
+   * What the harness's own records call this session, or null when there is nothing to read.
+   *
+   * OPTIONAL, and present only where the records hold a name: Claude Code (`custom-title` and
+   * `agent-name` for a `/rename`, `ai-title` for its own title), pi and Oh My Pi (pi's `session_info`,
+   * Oh My Pi's `title` header and `title_change` rows) and OpenCode (the session row's `title`).
+   * `person` is a name the person set in the harness, `agent` the title the agent gave the session
+   * itself (session-title.ts `NameReading`). The raw strings come back; the tracker cleans them through
+   * the one normalizer (bridge/session-titles.ts), so no adapter decides how a name looks.
+   *
+   * Driven only by the title tracker on the state engine's own poll, keyed by the harness session id
+   * like {@link cacheProbe}. Impure (a bounded head or tail read, or one indexed query) and it never
+   * throws: a missing file or a malformed row means null or an absent field.
+   */
+  nameProbe?(ref: AgentSessionRef): Promise<NameReading | null>;
   /**
    * The keys that make this harness take its queued messages NOW instead of at its next turn
    * boundary, in the neutral spelling (`bridge/mux/keys.ts`) — or absent when it has no such key.

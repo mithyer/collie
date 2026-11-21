@@ -61,6 +61,8 @@ import {
   systemdUserReachable,
   writeUnit,
 } from "./lifecycle.ts";
+import { linkRecordPath } from "../bridge/inside/links.ts";
+import { PART_MARKER } from "./harness-link.ts";
 import { ensureMuxChosen } from "./mux.ts";
 import { cmdServe } from "./serve.ts";
 import { formatTaskRecord, taskRecordPath, taskRestartPath } from "./task-scheduler.ts";
@@ -132,14 +134,14 @@ describe("the Host allowlist discovery", () => {
     ["tailscale status --json", { stdout: json }],
   ];
   const SELF = JSON.stringify({
-    Self: { DNSName: "desk.tail1234.ts.net.", TailscaleIPs: ["100.64.0.1"] },
+    Self: { DNSName: "desk.tail1234.ts.net.", TailscaleIPs: ["100.64.10.1"] },
   });
 
   test("discovers the node's name and IPs, and bakes them into the unit", () => {
     const h = harness({ answers: TAILSCALE(SELF) });
     expect(writeUnit(h.deps)).toBe(true);
     expect(h.files.read(`${HOME}/.config/systemd/user/collie.service`)).toContain(
-      "Environment=COLLIE_TAILSCALE_HOSTS=desk.tail1234.ts.net,100.64.0.1",
+      "Environment=COLLIE_TAILSCALE_HOSTS=desk.tail1234.ts.net,100.64.10.1",
     );
   });
 
@@ -444,8 +446,8 @@ describe("start, and the crew delta", () => {
   });
 
   test("a machine the crew already has, strongly or by a weak match, prints nothing", async () => {
-    const crew = leadStore({ peers: [member({ memberId: "nas", address: "100.64.0.9:8787" })] });
-    expect(await quietFor(JSON.stringify({ machines: [{ target: "op@100.64.0.9" }] }), crew)).toEqual([]);
+    const crew = leadStore({ peers: [member({ memberId: "nas", address: "100.64.10.9:8787" })] });
+    expect(await quietFor(JSON.stringify({ machines: [{ target: "op@100.64.10.9" }] }), crew)).toEqual([]);
     expect(await quietFor(JSON.stringify({ machines: [{ target: "op@nas" }] }), crew)).toEqual([]);
   });
 
@@ -1966,14 +1968,14 @@ describe("the status banner", () => {
   });
 
   test("COLLIE_HOST set: probes that address, not loopback, and names it in the warning", async () => {
-    const h = harness({ ready: true, env: { COLLIE_HOST: "100.64.0.8" } });
+    const h = harness({ ready: true, env: { COLLIE_HOST: "100.64.10.8" } });
     await statusBanner(h.deps);
-    expect(h.readyCalls).toEqual([{ port: 8787, host: "100.64.0.8" }]);
+    expect(h.readyCalls).toEqual([{ port: 8787, host: "100.64.10.8" }]);
 
-    const cold = harness({ ready: false, env: { COLLIE_HOST: "100.64.0.8" } });
+    const cold = harness({ ready: false, env: { COLLIE_HOST: "100.64.10.8" } });
     const lines = (await statusBanner(cold.deps)).join("\n");
-    expect(cold.readyCalls).toEqual([{ port: 8787, host: "100.64.0.8" }]);
-    expect(lines).toContain("⚠ Collie isn't answering on 100.64.0.8:8787 yet");
+    expect(cold.readyCalls).toEqual([{ port: 8787, host: "100.64.10.8" }]);
+    expect(lines).toContain("⚠ Collie isn't answering on 100.64.10.8:8787 yet");
   });
 
   // F13: the probe already resolved the bind; the `local` row two lines under it did not, so a peer
@@ -2203,8 +2205,8 @@ describe("the status banner", () => {
     expect(out.indexOf("Collie is running")).toBeLessThan(out.indexOf("  members"));
     expect(out).toContain("  members");
     // Columns are padded to the widest name, link and version, so the rows line up.
-    expect(out).toContain("\n    minibuch     reachable    1.25.0  mux -  panes -\n");
-    expect(out).toContain("\n    minibuch-hc  unreachable  -       mux -  panes -\n");
+    expect(out).toContain("\n    workshop     reachable    1.25.0  mux -  panes -\n");
+    expect(out).toContain("\n    workshop-hc  unreachable  -       mux -  panes -\n");
     expect(out).toContain("  devices   2 paired (Pixel, iPad)");
     expect(out).toContain("  sessions  5 agents  working 2  blocked 1  idle 1  done 1  unknown 0  (3 report a session id)");
     expect(out).not.toContain("serve config");
@@ -2239,8 +2241,8 @@ describe("the status banner", () => {
 /** A crew of two (one answering, one not), two devices and five agent sessions. */
 const FAKE_CENSUS: Census = {
   members: [
-    { name: "minibuch", role: "peer", link: "reachable", version: "1.25.0", mux: null, panes: null, host: null },
-    { name: "minibuch-hc", role: "peer", link: "unreachable", version: null, mux: null, panes: null, host: null },
+    { name: "workshop", role: "peer", link: "reachable", version: "1.25.0", mux: null, panes: null, host: null },
+    { name: "workshop-hc", role: "peer", link: "unreachable", version: null, mux: null, panes: null, host: null },
   ],
   devices: { count: 2, names: ["Pixel", "iPad"] },
   sessions: {
@@ -2445,6 +2447,55 @@ describe("uninstall", () => {
     expect(h.files.exists(`${CONFIG}/.env`)).toBe(true);
     expect(h.io.stdout.join("\n")).toContain("✓ uninstalled:");
     expect(h.io.stdout.join("\n")).toContain(`kept: ${join(CONFIG, ".env")} and the checkout`);
+  });
+
+  describe("the shared harness parts (M99 spec 09)", () => {
+    const PI_RECORD = linkRecordPath({}, HOME, "pi");
+    const PI_PART = `${HOME}/.pi/agent/extensions/collie-inside.ts`;
+    const linked = {
+      [UNIT_FILE]: "[Unit]\n",
+      [PI_RECORD]: JSON.stringify({ harness: "pi", version: "1.29.0", at: 1 }),
+      [PI_PART]: `${PART_MARKER} pi 1.29.0\nexport default function collie() {}\n`,
+    };
+    const NEXT_ENV = `${HOME}/.config/herdr/plugins/config/herdr.collie-next/.env`;
+    const NEXT_UNIT = `${HOME}/.config/systemd/user/collie-next.service`;
+
+    test("the last installed instance takes the parts along", async () => {
+      // `next` left a config behind but no unit: it is not installed any more.
+      const h = harness({ answers: [["tailscale serve status --json", { stdout: OWNED }]], files: { ...linked, [NEXT_ENV]: "COLLIE_PORT=8788\n" } });
+      expect(await cmdUninstall(h.deps)).toBe(EXIT.OK);
+      expect(h.files.exists(PI_RECORD)).toBe(false);
+      expect(h.files.exists(PI_PART)).toBe(false);
+      expect(h.io.stdout).toContain("  unlinked pi");
+    });
+
+    test("another installed instance keeps them, and one line says so", async () => {
+      const h = harness({ answers: [["tailscale serve status --json", { stdout: OWNED }]], files: { ...linked, [NEXT_ENV]: "COLLIE_PORT=8788\n", [NEXT_UNIT]: "[Unit]\n" } });
+      expect(await cmdUninstall(h.deps)).toBe(EXIT.OK);
+      expect(h.files.exists(PI_RECORD)).toBe(true);
+      expect(h.files.exists(PI_PART)).toBe(true);
+      expect(h.io.stdout.filter((line) => line.includes("kept the linked harness plugins"))).toEqual([
+        "  kept the linked harness plugins: another Collie instance uses them (next). `collie harness unlink <harness>` removes them.",
+      ]);
+      expect(h.io.stdout.join("\n")).not.toContain("unlinked pi");
+    });
+
+    test("an uninstall of a named lane counts the default instance as another", async () => {
+      const h = harness({
+        instance: "next",
+        answers: [["tailscale serve status --json", { stdout: OWNED }]],
+        files: { ...linked, [NEXT_ENV]: "COLLIE_PORT=8788\n", [NEXT_UNIT]: "[Unit]\n", [`${HOME}/.config/herdr/plugins/config/herdr.collie/.env`]: "COLLIE_PORT=8787\n" },
+      });
+      expect(await cmdUninstall(h.deps)).toBe(EXIT.OK);
+      expect(h.files.exists(PI_PART)).toBe(true);
+      expect(h.io.stdout.join("\n")).toContain("another Collie instance uses them (default)");
+    });
+
+    test("nothing linked: no line about parts at all", async () => {
+      const h = harness({ answers: [["tailscale serve status --json", { stdout: OWNED }]], files: { [UNIT_FILE]: "[Unit]\n", [NEXT_ENV]: "x\n", [NEXT_UNIT]: "[Unit]\n" } });
+      expect(await cmdUninstall(h.deps)).toBe(EXIT.OK);
+      expect(h.io.stdout.join("\n")).not.toContain("linked harness");
+    });
   });
 
   test("on Linux and macOS a binary install's uninstall output is exactly what it was", async () => {

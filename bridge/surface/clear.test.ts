@@ -5,17 +5,19 @@
 // route's body checks.
 
 import { describe, expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AuditLog } from "../audit.ts";
 import type { JsonValue } from "../../web/src/lib/json.ts";
-import { muxAck, muxGone, muxOk, muxRefused, type MuxAck, type MuxGrid, type MuxGridRequest, type MuxOutcome } from "../mux/types.ts";
+import { muxAck, muxGone, muxOk, muxRefused, muxUnconfirmed, type MuxAck, type MuxGrid, type MuxGridRequest, type MuxOutcome } from "../mux/types.ts";
 import { crewRouteFor } from "../crew/forward.ts";
 import { clearRoute, type ClearRouteRuntime } from "../server.ts";
 import { profileFor } from "../../web/src/lib/surface/profile.ts";
 import { boundedDraft, CLEAR_DRAFT_MAX_BYTES, type ClearReceipt } from "../../web/src/lib/surface/clear.ts";
-import { KeyGate } from "./key-gate.ts";
+import { KeyGate, LOCK_WAIT_MS } from "./key-gate.ts";
 import { ClearService } from "./clear.ts";
+import { PaneLockFiles } from "./pane-lock.ts";
 
 const FIXTURES = join(import.meta.dir, "..", "..", "web", "src", "fixtures", "panes");
 const fx = (name: string): string => readFileSync(join(FIXTURES, name), "utf8");
@@ -91,6 +93,9 @@ class ScriptPane {
   };
 
   /** The one Backspace that took each probe character out again, apart from the clear's own presses. */
+  /** The clear's own presses go in and the multiplexer does not confirm them in time (`unconfirmed`). */
+  lateKeys = false;
+
   probeKeys: string[][] = [];
   writeKeys = (paneId: string, keys: readonly string[]): Promise<MuxAck> => {
     void paneId;
@@ -112,7 +117,7 @@ class ScriptPane {
     this.keysSeen.push([...keys]);
     if (this.afterPress !== null) this.override = this.afterPress;
     else if (!this.deaf) this.draft = this.draft.slice(0, Math.max(0, this.draft.length - Math.min(keys.length, this.perPress)));
-    return Promise.resolve(muxAck());
+    return Promise.resolve(this.lateKeys ? muxUnconfirmed("the keys may still arrive") : muxAck());
   };
 }
 
@@ -128,14 +133,14 @@ interface Rig {
 }
 
 /** Panes: %1 grok, %4 an agent with no profile, %7 a bare shell. */
-function rig(draft: string): Rig {
+function rig(draft: string, gateOf: (pane: ScriptPane) => KeyGate = (p) => new KeyGate(p)): Rig {
   const pane = new ScriptPane(draft);
   const sleeps: number[] = [];
   const stales: string[] = [];
   const service = new ClearService({
     staleFrame: (paneId, frame) => void stales.push(`${paneId}:${frame}`),
     mux: pane,
-    gate: new KeyGate(pane),
+    gate: gateOf(pane),
     profile: (harness) => Promise.resolve(profileFor(harness, "99.0.0", { log: () => undefined })),
     sleep: (ms) => {
       sleeps.push(ms);
@@ -170,6 +175,31 @@ function rig(draft: string): Rig {
     clear: (paneId, body, redact = false) => clearRoute(rt, paneId, body, { audit, device: "phone", session: "main", acceptEncoding: null, redact }),
   };
 }
+
+describe("a Clear while another bridge writes into the pane (M102 spec 16)", () => {
+  test("it waits up to 1.5 s, then is refused pane_busy with nothing typed or pressed", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "clear-lock-"));
+    try {
+      const lockOf = (pid: number) => new PaneLockFiles({ dir, scope: "s", pid, alive: () => true, startOf: () => null });
+      expect(lockOf(202).take("%1", "their-send", Date.now() + 60_000)).toBe(true);
+      const pauses: number[] = [];
+      const { pane, clear, lines } = rig(GROK_BOX, (p) => {
+        const gate = new KeyGate(p, Date.now, (ms) => (pauses.push(ms), Promise.resolve()));
+        gate.share(lockOf(101));
+        return gate;
+      });
+      const res = await clear("%1", { requestId: "clear-busy-01" });
+      expect(res.headers.get("x-collie-reason")).toBe("pane_busy");
+      expect(await res.json()).toEqual({ requestId: "clear-busy-01", outcome: "refused", reason: "pane_busy" });
+      expect(pauses.reduce((a, b) => a + b, 0)).toBe(LOCK_WAIT_MS);
+      expect(pane.keysSeen).toEqual([]);
+      expect(pane.typed).toEqual([]);
+      expect(JSON.parse(lines[0]!).detail).toMatchObject({ outcome: "refused", reason: "pane_busy", pressed: false });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
 
 async function receipt(res: Response): Promise<ClearReceipt> {
   expect(res.status).toBe(200);
@@ -331,6 +361,25 @@ describe("a Clear on a pane with a screen", () => {
     expect(await receipt(await refused.clear("%1", { requestId: ID }))).toEqual({ requestId: ID, outcome: "refused", reason: "press_failed" });
     // The probe character went in and its Backspace was refused: a key left, so the engine looks again.
     expect(refused.pokes()).toBe(1);
+  });
+
+  // M100 spec 03: keys not confirmed in time may still land. They count as pressed (the engine looks
+  // again), the read-backs decide, and no later round presses on top of them.
+  test("clear keys not confirmed in time that landed: cleared, one press", async () => {
+    const { pane, clear } = rig(DRAFT);
+    pane.lateKeys = true;
+    pane.perPress = 1000;
+    expect(await receipt(await clear("%1", { requestId: ID }))).toMatchObject({ outcome: "cleared" });
+    expect(pane.keysSeen).toHaveLength(1);
+  });
+
+  test("clear keys not confirmed in time that did not show: press_failed after the read-backs, a key counted as left, no second press", async () => {
+    const { pane, clear, pokes } = rig(DRAFT);
+    pane.lateKeys = true;
+    pane.deaf = true;
+    expect(await receipt(await clear("%1", { requestId: ID }))).toEqual({ requestId: ID, outcome: "refused", reason: "press_failed" });
+    expect(pane.keysSeen).toHaveLength(1);
+    expect(pokes()).toBe(1);
   });
 
   test("a box that ignores the key: press_failed after the read-back, and the key is NOT pressed a second time", async () => {

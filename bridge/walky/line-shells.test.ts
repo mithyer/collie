@@ -1,17 +1,15 @@
-// The typed WalkyTalky line at a shell prompt (backport of fix/walky-line-fields, 1.29.0). Collie types
-// the line into a pane it found running an agent; when the agent exits between that check and the keys,
-// the line lands at a shell prompt and the Enter runs it. So the line must do nothing there, whatever
-// its fields hold.
+// The typed WalkyTalky line at a shell prompt (fix/walky-line-fields). Collie types the line into a pane
+// it found running an agent; when the agent exits between that check and the keys, the line lands at a
+// shell prompt and the Enter runs it. So the line must do nothing there, whatever its fields hold.
 //
 // Every line below is built by the real formatter from hostile values and handed to `<shell> -c` in an
 // empty folder whose HOME and XDG folders are inside it too. The payload is always `touch canary` (a file
 // in that folder), spelled for every way a shell runs a command: a separator, a pipe, `&&`, a backtick,
 // `$()`, fish's `(...)`, brace expansion, a newline, a glob, a redirect, a quote that would end the label's
 // quotes, and plain WORDS standing where a shell might take them for a command. Each value stands in every
-// place a value reaches the line: the label, the harness, the address, and an id or a reply id that
-// skipped the log's and the hop's checks, for an agent with a harness, an agent without one, and an
-// operator. (1.28 has no subject; 1.29 adds one, in quotes, with its own allow-list.) A shell that is
-// not installed gets no test (see below).
+// place a value reaches the line: the label, the harness, the address, the subject, and an id or a reply id
+// that skipped the log's and the hop's checks, for an agent with a
+// harness, an agent without one, and an operator. A shell that is not installed gets no test (see below).
 //
 // Shells not run here, by their grammar (Windows 11 with Herdr is a supported host, and a Windows bridge
 // does type lines: the phone's messages and a crew member's arrive there, only the agent's socket is
@@ -38,11 +36,24 @@ const SHELL_ARGS = [
   ["fish", ["--no-config", "-c"]],
   ["ksh", ["-c"]],
 ] as const;
-const installed = (shell: string): boolean => spawnSync("sh", ["-c", `command -v ${shell}`]).status === 0;
+const argsOf = (shell: string): readonly string[] => SHELL_ARGS.find(([name]) => name === shell)?.[1] ?? ["-c"];
+// A shell counts as installed when THIS process can spawn it by its bare name and it can run `touch`,
+// the canary every test below relies on. The older probe asked `sh -c "command -v <shell>"`. On Windows
+// that `sh` is the one of Git for Windows, and it can find a `dash` in Git's own `usr/bin` that a process
+// spawning "dash" itself cannot start, or that starts with no `touch` on its PATH. The shell then ran
+// nothing, and the dash canary test read false. A shell that fails the probe gets no test, as a missing one does.
+function installed(shell: string): boolean {
+  const root = mkdtempSync(join(tmpdir(), "walky-line-probe-"));
+  try {
+    spawnSync(shell, [...argsOf(shell), "touch probe"], { cwd: root, env: { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: root }, timeout: 10_000 });
+    return readdirSync(root).includes("probe");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
 const SHELLS: readonly string[] = SHELL_ARGS.map(([shell]) => shell).filter(installed);
 /** The shells the Linux CI job must have (COLLIE_REQUIRE_SHELLS=1). ksh is optional everywhere. */
 const REQUIRED_SHELLS = ["bash", "dash", "zsh", "fish"] as const;
-const argsOf = (shell: string): readonly string[] => SHELL_ARGS.find(([name]) => name === shell)?.[1] ?? ["-c"];
 
 /** What the canary run left behind: every path under the temp root that is not the empty work folder or HOME's own files. */
 async function run(shell: string, line: string): Promise<{ canary: boolean; workLeft: string[] }> {
@@ -100,7 +111,7 @@ const agent: WalkyMessage = {
 
 /** Every place a value reaches the typed line, for each sender kind. */
 function linesFor(payload: string) {
-  const firstLine = (message: WalkyMessage): string => formatEnvelope(message).split("\n")[0]!;
+  const firstLine = (message: WalkyMessage, outside = false): string => formatEnvelope(message, outside ? "outside" : undefined).split("\n")[0]!;
   const noHarness = { ...agent.from, harness: null };
   const operator: WalkyMessage = { ...agent, kind: "operator", from: { memberId: null, address: null, harness: null, label: payload } };
   return {
@@ -109,7 +120,9 @@ function linesFor(payload: string) {
     "agent harness": firstLine({ ...agent, from: { ...agent.from, harness: payload } }),
     "agent address, pane part": firstLine({ ...agent, from: { ...agent.from, address: `lodge/${payload}` } }),
     "agent address, member part": firstLine({ ...agent, from: { ...noHarness, address: `${payload}/w6:p3` } }),
+    "agent subject": firstLine({ ...agent, subject: payload, replyTo: "wt_8ab2k1m4q7zx" }, true),
     "operator label": firstLine(operator),
+    "operator subject": firstLine({ ...operator, from: { ...operator.from, label: "Pixel 9" }, subject: payload }),
     "agent id (forged)": firstLine({ ...agent, id: payload }),
     "agent reply id (forged)": firstLine({ ...agent, replyTo: payload }),
     "operator id (forged)": firstLine({ ...operator, from: { ...operator.from, label: "Pixel 9" }, id: payload }),
@@ -119,7 +132,7 @@ function linesFor(payload: string) {
 
 describe("the typed line at a shell prompt runs nothing (fix/walky-line-fields)", () => {
   // A shell this machine lacks gets no test at all rather than a skipped one, so the Windows skip budget
-  // (scripts/windows-suites.ps1) is untouched: on Windows `sh` is missing and only this first test runs.
+  // (scripts/windows-suites.ps1) is untouched: on Windows only the shells that start there (Git's bash) get tests.
   // With COLLIE_REQUIRE_SHELLS=1 (the Linux bridge job of ci.yml, which installs zsh and fish) a missing
   // bash, dash, zsh or fish FAILS here instead of leaving its tests out, so CI always runs the real shells.
   // Not keyed on CI: release, windows, webkit and packaging runs set CI too and lack these shells.
@@ -157,7 +170,7 @@ describe("the typed line at a shell prompt runs nothing (fix/walky-line-fields)"
     });
 
     test(
-      `${shell}: no hostile label, harness, address or id makes the canary, for any sender kind`,
+      `${shell}: no hostile label, harness, address or subject makes the canary, for any sender kind`,
       async () => {
         const failures: string[] = [];
         for (const [name, payload] of Object.entries(PAYLOADS)) {

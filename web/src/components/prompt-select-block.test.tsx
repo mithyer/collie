@@ -129,11 +129,16 @@ describe("PromptSelectBlock — the subject and the question are on the card", (
       "Dangerous rm operation on statically-unresolvable target: /var/home/devel/projects/sample-workspace/*",
     );
     expect(subject.textContent).not.toMatch(/[╌│]/);
-    // Wraps at phone width instead of panning, and scrolls on its own past its cap, so a long diff
-    // never pushes the buttons out of the dock.
+    // Wraps at phone width instead of panning, and scrolls on its own, so a long diff never pushes
+    // the buttons out of the dock.
     expect(subject.className).toContain("whitespace-pre-wrap");
-    expect(subject.className).toContain("max-h-[22dvh]");
     expect(subject.className).toContain("overflow-y-auto");
+    // The one box of the card that shrinks to fit the dock, never under three rows (2026-11-12). The
+    // heights themselves are a layout engine's to check: e2e/permission-card-fits.spec.ts.
+    const box = subject.parentElement!;
+    expect(box.hasAttribute("data-fit-shrink")).toBe(true);
+    expect(box.className).toContain("min-h-[calc(3lh+0.75rem)]");
+    expect(card.getByRole("group").hasAttribute("data-fit")).toBe(true);
 
     expect(container.querySelector('[data-slot="prompt-question"]')!.textContent).toBe("Do you want to proceed?");
     expect(card.getAllByRole("button").map((b) => b.textContent)).toEqual(["1Yes", "2No"]);
@@ -158,10 +163,14 @@ describe("PromptSelectBlock — the subject and the question are on the card", (
     expect(within(container).getAllByRole("button").map((b) => b.textContent)).toEqual(["1Yes", "2No"]);
   });
 
-  // jsdom lays nothing out, so the measurements the fade reads (`scrollHeight`, `clientHeight`,
-  // `scrollTop` on the scrolling <pre>) are stubbed, and this pins the structure only: whether the
+  // jsdom lays nothing out, so the measurements the fades read (`scrollHeight`, `clientHeight`,
+  // `scrollTop` on the scrolling <pre>) are stubbed, and this pins the structure only: whether each
   // fade element exists for each measured state. How it looks is for a real browser.
-  describe("the fade below a subject that continues", () => {
+  //
+  // The box opens at its BOTTOM (2026-11-12): the rows nearest the question, the end of the command
+  // and the warning under it, are the ones on show, and the fade marks the rows hidden ABOVE. Before,
+  // it opened at the top, and a tall command's warning sat under the fold.
+  describe("the fades at a subject's folds", () => {
     const measure = (heights: { scroll: number; client: number }) => {
       vi.spyOn(HTMLElement.prototype, "scrollHeight", "get").mockReturnValue(heights.scroll);
       vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockReturnValue(heights.client);
@@ -171,38 +180,123 @@ describe("PromptSelectBlock — the subject and the question are on the card", (
       const { container } = render(<PromptSelectBlock prompt={model} onAction={vi.fn()} />);
       return { container, pre: container.querySelector<HTMLElement>('[data-slot="prompt-subject"] pre')! };
     };
-    const fade = (container: HTMLElement) => container.querySelector('[data-slot="prompt-subject-more"]');
+    const below = (container: HTMLElement) => container.querySelector('[data-slot="prompt-subject-more"]');
+    const above = (container: HTMLElement) => container.querySelector('[data-slot="prompt-subject-more-above"]');
 
     afterEach(() => vi.restoreAllMocks());
 
-    it("shows while the box overflows and is not scrolled to the bottom", () => {
+    it("opens scrolled to the bottom, with the fade above it and none below", () => {
       measure({ scroll: 500, client: 150 });
-      const { container } = renderSubject();
-      const more = fade(container)!;
+      const { container, pre } = renderSubject();
+      expect(pre.scrollTop).toBe(500);
+      expect(below(container)).toBeNull();
+      const more = above(container)!;
       expect(more).not.toBeNull();
       // Inside the subject box, drawn over it, and out of the way of taps and of the accessibility tree.
       expect(more.parentElement).toBe(container.querySelector('[data-slot="prompt-subject"]'));
       expect(more.getAttribute("aria-hidden")).toBe("true");
       expect(more.className).toContain("pointer-events-none");
+      expect(more.className).toContain("top-0");
     });
 
-    it("goes once the box is scrolled to the bottom, and returns when it is scrolled back up", () => {
+    it("scrolled up to the top: the fade moves below; in between, both show", () => {
       measure({ scroll: 500, client: 150 });
       const { container, pre } = renderSubject();
-      expect(fade(container)).not.toBeNull();
-      Object.defineProperty(pre, "scrollTop", { configurable: true, value: 350 });
+      Object.defineProperty(pre, "scrollTop", { configurable: true, value: 0 });
       fireEvent.scroll(pre);
-      expect(fade(container)).toBeNull();
+      expect(above(container)).toBeNull();
+      expect(below(container)).not.toBeNull();
+      expect(below(container)!.getAttribute("aria-hidden")).toBe("true");
       Object.defineProperty(pre, "scrollTop", { configurable: true, value: 100 });
       fireEvent.scroll(pre);
-      expect(fade(container)).not.toBeNull();
+      expect(above(container)).not.toBeNull();
+      expect(below(container)).not.toBeNull();
+      Object.defineProperty(pre, "scrollTop", { configurable: true, value: 350 });
+      fireEvent.scroll(pre);
+      expect(above(container)).not.toBeNull();
+      expect(below(container)).toBeNull();
     });
 
     it("is absent when the content fits the box", () => {
       measure({ scroll: 150, client: 150 });
       const { container } = renderSubject();
       expect(container.querySelector('[data-slot="prompt-subject"]')).not.toBeNull();
-      expect(fade(container)).toBeNull();
+      expect(below(container)).toBeNull();
+      expect(above(container)).toBeNull();
+    });
+  });
+
+  // 2026-11-12 on 2.1.322: a command taller than the screen put the dialog's top above it, and the card
+  // read "Permission required / Do you want to proceed? / Yes / No", the "Dangerous rm operation"
+  // warning dropped. The card now shows the rows that are on the screen, says the start is above it,
+  // and draws the warning in the caution tone.
+  describe("a dialog that starts above the screen", () => {
+    const CUT = "claude--v2322-permission-bash-cut-top--w160.txt";
+    const CUT_LINE = "The start of this request is above the screen. Open Screen to read all of it.";
+
+    afterEach(() => vi.restoreAllMocks());
+
+    it("says so in one line above the rows, then shows the rows, the warning, the question and the options", () => {
+      const model = fixtureModel(CUT);
+      const { container } = render(<PromptSelectBlock prompt={model} onAction={vi.fn()} />);
+      const card = within(container);
+      const note = container.querySelector('[data-slot="prompt-subject-cut"]')!;
+      expect(note.textContent).toBe(CUT_LINE);
+      // The first captured row is a command row, not a header: no title.
+      expect(container.querySelector('[data-slot="prompt-subject-title"]')).toBeNull();
+      const subject = container.querySelector('[data-slot="prompt-subject"] pre')!;
+      expect(subject.textContent).toContain("// one arm: every item through the same model");
+      expect(subject.textContent).toContain('run_report.ts $a 0 10 2>&1 | grep -v "^key\\|Now using"; done');
+      expect(subject.textContent).not.toMatch(/[╌│]/);
+      expect(container.querySelector('[data-slot="prompt-question"]')!.textContent).toBe("Do you want to proceed?");
+      expect(card.getAllByRole("button").map((b) => b.textContent)).toEqual(["1Yes", "2No"]);
+      // Reading order: the line, the rows, the question, the options.
+      const order = [note, subject, container.querySelector('[data-slot="prompt-question"]')!, card.getAllByRole("button")[0]!];
+      for (let i = 1; i < order.length; i++) {
+        expect(order[i - 1]!.compareDocumentPosition(order[i]!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+      }
+    });
+
+    it("draws the warning row in the caution tone, and no other row", () => {
+      const { container } = render(<PromptSelectBlock prompt={fixtureModel(CUT)} onAction={vi.fn()} />);
+      const toned = [...container.querySelectorAll('[data-slot="prompt-subject"] pre [data-tone="warning"]')];
+      expect(toned).toHaveLength(1);
+      expect(toned[0]!.textContent).toContain(
+        "Dangerous rm operation not ruled out — the shell may read this command differently than it was parsed",
+      );
+      // `--status-working`: ui/notice.tsx's caution tone, the app's warning ink. No new colour.
+      expect(toned[0]!.className).toBe("text-status-working");
+    });
+
+    it("caps a long subject and opens it at the bottom, where the warning is", () => {
+      vi.spyOn(HTMLElement.prototype, "scrollHeight", "get").mockReturnValue(900);
+      vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockReturnValue(150);
+      const { container } = render(<PromptSelectBlock prompt={fixtureModel(CUT)} onAction={vi.fn()} />);
+      const pre = container.querySelector<HTMLElement>('[data-slot="prompt-subject"] pre')!;
+      expect(pre.parentElement!.hasAttribute("data-fit-shrink")).toBe(true);
+      expect(pre.className).toContain("overflow-y-auto");
+      expect(pre.scrollTop).toBe(900);
+      expect(container.querySelector('[data-slot="prompt-subject-more-above"]')).not.toBeNull();
+      expect(container.querySelector('[data-slot="prompt-subject-more"]')).toBeNull();
+    });
+
+    it("says the line when the question is all the screen held of the dialog", () => {
+      const model: PromptModel = { ...fixtureModel(CUT), subject: undefined };
+      const { container } = render(<PromptSelectBlock prompt={model} onAction={vi.fn()} />);
+      expect(container.querySelector('[data-slot="prompt-subject-cut"]')!.textContent).toBe(CUT_LINE);
+      expect(container.querySelector('[data-slot="prompt-subject"]')).toBeNull();
+      expect(within(container).getAllByRole("button").map((b) => b.textContent)).toEqual(["1Yes", "2No"]);
+    });
+
+    it("an uncut dialog says no such line, and its warning wears the same tone", () => {
+      const { container } = render(
+        <PromptSelectBlock prompt={fixtureModel("claude--v2291-permission-bash-subagent.txt")} onAction={vi.fn()} />,
+      );
+      expect(container.querySelector('[data-slot="prompt-subject-cut"]')).toBeNull();
+      const toned = [...container.querySelectorAll('[data-slot="prompt-subject"] pre [data-tone="warning"]')];
+      expect(toned.map((row) => row.textContent)).toEqual([
+        "\nDangerous rm operation on statically-unresolvable target: /var/home/devel/projects/sample-workspace/*",
+      ]);
     });
   });
 
@@ -330,7 +424,7 @@ describe("submitPromptOption — race guard + per-family keystroke recipe", () =
       "w1:p1",
       ["1", "Enter"],
       undefined,
-      model.signature,
+      model.bindRegion ?? model.signature,
     );
   });
 
@@ -351,10 +445,13 @@ describe("submitPromptOption — race guard + per-family keystroke recipe", () =
       option: model.options[0]!,
     });
     expect(res).toEqual({ status: "sent" });
-    expect(mockSendKeys).toHaveBeenCalledWith("w1:p1", ["1"], undefined, model.signature);
+    // A framed dialog binds its own rows (`bindRegion`); any other binds `signature`.
+    expect(mockSendKeys).toHaveBeenCalledWith("w1:p1", ["1"], undefined, model.bindRegion ?? model.signature);
   });
 
-  it("rejects (no send) when the fresh revision differs", async () => {
+  // A moved revision is no refusal by itself (lib/harness/guard.ts): Herdr 0.9.x moves it with every
+  // repaint, so a ticking row outside the dialog refused every tap. The same menu still sends.
+  it("sends when only the fresh revision differs and the menu is the same", async () => {
     const model = fixtureModel("claude--select-menu.txt");
     mockFetchPane.mockResolvedValue({
       paneId: "w1:p1",
@@ -370,8 +467,8 @@ describe("submitPromptOption — race guard + per-family keystroke recipe", () =
       prompt: model,
       option: model.options[0]!,
     });
-    expect(res).toEqual({ status: "changed" });
-    expect(mockSendKeys).not.toHaveBeenCalled();
+    expect(res).toEqual({ status: "sent" });
+    expect(mockSendKeys).toHaveBeenCalledTimes(1);
   });
 
   it("rejects (no send) when the fresh buffer resolves to a different menu", async () => {
@@ -414,7 +511,7 @@ describe("submitPromptOption — race guard + per-family keystroke recipe", () =
       option: model.options[1]!,
     });
     expect(res).toEqual({ status: "sent" });
-    expect(mockSendKeys).toHaveBeenCalledWith("w1:p1", ["2"], undefined, model.signature);
+    expect(mockSendKeys).toHaveBeenCalledWith("w1:p1", ["2"], undefined, model.bindRegion ?? model.signature);
   });
 
   it("rejects a 304 with MATCHING (stub) revisions when the cached text no longer shows the menu", async () => {
@@ -567,7 +664,7 @@ describe("PromptSelectBlock — wired tap (component → handler → api)", () =
       "w1:p1",
       ["1", "Enter"],
       undefined,
-      model.signature,
+      model.bindRegion ?? model.signature,
     );
   });
 
@@ -945,5 +1042,32 @@ describe("PromptSelectBlock, no action from cached state (M46 spec 11)", () => {
     render(<PromptSelectBlock prompt={selectModel} onAction={vi.fn()} />);
     expect(screen.queryByText("Reconnect to answer.")).toBeNull();
     expect(screen.getByRole("button", { name: /Red/ })).toBeEnabled();
+  });
+});
+
+// Claude Code 2.1.325's first-run theme step (harness/claude/first-run-theme.ts), at 40 columns as a
+// phone pane is: seven buttons by their own text, no Esc, and nothing of the diff preview under the list.
+describe("the first-run theme card", () => {
+  it("renders the seven styles as buttons, the pointed one badged, with no Esc and no preview row", () => {
+    const blocks = buildBlocks(splitLines(parseAnsi(fixtureText("claude--v2325-first-run-theme--w40.txt"))), { agent: "claude" });
+    const block = blocks.find((b) => b.kind === "prompt-select");
+    if (block?.kind !== "prompt-select") throw new Error("the theme step did not lift");
+    render(<PromptSelectBlock prompt={block.prompt} lines={block.lines} onAction={vi.fn()} />);
+    const group = screen.getByRole("group", { name: "Choose the text style that looks best with your terminal" });
+    const labels = [
+      "Auto (match terminal)",
+      "Dark mode",
+      "Light mode",
+      "Dark mode (colorblind-friendly)",
+      "Light mode (colorblind-friendly)",
+      "Dark mode (ANSI colors only)",
+      "Light mode (ANSI colors only)",
+    ];
+    for (const label of labels) {
+      expect(within(group).getByRole("button", { name: new RegExp(`^\\S*\\s*${label.replace(/[()]/gu, "\\$&")}$`, "u") })).toBeInTheDocument();
+    }
+    expect(within(screen.getByRole("button", { name: /^\S*\s*Dark mode$/u })).getByText("❯")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Esc/u })).toBeNull();
+    expect(screen.queryByText(/greet|Syntax theme/u)).toBeNull();
   });
 });

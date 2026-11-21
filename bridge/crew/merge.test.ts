@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 
 import { computeEtag } from "../http-cache.ts";
 import type { JsonValue } from "../json.ts";
-import type { PaneWire, SessionSummary, SnapshotResponse, TabView, WorkspaceView } from "../types.ts";
+import { toPaneWire, type AgentView, type PaneWire, type SessionSummary, type SnapshotResponse, type TabView, type WorkspaceView } from "../types.ts";
 import { NARROW_VIEW } from "../sessions.ts";
 import {
   leadLabel,
@@ -109,13 +109,43 @@ describe("a member's pin count (M90)", () => {
   });
 });
 
+describe("why a member's blocked pane needs a look (blockedBy, PR 787)", () => {
+  const parsed = (over: Record<string, JsonValue>) =>
+    // SAFETY: a test body shaped as a member's snapshot; the fields are deliberately of any type, the member's word.
+    parsePeerSnapshot({ sessions: [], agents: [{ ...pane({ paneId: "w1:p1" }), ...over }], shellPanes: [], workspaces: [], tabs: [] } as never)?.agents[0];
+
+  test("travels from the member's wire body to the lead as the member wrote it", () => {
+    const { hasSession: _flag, ...view } = pane({ paneId: "w1:p1", status: "blocked" });
+    // SAFETY: a member's own pane, AgentView minus the two server-only fields, which toPaneWire strips anyway.
+    const wire = toPaneWire({ ...view, blockedBy: "error" } as AgentView, () => false);
+    expect(wire.blockedBy).toBe("error");
+    // SAFETY: the wire pane as JSON, which is how the lead reads it.
+    expect(parsed(JSON.parse(JSON.stringify(wire)) as Record<string, JsonValue>)).toMatchObject({ status: "blocked", blockedBy: "error" });
+  });
+
+  test("an older member's blocked pane, without the field, stays a plain blocked", () => {
+    const old = parsed({ status: "blocked" });
+    expect(old?.status).toBe("blocked");
+    expect(old !== undefined && "blockedBy" in old).toBe(false);
+  });
+
+  test("is kept only as error on a blocked pane; anything else is dropped", () => {
+    for (const bad of ["question", "", 1, true, null]) {
+      const got = parsed({ status: "blocked", blockedBy: bad });
+      expect(got !== undefined && "blockedBy" in got).toBe(false);
+    }
+    const idle = parsed({ status: "idle", blockedBy: "error" });
+    expect(idle !== undefined && "blockedBy" in idle).toBe(false);
+  });
+});
+
 describe("leadLabel — the lead's servers[].name is a machine label, not the crew's name", () => {
   test("a bare short hostname passes through unchanged", () => {
-    expect(leadLabel("minibuch", "desk")).toBe("minibuch");
+    expect(leadLabel("workshop", "desk")).toBe("workshop");
   });
 
   test("an FQDN is truncated to its first label", () => {
-    expect(leadLabel("minibuch.tailnetxyz.ts.net", "desk")).toBe("minibuch");
+    expect(leadLabel("workshop.tailnetxyz.ts.net", "desk")).toBe("workshop");
   });
 
   test("an empty hostname() falls back to the member id", () => {
@@ -238,15 +268,15 @@ describe("mergeSnapshot — reachable / unreachable / incompatible, never confla
 
   test("each row carries the host name: the lead's own, and a member's banked one (M77 spec 01)", () => {
     const merged = mergeSnapshot(localBody(), {
-      self: { ...SELF, host: "bluefin" },
+      self: { ...SELF, host: "lodge" },
       peers: [
-        contribution({ state: state({ memberId: "laptop", host: "minibuch" }) }),
+        contribution({ state: state({ memberId: "laptop", host: "workshop" }) }),
         contribution({ state: state({ memberId: "old-box" }) }),
       ],
       now: NOW,
     });
-    expect(merged.servers!.find((s) => s.id === "desk")!.host).toBe("bluefin");
-    expect(merged.servers!.find((s) => s.id === "laptop")!.host).toBe("minibuch");
+    expect(merged.servers!.find((s) => s.id === "desk")!.host).toBe("lodge");
+    expect(merged.servers!.find((s) => s.id === "laptop")!.host).toBe("workshop");
     // A member that never said, and a lead whose OS gives no name, carry no `host` key at all.
     expect("host" in merged.servers!.find((s) => s.id === "old-box")!).toBe(false);
     expect("host" in mergeSnapshot(localBody(), { self: SELF, peers: [], now: NOW }).servers![0]!).toBe(false);
@@ -995,5 +1025,31 @@ describe("mergeSnapshot — a member's walky off flag (M89, §21)", () => {
     const of = (paneId: string) => merged.agents.find((row) => row.paneId === paneId && row.host === "laptop");
     expect(of("w2:p1")?.walkyOff).toBe(true);
     expect("walkyOff" in of("w2:p2")!).toBe(false);
+  });
+});
+
+describe("mergeSnapshot — a member pane's account tag (M101 spec 06, decision 6)", () => {
+  test("the tag the member set reaches the phone through the merge; a pane with none has no key", () => {
+    const merged = mergeSnapshot(localBody(), {
+      self: SELF,
+      peers: [contribution({ state: state({ memberId: "laptop" }), body: { ...peerBody, agents: [pane({ paneId: "w2:p1", account: { id: "acct-1", label: "Work" } }), pane({ paneId: "w2:p2" })] } })],
+      now: NOW,
+    });
+    const of = (paneId: string) => merged.agents.find((row) => row.paneId === paneId && row.host === "laptop");
+    expect(of("w2:p1")?.account).toEqual({ id: "acct-1", label: "Work" });
+    expect("account" in of("w2:p2")!).toBe(false);
+  });
+});
+
+describe("mergeSnapshot — a member's linked field (M99 spec 15, §21)", () => {
+  test("linked field: a member's `linked` reaches the phone through the merge unchanged, and an older member's pane carries none", () => {
+    const merged = mergeSnapshot(localBody(), {
+      self: SELF,
+      peers: [contribution({ state: state({ memberId: "laptop" }), body: { ...peerBody, agents: [pane({ paneId: "w2:p1", linked: true }), pane({ paneId: "w2:p2" })] } })],
+      now: NOW,
+    });
+    const of = (paneId: string) => merged.agents.find((row) => row.paneId === paneId && row.host === "laptop");
+    expect(of("w2:p1")?.linked).toBe(true);
+    expect("linked" in of("w2:p2")!).toBe(false);
   });
 });

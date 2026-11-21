@@ -181,12 +181,38 @@ test("switcher: the Pinned section leads the sheet and each pane is listed once"
   await expect(page).toHaveURL(new RegExp(`/pane/${encodeURIComponent("w2:p1")}$`, "u"));
 });
 
+test("switcher: the New button in the title row lands where the dashboard's New lands, and Back returns to the pane", async ({ page }) => {
+  // Where the dashboard's own New button goes.
+  await page.goto("/");
+  await page.getByRole("button", { name: en["home.new.label"], exact: true }).click();
+  await expect(page).toHaveURL(/\/new(?:\?|$)/u);
+  const newUrl = page.url();
+
+  const pane = new RegExp(`/pane/${encodeURIComponent("w1:p1")}$`, "u");
+  await page.goto(`/pane/${encodeURIComponent("w1:p1")}`);
+  await page.getByRole("button", { name: en["chat.switcher.aria"] }).click();
+  const sheet = page.getByRole("dialog", { name: en["chat.switcher.aria"] });
+  const create = sheet.getByRole("button", { name: en["home.new.label"], exact: true });
+  await expect(create).toBeVisible();
+  // It stands in the title row, left of the close button.
+  const close = sheet.getByRole("button", { name: en["common.closeAria"] });
+  expect((await box(create)).x + (await box(create)).width).toBeLessThanOrEqual((await box(close)).x);
+  await create.click();
+  await expect(page).toHaveURL(newUrl);
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+
+  // Back returns to the pane, with the sheet closed.
+  await page.goBack();
+  await expect(page).toHaveURL(pane);
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+});
+
 test("hold: a hold on a row pins it, the row lands in view with focus, and Unpin returns it", async ({ page }) => {
   await page.goto("/");
   const codex = mainRow(page, "codex");
   const target = await box(codex);
 
-  // A real hold: the finger down for longer than the 450ms threshold, then up. The pane must NOT open.
+  // A real hold: the finger down for longer than the 500ms threshold, then up. The pane must NOT open.
   await page.mouse.move(target.x + target.width / 2, target.y + target.height / 2);
   await page.mouse.down();
   await page.waitForTimeout(700);
@@ -249,8 +275,8 @@ test("hold: a held row shows the hold filling, moves nothing, and drops the look
 
   await page.mouse.move(target.x + target.width / 2, target.y + target.height / 2);
   await page.mouse.down();
-  // Inside the fill: past the 150ms delay, short of the 450ms mark. One read, so nothing races it.
-  await page.waitForTimeout(280);
+  // Inside the fill: past the 250ms delay, short of the 500ms mark. One read, so nothing races it.
+  await page.waitForTimeout(360);
   const held = await layout();
   expect(held.holding).toBe(true);
   // Pressed in and tinted, by a transform and a shadow only: the row's own box and the row above stay.
@@ -267,8 +293,8 @@ test("hold: a held row shows the hold filling, moves nothing, and drops the look
   const log = (await page.evaluate(() => window.holdLog)) ?? [];
   expect(log.map((e) => e.holding)).toEqual([true, false]);
   // A tap shorter than the delay would never see the mark, and it ends as the hold counts, at once.
-  expect(log[0]!.t).toBeGreaterThanOrEqual(140);
-  expect(log[1]!.t).toBeGreaterThanOrEqual(440);
+  expect(log[0]!.t).toBeGreaterThanOrEqual(240);
+  expect(log[1]!.t).toBeGreaterThanOrEqual(490);
   expect(log[1]!.transform).toBe("none");
 });
 

@@ -364,6 +364,66 @@ export const ERROR_CODES = {
    * body without one could not be told from a second, different tap.
    */
   "telemetry.request_id_required": "this action needs a request id; nothing was changed",
+
+  // ── Accounts: GET /api/accounts, POST /api/accounts[/remove], an `account` on a launch (M101) ───
+  /** This machine offers no accounts: Windows, or no agent here that takes one. */
+  "accounts.unavailable": "this machine offers no profiles",
+  /** Another account of the same agent already has this label. */
+  "accounts.label_taken": "another profile of this agent already has that name",
+  /** The label is empty, too long, or holds a character that is not allowed. */
+  "accounts.bad_label": "the name must be 1 to 24 characters, with letters or digits",
+  /** The folder is not one an account may use. `reason` names the rule it failed. */
+  "accounts.bad_folder": "that folder cannot hold a profile: {reason}",
+  /** Another account, or the agent's default, already uses this folder. */
+  "accounts.folder_taken": "another profile already uses that folder",
+  /** The agent does not take this kind of account on this machine. */
+  "accounts.kind_unsupported": "this agent cannot take that kind of profile here",
+  /** The machine already keeps the most accounts it may. */
+  "accounts.limit": "this machine already has {max} profiles; remove one first",
+  /** The new folder or its links could not be made. Nothing was saved. */
+  "accounts.link_failed": "the profile folder could not be set up: {reason}",
+  /** The Default account cannot be removed. */
+  "accounts.default": "the default profile cannot be removed",
+  /** The account the request names is not one of this machine's, or not of that agent. */
+  "accounts.unknown": "this machine has no such profile for that agent; nothing was started",
+  /** The account list on disk is not one this build can write; nothing was changed. */
+  "accounts.store_unreadable": "the profile list cannot be read; nothing was changed",
+
+  // ── The bridge's local key: `<stateDir>/local-secret` on the loopback port (bridge/local-key.ts) ──
+  /**
+   * The local key reached a route not in `LOCAL_KEY_ROUTES`: every route that returns a screen or a
+   * message, and every route nobody has marked yet. Only a caller holding the key gets this; a phone
+   * never holds it.
+   */
+  "local.no_text": "the bridge's local key reads no screen or message text; read this as a paired device (a script sends COLLIE_TOKEN)",
+
+  // ── The local API: `<stateDir>/api/sock`, one JSON line per request (M105 spec 03, bridge/api/) ──
+  /** The request names no operation this bridge offers. */
+  "api.unknown_op": "the local API has no such operation here; send hello to see the operations it offers",
+  /** The operation needs a level the caller's grant does not hold. The local tier grants `read`, which holds `see`. */
+  "api.denied": "the local API does not grant the right this operation needs; send hello to see the operations it offers",
+  /** The connection named no live run token in `hello`: no token, an unknown one, or one whose run ended (M105 spec 05). */
+  "api.no_run_token": "the local API answers a trick's own run in this release; send hello first, with the run token from the trick's facts",
+  /** The line is not a request the socket reads; `reason` is one of the socket's own fixed phrases. */
+  "api.bad_request": "the request cannot be read ({reason}); send one JSON object per line, as {\"op\": \"hello\"}",
+  /** The session id is malformed, of another machine, or names no pane here now. */
+  "api.session_unknown": "no session on this machine has that id; send sessions for the ids of now",
+  /** The pane the id named now holds another session (its id was reused). */
+  "api.session_replaced": "that session has ended and its pane now holds another one; send sessions for the ids of now",
+  /** Too many `events` waits are open, on this connection or in all. */
+  "api.too_many_waits": "too many waits are open (at most {perConnection} on one connection and {total} in all); let one end, or ask without wait",
+  /** Too many requests are in flight on one connection, waits included. */
+  "api.too_many_requests": "too many requests are in flight on this connection (at most {max}); wait for an answer before you send more",
+  /** Too many screen reads are in progress on the whole socket; `retryMs` is how long to wait first. */
+  "api.busy": "too many screens are being read now (at most {max} at once on this machine); try again in {retryMs} ms",
+  /** Too many programs hold a connection to the local API. */
+  "api.too_many_connections": "too many programs are connected to the local API (at most {max}); close one and connect again",
+  /** One answer would be larger than the cap. */
+  "api.answer_too_large": "the answer is larger than {maxBytes} bytes; ask for less",
+  /** The socket is going away: the last trick was switched off, or the bridge stops. */
+  "api.closing": "the local API is closing: it is on only while a trick is switched on; switch one on and connect again",
+  /** The operation failed inside the bridge. */
+  "api.failed": "the operation failed inside the bridge; try again, and read the bridge log if it fails again",
 } as const;
 
 /** Every code the bridge can send. The client mirror restates this union verbatim. */

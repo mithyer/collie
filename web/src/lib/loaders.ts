@@ -14,6 +14,7 @@
 // even while a poll's doomed fetch is still hanging.
 
 import {
+  fetchChat,
   fetchDevices,
   fetchHistory,
   fetchCrew,
@@ -27,6 +28,11 @@ import {
   readFailureKind,
 } from "@/lib/api";
 import { parseAnsi } from "@/lib/ansi";
+import { loadPaneViewPref } from "@/hooks/use-dash-prefs";
+import { heldChat, holdChat } from "@/lib/chat-held";
+import { EMPTY_CHAT_WINDOW, mergeChat } from "@/lib/chat-window";
+import { splitTrickSessions } from "@/lib/tricks/places";
+import { syncTricks } from "@/lib/tricks/store";
 import { noteUpdateRun } from "./self-update";
 import { splitLines } from "@/lib/blocks";
 import { type CacheHold, holdCacheReadings } from "@/lib/cache-hold";
@@ -35,6 +41,8 @@ import { markLive as markPaneLive, markSavedCopy } from "@/lib/liveness";
 import { paneGridOf, settleSessionCapabilities } from "@/lib/mux-capability";
 import { ambientSpaces, findPane } from "@/lib/hosts";
 import { noteSessionCards } from "@/lib/session-cards";
+import { syncHill } from "@/lib/hill/store";
+import { syncAgentViews } from "@/lib/agent-view/store";
 import {
   loadLastPaneText,
   loadLastSnapshot,
@@ -123,6 +131,42 @@ export interface HomeData {
   /** Every machine's workspaces from the snapshot (issue #587), so the herd list folds linked worktrees on peers too. */
   herdWorkspaces?: WorkspaceView[];
   tabs: TabView[];
+  /**
+   * The trick sessions (M94 slice 03): the panes of `kind: "trick"`, out of `agents` and the Tricks Space out of
+   * `workspaces` and `tabs`, in the bridge's order. Optional in the TYPE only, so hand-built fixtures stay
+   * valid; every loader return sets it, empty on a body with no trick session.
+   */
+  trickSessions?: AgentView[];
+  /**
+   * Whether this view has a hill (M96): the snapshot carries `hillRev`. False on a bridge older than the
+   * hill and on a crew member's own scope, where the Dashboard's bar draws no Hill item. Optional in the
+   * TYPE only, so hand-built fixtures stay valid.
+   */
+  hill?: boolean;
+  /**
+   * Whether the Hill is switched off on this bridge: the snapshot carries `hillOff` (and then no
+   * `hillRev`, so `hill` is false). The Hill's route and its row in Settings read it. Optional in the
+   * TYPE only, so hand-built fixtures stay valid.
+   */
+  hillOff?: boolean;
+  /**
+   * Whether tricks are switched off on this bridge: the snapshot carries `tricksOff`. Settings, Experiments
+   * draws the switch from it, the Settings index shows its Tricks row only without it, and Settings, Tricks redirects with it. Optional in the TYPE only, so hand-built fixtures stay valid.
+   */
+  tricksOff?: boolean;
+  /**
+   * Whether the hill's store has a list to read for Collie's cards about a trick (M96 spec 14): the
+   * snapshot carries `hillRev`, or with the Hill off `trickCardsRev`. A trick card's page with neither has
+   * nothing to wait for. Optional in the TYPE only, so hand-built fixtures stay valid.
+   */
+  trickCards?: boolean;
+  /**
+   * Whether this bridge runs tricks: the snapshot carries `tricksRev`. `false` is a real answer ("this
+   * bridge has none"), which the Settings index needs to draw its list without a Tricks row at once,
+   * because the tricks store stays empty for ever on a bridge with none and cannot say so itself.
+   * Optional in the TYPE only, so hand-built fixtures stay valid; absent there means "not known".
+   */
+  tricks?: boolean;
   /** The bridge's session registry (primary-first); empty on a single-session / older bridge. */
   sessions: SessionSummary[];
   /**
@@ -373,9 +417,14 @@ function toHomeData(
   // merged into the next one, so a pane that moves between the two lists keeps its reading and a pane
   // in neither list drops it. This runs on the stale path as well, because the same snapshot read
   // twice may not answer twice.
+  // THE TRICK SESSIONS (M94 slice 03) leave the herd here, with their Space and tabs, into a list of
+  // their own (lib/tricks/places.ts says why). A body with none hands every list back unchanged. A live
+  // answer also brings the tricks store to the body's `tricksRev`: no timer of its own, the snapshot's cadence.
+  const split = splitTrickSessions({ agents: snap.agents, shellPanes: snap.shellPanes ?? [], workspaces: snap.workspaces ?? [], tabs: snap.tabs ?? [] });
+  if (!error) void syncTricks(snap.tricksRev);
   const holdIn = paneCacheHold;
-  const agents = holdCacheReadings(holdIn, snap.agents);
-  const shells = holdCacheReadings(holdIn, snap.shellPanes ?? []);
+  const agents = holdCacheReadings(holdIn, split.agents);
+  const shells = holdCacheReadings(holdIn, split.shellPanes);
   paneCacheHold = new Map([...agents.held, ...shells.held]);
   const home: HomeData = {
     lastSeenAt,
@@ -388,9 +437,15 @@ function toHomeData(
     // beside them: the navigator is a tree of ONE machine, and on a crew the lead's merged body now
     // carries every machine's spaces. A solo body carries no host on any row, so both calls pass
     // everything through by identity and nothing about a solo dashboard changes.
-    workspaces: ambientSpaces(snap.workspaces ?? [], scope, snap.servers),
-    herdWorkspaces: snap.workspaces ?? [],
-    tabs: ambientSpaces(snap.tabs ?? [], scope, snap.servers),
+    workspaces: ambientSpaces(split.workspaces, scope, snap.servers),
+    herdWorkspaces: split.workspaces,
+    tabs: ambientSpaces(split.tabs, scope, snap.servers),
+    trickSessions: split.trickSessions,
+    hill: snap.hillRev !== undefined,
+    hillOff: snap.hillOff === true,
+    tricksOff: snap.tricksOff === true,
+    trickCards: snap.hillRev !== undefined || snap.trickCardsRev !== undefined,
+    tricks: snap.tricksRev !== undefined,
     sessions: snap.sessions ?? [],
     servers: snap.servers ?? [],
     ts: snap.ts ?? 0,
@@ -444,6 +499,7 @@ async function staleHome(scope: Scope, viewAll: boolean): Promise<HomeData> {
     shellPanes: [],
     workspaces: [],
     tabs: [],
+    trickSessions: [],
     sessions: [],
     servers: [],
     ts: 0,
@@ -494,6 +550,13 @@ export async function rootLoader({ request }: { request?: Request } = {}): Promi
       } else snap = outcome;
     } else snap = await fetching;
     answeredLive = true;
+    // The hill reads its list when the snapshot's number moved (lib/hill/store.ts). Live snapshots
+    // only: a saved copy's number is as old as the copy, and the store keeps what it last read.
+    // With the Hill off, the cards of Collie's own about a trick ride on their own number (spec 14).
+    if (snap.hillRev === undefined && snap.trickCardsRev !== undefined) syncHill(snap.trickCardsRev, "tricks");
+    else syncHill(snap.hillRev);
+    // The agent views are read the same way, on their own number (lib/agent-view/store.ts).
+    syncAgentViews(snap.trickViewsRev);
     lastSnapshot.set(snapshotKey(scope, viewAll), snap);
     lastSnapshotAt.set(snapshotKey(scope, viewAll), Date.now());
     // Write-through: the same body, dated, in a store that outlives this page (lib/last-seen.ts).
@@ -618,7 +681,7 @@ export function askOlderRows(paneId: string, scope?: Scope): void {
  * `w1:p1` of one session is never taken for the `w1:p1` of another. `findPane` then matches within
  * the pane's address, as the live lookup does.
  */
-async function savedPaneRow(paneId: string, scope: Scope): Promise<AgentView | undefined> {
+async function savedPaneRow(paneId: string, scope: Scope, memoryOnly = false): Promise<AgentView | undefined> {
   const homeHost = internScope({ host: scope.host });
   const lead = internScope({});
   const sources: { scope: Scope; all: boolean; needsSession: boolean; needsHost: boolean }[] = [
@@ -641,6 +704,7 @@ async function savedPaneRow(paneId: string, scope: Scope): Promise<AgentView | u
     const row = held === undefined ? undefined : pick(held, source);
     if (row !== undefined) return row;
   }
+  if (memoryOnly) return undefined;
   for (const source of sources) {
     const kept = await loadLastSnapshot(source.scope, source.all);
     const row = kept === null ? undefined : pick(kept.value, source);
@@ -785,6 +849,51 @@ export async function readPins(paneId: string, scope: Scope | undefined, signal?
   }
 }
 
+/**
+ * How long a switch waits for the new pane's first page of Chat, at most, counted from the start of the
+ * switch. The read starts with the pane's own and the two run side by side, so on a healthy link this adds
+ * nothing; past it the pane opens without the page and the Chat body asks for it itself, with its pending
+ * bars after their own short delay.
+ */
+export const CHAT_WARM_WAIT_MS = 600;
+
+/**
+ * Read the first page of a pane's Chat while a switch to it is still pending, and keep it (lib/chat-held.ts).
+ * The router leaves the old screen up until the loader answers, so the new pane's Chat body is built with
+ * its thread in hand and the first frame draws it; a switch has no frame with an empty reading area.
+ *
+ * Only for a pane the phone knows has a thread (the snapshot said it holds a session), only while Chat is the
+ * device's choice, and only when no window is held for it already: a revisit starts from the held one and the
+ * Chat body's own read asks what changed since. It reads nothing for a pane the snapshot does not name (a
+ * pane just created has no thread yet) and never throws.
+ */
+async function warmChat(paneId: string, scope: Scope, signal: AbortSignal | undefined): Promise<void> {
+  if (loadPaneViewPref() !== "chat") return;
+  const row = await savedPaneRow(paneId, scope, true);
+  if (row === undefined || row.kind === "shell" || row.hasSession !== true) return;
+  const address = paneKey(paneId, scope);
+  if (heldChat(address, row.instance) !== null) return;
+  try {
+    const answer = await fetchChat(paneId, {}, scope, signal, { seen: false });
+    holdChat(address, row.instance, mergeChat(EMPTY_CHAT_WINDOW, answer));
+  } catch {
+    // The Chat body asks again on its own and says what it finds; a failed warm-up draws nothing.
+  }
+}
+
+/**
+ * A warm-up that is counted as done once it settles or {@link CHAT_WARM_WAIT_MS} after it began, whichever is
+ * first. The limit runs from the start, beside the mirror's read, so a slow mirror and a slow page cost the
+ * slower of the two, and the page never adds its whole wait on top of the mirror's.
+ */
+function warmWithinLimit(warming: Promise<void>): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const limit = new Promise<void>((resolve) => {
+    timer = setTimeout(resolve, CHAT_WARM_WAIT_MS);
+  });
+  return Promise.race([warming, limit]).finally(() => clearTimeout(timer));
+}
+
 export async function paneLoader({
   params,
   request,
@@ -819,9 +928,13 @@ export async function paneLoader({
   // controls ask. Decided by the machine's own declaration, so a bridge that has not said no is read.
   // A cold open in a named session can run before the root loader filed that session's card.
   if (isNavigation) await settleSessionCapabilities(scope);
+  // The pane's first page of Chat, read beside the mirror (see warmChat).
+  const chatWarm = isNavigation ? warmWithinLimit(warmChat(paneId, scope, request?.signal)) : undefined;
   if (!paneGridOf(scope)) {
     markPaneLive(paneId, Date.now(), scope);
     markPollResult(false);
+    const walky = await readWalky(paneId, scope, request?.signal);
+    await chatWarm;
     return {
       paneId,
       scope,
@@ -832,7 +945,7 @@ export async function paneLoader({
       error: false,
       authError: false,
       stale: false,
-      walky: await readWalky(paneId, scope, request?.signal),
+      walky,
       walkyReads: walkyReadCounts.get(key) ?? 0,
     };
   }
@@ -881,6 +994,7 @@ export async function paneLoader({
     // The cadence consumes it (hooks/use-polling.ts): a mirror that keeps moving is one the operator
     // is watching move.
     markPollResult(read.notModified !== true && text !== lastPaneText.get(key));
+    await chatWarm;
     rememberPaneText(key, text);
     // Write-through, EXCEPT while the pane is asking for a secret — see holdsNoEchoPrompt (ADR 0017).
     // The drop is the wipe's session-text subset for this one pane (lib/wipe.ts, M46 spec 02): its
@@ -935,6 +1049,12 @@ export interface DevicesData {
   devices: PairedDeviceWire[];
   /** True when the fetch failed — the lists below are then empty rather than authoritative. */
   error: boolean;
+  /**
+   * True when that failure was a 401 or 403 that is not the bridge's own pairing refusal: the read
+   * was refused, so nothing here is known, and the card says so instead of "could not load". Only
+   * ever set together with `error`.
+   */
+  denied?: boolean;
 }
 
 /**
@@ -968,6 +1088,9 @@ export async function devicesLoader({ request }: { request?: Request } = {}): Pr
     // answer, not a failure: pairing is on and this device is not in it, and the card then offers the
     // pair form. The latch was already set where the refusal was read (lib/api.ts).
     if (isPairingRefusal(e)) return { enforced: true, current: null, devices: [], error: false };
+    // Any other refusal (a fronting proxy's 401/403) is a read that was refused: the card says that
+    // this browser is not allowed to read, and does not guess what is or is not paired.
+    if (isAuthError(e)) return { enforced: false, current: null, devices: [], error: true, denied: true };
     // Any other failed read says nothing about pairing, so the latch is left exactly as it was.
     return { enforced: false, current: null, devices: [], error: true };
   }

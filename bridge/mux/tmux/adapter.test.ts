@@ -126,7 +126,7 @@ describe("an auto-named window shows its folder, not its program", () => {
   test("a window the operator named keeps that name", async () => {
     const fake = new FakeTmux();
     const adapter = new TmuxMux(fake);
-    const created = await adapter.createTab({ spaceId: "$1", cwd: "/var/home/altan/playground/herdr-pouch" });
+    const created = await adapter.createTab({ spaceId: "$1", cwd: "/home/dev/playground/herdr-pouch" });
     if (!created.ok) throw new Error("unreachable");
     const renamed = await adapter.renameTab(created.value.tabId, "notes");
     expect(renamed.ok).toBe(true);
@@ -143,7 +143,7 @@ describe("an auto-named window shows its folder, not its program", () => {
     const fake = new FakeTmux();
     const adapter = new TmuxMux(fake);
     // No `-n`, so tmux keeps `automatic-rename` on and names the window after the shell it opened.
-    const created = await adapter.createTab({ spaceId: "$1", cwd: "/var/home/altan/playground/herdr-pouch" });
+    const created = await adapter.createTab({ spaceId: "$1", cwd: "/home/dev/playground/herdr-pouch" });
     if (!created.ok) throw new Error("unreachable");
 
     const { tab, pane } = await tabAndPane(adapter, created.value.tabId, created.value.paneId);
@@ -166,7 +166,7 @@ describe("an auto-named window shows its folder, not its program", () => {
   test("an auto-named window with no known path falls back to its bare index", async () => {
     const fake = new FakeTmux();
     const adapter = new TmuxMux(fake);
-    const created = await adapter.createTab({ spaceId: "$1", cwd: "/var/home/altan/playground/herdr-pouch" });
+    const created = await adapter.createTab({ spaceId: "$1", cwd: "/home/dev/playground/herdr-pouch" });
     if (!created.ok) throw new Error("unreachable");
     await fake.blankPaneCwd(created.value.paneId);
 
@@ -185,7 +185,7 @@ describe("an auto-named window shows its folder, not its program", () => {
     const adapter = new TmuxMux(fake);
     // `-n 42` turns `automatic-rename` off (tmux's own behaviour), so this is the operator's choice —
     // and the rule still reads a bare digit string as positional, never as a name to keep verbatim.
-    const created = await adapter.createTab({ spaceId: "$1", label: "42", cwd: "/var/home/altan/playground/herdr-pouch" });
+    const created = await adapter.createTab({ spaceId: "$1", label: "42", cwd: "/home/dev/playground/herdr-pouch" });
     if (!created.ok) throw new Error("unreachable");
 
     const { tab, pane } = await tabAndPane(adapter, created.value.tabId, created.value.paneId);
@@ -493,5 +493,62 @@ describe("send-keys with this adapter's own read-only watcher attached", () => {
 
     expect(ack.ok).toBe(false);
     expect(sendKeys(fake)).toHaveLength(1);
+  });
+});
+
+describe("whether a space has a name of its own (M98)", () => {
+  test("a session the operator named is named", async () => {
+    const pane = await paneOf(new TmuxMux(new FakeTmux()), TITLED_PANE);
+    expect(pane.spaceLabel).toBe("collie");
+    expect(pane.spaceNamed).toBe(true);
+  });
+
+  test("a session tmux numbered itself is not named: every machine has a `0`", async () => {
+    const fake = new FakeTmux();
+    const adapter = new TmuxMux(fake);
+    const created = await adapter.createSpace({ cwd: "/tmp" });
+    if (!created.ok) throw new Error("unreachable");
+    const pane = await paneOf(adapter, created.value.paneId);
+    expect(pane.spaceLabel).toMatch(/^\d+$/u);
+    expect(pane.spaceNamed).toBe(false);
+  });
+
+  test("a session named with letters next to digits is named", async () => {
+    const fake = new FakeTmux();
+    const adapter = new TmuxMux(fake);
+    const created = await adapter.createSpace({ cwd: "/tmp", label: "api2" });
+    if (!created.ok) throw new Error("unreachable");
+    expect((await paneOf(adapter, created.value.paneId)).spaceNamed).toBe(true);
+  });
+});
+
+// M100 spec 03: a tmux killed on its time budget (SpawnTmuxExec names the kill with TIMED_OUT_CODE) may have taken
+// the text or the keys before it hung, so a write answers `unconfirmed` and is never asked again; a read
+// answers unreachable. A read-only-client refusal is still asked once more, a time-out never.
+describe("TmuxMux when a run is killed on its budget", () => {
+  const hung = (calls: string[][]): TmuxExec => ({
+    run: (args) => {
+      calls.push([...args]);
+      return Promise.resolve({ code: 143, stdout: "", stderr: "timed out after 5000ms" });
+    },
+    control: () => ({ kill: () => undefined }),
+  });
+
+  test("text, a paste and keys answer unconfirmed, and the keys are sent once", async () => {
+    const calls: string[][] = [];
+    const adapter = new TmuxMux(hung(calls));
+    const typed = await adapter.typeText("%3", "hello");
+    expect(typed).toMatchObject({ ok: false, reason: "unconfirmed" });
+    if (!typed.ok) expect(typed.detail).toContain("It may still arrive, so it was not written again.");
+    expect(await adapter.pasteText("%3", "hello")).toMatchObject({ ok: false, reason: "unconfirmed" });
+    const before = calls.length;
+    const keyed = await adapter.writeKeys("%3", ["Enter"]);
+    expect(keyed).toMatchObject({ ok: false, reason: "unconfirmed" });
+    if (!keyed.ok) expect(keyed.detail).toContain("They may still arrive, so they were not sent again.");
+    expect(calls.length - before).toBe(1);
+  });
+
+  test("a read answers unreachable", async () => {
+    expect(await new TmuxMux(hung([])).readGrid("%3", { scope: "viewport", lines: 10, styling: "strip" })).toMatchObject({ ok: false, reason: "unreachable" });
   });
 });

@@ -48,6 +48,18 @@ describe("the recipe table", () => {
     expect(recipeOptions("hermes")).toEqual([]);
     expect(recipeOptions("__proto__")).toEqual([]);
   });
+
+  test("mcode builds a recipe from its chips, and refuses a conflicting mode", () => {
+    expect(recipeOptions("mcode").map((o) => o.id)).toEqual(["continue", "ptc", "lightweight", "standard"]);
+    expect(buildRecipe("mcode", ["continue", "ptc"])).toEqual({
+      ok: true,
+      command: "mcode --continue --ptc",
+      label: "MiniMax Code, Continue last, Programmatic Tool Calling",
+      noPrompts: false,
+      options: ["continue", "ptc"],
+    });
+    expect(buildRecipe("mcode", ["lightweight", "standard"]).ok).toBe(false);
+  });
 });
 
 describe("buildRecipe", () => {
@@ -152,6 +164,12 @@ describe("scanNoPrompts", () => {
     ["make --auto", false],
     ["pi -a never", false],
     ["FOO=1 claude '--dangerously-skip-permissions'", true],
+    // An account's start line (M101): the leading assignments are not the command word.
+    ["CODEX_HOME='/home/op/.codex-work' codex -a never", true],
+    ["CODEX_HOME='/home/op/my codex' codex -a never", true],
+    ["A=1 B=\"x y\" opencode --auto", true],
+    ["CLAUDE_CONFIG_DIR='/home/op/.claude-work' claude", false],
+    ["CODEX_HOME=/x make -a", false],
     ["claude-danger", false],
     ["htop", false],
   ];

@@ -1,4 +1,5 @@
 import type { JsonObject, JsonValue } from "../json.ts";
+import { LAUNCH_BUDGET_MS } from "../create-confirm.ts";
 import { CREW_PROTOCOL_VERSION } from "./enrollment.ts";
 import {
   DEVICE_HEADER,
@@ -28,11 +29,13 @@ import type { Warrant } from "./trust-store.ts";
 import { NARROW_VIEW, SESSIONS_ALL, SESSIONS_PARAM, SESSION_PARAM, type SnapshotView } from "../sessions.ts";
 import type { MuxConfig, SessionCard, SessionState } from "../types.ts";
 import type { CopiedRow } from "./standby-launchers.ts";
+import type { CarryCall } from "./carry-sync.ts";
 import { parseCollisionReport, parsePairingReport, type PairingSync } from "./standby-devices.ts";
 import type { TakeoverBody } from "./takeover.ts";
 import { parseWarrant, parseWarrantActiveReport, type WarrantPush } from "./warrant.ts";
 import { CREW_VERSION_FIELD } from "../update-action.ts";
 import { WALKY_ACK_HEADER, WALKY_OUTCOMES_ROUTE } from "../walky/crew.ts";
+import { INPUT_CALL_MS, TRICKS_INPUTS_ROUTE } from "../tricks/inputs.ts";
 
 // The LEAD side of a crew link: the client that dials a peer's `/crew/v1/*` surface.
 //
@@ -166,6 +169,8 @@ function readBudgetEnv(env: Record<string, string | undefined>, key: string): st
  * Lead-local, never on the wire, so moving it needs no protocol bump.
  */
 export const WRITE_BUDGET_MS = 5000;
+/** A trick's inputs call (§23): 8 s, no retry, whatever the poll budget is. */
+export const TRICKS_INPUTS_BUDGET_MS = INPUT_CALL_MS;
 
 /**
  * How long a **forwarded read of a pane's screen** (`GET /api/pane/:id`) may take before the lead gives up
@@ -212,6 +217,25 @@ export const PANE_READ_BUDGET_MS = 5000;
  * Lead-local, never on the wire, so moving it needs no protocol bump.
  */
 export const PANE_WRITE_BUDGET_MS = 15000;
+
+/**
+ * How long a **forwarded launch, tab or space create** (`POST /api/launch`, `/api/tab`, `/api/workspace`) may
+ * take before the lead gives up on it and tells the phone `write_outcome_unknown`. {@link WRITE_BUDGET_MS}
+ * covers every other write that is not addressed to a pane.
+ *
+ * ── WHY (M100 spec 04) ────────────────────────────────────────────────────────
+ * These creates do more than one thing on the member: the multiplexer's create call (5 s of its own), a
+ * look in the snapshot when that call timed out ({@link CONFIRM_BOUND_MS} in `bridge/create-confirm.ts`), and,
+ * for a launch, the member's wait for the new shell to draw (5 s) before it types. A lead that dialled them on
+ * the 5 s write budget gave up while the member was still inside its own wait, read 504 `write_outcome_unknown`
+ * over a pane the member then made, and the next tap made a second agent. The budget is the member's own
+ * bound, {@link LAUNCH_BUDGET_MS} (18 s), so the lead never gives up before the member's own deadline passes.
+ * It stays inside the phone's 20 s mutation budget (`web/src/lib/api.ts` `MUTATION_TIMEOUT_MS`). The lead
+ * still dials a write once, and the phone's request id makes the retry land on the member's receipt.
+ *
+ * Lead-local, never on the wire, so moving it needs no protocol bump.
+ */
+export const CREATE_WRITE_BUDGET_MS = LAUNCH_BUDGET_MS;
 
 /**
  * How long a **forwarded worktree create** (`POST /api/worktree`, ADR 0126) may take before the lead gives up on
@@ -489,6 +513,9 @@ export type PeerOutcome<T> =
       readonly date: number | null;
     }
   | (PeerFailure & { readonly ok: false; readonly receivedAt: number });
+
+/** How long one §25 call to the deputy may take: a 3 MiB body over a slow relayed link, and room. */
+export const CARRY_CALL_MS = 30_000;
 
 /** How a launcher copy ended (ADR 0127 point 5): landed, a deputy without the route, or anything else. */
 export type LaunchersCopyAnswer = "applied" | "no_route" | "failed";
@@ -812,6 +839,35 @@ export class PeerClient {
   }
 
   /**
+   * One §25 call to the DEPUTY (`tricks-copy`, `tricks-copy/code`, `tricks-copy/state`, `hill-copy`,
+   * `hill-copy/media`): the launchers copy's dial, with its status and JSON body handed back. A 404 is a
+   * deputy before the routes. The body is read only up to 64 KiB: every answer is a few ids.
+   */
+  async carryPost(link: CrewLink, route: string, body: JsonObject): Promise<CarryCall> {
+    const outcome = await this.proxy(
+      link,
+      route,
+      undefined,
+      { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) },
+      CARRY_CALL_MS,
+      true,
+    );
+    if (!outcome.ok) return { kind: "failed" };
+    const status = outcome.value.status;
+    const text = await outcome.value.text().catch(() => "");
+    let parsed: JsonValue | null = null;
+    if (text.length <= 64 * 1024) {
+      try {
+        // SAFETY: `JSON.parse` output IS a JsonValue by construction; the caller reads it field by field.
+        parsed = JSON.parse(text) as JsonValue;
+      } catch {
+        parsed = null;
+      }
+    }
+    return { kind: "answer", status, body: parsed };
+  }
+
+  /**
    * `POST /crew/v1/pairing` — sync the lead's paired-device registry to the DEPUTY (RFC §6.5, §18.14).
    *
    * An ordinary data dial on the ordinary budget. A `404` or a `401` is the answer, not a fault: a
@@ -913,6 +969,25 @@ export class PeerClient {
       undefined,
       { method: "POST", headers: { "content-type": "application/json" }, body: payload },
       WRITE_BUDGET_MS,
+      false,
+    );
+  }
+
+  /**
+   * `POST /crew/v1/tricks/inputs` — the lead asks a member for a trick's inputs (§23, added in 1.29.0).
+   *
+   * Like the walky outcomes push: the pinned handshake and the dial attestation, no §8.6 signature, and
+   * every status the member chose kept (its 403 is "trick reads are off", its 404 an older member). The
+   * budget is the route's own, {@link TRICKS_INPUTS_BUDGET_MS}, and the call is never retried. The body is
+   * not read here: the caller reads it up to its own cap.
+   */
+  tricksInputs(link: CrewLink, payload: string): Promise<PeerOutcome<Response>> {
+    return this.proxy(
+      link,
+      TRICKS_INPUTS_ROUTE,
+      undefined,
+      { method: "POST", headers: { "content-type": "application/json" }, body: payload },
+      TRICKS_INPUTS_BUDGET_MS,
       false,
     );
   }

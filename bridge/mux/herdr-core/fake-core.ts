@@ -53,9 +53,10 @@
 //    still lands when its turn comes, as the real `Down` did. Screen reads (`lines: 0`) and other
 //    terminals answer at once.
 
-import type { MuxWrite } from "../conformance.ts";
+import type { MuxWrite, MuxWriteFailure } from "../conformance.ts";
 import {
   HcError,
+  HcNoReply,
   HcTimeout,
   type EventStream,
   type HcRpc,
@@ -188,8 +189,27 @@ function notFound(address: string): HcError {
   return new HcError("not_found", `herdr-core terminal: not_found: no terminal "${address}"`);
 }
 
+/** The socket path the fake's dial errors name; the decorated world's beacons use the same one. */
+const FAKE_SOCKET = "/run/user/1000/herdr-core/default.sock";
+
+/**
+ * What the client gives for a dead socket: the dial's own error. The client dials with node:net, which
+ * says "connect <CODE> <path>" (ECONNREFUSED for a socket nobody listens on, ENOENT for a missing one;
+ * read off Bun's node:net 2026-11-13). Nothing went out, so the adapter answers `unreachable`.
+ */
+function dialFailed(code: "ECONNREFUSED" | "ENOENT", errno: number): Error {
+  return Object.assign(new Error(`connect ${code} ${FAKE_SOCKET}`), { code, errno, syscall: "connect", address: FAKE_SOCKET });
+}
+
 /** A herdr-core socket, in memory, answering as the real one does. */
 export class FakeHcCore implements HcRpc {
+  /**
+   * The next text write fails once (M100 spec 03): `stall` gets no answer in time, `refuse` is told no,
+   * `closed` loses its connection after the request (or the text) went out.
+   */
+  nextWrite: MuxWriteFailure | null = null;
+  /** The next key write fails once, the same three ways (M100 spec 03). */
+  nextKeys: MuxWriteFailure | null = null;
   private terminals: FakeTerminal[] = [];
   private layout: WireLayoutSpace[] = [];
   private readonly subscribers = new Set<Subscriber>();
@@ -510,7 +530,7 @@ export class FakeHcCore implements HcRpc {
   // ── The methods (HcRpc) ───────────────────────────────────────────────────
 
   async hello(): Promise<WireHello> {
-    this.assertConnected("hello");
+    this.assertConnected();
     if (this.generation !== 1) {
       throw new HcError("unsupported_generation", "herdr-core hello: unsupported_generation: protocol generation 1 not supported");
     }
@@ -518,7 +538,7 @@ export class FakeHcCore implements HcRpc {
   }
 
   async listTerminals(): Promise<WireTerminal[]> {
-    this.assertConnected("terminal.list");
+    this.assertConnected();
     const live = this.terminals.filter((terminal) => terminal.state === "live");
     const local = live.filter((terminal) => !terminal.address.includes("/"));
     const remote = live.filter((terminal) => terminal.address.includes("/"));
@@ -526,12 +546,12 @@ export class FakeHcCore implements HcRpc {
   }
 
   async getTerminal(address: string): Promise<WireTerminal> {
-    this.assertConnected("terminal.get");
+    this.assertConnected();
     return record(this.known(address));
   }
 
   async readTerminal(address: string, lines: number): Promise<WireRead> {
-    this.assertConnected("terminal.read");
+    this.assertConnected();
     if (lines > 0) this.historyCounts.set(address, this.historyReads(address) + 1);
     if (lines > 0 && this.slowHistory.has(address)) return this.slowRead(address);
     if (lines > 0 && this.hungHistory.has(address)) await new Promise<void>((resolve) => this.heldReads.push(resolve));
@@ -549,10 +569,15 @@ export class FakeHcCore implements HcRpc {
   }
 
   async pressKeys(address: string, keys: readonly string[]): Promise<void> {
-    this.assertConnected("terminal.keys");
+    this.assertConnected();
     this.deliverDueKeys();
     const terminal = this.known(address);
     this.assertTakesInput(terminal, "terminal.keys");
+    const failing = this.nextKeys;
+    this.nextKeys = null;
+    if (failing === "stall") throw new HcTimeout("terminal.keys", 5000);
+    if (failing === "closed") throw new HcNoReply("herdr-core terminal.keys: connection closed before the answer");
+    if (failing === "refuse") throw new HcError("internal", "terminal.keys: the terminal did not take the keys");
     const unknown = keys.find((key) => !coreKnowsKey(key));
     if (unknown !== undefined) {
       throw new HcError("invalid_params", `herdr-core terminal.keys: invalid_params: unknown key "${unknown}" (try enter, esc, up, ctrl+c, alt+x, f5, a)`);
@@ -572,10 +597,17 @@ export class FakeHcCore implements HcRpc {
   }
 
   async typeRaw(address: string, text: string): Promise<void> {
-    this.assertConnected("terminal.attach");
+    this.assertConnected();
     this.deliverDueKeys();
     const terminal = this.known(address);
     this.assertTakesInput(terminal, "terminal.attach");
+    // The core takes Enter and other raw key bytes on this same write, so a key failure lands here too.
+    const failing = this.nextWrite ?? this.nextKeys;
+    this.nextWrite = null;
+    this.nextKeys = null;
+    if (failing === "stall") throw new HcTimeout("terminal.attach", 5000);
+    if (failing === "closed") throw new HcNoReply("herdr-core terminal.attach: connection closed before the core closed the stream");
+    if (failing === "refuse") throw new HcError("internal", "terminal.attach: the terminal did not take the input");
     if (this.hold !== null) this.hold.lastWriteAt = this.hold.clock.now();
     this.recorded.push({ paneId: address, kind: "text", payload: [text] });
     // Raw LF and DC1 are the Ctrl+J/Ctrl+Q inputs whose real OMP and Claude encodings were verified.
@@ -595,7 +627,7 @@ export class FakeHcCore implements HcRpc {
   }
 
   async killTerminal(address: string): Promise<void> {
-    this.assertConnected("terminal.kill");
+    this.assertConnected();
     const terminal = this.known(address);
     if (terminal.state === "live") {
       terminal.state = "finished";
@@ -604,13 +636,13 @@ export class FakeHcCore implements HcRpc {
   }
 
   async runShell(request: RunShellRequest): Promise<WireTerminal> {
-    this.assertConnected("terminal.run");
+    this.assertConnected();
     const address = this.add({ labels: { ...request.labels }, cwd: request.cwd ?? "/home/dev" });
     return record(this.known(address));
   }
 
   async readLayout(): Promise<WireLayout | null> {
-    this.assertConnected("doc.get");
+    this.assertConnected();
     return this.layout.length === 0 ? null : { spaces: this.layout.map((space) => ({ ...space, tabs: space.tabs.map((tab) => ({ ...tab })) })) };
   }
 
@@ -644,9 +676,9 @@ export class FakeHcCore implements HcRpc {
     return terminal;
   }
 
-  private assertConnected(method: string): void {
-    if (!this.connected) throw new Error(`herdr-core ${method}: connection closed before the answer`);
-    if (!this.running) throw new Error(`herdr-core ${method}: connect ENOENT: the core is not running`);
+  private assertConnected(): void {
+    if (!this.connected) throw dialFailed("ECONNREFUSED", -111);
+    if (!this.running) throw dialFailed("ENOENT", -2);
   }
 
   /** Keys and typing: a finished terminal says `finished`, a kept terminal without its shell says `unavailable`. */

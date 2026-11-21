@@ -3,9 +3,13 @@ import { isIP } from "node:net";
 import { homedir, hostname, networkInterfaces } from "node:os";
 import { basename, dirname, extname, isAbsolute, join, normalize, sep } from "node:path";
 import { createAccessGate, DOOR_PRESETS, FORWARDING_HEADERS } from "./access-jwt.ts";
+import type { Accounts } from "./accounts-routes.ts";
 import type { JsonObject, JsonValue } from "./json.ts";
+import { asJsonBoolean, asJsonNumber, asJsonObject, asJsonString, parseJsonObject } from "../web/src/lib/json.ts";
 import type { ActivityLedger } from "./activity.ts";
 import { type AuditDetail, type AuditEntry, AuditLog } from "./audit.ts";
+import { recordRefusal, withRefusal, type RefusalReason } from "./refusal.ts";
+import { API_VERSION } from "../web/src/lib/api-version.ts";
 import { isLoopbackBindHost, type Config } from "./config.ts";
 import {
   changesParams,
@@ -31,8 +35,8 @@ import {
 } from "./files-view.ts";
 import { apiError, type ApiErrorBody, type ApiErrorDetail, type ErrorCode } from "./error-codes.ts";
 import { keysDeliverable, MUX_CAPABILITIES, supportsCapability, type MuxCapability, type MuxCapabilityDeclaration } from "./mux/capabilities.ts";
-import { muxUnsupported } from "./mux/types.ts";
-import type { MuxAdapter, MuxAck, MuxGrid, MuxGridRequest, MuxHistoryPage, MuxReadHint, MuxReadPurpose, MuxStarters } from "./mux/types.ts";
+import { muxOk, muxUnsupported } from "./mux/types.ts";
+import type { MuxAdapter, MuxAck, MuxCreatedPane, MuxOutcome, MuxGrid, MuxGridRequest, MuxHistoryPage, MuxReadHint, MuxReadPurpose, MuxStarters } from "./mux/types.ts";
 import { allCacheRules } from "./cache/rules/index.ts";
 import type { CacheOverride } from "./cache/engine.ts";
 import type { GitHeadSurface } from "./git-head.ts";
@@ -44,13 +48,23 @@ import { computeEtag, gzipJsonResponse, notModified, wantsGzip } from "./http-ca
 import { pluginRoot } from "./root.ts";
 import { DEFAULT_NOTIFY_PREFS, type NotifyPrefs, type NotifyPrefsStore } from "./notify-prefs.ts";
 import { defaultPhoneRules, parseRulesRequest, type RulesStore } from "./notify-rules.ts";
-import { paneClears, paneTag } from "./notifications.ts";
+import { paneClears, paneTag, type NotificationCoordinator } from "./notifications.ts";
 import { browseFolders, type FolderBrowseContext } from "./folder-browse.ts";
 import { MAX_FAVOURITES, MAX_FOLDER_CHARS, type FolderSurface } from "./folders.ts";
 import { isValidWorktreeBranch } from "./worktree-branch.ts";
 import { createHarnessProbe, type HarnessProbe } from "./harness-launch.ts";
-import { launchReplay, memoryLaunchReceipts, type LaunchReceiptSurface } from "./launch-receipts.ts";
+import { endsInShellPrompt } from "./surface/shell-prompt.ts";
+import { isUnsettled, LAUNCH_NO_PROMPT_TEXT, LAUNCH_UNKNOWN_TEXT, launchReplay, memoryLaunchReceipts, type LaunchAnswer, type LaunchReceiptSurface } from "./launch-receipts.ts";
+import {
+  MEMBER_DEADLINE_MS,
+  lookForCreated,
+  snapshotBefore,
+  withinTime,
+  type CreateWanted,
+  type LookClock,
+} from "./create-confirm.ts";
 import type { LaunchWindow } from "./launch-window.ts";
+import { signInFolder } from "./account-folder.ts";
 import { isStarterBody, launchStarter, memoryStarterReceipts, starterItems, type StarterReceiptSurface } from "./starter-launch.ts";
 import { answerPane, memoryAnswerReceipts, type AnswerReceiptSurface } from "./durable/answer.ts";
 import { controlPane, memoryControlReceipts, rawInputRefusal, type ControlReceiptSurface } from "./durable/control.ts";
@@ -68,12 +82,16 @@ import {
   herdrDefaultTarget,
   nearestWorkTree,
   resolveParentTarget,
+  resolveSetFolderTarget,
   type FolderFs,
   type HerdrConfigRead,
 } from "./worktree-folder.ts";
+import { memoryWorktreeFolderSetting, type WorktreeFolderSettingSurface } from "./worktree-folder-setting.ts";
+import { parseWorktreeFolderBody, saveWorktreeFolder, worktreeFolderAnswer } from "./worktree-folder-route.ts";
 import { askGit, parseBase, resolveBase, resolveDefaultBranch, type GitAsk } from "./worktree-base.ts";
 import { memoryWorktreeBases, type WorktreeBaseSurface } from "./worktree-bases.ts";
 import { withSpacesContext } from "./space-view.ts";
+import { spaceShowing } from "./worktree-reuse.ts";
 import { addWorktree, targetExistsDetail, type WorktreeAddDeps, type WorktreeAddRequest, worktreeMatchOf } from "./worktree-add.ts";
 import {
   isRequestId,
@@ -117,6 +135,7 @@ import {
   type SentSurface,
   type SentWriteAnswer,
 } from "./sent.ts";
+import { ComposerDiagStore, DIAG_COMPOSER_BODY_MAX, diagFileIo, parseComposerDiag } from "./diag-composer.ts";
 import {
   clearRecentRuns,
   memoryRecentRuns,
@@ -131,7 +150,10 @@ import {
 import {
   composerBelowShadow,
   DEFAULT_PROMPT_TAIL_LINES,
+  MAX_PART_GAP_ROWS,
+  MAX_PROMPT_PARTS,
   verifyPromptBinding,
+  verifyPromptParts,
   type BindingShadow,
   type PromptBindingVerdict,
   type StyledOutcome,
@@ -156,7 +178,7 @@ import {
   type UpdateStartResult,
 } from "./update-action.ts";
 import { type ReleaseLine, type UpdateLineRecord, withLine } from "./update-line.ts";
-import { parseTelemetryRequest, parseTroubleSignal, type Telemetry } from "./telemetry.ts";
+import { parseTelemetryRequest, parseTroubleBody, type Telemetry } from "./telemetry.ts";
 import { REPORT_SCREEN_ROWS, reportDoctorRows, reportScreen, type DoctorRowSource, type ReportContext, type ReportDoctorRow } from "./report.ts";
 import type { StateEngine } from "./state-engine.ts";
 import { adapterFor, buildJournalRegistry, journalAgentName } from "./journal/registry.ts";
@@ -166,11 +188,13 @@ import { JournalSubagents } from "./subagents-journal.ts";
 import { JournalTodos } from "./todos.ts";
 import { JournalJobs } from "./jobs-journal.ts";
 import { parseDurableLog } from "./journal/durable.ts";
+import { MAX_READ_LINES } from "./read-limits.ts";
 import { redactText } from "./redact.ts";
 import { maskSurface, surfaceRouteBody, type SurfaceShadow } from "./surface/shadow.ts";
 import type { SurfaceTotals } from "./surface/counters.ts";
 import { SURFACE_VERSION } from "../web/src/lib/surface/surface.ts";
-import { gateFor } from "./surface/key-gate.ts";
+import { gateFor, isPaneBusy } from "./surface/key-gate.ts";
+import { PANE_BUSY } from "./surface/pane-lock.ts";
 import { BOX_CHANGED, type SendProtocol, type SendRequest } from "./surface/protocol.ts";
 import type { AskAnswerer } from "./surface/ask.ts";
 import type { ClearService } from "./surface/clear.ts";
@@ -178,7 +202,8 @@ import type { StopService } from "./surface/stop.ts";
 import type { ReceiptQueued } from "./surface/queued.ts";
 import type { ProgramDriver } from "./surface/durable-driver.ts";
 import { parseAnswerBody, type AskReply } from "../web/src/lib/surface/ask.ts";
-import { REQUEST_ID, RETURNED_CARD_DROPPED, reservedLead, SEND_MODES, SEND_WHENS, type HeldCancelAnswer, type SendAnswer, type SendReceiptsAnswer } from "../web/src/lib/surface/send.ts";
+import { REQUEST_ID, RETURNED_CARD_DROPPED, reservedLead, SEND_MODES, SEND_WHENS, type HeldCancelAnswer, type SendAnswer, type SendReceipt, type SendReceiptsAnswer } from "../web/src/lib/surface/send.ts";
+import { isCommand } from "../web/src/lib/send-protocol.ts";
 import {
   maskChatBody,
   maskDiff,
@@ -192,7 +217,7 @@ import {
   maskTodoList,
 } from "./answer-mask.ts";
 import { maskForwardedAnswer } from "./crew/mask.ts";
-import type { LeadMerge } from "./crew/forward.ts";
+import { forwardAuditDetail, forwardError, type LeadMerge } from "./crew/forward.ts";
 import { CWD_PARAM, folderAnswers, leadRowCarry, leadRowMarked, leadRowsRead, ROW_FIELD, rowFromLead, type LeadWrite } from "./crew/launcher-rows.ts";
 import { withCopyRows, type LauncherCopySeam } from "./crew/standby-launchers.ts";
 import { redactAnsi } from "./redact.ts";
@@ -211,11 +236,30 @@ import {
 } from "./pairing.ts";
 import { pairAuditEntry, pairRoute } from "./pair-audit.ts";
 import { createPairLimiter, pairSourceKey } from "./pair-limit.ts";
+import {
+  pairApproveAnswerRoute,
+  pairApproveGateLevel,
+  pairApproveReadRoute,
+  pairRequestCancelRoute,
+  pairRequestCreateRoute,
+  pairRequestPollRoute,
+  PairRequestBook,
+  POLL_HEADER,
+  settlePairRequests,
+  type PairRequestDeps,
+} from "./pair-request.ts";
 import { LOCAL_LABEL, type LocalCredential } from "./local-secret.ts";
+import { isLocalKeyRoute, localConfigView, localSnapshotView, localTricksView, localUpdateCheckView } from "./local-key.ts";
 import { modeForWire } from "./crew/mode.ts";
 import type { CrewRuntime } from "./crew/config.ts";
 import type { CrewLead } from "./crew/lead.ts";
 import { crewDeviceOf, crewGate, type GateLevel } from "./crew/peer-gate.ts";
+import { asksBound, TRICKS_ROUTE_RIGHTS, tricksAutoRoute, tricksCodeRoute, tricksMediaRoute, tricksOfficialRoute, tricksSwitchRoute, tricksTapRoute, tricksUndoRoute, tricksValueRoute, parseSince } from "./tricks/routes.ts";
+import type { OfficialTricksSurface } from "./tricks/official-install.ts";
+import type { RepoIndexSurface } from "./tricks/repo-index.ts";
+import { placeTrickSessions } from "./tricks/panes.ts";
+import type { TricksSurface } from "./tricks/service.ts";
+import { TRICKS_OFF_LINE } from "../web/src/lib/tricks/schema.ts";
 import { snapshotPlan } from "./crew/merge.ts";
 import { selectHostFrom, type HostSelector } from "./crew/registry.ts";
 import { crewHerdTagFor } from "./crew/tags.ts";
@@ -241,7 +285,7 @@ import {
   type WhistleRouteDeps,
 } from "./stt/whistle-http.ts";
 import { uploadTooLarge } from "./uploads.ts";
-import { MUX_LOGO_PATH, OPERATOR_FONTS_PATH, journalAgentOf, toPaneWire } from "./types.ts";
+import { MUX_LOGO_PATH, OPERATOR_FONTS_PATH, isErrorBlocked, isQuestionPane, journalAgentOf, toPaneWire } from "./types.ts";
 import type { LaunchCheckResponse, MachineAlertsResponse } from "./types.ts";
 import { parseMachineAlerts } from "./machine-parse.ts";
 import { SPARK_MAX_MINUTES } from "./machine-history.ts";
@@ -250,9 +294,15 @@ import { pinSessionKey } from "./pins/key.ts";
 import { PinKeys } from "./pins/keys.ts";
 import { pinsRoute, type PinsAnswer, type PinsSession } from "./pins/routes.ts";
 import { PinStore } from "./pins/store.ts";
+import { HILL_ANSWER_RIGHT, readAnswerRequest } from "./hill/parse.ts";
+import { HILL_ID_RE, HILL_MEDIA_ID_RE, isHillCrewState } from "../web/src/lib/hill/wire.ts";
+import { HILL_STATE_ON_LEAD, hillDeviceId, type HillService } from "./hill/service.ts";
+import type { AgentViewService } from "./agent-view/service.ts";
+import { BAD_HEAD, hasViewHead, VIEW_MEDIA_ID_RE, VIEW_SESSION_MAX, VIEW_SET_RE, readTrickViewSwitchBody, readViewSendField, type ViewSendField, type ViewSentOutcome } from "../web/src/lib/agent-view/wire.ts";
 import { isPaneId, parseAddress } from "./walky/address.ts";
 import { isWalkyId, parsePhoneSend } from "./walky/parse.ts";
 import { NOT_THE_SENDER, type TakeBackAnswer, type WalkyService } from "./walky/service.ts";
+import type { DeliverNow } from "./walky/deliver.ts";
 import { olderThanWalky, type WalkyCrew } from "./walky/crew.ts";
 import { journalModelShown, paneModel, type ModelReading } from "./pane-model.ts";
 import type {
@@ -277,6 +327,7 @@ import type {
   CacheRuleWire,
   CacheWatchListResponse,
   CacheWatchResponse,
+  NotificationsClearResponse,
   PaneCache,
   PaneChangeCommitDiffResponse,
   PaneChangeCommitResponse,
@@ -335,8 +386,6 @@ const REQUEST_BODY_HEADROOM = 2 * 1024 * 1024; // 2 MB, well clear of uploads.ts
 export function requestBodyCap(cfg: Config): number {
   return Math.max(cfg.maxUploadBytes, MAX_STT_AUDIO_BYTES) + REQUEST_BODY_HEADROOM;
 }
-// Upper bound on the pane-read `lines` param — don't trust the client (or Herdr) to cap it.
-const MAX_READ_LINES = 10_000;
 // A bound region is whatever a dialog card covers, and a full-screen picker covers the whole pane:
 // about rows times columns, so 8192 refused a pane wider than ~134 columns at 59 rows. 32 KiB takes
 // a 220-column pane. A phone newer than this bridge gets the old 400 on such a pane and no key is sent.
@@ -487,10 +536,15 @@ export function isLoopbackPeer(address: string | null | undefined): boolean {
  * with a screen: it empties the harness's input box with the profile's clear key as a person's tap, reads
  * back, and answers `{ requestId, outcome: "cleared" | "refused", reason? }` (always 200). See `bridge/surface/clear.ts`.
  *
+ * `arrived` (M102 spec 01) is `POST /api/pane/:id/arrived` with `{ requestId }`: the person's "It arrived" on a
+ * send of the pane whose receipt ended `unknown`. It writes `word: "arrived"` beside the outcome and answers
+ * `{ word: "arrived" }` (200), 404 for an id of another pane or nobody's, 409 for a receipt that did not end
+ * `unknown` or is already marked. A write; the crew link carries it to the member whose store keeps the receipt.
+ *
  * `pins` (M90) is the one segment with a read and writes: a GET lists the pins of the pane's session (a read), a
  * POST `{ itemId }` pins a block and a DELETE `?pin=<id>` drops one (writes). See `bridge/pins/routes.ts`.
  */
-const PANE_ROUTE = /^\/api\/pane\/([^/]+)(?:\/(reply|keys|upload|close|rename|history|chat|changes|files|focus|answer|send|abort|clear|action|pins|held))?$/;
+const PANE_ROUTE = /^\/api\/pane\/([^/]+)(?:\/(reply|keys|upload|close|rename|history|chat|changes|files|focus|answer|send|abort|clear|action|pins|held|arrived))?$/;
 
 /**
  * A pairing claim's refusal, as an error code.
@@ -550,6 +604,16 @@ const STT_MODEL_ROUTE = /^\/api\/stt\/model\/([^/]+)$/;
 const BLOB_ROUTE = /^\/api\/blobs\/([^/]+)$/;
 
 /**
+ * `GET /api/hill/media/<decision id>/<media id>` (M96): one image of a decision, as its bytes. Both
+ * segments are matched as opaque values here and checked against their patterns in the handler
+ * (`hillMediaRoute`) before anything else, and only a pair the store holds names a file. Lead-local,
+ * like the rest of the hill: not forwarded across a crew link.
+ */
+const HILL_IMAGE_ROUTE = /^\/api\/hill\/media\/([^/]+)\/([^/]+)$/;
+/** `GET /api/trick-views/media/<set id>/<media id>`: one picture of an agent view's screen. Both ids are checked before any path is built. */
+const VIEW_IMAGE_ROUTE = /^\/api\/trick-views\/media\/([^/]+)\/([^/]+)$/;
+
+/**
  * Walky talky's list for one pane (M62): the messages that reached it, newest first, each with its
  * newest receipt. Read-gated like the pane read. A route of its own beside `PANE_ROUTE`: a `?host=`
  * read is forwarded to the member that owns the pane and answered from that member's own log
@@ -577,11 +641,47 @@ const ASK_ROUTE = /^\/api\/ask\/([^/]+)$/;
 // The id's shape is the handler's check (`isWalkyId`), so the route table keeps one shape of segment.
 const WALKY_CANCEL_ROUTE = /^\/api\/walky\/([^/]+)\/cancel$/;
 const WALKY_DROP_ROUTE = /^\/api\/pane\/([^/]+)\/walky\/([^/]+)\/drop$/;
+/**
+ * Deliver now (M99 spec 05, decision of 2026-11-13): `POST /api/pane/<pane>/walky/<id>/deliver`, the pane
+ * owner's, for one message held for their draft, on the machine that owns the pane, under the browser
+ * gate like Drop.
+ */
+const WALKY_DELIVER_ROUTE = /^\/api\/pane\/([^/]+)\/walky\/([^/]+)\/deliver$/;
+// Collie tricks (M94 slice 01): a tap on a trick's control, on this bridge's own host. The list and the
+// parts are `GET /api/tricks`, an exact path below.
+const TRICKS_TAP_ROUTE = /^\/api\/tricks\/([^/]+)\/([^/]+)\/tap$/;
+// And the off switch (M94 slice 04): write-gated like the tap, the same file `collie trick on|off` writes.
+const TRICKS_SWITCH_ROUTE = /^\/api\/tricks\/([^/]+)\/([^/]+)\/switch$/;
+/** The switch for tricks as a whole: two segments, so it never meets a trick's `<host>/<id>/switch`. */
+const TRICKS_FEATURE_ROUTE = "/api/tricks/switch";
+// Pairing by a request a paired phone approves (ADR 0139, bridge/pair-request.ts). The asking browser's
+// poll is OPEN (its poll secret, in a header, is its credential; `OPEN_API_PATTERNS`), and the approver's
+// read and answer of one request need a paired device's token (`pairApproveGateLevel`). Each id's shape
+// is the handler's check, so the route table keeps one shape of segment.
+const PAIR_REQUEST_ROUTE = /^\/api\/pair\/request\/([^/]+)$/;
+const PAIR_APPROVE_ROUTE = /^\/api\/pair\/approve\/([^/]+)$/;
+// Take changes without asking, and go back one version (crew slice 3): write-gated like the switch.
+const TRICKS_AUTO_ROUTE = /^\/api\/tricks\/([^/]+)\/([^/]+)\/auto$/;
+const TRICKS_UNDO_ROUTE = /^\/api\/tricks\/([^/]+)\/([^/]+)\/undo$/;
+// A trick's settings (contract 3): one field's value, write-gated like the switch.
+const TRICKS_VALUE_ROUTE = /^\/api\/tricks\/([^/]+)\/([^/]+)\/value$/;
+// And a picture of the trick's own `media/` folder (M94 review 11), read-gated like the list. Group 3 is
+// `media/` and the file; bridge/tricks/media.ts checks it before any path is built.
+export const TRICKS_MEDIA_ROUTE = /^\/api\/tricks\/([^/]+)\/([^/]+)\/(media\/.+)$/;
+// And a trick's code for the About sheet's folds (package F), read-gated like the list: the approved copy's
+// bytes, masked, marked by the text search. Group 1 the host, group 2 the trick id; `?file=` names one file.
+const TRICKS_CODE_ROUTE = /^\/api\/tricks\/([^/]+)\/([^/]+)\/code$/;
+// The official list (bridge/tricks/official.ts): add or update one entry. Group 1 the trick id, group 2 the verb.
+const TRICKS_OFFICIAL_ROUTE = /^\/api\/tricks\/official\/([^/]+)\/(add|update)$/;
+// A repository's index (bridge/tricks/repo-index.ts): read it, or add one trick it lists. Group 1 the verb.
+const TRICKS_REPO_ROUTE = /^\/api\/tricks\/repo\/(list|add)$/;
 
 /**
- * How long a worktree create may hold its connection open, in seconds (ADR 0089). Above Herdr's own
- * 60 s worktree budget plus the launcher's wait, so the bridge always answers before the listener
- * gives up. The phone waits 75 s (web/src/lib/api.ts).
+ * How long a worktree create may hold its connection open, in seconds (ADR 0089). Bun drops a request
+ * that has been idle for 10 s unless the route calls `server.timeout`, so a create must ask for more.
+ * The bound is above `WORKTREE_ADD_TIMEOUT_MS` (60 s, bridge/worktree-add.ts, the time `git worktree
+ * add` may run) plus the launcher's wait, so the bridge always answers before the listener gives up.
+ * The phone waits 75 s (web/src/lib/api.ts), so a phone that gave up retries into the receipt.
  */
 const WORKTREE_ROUTE_BUDGET_S = 90;
 
@@ -719,7 +819,7 @@ export function isPaneInput(pathname: string, method: string): boolean {
  * or renamed? On the owning host each of those settles itself (`settleTopology`). Forwarded to a
  * member, the member settles and the lead does not: the lead sees the member only through its sweep,
  * which rides the primary engine's tick, so a pane launched on a member stayed a shell, or missing,
- * on the phone for up to one idle interval (12 s; minibuch, 2026-10-14). The forward branch gives
+ * on the phone for up to one idle interval (12 s; workshop, 2026-10-14). The forward branch gives
  * these the same hot spell an input buys.
  */
 const TOPOLOGY_CREATES: ReadonlySet<string> = new Set(["/api/launch", "/api/workspace", "/api/tab", "/api/worktree"]);
@@ -754,6 +854,9 @@ export function afterPaneInput(engine: Pick<StateEngine, "noteInput">, res: Resp
  * and `changes`; `device-read` for `files`, which is a read that needs an authorised device (ADR 0083:
  * it exposes every file under the root, which Changes does not); a write for everything that types
  * into or restructures a terminal. `pins` reads for a GET and writes otherwise (M90).
+ *
+ * No audit line is written for a Files or Changes read. The audit log records what reaches a
+ * terminal, and a line per folder tap would bury the lines that matter.
  */
 export function paneGateLevel(action: string | undefined, method?: string): GateLevel {
   if (action === "files") return "device-read";
@@ -1078,6 +1181,8 @@ export function bridgeConfigBody(opts: {
    * member's own switch is not in the capability block the lead holds.
    */
   redact?: boolean;
+  /** The API number (M102 spec 14). Optional for the reason `upload` is; the real handler passes it. */
+  apiVersion?: number;
 }): BridgeConfig {
   const mode = modeForWire(opts.mode);
   const mine = opts.operatorCommands ?? [];
@@ -1113,6 +1218,8 @@ export function bridgeConfigBody(opts: {
   // Appended last and omit-when-absent: no key is an older bridge, or a member's scoped answer, and
   // the phone shows "unknown" for both rather than guessing "on".
   if (opts.redact !== undefined) wire.redact = opts.redact;
+  // Appended last and omit-when-absent: no key is an older bridge, which the phone reads as no word at all.
+  if (opts.apiVersion !== undefined) wire.apiVersion = opts.apiVersion;
   return wire;
 }
 
@@ -1235,6 +1342,18 @@ export function startServer(opts: {
    * answer 404: an instance built without it (a test) takes no message.
    */
   walky?: WalkyService;
+  /**
+   * The hill (M96): the decisions agents posted over the walky socket, and the phone's answers. Absent,
+   * `GET /api/hill` and `POST /api/hill/answer` answer 404 and the snapshot carries no `hillRev`.
+   */
+  hill?: HillService;
+  /**
+   * Agent views: the screen an agent drew per (trick, session) (`collie trick view <trick> show`), the
+   * person's per-session switch, and the `view` field of a send. Absent, `GET /api/trick-views` and
+   * `POST /api/trick-views/switch` answer 404, a send with `view` is refused, and the snapshot carries no
+   * `trickViewsRev`.
+   */
+  views?: AgentViewService;
   /**
    * Walky talky's crew half (CREW_PROTOCOL.md §21): on a member, the handler of the lead's
    * `POST /crew/v1/pane/<pane | all>/walky`, reached through the crew dispatch only. Absent (solo, a
@@ -1384,7 +1503,7 @@ export function startServer(opts: {
    * Each pane's context use and subscription windows (bridge/usage.ts), read synchronously at
    * serialise time like `todos`. Absent means no pane carries a `usage` key.
    */
-  usage?: { get(pane: AgentView): AgentView["usage"] };
+  usage?: { get(pane: AgentView, scope?: string): AgentView["usage"] };
   /**
    * Which branch each pane's folder is on (bridge/git-head.ts), read synchronously at serialise time
    * like `cache`: it answers from memory and reads the disk in the background. Absent means no pane
@@ -1400,6 +1519,12 @@ export function startServer(opts: {
   walkyInstance?: (session: string, paneId: string) => string;
   /** Whether the pane's session turned its walky talky off (M89), read at serialise time like the token. True adds `walkyOff` to the pane. */
   walkyPaneOff?: (session: string, paneId: string) => boolean;
+  /**
+   * Whether the pane is linked (M99 spec 15, `bridge/surface/path.ts` `isLinked`): the inside wire is on
+   * and a live part of the pane declares what a send needs. True adds `linked` to the pane, read at
+   * serialise time like the off switch. Absent: no pane carries the key.
+   */
+  paneLinked?: (session: string, paneId: string) => boolean;
   /**
    * The pins of every session this machine keeps (M90, bridge/pins/store.ts), on disk under the state
    * folder in `bridge/index.ts`. Absent keeps them in memory only, which is every test that builds this
@@ -1496,6 +1621,16 @@ export function startServer(opts: {
    */
   worktreeChoices?: WorktreeChoiceSurface;
   /**
+   * This machine's "Worktree folder" setting (`bridge/worktree-folder-setting.ts`, ADR 0093 note of
+   * 2026-11-13). Absent means an in-memory, unset one; `bridge/index.ts` passes the file-backed one.
+   */
+  worktreeFolderSetting?: WorktreeFolderSettingSurface;
+  /**
+   * This machine's accounts (M101, ADR 0141). Absent: `GET /api/accounts` answers
+   * `accounts.unavailable`, a launch that names an account is refused, and no pane carries a tag.
+   */
+  accounts?: Accounts;
+  /**
    * Every machine's load, the day of minutes behind it and the alert rules (ADR 0084).
    *
    * Supplied on a lead and on a solo collie, and **absent on a peer**, which answers the three
@@ -1503,6 +1638,20 @@ export function startServer(opts: {
    * front door (ADR 0013), and its own load already reaches the lead beside its snapshot.
    */
   machines?: MachineSurface;
+  /**
+   * Collie tricks (M94 slice 01, `bridge/tricks/service.ts`): the runner's rev for the snapshot, the watch
+   * stamp, and the two tricks routes. Absent means no `tricksRev` on any snapshot and both routes answer
+   * 404, which is every test that builds this server by hand. `bridge/index.ts` always passes one; it
+   * reads nothing but a missing folder until the operator makes `<configDir>/tricks/`.
+   */
+  tricks?: TricksSurface;
+  /**
+   * The official list (bridge/tricks/official-install.ts): `GET /api/tricks/official` and the add and
+   * update writes. Absent: both answer 404.
+   */
+  officialTricks?: OfficialTricksSurface;
+  /** A repository's index (bridge/tricks/repo-index.ts): `POST /api/tricks/repo/list` and `/add`. 404 when absent. */
+  repoTricks?: RepoIndexSurface;
 }) {
   const { cfg, registry, push, snooze, notifyPrefs, notifyRules, updateMonitor, audit, activity, crew } = opts;
   // The prompt-cache ledger, built in bridge/index.ts beside the journal registry it probes through,
@@ -1512,6 +1661,7 @@ export function startServer(opts: {
   const gitHeads = opts.gitHeads;
   const walkyInstance = opts.walkyInstance;
   const walkyPaneOff = opts.walkyPaneOff;
+  const paneLinked = opts.paneLinked;
   const pins = opts.pins ?? new PinStore(null);
   // The key a pane's pins are filed under, for the snapshot's badge. The route's own resolver
   // (`resolvePinSession`) is the one key function; this cache stores what it answered (bridge/pins/keys.ts).
@@ -1533,6 +1683,8 @@ export function startServer(opts: {
     return key === null ? 0 : pins.count(key);
   };
   const walky = opts.walky;
+  const hill = opts.hill;
+  const views = opts.views;
   const pairing = opts.pairing;
   const localCredential = opts.localCredential;
   /**
@@ -1555,6 +1707,7 @@ export function startServer(opts: {
   const controlReceipts = opts.controlReceipts ?? memoryControlReceipts();
   const harnesses = opts.harnesses ?? createHarnessProbe();
   const worktreeChoices = opts.worktreeChoices ?? memoryWorktreeChoices();
+  const worktreeFolderSetting = opts.worktreeFolderSetting ?? memoryWorktreeFolderSetting();
   const machines = opts.machines;
   const stt = opts.stt ?? (async () => null);
   // One gate per Bun server, not per request: two slow uploads and their two provider calls share
@@ -1599,6 +1752,8 @@ export function startServer(opts: {
   };
   /** Who the requester is, across both device gates — see {@link requestDevice}. */
   const whois = (req: Request): DeviceAuth => requestDevice(req, cfg, pairingGate);
+  // The composer diagnostic's file (bridge/diag-composer.ts): nothing touches the disk until a phone reports one.
+  const composerDiag = new ComposerDiagStore(diagFileIo(cfg.stateDir), { version: opts.version });
   const crewLead = opts.crewLead;
   const crewStatus = opts.crewStatus;
   const peerNotifier = opts.peerNotifier;
@@ -1677,6 +1832,16 @@ export function startServer(opts: {
     await notifyRules?.forget(label);
     if (crewLead !== undefined) void forgetOnMembers(label);
   };
+  /**
+   * What follows a revoke, whoever made it: one `device.revoke` audit line, the rows the device added go
+   * (here and on the crew), and the watch learns the label is gone, so it does not report it again. The
+   * device list's revoke and a pairing request's never-collected device both come through here.
+   */
+  const deviceRevoked = async (label: string, by: string | null | undefined, reason?: string): Promise<void> => {
+    audit.record({ action: "device.revoke", device: by, detail: reason === undefined ? { label } : { label, reason } });
+    await forgetDevice(label, "device-revoked");
+    revokeWatch(pairedLabels());
+  };
   const noticeRevokes = async (): Promise<void> => {
     for (const label of revokeWatch(pairedLabels())) await forgetDevice(label, "device-revoked");
   };
@@ -1698,7 +1863,7 @@ export function startServer(opts: {
         try {
           const res = await lead.forward(req, url, resolved, {
             device: null,
-            audit: (entry) => audit.record({ action: entry.action, host: entry.host, device: null, detail: { forwarded: entry.outcome } }),
+            audit: (entry) => audit.record({ action: entry.action, host: entry.host, device: null, detail: forwardAuditDetail(entry) }),
           });
           await res.body?.cancel();
         } catch (err) {
@@ -1775,11 +1940,18 @@ export function startServer(opts: {
     sessionName: string | undefined,
     device: DeviceAuth | null,
     widen = false,
+    // The body a LEAD reads of this member (`/crew/v1/snapshot`): no tricks at all. See below.
+    forCrew = false,
   ): SnapshotResponse | undefined => {
     const rt = registry.get(sessionName);
     if (!rt) return undefined;
     void sessionLabels.refresh();
     const { workspaces, tabs, bridge, muxFault } = rt.engine.current();
+    // A launch note (M101) lives only as long as its pane: the panes of every session read here prune it.
+    for (const from of widen ? registry.ordered() : [rt]) {
+      const now = from.engine.current();
+      opts.accounts?.keep(from.name, [...now.agents, ...now.shellPanes].map((p) => p.paneId));
+    }
     // Attach each pane's activity timestamps. Done here rather than in the state engine so the
     // engine stays a pure Herdr-poller with no knowledge of the ledger — and so the two numbers
     // are read at serialise time, i.e. as fresh as the request. The ledger is keyed by SESSION, so
@@ -1822,11 +1994,14 @@ export function startServer(opts: {
       const jobs = readJobs !== undefined && cfg.redact ? maskJobList(readJobs) : readJobs;
       const withJobs = jobs === undefined ? withSubagents : { ...withSubagents, jobs };
       // The usage dots: numbers only, the session's context and the account's windows (ADR 0118).
-      const readUsage = opts.usage?.get(p);
+      const readUsage = opts.usage?.get(p, from.name);
       const withUsage = readUsage === undefined ? withJobs : { ...withJobs, usage: readUsage };
+      // The added account the pane runs under (M101): from memory, a label and an id, never a folder.
+      const account = opts.accounts?.paneAccount(from.name, p);
+      const withAccount = account === undefined ? withUsage : { ...withUsage, account };
       // The branch rides the same way: from memory, never a wait, and no key when there is none.
       const gitHead = gitHeads?.get(p.cwd);
-      return gitHead === undefined ? withUsage : { ...withUsage, gitHead };
+      return gitHead === undefined ? withAccount : { ...withAccount, gitHead };
     };
     // The one place a pane leaves the bridge: the session ref is stripped to a presence flag here,
     // so an agent-reported filesystem path never reaches a browser (see toPaneWire). The flag is
@@ -1883,9 +2058,14 @@ export function startServer(opts: {
       const held = from.send?.heldOf(from.name, wire.paneId) ?? [];
       const shown = cfg.redact ? held.map((row) => ({ ...row, text: redactText(row.text) })) : held;
       // M69: a pane the phone may steer says so (paneCanSteer).
-      const marked: PaneWire = paneCanSteer(from, wire.paneId) ? { ...withHold, sendProtocol: true as const, canSteer: true as const } : { ...withHold, sendProtocol: true as const };
+      const steered: PaneWire = paneCanSteer(from, wire.paneId) ? { ...withHold, sendProtocol: true as const, canSteer: true as const } : { ...withHold, sendProtocol: true as const };
+      // M102 spec 14: a terminal pane whose ask book answers a screen card's tap by id says so, so a lead
+      // sends this member's card taps by the ask route, with this bridge's checks and record, not raw keys.
+      const marked: PaneWire = paneTakesAskRoute(from) ? { ...steered, askRoute: true as const } : steered;
       return held.length === 0 ? marked : { ...marked, held: shown };
     };
+    // M99 spec 15: a linked pane says so. Only a `true` rides; an unlinked pane and every older body carry no key.
+    const withLinked = (wire: PaneWire, from: SessionRuntime): PaneWire => (paneLinked?.(from.name, wire.paneId) === true ? { ...wire, linked: true as const } : wire);
     const sources = widen ? registry.ordered() : [rt];
     const paneList = (pick: (rtx: SessionRuntime) => AgentView[]): PaneWire[] => {
       const wired = sources.map((from) => ({
@@ -1895,8 +2075,11 @@ export function startServer(opts: {
         // back from `withOpenAsks` and `withTurn` as the same object. One whose program lists belt actions
         // carries them (M53 spec 07), the same way.
         panes: pick(from).map((p) =>
-          withSurface(
-            withActions(withTurn(withOpenAsks(toPaneWire(withActivity(from, p), hasJournal, discoversSessions, walkyInstance?.(from.name, p.paneId), walkyPaneOff?.(from.name, p.paneId), pinCountOf(from, p)), from.herdr), from.herdr), from.herdr),
+          withLinked(
+            withSurface(
+              withActions(withTurn(withOpenAsks(toPaneWire(withActivity(from, p), hasJournal, discoversSessions, walkyInstance?.(from.name, p.paneId), walkyPaneOff?.(from.name, p.paneId), pinCountOf(from, p)), from.herdr), from.herdr), from.herdr),
+              from,
+            ),
             from,
           ),
         ),
@@ -1914,7 +2097,14 @@ export function startServer(opts: {
       workspaces: withSpacesContext(workspaces, { gitHeads, bases: worktreeBases }),
       tabs,
       // A label is display-only: `name` stays the identity the phone sends back as `?session=`.
-      sessions: withSessionLabels(registry.list(), sessionLabels.labelOf),
+      // A pane that stopped on an error counts as needing you until it is seen, the phone's own rule.
+      sessions: withSessionLabels(
+        registry.list((session, pane) => {
+          const a = activity.get(session, pane.paneId);
+          return a !== undefined && a.activeAt > a.seenAt;
+        }),
+        sessionLabels.labelOf,
+      ),
       notifications: { snoozedUntil: snooze.until() },
       update: updateStatusWithPeers(),
       ts: Date.now(),
@@ -1923,6 +2113,33 @@ export function startServer(opts: {
     if (device !== null) body.device = device;
     // Only while the mux is down for a cause the phone words (a refused token), like `device`.
     if (muxFault !== undefined) body.muxFault = muxFault;
+    // CREW HONESTY (M94 review row 12): tricks are not merged across the crew yet. The lead's phone could
+    // not tap a member's trick (its routes are this bridge's own, and a foreign host is 404), so a member
+    // tells its lead nothing about its tricks: no `tricksRev`, no Tricks Space, no trick tab, no trick
+    // pane. Dropped HERE, on the member, so no lead of any version can merge, push or count one. The lead's
+    // own body and a solo body are unchanged.
+    if (forCrew) return body;
+    // Only when a tricks folder exists (M94), or the official list offers a trick on a bridge that runs
+    // tricks (service.ts `rev`): an install with neither sends the bytes it always sent.
+    const tricksRev = opts.tricks?.rev();
+    if (tricksRev !== undefined) body.tricksRev = tricksRev;
+    // The switch for tricks as a whole (bridge/tricks/feature-switch.ts), as `hillOff` carries the Hill's: every
+    // phone draws the switch and the off state from it, so a second phone sees a change on its next poll.
+    if (opts.tricks !== undefined && !opts.tricks.switchedOn()) body.tricksOff = true;
+    // The trick sessions (M94 slice 03, bridge/tricks/panes.ts): the Tricks Space after the real Spaces, a
+    // tab per trick, a pane per session part. Added AFTER `sessions` took its counts and outside every
+    // state engine, so no count, triage or push ever sees one. None without a trick session.
+    const trickSessions = opts.tricks?.sessionPanes();
+    if (trickSessions !== undefined) {
+      const placed = placeTrickSessions(trickSessions, {
+        numbers: body.workspaces.map((w) => w.number),
+        // A widened body tags every pane with its session (types.ts says why); a trick pane takes the primary's.
+        session: widen ? registry.primary : undefined,
+      });
+      body.workspaces = [...body.workspaces, placed.workspace];
+      body.tabs = [...body.tabs, ...placed.tabs];
+      body.agents = [...body.agents, ...placed.panes];
+    }
     return body;
   };
 
@@ -2054,7 +2271,11 @@ export function startServer(opts: {
       } catch {
         body = undefined;
       }
-      return askRoute(rt, askMatch[1]!, body, { audit: caller.audit, device: caller.device(), redact: cfg.redact, acceptEncoding: req.headers.get("accept-encoding") });
+      const personTurn = (paneId: string): void => {
+        const pane = walky?.paneAt(rt.name, paneId) ?? null;
+        if (walky !== undefined && pane !== null && pane.agent) views?.notePersonTurn(walky.addressOf(pane.paneId, pane.instance));
+      };
+      return askRoute(rt, askMatch[1]!, body, { audit: caller.audit, device: caller.device(), redact: cfg.redact, acceptEncoding: req.headers.get("accept-encoding"), personTurn });
     }
 
     // ── Walky talky off for one session (M89 spec 04) ─────────────────────
@@ -2082,14 +2303,14 @@ export function startServer(opts: {
       if (denied) return denied;
       const rt = await caller.resolve();
       if (rt instanceof Response) return rt;
-      return createTab(rt.herdr, rt.engine, req, caller.audit, caller.device(), rt.name);
+      return createTab(rt.herdr, rt.engine, req, caller.audit, caller.device(), rt.name, { receipts: launchReceipts });
     }
     if (pathname === "/api/workspace" && req.method === "POST") {
       const denied = caller.gate("write");
       if (denied) return denied;
       const rt = await caller.resolve();
       if (rt instanceof Response) return rt;
-      return createWorkspace(rt.herdr, rt.engine, req, caller.audit, caller.device(), rt.name, folders, await sessionFolderOf(rt.name));
+      return createWorkspace(rt.herdr, rt.engine, req, caller.audit, caller.device(), rt.name, folders, await sessionFolderOf(rt.name), { receipts: launchReceipts });
     }
     // A launch is a `/api/workspace` create the operator pre-declared: the client names a row in
     // `launchers.toml` and the bridge, never the client, supplies the command line. It sits here
@@ -2107,12 +2328,14 @@ export function startServer(opts: {
         harnesses,
         receipts: launchReceipts,
         launchWindow: opts.launchWindow,
+        accounts: opts.accounts,
         starterReceipts,
         folders,
         switches: launcherSources.switches,
         recentRuns,
         sent,
         sessionFolder: await sessionFolderOf(rt.name),
+        stateDir: cfg.stateDir,
       });
     }
     // Session-scoped like `/api/launch` beside it, so a `?host=` read is forwarded (§5) and the
@@ -2166,6 +2389,14 @@ export function startServer(opts: {
     const folderBrowse: FolderBrowseContext = { home: homedir(), privateFolders: filesPrivateFolders(cfg) };
     const folderAnswer = await serveFolderRoute(req, pathname, caller, folders, folderBrowse);
     if (folderAnswer !== null) return folderAnswer;
+    // This machine's "Worktree folder" setting: session-scoped for the folder list's reason, so a
+    // `?host=` call reads and writes the member's own value, never the lead's.
+    const worktreeFolderAnswerRes = await serveWorktreeFolderRoute(req, pathname, caller, worktreeFolderSetting);
+    if (worktreeFolderAnswerRes !== null) return worktreeFolderAnswerRes;
+    // Accounts (M101): this machine's, read and changed per machine. Session-scoped for the folder
+    // setting's reason: `?host=` reaches the member whose folders they are.
+    const accountsAnswer = await serveAccountsRoute(req, pathname, caller, opts.accounts);
+    if (accountsAnswer !== null) return accountsAnswer;
     // ── Blobs: the bytes a pi/omp journal named (`resolveImageUrl` in journal/pi.ts) ──
     //
     // A READ, and gated as one: it hands back a picture an agent already put in its own log, so a
@@ -2313,13 +2544,14 @@ export function startServer(opts: {
           const family = canonicalAgent(pane.agent?.toLowerCase().trim() ?? "");
           const skillAgent = skillAgentFor(family);
           if (skillAgent !== undefined) {
-            commands = await discoverAgentSkills(skillAgent, { home, cwd, env: process.env });
+            // An added account's agent reads its own folder (M101): the scan reads the same one.
+            commands = await discoverAgentSkills(skillAgent, { home, cwd, env: opts.accounts?.envOf(rt.name, pane) ?? process.env });
           }
         } else {
           commands = await discoverClaudeCommands({
             home,
             cwd,
-            configDir: claudeConfigDir(cfg.journalRoots.claude, home),
+            configDir: opts.accounts?.folderOf(rt.name, pane) ?? claudeConfigDir(cfg.journalRoots.claude, home),
           });
         }
       } catch (err) {
@@ -2337,7 +2569,7 @@ export function startServer(opts: {
       if (denied) return denied;
       const rt = await caller.resolve();
       if (rt instanceof Response) return rt;
-      return planWorktree(req, worktreeChoices);
+      return planWorktree(req, worktreeChoices, { folderSetting: worktreeFolderSetting });
     }
     if (pathname === "/api/worktree" && req.method === "POST") {
       const denied = caller.gate("write");
@@ -2353,8 +2585,10 @@ export function startServer(opts: {
         receipts: worktreeReceipts,
         bases: worktreeBases,
         choices: worktreeChoices,
+        folderSetting: worktreeFolderSetting,
         harnesses,
         folders,
+        accounts: opts.accounts,
       });
     }
     // ── Tab actions: rename (set its label) / close (kill it + every pane in it) ──
@@ -2498,6 +2732,18 @@ export function startServer(opts: {
       if (isHeldCancel(pathname, req.method)) {
         return heldCancelRoute(rt, url.searchParams.get("request") ?? "", paneId, { audit: audit_, device, acceptEncoding: req.headers.get("accept-encoding") });
       }
+      // The person's "It arrived" on an `unknown` send (M102 spec 01), by the pane the receipt sits on, so the
+      // crew link carries it to the member whose store keeps the receipt.
+      if (action === "arrived" && req.method === "POST") {
+        let body: JsonValue | undefined;
+        try {
+          // SAFETY: `Request.json()` output IS a JsonValue by construction; `arrivedRoute` checks every field.
+          body = (await req.json()) as JsonValue;
+        } catch {
+          body = undefined;
+        }
+        return arrivedRoute(rt, paneId, body, { audit: audit_, device, acceptEncoding: req.headers.get("accept-encoding") });
+      }
       if (action === "changes" && req.method === "GET") return paneChanges(rt.engine, paneId, url, req, changesScope(cfg, caller), cfg.redact);
       if (action === "files" && req.method === "GET")
         return paneFiles(rt.engine, paneId, url, req, filesPrivateFolders(cfg), homedir(), cfg.redact);
@@ -2516,7 +2762,14 @@ export function startServer(opts: {
       if (action === "keys" && req.method === "POST")
         return afterPaneInput(rt.engine, await keysPane(herdr, cfg, paneId, req, audit_, device, session, paneReadHint(rt.engine, paneId)));
       if (action === "upload" && req.method === "POST") return uploadPane(cfg, paneId, req, audit_, device, session);
-      if (action === "close" && req.method === "POST") return closePane(herdr, rt.engine, paneId, req, audit_, device, session);
+      if (action === "close" && req.method === "POST") {
+        const closed = await closePane(herdr, rt.engine, paneId, req, audit_, device, session);
+        // A closed sign-in session's account (M101, Change login) is read again at the next list read,
+        // not at the next snapshot: the phone that ended it reads the list right after this answer.
+        const now = rt.engine.current();
+        opts.accounts?.keep(rt.name, [...now.agents, ...now.shellPanes].map((p) => p.paneId));
+        return closed;
+      }
       if (action === "rename" && req.method === "POST") return renamePane(herdr, rt.engine, paneId, req, audit_, device, session);
       if (action === "focus" && req.method === "POST") return focusPane(herdr, rt.engine, paneId, req, audit_, device, session);
       // An answer to an ask, by id, from a person's tap (ADR 0100). The receipt is written before
@@ -2610,7 +2863,7 @@ export function startServer(opts: {
     // not move, and a lead that does not send it still gets the primary session. A crew request may
     // still not name a host — widening is a second dimension of ONE machine, and a peer has no
     // peers (§4).
-    snapshot: (view) => localSnapshot(view.session, null, view.widen),
+    snapshot: (view) => localSnapshot(view.session, null, view.widen, true),
     // M22/03: this collie's own capability declaration, for `hello`. The SAME expression the
     // `/api/config` route below publishes to a browser — the primary session's adapter — so a peer
     // cannot report capabilities that differ from the ones it serves its own operator.
@@ -2801,6 +3054,25 @@ export function startServer(opts: {
 
   // Ten attempts per source address per minute on POST /api/pair, in memory (bridge/pair-limit.ts).
   const pairLimiter = createPairLimiter();
+
+  // Requests a paired phone approves (ADR 0139), in memory: a restart drops them all. A crew member
+  // serves no browser door, so it makes none. The sweep runs before every route and on a timer, so a
+  // token nobody collected is revoked within its window plus one tick.
+  const pairRequestDeps: PairRequestDeps = {
+    book: new PairRequestBook(),
+    pairing,
+    // By the token's hash, never by label, and through the device list's own revoke effects.
+    revoke: async (tokenHash) => {
+      const label = pairing === undefined ? null : await pairing.revokeByTokenHash(tokenHash);
+      if (label !== null) await deviceRevoked(label, undefined, "never-collected");
+    },
+    audit: (entry) => audit.record(entry),
+    isPeer: crew.mode === "peer",
+  };
+  setInterval(() => void settlePairRequests(pairRequestDeps), 15_000).unref();
+  // The kernel's peer address for a pairing request. Typed here, outside `fetch`, so the handlers that
+  // read it do not make `server`'s type depend on itself.
+  const peerAddress = (req: Request): string | undefined => server.requestIP(req)?.address;
 
   const server = Bun.serve({
     hostname: cfg.host,
@@ -3000,7 +3272,7 @@ export function startServer(opts: {
                     action: entry.action,
                     host: entry.host,
                     device: whois(req).device,
-                    detail: { forwarded: entry.outcome },
+                    detail: forwardAuditDetail(entry),
                   };
                   if (entry.paneId !== undefined) row.paneId = entry.paneId;
                   if (entry.session !== undefined) row.session = entry.session;
@@ -3035,6 +3307,8 @@ export function startServer(opts: {
         // rule 1). By pairing label only, so the host's CLI and an unpaired caller stamp nothing.
         const poller = pairedLabel(req, pairingGate);
         if (poller !== null) push.notePoll(poller);
+        // And for the tricks runner (M94): timers run only while a paired phone has looked lately.
+        if (poller !== null) opts.tricks?.noteWatched();
         // `?sessions=all` WIDENS the pane lists to every session on ONE machine (see localSnapshot).
         // One exact spelling and nothing else is accepted: the parameter is a switch, not a list, and
         // a typo must read as "no" rather than as some third behaviour. It does NOT replace
@@ -3060,9 +3334,16 @@ export function startServer(opts: {
         // A member's panes arrive as the member sent them, and one release behind it sent each
         // program-set title in clear, so the lead masks the merged titles by its own switch. Its own
         // titles are already masked, and the mask leaves a masked title as it is.
+        // The merge does not carry a member's `hillRev` yet: the hill is not merged across the crew (M96),
+        // and a member refuses posts (`not_on_lead`). The revision below is this bridge's own store.
         const merged = crewLead ? crewLead.merge(body, plan) : body;
         const out = crewLead && cfg.redact ? maskSnapshotTitles(merged) : merged;
-        return withBuildHeader(json(out, req.headers.get("accept-encoding")), await buildId());
+        // The bridge's own local key gets the CLI's fields and no screen or message text (bridge/local-key.ts).
+        if (isLocalRequest(req, pairingGate)) {
+          return withBuildHeader(json(localSnapshotView(parseJsonObject(JSON.stringify(out)) ?? {}), req.headers.get("accept-encoding")), await buildId());
+        }
+        // The agent views' revision rides beside the hill's (or its off switch), this bridge's own, lead-local as the hill.
+        return withBuildHeader(json(withTrickViewsRev(withHill(out, hill), views?.rev()), req.headers.get("accept-encoding")), await buildId());
       }
 
       // ── Surface shadow mode's debug route (M56 spec 04) ──────────────────
@@ -3077,6 +3358,173 @@ export function startServer(opts: {
         const rt = localRuntime(sessionName, req.headers.get("accept-encoding"));
         if (rt instanceof Response) return rt;
         return surfaceRoute(rt.surface, url.searchParams.get("pane"), cfg.redact, req.headers.get("accept-encoding"));
+      }
+
+      // ── Collie tricks (M94 slice 01) ───────────────────────────────────────
+      // The parts and the list since a rev, and a tap. Both are this bridge's own, gated like the
+      // snapshot (a tap as a write, since it runs the program), and both answer 404 without a runner.
+      // `?host=` plays no part: the trick's host is in the tap's path, and a foreign one is 404 until
+      // the crew merge (a later slice).
+      if (pathname === "/api/tricks" && req.method === "GET") {
+        const denied = guard(req, cfg, TRICKS_ROUTE_RIGHTS.reply, pairingGate);
+        if (denied) return denied;
+        const tricks = opts.tricks;
+        if (tricks === undefined) return jsonError({ error: "not found" }, 404, null);
+        if (pairedLabel(req, pairingGate) !== null) tricks.noteWatched();
+        // The runner's PATH is for `collie doctor` and `collie trick list` only: the host's own CLI, never a phone.
+        const forCli = isLocalRequest(req, pairingGate);
+        const reply = await tricks.reply(parseSince(url.searchParams.get("since")), { bound: asksBound(url.searchParams), forCli });
+        // The local key gets each trick's row and the PATH, and no part, About or rule (bridge/local-key.ts).
+        if (forCli) return json(localTricksView(parseJsonObject(JSON.stringify(reply)) ?? {}), req.headers.get("accept-encoding"));
+        return json(reply, req.headers.get("accept-encoding"));
+      }
+      // The official list: the read is gated like the list, the add and the update like the switch,
+      // since they bring code onto the machine. Only a paired phone with the write right gets past the
+      // write gate; the host's own read credential and a request with no token do not.
+      if (pathname === "/api/tricks/official" && req.method === "GET") {
+        const denied = guard(req, cfg, TRICKS_ROUTE_RIGHTS.official, pairingGate);
+        if (denied) return denied;
+        const official = opts.officialTricks;
+        if (official === undefined) return jsonError({ error: "not found" }, 404, null);
+        return json(await official.reply(), req.headers.get("accept-encoding"));
+      }
+      const tricksOfficial = TRICKS_OFFICIAL_ROUTE.exec(pathname);
+      if (tricksOfficial !== null && req.method === "POST") {
+        const denied = guard(req, cfg, TRICKS_ROUTE_RIGHTS.officialAdd, pairingGate);
+        if (denied) return denied;
+        const official = opts.officialTricks;
+        if (official === undefined) return jsonError({ error: "not found" }, 404, null);
+        let body: JsonValue | undefined;
+        try {
+          // SAFETY: `Request.json()` output IS a JsonValue by construction; `tricksOfficialRoute` takes `{}` only.
+          body = (await req.json()) as JsonValue;
+        } catch {
+          body = undefined;
+        }
+        const answer = await tricksOfficialRoute(official, tricksOfficial, body);
+        return json(answer.body, req.headers.get("accept-encoding"), answer.status);
+      }
+      // A repository's index: both verbs make the bridge fetch from a host the person pasted, so both are gated
+      // like the official add. The host rule, the request id and the receipt are repo-index.ts's.
+      const tricksRepo = TRICKS_REPO_ROUTE.exec(pathname);
+      if (tricksRepo !== null && req.method === "POST") {
+        const denied = guard(req, cfg, tricksRepo[1] === "add" ? TRICKS_ROUTE_RIGHTS.repoAdd : TRICKS_ROUTE_RIGHTS.repoList, pairingGate);
+        if (denied) return denied;
+        const repo = opts.repoTricks;
+        if (repo === undefined) return jsonError({ error: "not found" }, 404, null);
+        let body: JsonValue | undefined;
+        try {
+          // SAFETY: `Request.json()` output IS a JsonValue by construction; repo-index.ts checks every field.
+          body = (await req.json()) as JsonValue;
+        } catch {
+          body = undefined;
+        }
+        const answer = tricksRepo[1] === "add" ? await repo.add(body) : await repo.list(body);
+        return json(answer.body, req.headers.get("accept-encoding"), answer.status);
+      }
+      const tricksTap = TRICKS_TAP_ROUTE.exec(pathname);
+      if (tricksTap !== null && req.method === "POST") {
+        const denied = guard(req, cfg, TRICKS_ROUTE_RIGHTS.tap, pairingGate);
+        if (denied) return denied;
+        const tricks = opts.tricks;
+        if (tricks === undefined) return jsonError({ error: "not found" }, 404, null);
+        let body: JsonValue | undefined;
+        try {
+          // SAFETY: `Request.json()` output IS a JsonValue by construction; `parseTapRequest` checks every field.
+          body = (await req.json()) as JsonValue;
+        } catch {
+          body = undefined;
+        }
+        const answer = await tricksTapRoute(tricks, tricksTap, body, url.searchParams);
+        return json(answer.body, req.headers.get("accept-encoding"), answer.status);
+      }
+      // The switch for tricks as a whole: read by any paired device, moved with the write right, as the Hill's
+      // switch and a trick's own switch are, because it decides whether any trick's program runs. The value
+      // also rides on the snapshot as `tricksOff`, which is what the phone draws from.
+      if (pathname === TRICKS_FEATURE_ROUTE && (req.method === "GET" || req.method === "POST")) {
+        const denied = guard(req, cfg, req.method === "GET" ? TRICKS_ROUTE_RIGHTS.reply : TRICKS_ROUTE_RIGHTS.feature, pairingGate);
+        if (denied) return denied;
+        // This machine's switch only, as the Hill's: a `?h=<member>` would read as if it moved the member's.
+        if (host.kind === "member") return text(TRICKS_SWITCH_LOCAL_TEXT, 400);
+        let body: JsonValue | undefined;
+        if (req.method === "POST") {
+          try {
+            // SAFETY: `Request.json()` output IS a JsonValue by construction; `tricksFeatureRoute` checks the one field.
+            body = (await req.json()) as JsonValue;
+          } catch {
+            body = undefined;
+          }
+        }
+        return tricksFeatureRoute(opts.tricks, req.method === "POST" ? { body } : null, { device: whois(req).device, acceptEncoding: req.headers.get("accept-encoding") });
+      }
+      const tricksSwitch = TRICKS_SWITCH_ROUTE.exec(pathname);
+      if (tricksSwitch !== null && req.method === "POST") {
+        const denied = guard(req, cfg, TRICKS_ROUTE_RIGHTS.switch, pairingGate);
+        if (denied) return denied;
+        const tricks = opts.tricks;
+        if (tricks === undefined) return jsonError({ error: "not found" }, 404, null);
+        let body: JsonValue | undefined;
+        try {
+          // SAFETY: `Request.json()` output IS a JsonValue by construction; `tricksSwitchRoute` checks the shape.
+          body = (await req.json()) as JsonValue;
+        } catch {
+          body = undefined;
+        }
+        const answer = await tricksSwitchRoute(tricks, tricksSwitch, body);
+        return json(answer.body, req.headers.get("accept-encoding"), answer.status);
+      }
+      const tricksVersion = TRICKS_AUTO_ROUTE.exec(pathname) ?? TRICKS_UNDO_ROUTE.exec(pathname);
+      if (tricksVersion !== null && req.method === "POST") {
+        const auto = pathname.endsWith("/auto");
+        const denied = guard(req, cfg, auto ? TRICKS_ROUTE_RIGHTS.auto : TRICKS_ROUTE_RIGHTS.undo, pairingGate);
+        if (denied) return denied;
+        const tricks = opts.tricks;
+        if (tricks === undefined) return jsonError({ error: "not found" }, 404, null);
+        let body: JsonValue | undefined;
+        try {
+          // SAFETY: `Request.json()` output IS a JsonValue by construction; the route reads every field it takes.
+          body = (await req.json()) as JsonValue;
+        } catch {
+          body = undefined;
+        }
+        const answer = auto ? await tricksAutoRoute(tricks, tricksVersion, body) : await tricksUndoRoute(tricks, tricksVersion, body);
+        return json(answer.body, req.headers.get("accept-encoding"), answer.status);
+      }
+      const tricksCode = TRICKS_CODE_ROUTE.exec(pathname);
+      if (tricksCode !== null && req.method === "GET") {
+        const denied = guard(req, cfg, TRICKS_ROUTE_RIGHTS.code, pairingGate);
+        if (denied) return denied;
+        const tricks = opts.tricks;
+        if (tricks === undefined) return jsonError({ error: "not found" }, 404, null);
+        const answer = await tricksCodeRoute(tricks, tricksCode, url.searchParams);
+        return json(answer.body, req.headers.get("accept-encoding"), answer.status);
+      }
+      const tricksValue = TRICKS_VALUE_ROUTE.exec(pathname);
+      if (tricksValue !== null && req.method === "POST") {
+        const denied = guard(req, cfg, TRICKS_ROUTE_RIGHTS.value, pairingGate);
+        if (denied) return denied;
+        const tricks = opts.tricks;
+        if (tricks === undefined) return jsonError({ error: "not found" }, 404, null);
+        let body: JsonValue | undefined;
+        try {
+          // SAFETY: `Request.json()` output IS a JsonValue by construction; `tricksValueRoute` checks the shape.
+          body = (await req.json()) as JsonValue;
+        } catch {
+          body = undefined;
+        }
+        const answer = await tricksValueRoute(tricks, tricksValue, body);
+        return json(answer.body, req.headers.get("accept-encoding"), answer.status);
+      }
+      const tricksMedia = TRICKS_MEDIA_ROUTE.exec(pathname);
+      if (tricksMedia !== null && req.method === "GET") {
+        const denied = guard(req, cfg, TRICKS_ROUTE_RIGHTS.media, pairingGate);
+        if (denied) return denied;
+        const tricks = opts.tricks;
+        if (tricks === undefined) return text(HILL_MEDIA_MISSING, 404);
+        const file = await tricksMediaRoute(tricks, tricksMedia);
+        if (file === null) return text(HILL_MEDIA_MISSING, 404);
+        // The hill image's headers: no-store, a sandboxed CSP and inline, beside `secure`'s nosniff.
+        return secure(new Response(file.bytes, { headers: { "content-type": file.mime, ...HILL_MEDIA_HEADERS } }));
       }
 
       // ── Session-scoped routes: the pane family, tabs, workspaces ─────────
@@ -3115,7 +3563,24 @@ export function startServer(opts: {
         } catch {
           body = undefined;
         }
-        return sendRoute(rt, body, { audit, device: whois(req).device, redact: cfg.redact, acceptEncoding: req.headers.get("accept-encoding") });
+        const addressOf = (paneId: string): string | null => {
+          const pane = walky?.paneAt(rt.name, paneId) ?? null;
+          return walky !== undefined && pane !== null && pane.agent ? walky.addressOf(pane.paneId, pane.instance) : null;
+        };
+        // The Hill's quiet mark (1.29.0): a send that reached an agent's pane marks the open Decisions it
+        // posted. The same person turn ends a view's screen on a harness that reports no conversation.
+        const spoke = (paneId: string, started: boolean) => {
+          const address = addressOf(paneId);
+          if (address === null) return;
+          hill?.noteSpoke(address, undefined, started);
+          views?.notePersonTurn(address);
+        };
+        // A send from an agent view (SECURITY rule 3): only a paired device's own token with write access.
+        const viewAsked = readViewSendField(asJsonRecord(body)?.view ?? undefined) !== undefined;
+        const viewDenied = viewAsked ? viewWriteGate(req, pairingGate) : null;
+        if (viewDenied) return viewDenied;
+        const view = viewAsked && views !== undefined ? { service: views, addressOf } : undefined;
+        return sendRoute(rt, body, { audit, device: whois(req).device, redact: cfg.redact, acceptEncoding: req.headers.get("accept-encoding"), spoke, view });
       }
       // `DELETE /api/send/<id>?session=<name>&pane=<id>` (M56 spec 15): the Cancel on a queued row. A held
       // request ends `cancelled`, an ended row is dismissed, one going out now is refused `busy`.
@@ -3139,6 +3604,28 @@ export function startServer(opts: {
         const rt = localRuntime(sessionName, req.headers.get("accept-encoding"));
         if (rt instanceof Response) return rt;
         return sendReceiptsRoute(rt, url.searchParams.get("pane"), req.headers.get("accept-encoding"));
+      }
+      // The composer diagnostic: a phone whose reply box sits below its screen sends the heights it measured,
+      // once. Numbers, booleans and three small enums, a fixed key set (bridge/diag-composer.ts), kept in
+      // `<stateDir>/diag-composer.jsonl` for a person on this host to read. Read-gated like the notification
+      // preferences: a paired device, with or without the write right, because a read-only phone shows the same
+      // fault. This machine's file only, never forwarded, nothing leaves the host.
+      if (pathname === "/api/diag/composer" && req.method === "POST") {
+        const denied = browserGate("read");
+        if (denied) return denied;
+        const raw = await req.text().catch(() => "");
+        if (raw.length > DIAG_COMPOSER_BODY_MAX) return text("bad composer record", 400);
+        let body: JsonValue | undefined;
+        try {
+          // SAFETY: `JSON.parse` output IS a JsonValue by construction; `parseComposerDiag` checks every key and value.
+          body = JSON.parse(raw) as JsonValue;
+        } catch {
+          body = undefined;
+        }
+        const diag = parseComposerDiag(body);
+        if (diag === null) return text("bad composer record", 400);
+        if ((await composerDiag.record(diag, pairedLabel(req, pairingGate))) === "unwritable") return text("could not keep the record", 500);
+        return secure(new Response(null, { status: 204 }));
       }
       // Report a problem (ADR 0123): the setup block and, on `screen=1`, the pane's last rows, always
       // masked. A read for a paired device only, since the screen goes to a public issue if the person
@@ -3176,6 +3663,147 @@ export function startServer(opts: {
         }
         return walkyPostRoute(walky, body, { audit, device: whois(req).device, acceptEncoding: req.headers.get("accept-encoding") });
       }
+      // ── The hill (M96) ───────────────────────────────────────────────────
+      // The decisions agents posted on this bridge (a read), and the phone's answer to one: a write under
+      // the same gate and the same device label as `POST /api/walky`, because the answer is typed as an
+      // operator walky message. This machine only: the hill is not merged across the crew yet.
+      if (pathname === "/api/hill" && req.method === "GET") {
+        const denied = browserGate("read");
+        if (denied) return denied;
+        if (host.kind === "member") return text(HILL_LOCAL_TEXT, 400);
+        return hillListRoute(hill, url.searchParams.get("since"), req.headers.get("accept-encoding"));
+      }
+      // The Hill's switch: read by any paired device, moved with the write right, as a trick's switch is,
+      // because off refuses every agent's post on this machine. The value also rides on the snapshot as
+      // `hillOff`, which is what the phone draws from; this route is the write and a plain read.
+      if (pathname === "/api/hill/switch" && (req.method === "GET" || req.method === "POST")) {
+        const denied = browserGate(req.method === "GET" ? "read" : "write");
+        if (denied) return denied;
+        if (host.kind === "member") return text(HILL_LOCAL_TEXT, 400);
+        let body: JsonValue | undefined;
+        if (req.method === "POST") {
+          try {
+            // SAFETY: `Request.json()` output IS a JsonValue by construction; `hillSwitchRoute` checks the one field.
+            body = (await req.json()) as JsonValue;
+          } catch {
+            body = undefined;
+          }
+        }
+        return hillSwitchRoute(hill, req.method === "POST" ? { body } : null, { device: whois(req).device, acceptEncoding: req.headers.get("accept-encoding") });
+      }
+      // The crew state (1.29.0): read by any paired device, set with the write right, as the switch is,
+      // because every agent of the crew reads it. The value also rides on `GET /api/hill` as `crewState`.
+      if (pathname === "/api/hill/state" && (req.method === "GET" || req.method === "POST")) {
+        const denied = browserGate(req.method === "GET" ? "read" : "write");
+        if (denied) return denied;
+        if (host.kind === "member") return text(HILL_LOCAL_TEXT, 400);
+        let body: JsonValue | undefined;
+        if (req.method === "POST") {
+          try {
+            // SAFETY: `Request.json()` output IS a JsonValue by construction; `hillStateRoute` checks the one field.
+            body = (await req.json()) as JsonValue;
+          } catch {
+            body = undefined;
+          }
+        }
+        return hillStateRoute(hill, req.method === "POST" ? { body } : null, { device: whois(req).device, acceptEncoding: req.headers.get("accept-encoding") });
+      }
+      // "Tell all sessions now": one operator line into the sessions with a Decision, once per change of
+      // the crew state. Typed as an answer is, so the write right of an answer.
+      if (pathname === "/api/hill/state/tell" && req.method === "POST") {
+        const denied = browserGate("write");
+        if (denied) return denied;
+        if (host.kind === "member") return text(HILL_LOCAL_TEXT, 400);
+        let body: JsonValue | undefined;
+        try {
+          // SAFETY: `Request.json()` output IS a JsonValue by construction; `hillTellRoute` checks the one field.
+          body = (await req.json()) as JsonValue;
+        } catch {
+          body = undefined;
+        }
+        return hillTellRoute(hill, body, { device: whois(req).device, acceptEncoding: req.headers.get("accept-encoding") });
+      }
+      if (pathname === "/api/hill/answer" && req.method === "POST") {
+        const denied = browserGate(HILL_ANSWER_RIGHT);
+        if (denied) return denied;
+        if (host.kind === "member") return text(HILL_LOCAL_TEXT, 400);
+        let body: JsonValue | undefined;
+        try {
+          // SAFETY: `Request.json()` output IS a JsonValue by construction; `readAnswerRequest` checks every field.
+          body = (await req.json()) as JsonValue;
+        } catch {
+          body = undefined;
+        }
+        return hillAnswerRoute(hill, body, { device: whois(req).device, deviceId: pairedDeviceId(req, pairingGate), acceptEncoding: req.headers.get("accept-encoding") });
+      }
+      // ── Agent views ───────────────────────────────────────────────────────
+      // The screens agents drew on this bridge (a read), and the phone's per-session switch: a write that
+      // needs a paired device's own token with write access (agent views SECURITY rule 3), beyond the
+      // gate. This machine only, as the hill.
+      if (pathname === "/api/trick-views" && req.method === "GET") {
+        const denied = browserGate("read");
+        if (denied) return denied;
+        if (host.kind === "member") return text(VIEW_LOCAL_TEXT, 400);
+        return await trickViewsListRoute(views, url.searchParams.get("since"), req.headers.get("accept-encoding"), url.searchParams.getAll("session"));
+      }
+      if (pathname === "/api/trick-views/switch" && req.method === "POST") {
+        const denied = browserGate("write") ?? viewWriteGate(req, pairingGate);
+        if (denied) return denied;
+        if (host.kind === "member") return text(VIEW_LOCAL_TEXT, 400);
+        let body: JsonValue | undefined;
+        try {
+          // SAFETY: `Request.json()` output IS a JsonValue by construction; `readTrickViewSwitchBody` checks every field.
+          body = (await req.json()) as JsonValue;
+        } catch {
+          body = undefined;
+        }
+        return await trickViewsSwitchRoute(views, body, { device: whois(req).device, acceptEncoding: req.headers.get("accept-encoding") });
+      }
+      // A picture of an agent view's screen: the read gate, this machine only, as the hill's images.
+      const viewImage = pathname.match(VIEW_IMAGE_ROUTE);
+      if (viewImage && req.method === "GET") {
+        const denied = browserGate("read");
+        if (denied) return denied;
+        if (host.kind === "member") return text(VIEW_LOCAL_TEXT, 400);
+        return trickViewsMediaRoute(views, viewImage[1]!, viewImage[2]!);
+      }
+      // Clear: remove closed decisions from the Hill, all of them or the ids named. The write right of an
+      // answer, and it works with the Hill off (it types nothing and rings nothing). Never an open one.
+      if (pathname === "/api/hill/clear" && req.method === "POST") {
+        const denied = browserGate("write");
+        if (denied) return denied;
+        if (host.kind === "member") return text(HILL_LOCAL_TEXT, 400);
+        let body: JsonValue | undefined;
+        try {
+          // SAFETY: `Request.json()` output IS a JsonValue by construction; `hillClearRoute` checks the one field.
+          body = (await req.json()) as JsonValue;
+        } catch {
+          body = undefined;
+        }
+        return hillClearRoute(hill, body, { device: whois(req).device, acceptEncoding: req.headers.get("accept-encoding") });
+      }
+      // The second Clear (1.29.0): withdraw and clear the OPEN cards the person answered in the session.
+      // Its own path, so an older bridge answers 404 and never reads it as the first Clear. Types nothing.
+      if (pathname === "/api/hill/clear/spoken" && req.method === "POST") {
+        const denied = browserGate("write");
+        if (denied) return denied;
+        if (host.kind === "member") return text(HILL_LOCAL_TEXT, 400);
+        let body: JsonValue | undefined;
+        try {
+          // SAFETY: `Request.json()` output IS a JsonValue by construction; `hillSpokenClearRoute` takes only `{}`.
+          body = (await req.json()) as JsonValue;
+        } catch {
+          body = undefined;
+        }
+        return hillSpokenClearRoute(hill, body, { device: whois(req).device, acceptEncoding: req.headers.get("accept-encoding") });
+      }
+      const hillImage = pathname.match(HILL_IMAGE_ROUTE);
+      if (hillImage && req.method === "GET") {
+        const denied = browserGate("read");
+        if (denied) return denied;
+        if (host.kind === "member") return text(HILL_LOCAL_TEXT, 400);
+        return hillMediaRoute(hill, hillImage[1]!, hillImage[2]!);
+      }
       if (pathname === "/api/walky/who" && req.method === "GET") {
         const denied = browserGate("read");
         if (denied) return denied;
@@ -3206,6 +3834,22 @@ export function startServer(opts: {
           return text("malformed URL", 400);
         }
         return walkyDropRoute(walky, rt.name, paneId, walkyDrop[2]!, { audit, device: whois(req).device, acceptEncoding: req.headers.get("accept-encoding") });
+      }
+      // Deliver now (M99 spec 05): the pane's owner, this machine's own panes only, the same right as Drop.
+      const walkyDeliver = pathname.match(WALKY_DELIVER_ROUTE);
+      if (walkyDeliver && req.method === "POST") {
+        const denied = browserGate("write");
+        if (denied) return denied;
+        if (host.kind === "member") return text(WALKY_DELIVER_LOCAL_TEXT, 400);
+        const rt = localRuntime(sessionName, req.headers.get("accept-encoding"));
+        if (rt instanceof Response) return rt;
+        let paneId: string;
+        try {
+          paneId = decodeURIComponent(walkyDeliver[1]!);
+        } catch {
+          return text("malformed URL", 400);
+        }
+        return walkyDeliverRoute(walky, rt.name, paneId, walkyDeliver[2]!, { audit, device: whois(req).device, acceptEncoding: req.headers.get("accept-encoding") });
       }
       const walkyPane = pathname.match(WALKY_PANE_ROUTE);
       // The POST on this path is the lead's, through the crew dispatch (§21): never a phone's.
@@ -3310,6 +3954,9 @@ export function startServer(opts: {
             req.headers.get("accept-encoding"),
           );
         }
+        // The bridge's own local key learns only that the session is known: the two 404s above, or this
+        // empty body (bridge/local-key.ts). No row, no key, no speech or model fact.
+        if (isLocalRequest(req, pairingGate)) return json(localConfigView(), req.headers.get("accept-encoding"));
         // A member that has published nothing answers with the LEAD's block, because absent means
         // "use the lead's" — which is byte for byte the reading the phone gives every pane today.
         // The lead's own entry resolves `local`, so it takes its own branch and its own adapter.
@@ -3334,6 +3981,7 @@ export function startServer(opts: {
             push: push.enabled,
             vapidPublicKey: push.publicKey,
             build: await buildId(),
+            apiVersion: API_VERSION,
             mode: crew.mode,
             operatorCommands: mine,
             operatorKeys: myKeys,
@@ -3489,6 +4137,21 @@ export function startServer(opts: {
           }
         }
         return json({ snoozedUntil: snooze.until() }, req.headers.get("accept-encoding"));
+      }
+      if (pathname === "/api/notifications/clear" && req.method === "POST") {
+        // Clear all: what opening every pane of this collie does, as one request. The gate, the
+        // attribution and the work are serveNotificationsClear's. Not forwardable (§5).
+        const caller: NotificationsClearCaller = {
+          gate: () => guard(req, cfg, "read", pairingGate),
+          device: () => pairedLabel(req, pairingGate),
+        };
+        const sessions = (): ClearSession[] =>
+          registry.all().map((rt) => ({
+            herdTag: herdTagFor(rt.isPrimary, rt.name),
+            coordinator: rt.notifications,
+            markAllSeen: () => activity.noteAllSeen(rt.name),
+          }));
+        return serveNotificationsClear(caller, sessions, push, req.headers.get("accept-encoding"));
       }
       if (pathname === "/api/notifications/prefs") {
         // Which agent statuses push (bridge-wide). Read-level like snooze — managing your own
@@ -3739,10 +4402,13 @@ export function startServer(opts: {
         // the Updates page's business, and the snapshot is polled by every open client. No request
         // of its own (see `UpdateMonitor.notes`).
         const releaseNotes = await updateMonitor.notes();
-        return json(
-          { ...updateStatusWithPeers(), preflight: report, crew: opts.crewLead?.updateRows() ?? [], releaseNotes },
-          req.headers.get("accept-encoding"),
-        );
+        const checked = { ...updateStatusWithPeers(), preflight: report, crew: opts.crewLead?.updateRows() ?? [], releaseNotes };
+        // The bridge's own local key gets the crew rows `collie crew update` prints, and no run record,
+        // log tail or release note (bridge/local-key.ts).
+        if (isLocalRequest(req, pairingGate)) {
+          return json(localUpdateCheckView(parseJsonObject(JSON.stringify(checked)) ?? {}), req.headers.get("accept-encoding"));
+        }
+        return json(checked, req.headers.get("accept-encoding"));
       }
       if (pathname === "/api/update" && req.method === "POST") {
         // ── STARTING AN UPDATE FROM THE PHONE (M15/05) ──────────────────────
@@ -4306,6 +4972,67 @@ export function startServer(opts: {
         // The ONLY time this token exists outside the requesting device. Nothing stores it here.
         return json({ token: claimed.token, label: parsed.label }, req.headers.get("accept-encoding"));
       }
+      // ── Pairing by a request a paired phone approves (ADR 0139, bridge/pair-request.ts) ──
+      // Making a request is OPEN, as `POST /api/pair` is and under the same front-door rule: a
+      // same-origin `Origin` for a write. It grants nothing alone. A token is minted only on a paired
+      // device's tap on the right code, and the creator caps are in the book (3 open, 6 per source in
+      // 10 minutes, keyed like the `/api/pair` limiter).
+      if (pathname === "/api/pair/request" && req.method === "POST") {
+        const gate = checkAccess(req, cfg, "write");
+        if (!gate.ok) return text(gate.reason, 403);
+        const peer = peerAddress(req);
+        const forwardedFor = req.headers.get("x-forwarded-for");
+        return secure(
+          await pairRequestCreateRoute(pairRequestDeps, {
+            source: pairSourceKey(peer, isLoopbackPeer(peer), forwardedFor),
+            route: pairRoute(peer, isLoopbackPeer(peer), forwardedFor),
+            userAgent: req.headers.get("user-agent"),
+          }),
+        );
+      }
+      // The asking browser's poll: open, its credential is the poll secret in a header (never the URL).
+      // An unknown id and a wrong secret are the same 404.
+      const pairRequestMatch = pathname.match(PAIR_REQUEST_ROUTE);
+      if (pairRequestMatch && req.method === "GET") {
+        const gate = checkAccess(req, cfg, "read");
+        if (!gate.ok) return text(gate.reason, 403);
+        return secure(await pairRequestPollRoute(pairRequestDeps, pairRequestMatch[1]!, req.headers.get(POLL_HEADER)));
+      }
+      // Its cancel: the same secret, the same 404, and the write's `Origin` rule.
+      if (pairRequestMatch && req.method === "DELETE") {
+        const gate = checkAccess(req, cfg, "write");
+        if (!gate.ok) return text(gate.reason, 403);
+        return secure(await pairRequestCancelRoute(pairRequestDeps, pairRequestMatch[1]!, req.headers.get(POLL_HEADER)));
+      }
+      // The approver: a paired device's token with the write right, the trick switch's gate (a read is
+      // `device-read`, the same device factors without the write's Origin rule). The host's local
+      // credential, an unpaired browser, a header-allowlisted device with no token and a crew forward
+      // are all refused here, before the book is asked anything.
+      const pairApproveMatch = pathname.match(PAIR_APPROVE_ROUTE);
+      if (pairApproveMatch && (req.method === "GET" || req.method === "POST")) {
+        const denied = guard(req, cfg, pairApproveGateLevel(req.method), pairingGate);
+        if (denied) return denied;
+        // The approver's own device: its label for the audit line, and its expiry, which the new device
+        // inherits (never longer than the approver's access).
+        const approverDevice = pairing?.resolve(bearerToken(req.headers)) ?? null;
+        const approverExpiresAt = approverDevice?.expiresAt;
+        if (req.method === "GET") return secure(await pairApproveReadRoute(pairRequestDeps, pairApproveMatch[1]!, { approverExpiresAt }));
+        let body: JsonValue | undefined;
+        try {
+          // SAFETY: `Request.json()` output IS a JsonValue by construction; `parseApproveBody` checks every field.
+          body = (await req.json()) as JsonValue;
+        } catch {
+          body = undefined;
+        }
+        const peer = peerAddress(req);
+        return secure(
+          await pairApproveAnswerRoute(pairRequestDeps, pairApproveMatch[1]!, body, {
+            approver: approverDevice?.label ?? pairedLabel(req, pairingGate) ?? "unknown",
+            approverRoute: pairRoute(peer, isLoopbackPeer(peer), req.headers.get("x-forwarded-for")),
+            approverExpiresAt,
+          }),
+        );
+      }
       if (pathname === "/api/crew" && req.method === "GET") {
         // Read-level, exactly like `/api/devices` and `/api/config`: this is a report about machines
         // the operator already owns, and it drives nothing. Every field is a fact this process was
@@ -4394,11 +5121,9 @@ export function startServer(opts: {
         if (!revoked) {
           return jsonError(apiError("device.unknown"), 404, req.headers.get("accept-encoding"));
         }
-        audit.record({ action: "device.revoke", device: whois(req).device, detail: { label } });
-        // The rows that device added from its phone go with it, here and on every crew member (ADR 0094).
-        await forgetDevice(label, "device-revoked");
-        // Seen now, so the watch does not report the same label a second time.
-        revokeWatch(pairedLabels());
+        // The audit line, the rows that device added from its phone (here and on every crew member,
+        // ADR 0094), and the watch told, so it does not report the same label a second time.
+        await deviceRevoked(label, whois(req).device);
         let after: DevicesResponseBody;
         try {
           const current = pairing.resolve(bearerToken(req.headers))?.label ?? null;
@@ -4426,7 +5151,9 @@ export function startServer(opts: {
       // the bridge refuses a stale session. Collie never routes it. If a request gets this far, no
       // proxy claimed it — say so, instead of letting the SPA fallback answer with the app shell and
       // leave the operator staring at the UI they were trying to escape.
-      if (isReservedAuthPath(pathname)) return reservedAuthPlaceholder(cfg.basePath);
+      if (isReservedAuthPath(pathname)) {
+        return cfg.authReturn ? reservedAuthReturn(cfg.basePath) : reservedAuthPlaceholder(cfg.basePath);
+      }
 
       // ── The math engines (ADR 0132) ──────────────────────────────────────
       // From the store's pack of the running version, else `web/dist/math/` beside a source build,
@@ -4576,16 +5303,18 @@ export function hasSplitUrl(ansiText: string): boolean {
 /**
  * What the bridge knows about a pane that its multiplexer may not, for a `recent` read of it
  * (mux/types.ts `MuxReadHint`): `blocked` when the state engine reads the pane as waiting on a
- * person. The engine lifts a pane whose screen shows an ask to `blocked` even when the multiplexer
- * reports `working` (state-engine.ts `liftScreenAsks`), which is the case herdr-core cannot see on
- * its own: pi under a dialog. `undefined` when the engine knows nothing to add.
+ * person's answer. The engine lifts a pane whose screen shows an ask to `blocked` even when the
+ * multiplexer reports `working` (state-engine.ts `liftScreenAsks`), which is the case herdr-core cannot
+ * see on its own: pi under a dialog. A pane that stopped on an error (`blockedBy: "error"`) waits on no
+ * answer, so it gets no hint and Load older reads its history. `undefined` when the engine knows
+ * nothing to add.
  */
 export function paneReadHint(
-  engine: { current(): { readonly agents: readonly Pick<AgentView, "paneId" | "status">[] } },
+  engine: { current(): { readonly agents: readonly Pick<AgentView, "paneId" | "status" | "blockedBy">[] } },
   paneId: string,
 ): MuxReadHint | undefined {
   const pane = engine.current().agents.find((agent) => agent.paneId === paneId);
-  return pane?.status === "blocked" ? { blocked: true } : undefined;
+  return pane !== undefined && isQuestionPane(pane) ? { blocked: true } : undefined;
 }
 
 /**
@@ -4593,7 +5322,7 @@ export function paneReadHint(
  * and the purpose when it is `older`. A request without `purpose` is a `poll` (mux/types.ts
  * `MuxGridRequest.purpose`), so the mirror's refresh and the bridge's own checks leave it out.
  */
-function recentRead(lines: number, hint: MuxReadHint | undefined, purpose: MuxReadPurpose = "poll"): MuxGridRequest {
+export function recentRead(lines: number, hint: MuxReadHint | undefined, purpose: MuxReadPurpose = "poll"): MuxGridRequest {
   const base = { scope: "recent", lines, styling: "preserve" } as const;
   const hinted: MuxGridRequest = hint === undefined ? base : { ...base, hint };
   return purpose === "older" ? { ...hinted, purpose } : hinted;
@@ -4604,6 +5333,14 @@ function recentRead(lines: number, hint: MuxReadHint | undefined, purpose: MuxRe
  * `GET /api/pane/:id?lines=N&purpose=older`. Any other value, or none, is the mirror's poll.
  */
 export const PANE_READ_PURPOSE_PARAM = "purpose";
+
+/**
+ * The query word with which a narrow client opts in to `logicalText` (soft wraps undone, SGR styling
+ * kept) on every read when the multiplexer implements `readLogicalText`:
+ * `GET /api/pane/:id?logical=1`. Without it, `logicalText` is sent (SGR-stripped) only when the grid
+ * shows a split URL (`hasSplitUrl`).
+ */
+export const PANE_READ_LOGICAL_PARAM = "logical";
 
 export async function readPane(
   herdr: MuxAdapter,
@@ -4630,21 +5367,23 @@ export async function readPane(
     // is the phone's Load older; every other read is the mirror's poll, which herdr-core answers from
     // the screen alone.
     const purpose: MuxReadPurpose = url.searchParams.get(PANE_READ_PURPOSE_PARAM) === "older" ? "older" : "poll";
+    const wantLogical = url.searchParams.get(PANE_READ_LOGICAL_PARAM) === "1";
     const read = await herdr.readGrid(paneId, recentRead(lines, hint, purpose));
     if (!read.ok) return text(`${herdr.mux} read failed: ${read.detail}`, 502);
     // A URL the pane's column edge cut in two is the one thing the mirror cannot repair on its own,
-    // and the repair needs the same rows with soft wraps undone. Ask for them only when the grid
-    // shows such a URL — this is a second round trip, and a multiplexer without the source has
-    // nothing to give. Same `lines` and the same escape-carrying form as the grid read above, so a
-    // read that would move the operator's screen here is the one `readGrid` already refuses.
+    // and the repair needs the same rows with soft wraps undone. Ask for them when the grid shows
+    // such a URL, or when a narrow client explicitly opted in (`?logical=1`) — this is a second
+    // round trip, and a multiplexer without the source has nothing to give. Same `lines` and the
+    // same escape-carrying form as the grid read above, so a read that would move the operator's
+    // screen here is the one `readGrid` already refuses.
     const logical =
-      herdr.readLogicalText !== undefined && hasSplitUrl(read.value.text)
+      herdr.readLogicalText !== undefined && (wantLogical || hasSplitUrl(read.value.text))
         ? await herdr.readLogicalText(paneId, lines)
         : undefined;
     const data = paneReadResponse(
       paneId,
       read.value,
-      logical?.ok ? stripSgr(logical.value) : undefined,
+      logical?.ok ? (wantLogical ? logical.value : stripSgr(logical.value)) : undefined,
       cfg.redact,
     );
     // ETag is derived from the serialised body — if content hasn't changed the client gets a 304
@@ -5507,6 +6246,19 @@ export async function filesExist(
 }
 
 /**
+ * The Files root of one of this machine's AGENT panes, the one the Files view reads for it (a trick's
+ * inputs, M99): `{ root }`, `{ root: null }` when the pane has no folder narrow enough to read, or null
+ * when the id names no agent pane in any runtime here, or more than one: a shell pane, a trick's pane, a
+ * pane of another machine and an unknown id alike.
+ */
+export async function agentPaneFilesRoot(snaps: readonly RootSnapshot[], paneId: string, home: string): Promise<{ root: string | null } | null> {
+  const hits = snaps.flatMap((snap) => snap.agents.filter((a) => a.paneId === paneId && (a.kind ?? "agent") === "agent").map((pane) => ({ snap, pane })));
+  if (hits.length !== 1) return null;
+  const { snap, pane } = hits[0]!;
+  return { root: paneFilesRootOf(await paneWorkspaceRoot(rootOfWorkspace(snap, pane.workspaceId, home), pane.cwd), pane.cwd, home) };
+}
+
+/**
  * The Files root of a pane or a workspace, the one the Files read picks for the same subject: a
  * pane's workspace root as that pane sees it ({@link paneWorkspaceRoot}, #509), else its own cwd
  * when that is bounded; a workspace's root. `null` when there is none, or no such pane or workspace.
@@ -5622,6 +6374,15 @@ export async function sendReplySteps(
   submit: boolean,
   submitKeys: string[],
 ): Promise<ReplyOutcome> {
+  // The text and its submit under the pane's machine-wide lock (M102 spec 16): while another bridge writes
+  // into the pane, nothing is typed. The press inside joins this hold.
+  return gateFor(client).hold(paneId, REPLY_SPAN_MS, () => replySteps(client, paneId, txt, submit, submitKeys), () => ({ ok: false, textDelivered: false, ...apiError("reply.send_failed", { reason: PANE_BUSY }) }));
+}
+
+/** The longest the reply steps hold the machine-wide pane lock: one text write and one key press. */
+const REPLY_SPAN_MS = 20_000;
+
+async function replySteps(client: ReplySender, paneId: string, txt: string, submit: boolean, submitKeys: string[]): Promise<ReplyOutcome> {
   let textDelivered = false;
   // One shape for both ways a step can fail — a refusal the adapter returned and an exception it
   // let escape — so the partial-delivery branch cannot drift between them.
@@ -5640,6 +6401,9 @@ export async function sendReplySteps(
   try {
     if (txt) {
       const typed = await client.typeText(paneId, txt);
+      // Text not confirmed in time may still land (M100 spec 03): no submit follows, and the answer
+      // flags it delivered, so a resend-on-error screen holds off.
+      if (!typed.ok && typed.reason === "unconfirmed") return { ok: false, textDelivered: true, ...apiError("reply.send_failed", { reason: typed.detail }) };
       if (!typed.ok) return failed(typed.detail);
       textDelivered = true;
     }
@@ -5647,6 +6411,9 @@ export async function sendReplySteps(
       // Through the key gate, like every key the bridge sends (M56 spec 05). This route keeps its
       // own guard: no revision check, the adapter's answer unchanged.
       const sent = await gateFor(client).press(paneId, submitKeys, "legacy_reply");
+      // A submit not confirmed in time may still land: "not confirmed", never "not submitted", so nobody
+      // submits it a second time by hand (the keys route's answer, M100 spec 03).
+      if (!sent.ok && sent.reason === "unconfirmed") return { ok: false, textDelivered, ...apiError("keys.unconfirmed", { reason: sent.detail }) };
       if (!sent.ok) return failed(sent.detail);
     }
     return { ok: true, textDelivered };
@@ -5671,6 +6438,11 @@ export interface PaneReadyOptions {
   readonly pollMs?: number;
   readonly floorMs?: number;
   readonly ceilingMs?: number;
+  /**
+   * A screen is ready only when this also holds for its text. The launch into a pane it FOUND (not one the
+   * create call answered with) asks for a shell prompt on the last row; absent, a settled non-blank screen is enough.
+   */
+  readonly accepts?: (screen: string) => boolean;
 }
 
 /** One poll of the new pane's screen. Small: a prompt is one short line at the top of a fresh shell. */
@@ -5727,7 +6499,7 @@ export async function awaitPaneReady(
       // Swallowed on purpose: an unreadable brand-new pane is "not ready yet", not a failure.
     }
     const elapsed = now() - started;
-    if (current !== null && current.trim() !== "" && current === previous && elapsed >= floorMs) {
+    if (current !== null && current.trim() !== "" && current === previous && elapsed >= floorMs && (opts.accepts?.(current) ?? true)) {
       return { ready: true, ms: elapsed };
     }
     previous = current;
@@ -5837,7 +6609,9 @@ export async function replyThroughProtocol(
   const { pane: target, ...asked } = request;
   // A request id the caller minted is the phone's, on a crew member's pane (M56 spec 06): a person's
   // send, which may steer (M69). A caller that names no id is not the phone and never steers.
-  const sendRequest: SendRequest = fields.id === undefined ? asked : { ...asked, fromPhone: true };
+  // The same goes for the person's word (M102 spec 01): only the phone's own commit tap carries an override.
+  const { override: _word, ...anonymous } = asked;
+  const sendRequest: SendRequest = fields.id === undefined ? anonymous : { ...asked, fromPhone: true };
   const answer = await send.protocol.handle(sendRequest, { session, paneId: target, harness });
   const receipt = answer.receipt;
   const auditDetail: AuditDetail = { mode: sendRequest.mode, submit: true, textLength: words.length };
@@ -5847,7 +6621,7 @@ export async function replyThroughProtocol(
     auditDetail.probed = receipt.keys.includes("probe");
   }
   context.audit.record({ action: "reply", paneId, session, device: context.device, detail: auditDetail });
-  const shown: SendAnswer = context.redact && answer.surface !== undefined ? { ...answer, surface: maskSurface(answer.surface) } : answer;
+  const shown: SendAnswer = context.redact ? maskedAnswer(answer) : answer;
   const outcome = receipt?.outcome;
   // A held send (M56 spec 15) is taken: Collie sends it when the turn ends.
   if (outcome === undefined || outcome === "sent" || outcome === "effective" || outcome === "steered" || outcome === "discarded" || outcome === "held") return json({ ok: true, send: shown } satisfies ReplyProtocolResponse, context.acceptEncoding);
@@ -5910,7 +6684,7 @@ export async function replyPane(
     return json(refusal, ae);
   }
   const binding = expected.present
-    ? await checkPromptBinding(herdr, cfg, paneId, expected.value, styled.value, columns.value, tail.value, send.readHint)
+    ? await checkPromptBinding(herdr, cfg, paneId, expected.value, styled.value, columns.value, tail.value, send.readHint, expected.parts)
     : null;
   if (binding && !binding.ok) {
     audit.record({
@@ -5935,6 +6709,14 @@ export async function replyPane(
     return replyThroughProtocol(send, paneId, session, fields, { audit, device, redact: cfg.redact, acceptEncoding: ae });
   }
   if (submit && binding === null) return text("a submit with no text needs expected_prompt", 400);
+  // One head, one door (agent views SECURITY rule 7, review 9 R2): the raw text this route types with
+  // `submit: false` never passes the Send Protocol, so it is read for a view head here, before any key.
+  // A crew member answers its lead's forwarded reply through this same function.
+  if (txt !== "" && hasViewHead(txt)) {
+    audit.record({ action: "reply", paneId, session, device, detail: { submit, submitted: false, textDelivered: false, reason: "bad_head" } });
+    const refusal: ActionResponse = { ok: false, textDelivered: false, ...apiError("reply.send_failed", { reason: BAD_HEAD }) };
+    return json(refusal, ae);
+  }
   const outcome = await sendReplySteps(herdr, paneId, txt, submit, cfg.submitKeys);
   const replyDetail: AuditDetail = {
     text: txt,
@@ -5997,7 +6779,7 @@ export async function keysPane(
   if (keys.length === 0) return text("no keys", 400);
   const ae = req.headers.get("accept-encoding");
   const binding = expected.present
-    ? await checkPromptBinding(herdr, cfg, paneId, expected.value, styled.value, columns.value, tail.value, hint)
+    ? await checkPromptBinding(herdr, cfg, paneId, expected.value, styled.value, columns.value, tail.value, hint, expected.parts)
     : null;
   if (binding && !binding.ok) {
     audit.record({
@@ -6033,6 +6815,11 @@ export async function keysPane(
     audit.record({ action: "keys", paneId, session, device, detail: keysDetail });
     return json({ ok: false, ...apiError("keys.unconfirmed", { reason: sent.detail }) } satisfies ActionResponse, ae);
   }
+  // Another bridge writes into this pane (M102 spec 16): no key left. One record with the code, never the keys' words.
+  if (isPaneBusy(sent)) {
+    recordRefusal(audit, { action: "keys", by: "bridge", outcome: "refused", reason: "pane_busy", paneId, session, device });
+    return withRefusal(json({ ok: false, ...apiError("keys.send_failed", { reason: sent.detail }) } satisfies ActionResponse, ae), "bridge", "pane_busy");
+  }
   if (binding) {
     audit.record({
       action: "keys",
@@ -6048,16 +6835,41 @@ export async function keysPane(
   );
 }
 
+/**
+ * `value` is the region as one text: the whole binding, or, with `parts`, the parts joined by line
+ * breaks, for the read's size and the audit line. `parts` is set when the phone sent the region as
+ * ORDERED LITERAL PARTS (`PromptModel.bindParts`): rows it left out between them, because they redraw
+ * by themselves, and `verifyPromptParts` checks the rest.
+ */
 type ExpectedPrompt =
   | { ok: true; present: false }
-  | { ok: true; present: true; value: string }
+  | { ok: true; present: true; value: string; parts?: readonly string[] }
   | { ok: false };
 
+/**
+ * The optional `expected_prompt` body field: a string, or a list of 2 to `MAX_PROMPT_PARTS` non-empty
+ * strings. The list form arrived after 1.29.0-edge.3. A bridge from before it answers a list with
+ * 400 "bad expected_prompt" (it accepted a string only) and types nothing, which is why the phone
+ * sends a list only when the dialog holds a row that redraws by itself, and the plain string always
+ * else. A list refines nothing: it cannot be combined with `expected_styled` or `expected_columns`.
+ */
 function expectedPrompt(body: JsonObject): ExpectedPrompt {
   if (!Object.prototype.hasOwnProperty.call(body, "expected_prompt")) {
     return { ok: true, present: false };
   }
   const value = body.expected_prompt;
+  if (Array.isArray(value)) {
+    if (value.length < 2 || value.length > MAX_PROMPT_PARTS) return { ok: false };
+    const parts: string[] = [];
+    for (const part of value) {
+      if (typeof part !== "string" || part.length === 0) return { ok: false };
+      parts.push(part);
+    }
+    const whole = parts.join("\n");
+    if (whole.length > MAX_EXPECTED_PROMPT_CHARS) return { ok: false };
+    if (body.expected_styled !== undefined || body.expected_columns !== undefined) return { ok: false };
+    return { ok: true, present: true, value: whole, parts };
+  }
   if (typeof value !== "string" || value.length > MAX_EXPECTED_PROMPT_CHARS) {
     return { ok: false };
   }
@@ -6192,11 +7004,14 @@ async function checkPromptBinding(
   columns?: ColumnRange,
   tailLines?: number,
   hint?: MuxReadHint,
+  parts?: readonly string[],
 ): Promise<PromptBindingCheck> {
   const tailWindow = tailLines ?? DEFAULT_PROMPT_TAIL_LINES;
   let fresh: MuxGrid;
   try {
-    const expectedRawLines = expected.split(/\r\n?|\n/).length;
+    // A list binding leaves rows out between its parts; the read must hold them too.
+    const leftOut = parts === undefined ? 0 : (parts.length - 1) * MAX_PART_GAP_ROWS;
+    const expectedRawLines = expected.split(/\r\n?|\n/).length + leftOut;
     const bindingReadLines = Math.min(
       MAX_READ_LINES,
       Math.max(
@@ -6224,7 +7039,9 @@ async function checkPromptBinding(
   const freshText = cfg.redact ? redactAnsi(fresh.text) : fresh.text;
   // With `expected_columns`, both checks run on the read cut to those columns (verifyPromptBinding).
   // With `expected_tail_lines`, the match may end that many non-blank rows from the read's end.
-  const result = verifyPromptBinding(freshText, expected, expectedStyledLines, columns, tailWindow);
+  // A list binding (`parts`) is checked part by part, in order (verifyPromptParts); it never carries a
+  // style or a column range (expectedPrompt refuses that body).
+  const result: PromptBindingVerdict = parts === undefined ? verifyPromptBinding(freshText, expected, expectedStyledLines, columns, tailWindow) : verifyPromptParts(freshText, parts, tailWindow);
   if (!result.ok) {
     const refused: Extract<PromptBindingCheck, { ok: false }>["audit"] = {
       checked: true,
@@ -6256,7 +7073,7 @@ async function checkPromptBinding(
   // A throw in the shadow check must never cost the tap, so it records nothing then.
   let shadow: BindingShadow | undefined;
   try {
-    shadow = composerBelowShadow(freshText, expected, columns);
+    shadow = composerBelowShadow(freshText, parts === undefined ? expected : parts.at(-1)!, columns);
   } catch {
     shadow = undefined;
   }
@@ -6459,12 +7276,16 @@ export function normalizeTabLabel(
 // Set a tab's label. Structural metadata op — strictly less powerful than the text/keys injection the
 // bridge already allows, so it stays within the existing remote-shell threat model. A tab has no
 // "clear" (see normalizeTabLabel): a blank label is a 400, not a reset to the tab number.
-async function renameTab(
-  herdr: MuxAdapter,
-  engine: StateEngine,
+//
+// The tab is all it renames. A one-pane tab's name already names its session through the name rule
+// (pane-name.ts `givenName`: a person's names come before the agent's title, #815), so no pane label is
+// copied from it; a copy would go stale at the next rename made anywhere else.
+export async function renameTab(
+  herdr: Pick<MuxAdapter, "renameTab" | "refresh">,
+  engine: Pick<StateEngine, "pokeNow">,
   tabId: string,
   req: Request,
-  audit: AuditLog,
+  audit: Pick<AuditLog, "record">,
   device: string | null,
   session: string,
 ): Promise<Response> {
@@ -6561,13 +7382,14 @@ async function closeTab(
 // Create a new tab in a workspace, opening a fresh shell pane (you then launch your own agent in
 // it). Structural — no more privilege than typing into an existing pane (you can already spawn a
 // shell that way). `cwd` omitted => inherits the workspace dir. session.* stays unexposed.
-async function createTab(
+export async function createTab(
   herdr: MuxAdapter,
   engine: StateEngine,
   req: Request,
   audit: AuditLog,
   device: string | null,
   session: string,
+  deps: CreateDeps = {},
 ): Promise<Response> {
   let body: JsonValue;
   try {
@@ -6588,37 +7410,55 @@ async function createTab(
   if (!workspaceId) {
     return json({ ok: false, ...apiError("tab.workspace_required") } satisfies CreateResponse, ae);
   }
-  const outcome = await herdr.createTab({ spaceId: workspaceId, label: tabLabel, cwd });
-  if (!outcome.ok) {
-    return json(
-      { ok: false, ...apiError("tab.create_failed", { reason: outcome.detail }) } satisfies CreateResponse,
-      ae,
-    );
-  }
-  const created = outcome.value;
-  // The adapter answers with the space id when the create call doesn't carry a label back; the
-  // snapshot we already hold knows the real one, and that lookup is cheaper than a round trip.
-  const workspaceLabel =
-    engine.current().workspaces.find((w) => w.workspaceId === created.spaceId)?.label ??
-    created.spaceLabel;
-  audit.record({
-    action: "tab.create",
-    paneId: created.paneId,
-    session,
-    device,
-    detail: { workspaceId, label: tabLabel, cwd },
-  });
-  await settleTopology(herdr, engine);
-  return json({
-    ok: true,
-    pane: {
-      paneId: created.paneId,
-      workspaceId: created.spaceId,
-      workspaceLabel,
-      tabId: created.tabId,
-      cwd: created.cwd,
-    },
-  } satisfies CreateResponse, ae);
+  const receipts = deps.receipts ?? memoryLaunchReceipts();
+  const rawId = fields.requestId;
+  if (rawId !== undefined && !isRequestId(rawId)) return text("bad requestId", 400);
+  const requestId = rawId;
+  const clock = deps.wait ?? {};
+  const deadline = deps.deadline ?? {};
+  const earlier = requestId === undefined ? null : earlierLaunch(receipts, requestId);
+  if (earlier !== null) return launchJson(await withinDeadline(earlier, deadline), ae);
+  const work = (async (): Promise<LaunchAnswer> => {
+    const made = await createRecorded({
+      herdr,
+      receipts,
+      requestId,
+      wanted: { kind: "tab", spaceId: workspaceId, cwd, label: tabLabel },
+      failed: "tab.create_failed",
+      clock,
+      call: () => herdr.createTab({ spaceId: workspaceId, label: tabLabel, cwd }),
+    });
+    if (!made.ok) return made.answer;
+    const created = made.pane;
+    return guardPending(receipts, requestId, async () => {
+      // The adapter answers with the space id when the create call doesn't carry a label back; the
+      // snapshot we already hold knows the real one, and that lookup is cheaper than a round trip.
+      const workspaceLabel =
+        engine.current().workspaces.find((w) => w.workspaceId === created.spaceId)?.label ??
+        created.spaceLabel;
+      audit.record({
+        action: "tab.create",
+        paneId: created.paneId,
+        session,
+        device,
+        detail: { workspaceId, label: tabLabel, cwd, requestId },
+      });
+      await settleTopology(herdr, engine);
+      await settleCreate(receipts, requestId, created, workspaceLabel);
+      return {
+        ok: true,
+        pane: {
+          paneId: created.paneId,
+          workspaceId: created.spaceId,
+          workspaceLabel,
+          tabId: created.tabId,
+          cwd: created.cwd,
+        },
+      } satisfies LaunchAnswer;
+    });
+  })();
+  if (requestId !== undefined) receipts.track(requestId, work);
+  return launchJson(await withinDeadline(work, deadline), ae);
 }
 
 // Create a new workspace ("space") with a fresh shell pane. `cwd` defaults to the session's folder
@@ -6641,6 +7481,7 @@ export async function createWorkspace(
   folders?: Pick<FolderSurface, "recordRecent">,
   // The operator's folder for this session (`spaces.toml` `[folders]`), already checked to exist.
   sessionFolder?: string,
+  deps: CreateDeps = {},
 ): Promise<Response> {
   let body: JsonValue;
   try {
@@ -6657,34 +7498,184 @@ export async function createWorkspace(
   const cwd = typed || sessionFolder || homedir();
   const label = typeof fields.label === "string" ? fields.label : undefined;
   const ae = req.headers.get("accept-encoding");
-  const outcome = await herdr.createSpace({ cwd, label });
-  if (!outcome.ok) {
-    return json(
-      { ok: false, ...apiError("workspace.create_failed", { reason: outcome.detail }) } satisfies CreateResponse,
-      ae,
-    );
+  const receipts = deps.receipts ?? memoryLaunchReceipts();
+  const rawId = fields.requestId;
+  if (rawId !== undefined && !isRequestId(rawId)) return text("bad requestId", 400);
+  const requestId = rawId;
+  const clock = deps.wait ?? {};
+  const deadline = deps.deadline ?? {};
+  const earlier = requestId === undefined ? null : earlierLaunch(receipts, requestId);
+  if (earlier !== null) return launchJson(await withinDeadline(earlier, deadline), ae);
+  const work = (async (): Promise<LaunchAnswer> => {
+    const made = await createRecorded({
+      herdr,
+      receipts,
+      requestId,
+      wanted: { kind: "space", cwd, label },
+      failed: "workspace.create_failed",
+      clock,
+      call: () => herdr.createSpace({ cwd, label }),
+    });
+    if (!made.ok) return made.answer;
+    const created = made.pane;
+    return guardPending(receipts, requestId, async () => {
+      audit.record({
+        action: "workspace.create",
+        paneId: created.paneId,
+        session,
+        device,
+        detail: { label, cwd, requestId },
+      });
+      // Never throws: a list that could not be saved costs a Recent entry, never the space just made.
+      if (typed !== "" && folders !== undefined) await folders.recordRecent(created.cwd);
+      await settleTopology(herdr, engine);
+      await settleCreate(receipts, requestId, created, created.spaceLabel);
+      return {
+        ok: true,
+        pane: {
+          paneId: created.paneId,
+          workspaceId: created.spaceId,
+          workspaceLabel: created.spaceLabel,
+          tabId: created.tabId,
+          cwd: created.cwd,
+        },
+      } satisfies LaunchAnswer;
+    });
+  })();
+  if (requestId !== undefined) receipts.track(requestId, work);
+  return launchJson(await withinDeadline(work, deadline), ae);
+}
+
+/** What a tab or space create reaches beyond its request. Every field defaults for a test. */
+export interface CreateDeps {
+  /** The receipts of launches and creates that carry a request id. Absent: an in-memory store. */
+  receipts?: LaunchReceiptSurface;
+  /** The clock the look at the snapshot runs on (bridge/create-confirm.ts); production passes nothing. */
+  wait?: LookClock;
+  /** The clock the member's one deadline ({@link MEMBER_DEADLINE_MS}) runs on; production passes nothing. */
+  deadline?: LookClock;
+}
+
+/**
+ * How a create that may have timed out came out. `looked` is set when the pane was NOT the create's own
+ * answer but one found in the snapshot, and holds what the snapshot called its agent: a pane found that way
+ * is a guess until the route has read that it is a bare shell.
+ */
+type CreateMade =
+  | { readonly ok: true; readonly pane: MuxCreatedPane; readonly looked: { readonly agent: string } | null }
+  | { readonly ok: false; readonly answer: LaunchAnswer };
+
+/**
+ * The part of a launch, a tab or a space create that asks the multiplexer for the pane (M100 spec 04).
+ * A receipt `pending` is written first when the request carries an id. A fresh snapshot is read right
+ * before the create, as the look's "before". The create then runs; one that timed out (`unconfirmed`) is
+ * looked up in the snapshot (bridge/create-confirm.ts). The result is the pane, or the answer to give: a
+ * plain failure only when the multiplexer REFUSED the create (the receipt is forgotten, so the id may run
+ * again), or `write_outcome_unknown` when it did not answer and the look did not find the pane (the receipt
+ * becomes `unknown` and stays: "not seen in 4 s" is a time-out, and the create may land after it). A throw
+ * settles the receipt too: `unknown` once the multiplexer was asked, forgotten before.
+ */
+async function createRecorded(job: {
+  herdr: Pick<MuxAdapter, "snapshot">;
+  receipts: LaunchReceiptSurface;
+  requestId: string | undefined;
+  wanted: CreateWanted;
+  failed: "workspace.create_failed" | "tab.create_failed";
+  clock: LookClock;
+  call: () => Promise<MuxOutcome<MuxCreatedPane>>;
+}): Promise<CreateMade> {
+  const { receipts, requestId } = job;
+  let written = false;
+  let asked = false;
+  let handedOn = false;
+  try {
+    if (requestId !== undefined) {
+      await receipts.record({ requestId, at: Date.now(), state: "pending" });
+      written = true;
+    }
+    const known = await snapshotBefore(job.herdr, job.clock);
+    asked = true;
+    const outcome = await job.call();
+    if (outcome.ok) {
+      handedOn = true;
+      return { ok: true, pane: outcome.value, looked: null };
+    }
+    if (outcome.reason === "unconfirmed") {
+      // Without a "before" nothing can be told apart from what was already there: the look is not run.
+      const look = known === null ? ({ kind: "unread" } as const) : await lookForCreated(job.herdr, known, job.wanted, job.clock);
+      if (look.kind === "found") {
+        handedOn = true;
+        return { ok: true, pane: look.pane, looked: { agent: look.agent } };
+      }
+      // Nothing found is not nothing made: the look ended at its bound, and the adapter's own call may land
+      // after it. The receipt is kept as `unknown`, so the same id answers unknown and never creates again.
+      if (requestId !== undefined) await receipts.record({ requestId, at: Date.now(), state: "unknown" });
+      handedOn = true;
+      return { ok: false, answer: unknownCreate(outcome.detail) };
+    }
+    if (requestId !== undefined) await receipts.forget(requestId);
+    handedOn = true;
+    return { ok: false, answer: { ok: false, ...apiError(job.failed, { reason: outcome.detail }) } };
+  } finally {
+    // A throw (an adapter that did not answer, a disk that did not write) must not leave `pending` behind.
+    if (written && !handedOn && requestId !== undefined) {
+      if (asked) await receipts.record({ requestId, at: Date.now(), state: "unknown" });
+      else await receipts.forget(requestId);
+    }
   }
-  const created = outcome.value;
-  audit.record({
-    action: "workspace.create",
+}
+
+/**
+ * Run the steps after a create that made a pane. A throw in one leaves the receipt `pending` for ever:
+ * the pane is there and the id must not run again, so it becomes `unknown` and the throw goes on.
+ */
+async function guardPending<T>(receipts: LaunchReceiptSurface, requestId: string | undefined, run: () => Promise<T>): Promise<T> {
+  try {
+    return await run();
+  } catch (err) {
+    const held = requestId === undefined ? undefined : receipts.get(requestId);
+    if (requestId !== undefined && held !== undefined && isUnsettled(held) && held.state === "pending") {
+      await receipts.record({ requestId, at: Date.now(), state: "unknown" });
+    }
+    throw err;
+  }
+}
+
+/**
+ * One deadline on the member's whole run of a launch, a tab or a space create ({@link MEMBER_DEADLINE_MS}).
+ * Past it the answer is `write_outcome_unknown` at once, and the run goes on: it settles its own receipt as
+ * the pane or as unknown, and a retap with the same id joins it or replays it.
+ */
+async function withinDeadline(run: Promise<LaunchAnswer>, clock: LookClock): Promise<LaunchAnswer> {
+  const answer = await withinTime(run, MEMBER_DEADLINE_MS, clock);
+  return answer === "timeout" ? unknownCreate(LAUNCH_UNKNOWN_TEXT) : answer;
+}
+
+/** The create that made a pane, settled: the pending receipt becomes the pane it names. */
+async function settleCreate(receipts: LaunchReceiptSurface, requestId: string | undefined, created: MuxCreatedPane, workspaceLabel: string): Promise<void> {
+  if (requestId === undefined) return;
+  await receipts.record({
+    requestId,
+    at: Date.now(),
+    workspaceId: created.spaceId,
+    workspaceLabel,
     paneId: created.paneId,
-    session,
-    device,
-    detail: { label, cwd },
+    tabId: created.tabId,
+    cwd: created.cwd,
   });
-  // Never throws: a list that could not be saved costs a Recent entry, never the space just made.
-  if (typed !== "" && folders !== undefined) await folders.recordRecent(created.cwd);
-  await settleTopology(herdr, engine);
-  return json({
-    ok: true,
-    pane: {
-      paneId: created.paneId,
-      workspaceId: created.spaceId,
-      workspaceLabel: created.spaceLabel,
-      tabId: created.tabId,
-      cwd: created.cwd,
-    },
-  } satisfies CreateResponse, ae);
+}
+
+/** A create nobody could confirm: it says so and carries the multiplexer's own sentence. */
+function unknownCreate(detail: string): LaunchAnswer {
+  return { ok: false, code: "write_outcome_unknown", error: detail };
+}
+
+/** A launch or create answer as a response: `write_outcome_unknown` is the 504 the crew link already uses. */
+function launchJson(answer: LaunchAnswer, acceptEncoding: string | null): Response {
+  if (!answer.ok && "code" in answer && answer.code === "write_outcome_unknown") {
+    return forwardError("write_outcome_unknown", answer.error, 504);
+  }
+  return json(answer, acceptEncoding);
 }
 
 // ── Worktrees ────────────────────────────────────────────────────────────────
@@ -6737,7 +7728,7 @@ async function runWorktreeCreate(
   branch: string,
   base: string | undefined,
   // The row to start once the space is open, and `lead` when it is a lead row this member was sent.
-  launcher: Pick<PickedLaunch, "row" | "source">,
+  launcher: Pick<PickedLaunch, "row" | "source" | "afterTyped">,
   requestId: string | undefined,
   audit: AuditLog,
   device: string | null,
@@ -6761,7 +7752,15 @@ async function runWorktreeCreate(
     return { ok: false, ...apiError(added.code, { path: added.path, reason: added.detail }) };
   }
   if (!added.ok) return { ok: false, ...apiError(added.code, { reason: added.detail }) };
-  const opened = await herdr.createSpace({ cwd: added.path, label: branchSlug(branch) });
+  // `worktree` tells the adapter the folder is a linked checkout of this repo, so a multiplexer that
+  // keeps its own worktree record (Herdr) files the space under it. One that does not ignores it.
+  // A retry on a finished checkout (`existed`) first looks for the space that already shows it, so a
+  // multiplexer with no memory of the folder is never asked to open it twice (bridge/worktree-reuse.ts).
+  const reused = added.existed ? await spaceShowing(herdr, added.path) : null;
+  const opened =
+    reused !== null
+      ? muxOk(reused.pane)
+      : await herdr.createSpace({ cwd: added.path, label: branchSlug(branch), worktree: { repoRoot } });
   if (!opened.ok) {
     // The half-done case gets its OWN code, because the recovery is the opposite one: the checkout is
     // on disk and only the opening failed. It stays, and a retry finds it (`existed`) and only opens.
@@ -6778,9 +7777,13 @@ async function runWorktreeCreate(
   let launcherStarted = false;
   let launcherError: string | undefined;
   const row = launcher.row;
-  if (row !== undefined) {
+  if (row !== undefined && reused !== null && !reused.fresh) {
+    // The space was open before this request and its pane is not a bare shell: never type into it.
+    launcherError = "this folder was already open and its pane is in use, so the launcher was not started";
+  } else if (row !== undefined) {
     const sent = await typeIntoFreshShell(herdr, created.paneId, row.command, wait, "worktree");
     launcherStarted = sent.ok;
+    if (sent.ok) launcher.afterTyped?.(session, created.paneId);
     if (!sent.ok) launcherError = sent.error;
   }
   // `launcher` redacts under COLLIE_AUDIT_CONTENT=none like `command` on a launch; `requestId` is an
@@ -6799,6 +7802,7 @@ async function runWorktreeCreate(
       launcherStarted: row === undefined ? undefined : String(launcherStarted),
       path,
       source: launcher.source,
+      reusedSpace: reused === null ? undefined : "true",
     },
   });
   if (requestId !== undefined) {
@@ -6851,6 +7855,8 @@ export interface FolderWorktreeDeps {
   fs?: FolderFs;
   home?: string;
   readHerdrConfig?: HerdrConfigRead;
+  /** The "Worktree folder" setting: when set, it is where the default puts a branch. Absent is unset. */
+  folderSetting?: Pick<WorktreeFolderSettingSurface, "get">;
 }
 
 /** The repo `folder` sits in, or `null` when it is in none (or is not there). */
@@ -6935,8 +7941,26 @@ export async function planWorktree(
   if (branch !== "") {
     answer.branchValid = await gitAcceptsBranch(repo.repoRoot, branch, ask);
     if (answer.branchValid) {
-      const path = await herdrDefaultTarget(repo.repoRoot, branch, home, deps.readHerdrConfig);
-      answer.defaultTarget = await defaultTargetOf(repo.repoRoot, path, branch, deps.fs ?? diskFolderFs);
+      const fs = deps.fs ?? diskFolderFs;
+      const dir = deps.folderSetting?.get();
+      if (dir === undefined) {
+        const path = await herdrDefaultTarget(repo.repoRoot, branch, home, deps.readHerdrConfig);
+        answer.defaultTarget = await defaultTargetOf(repo.repoRoot, path, branch, fs);
+        answer.defaultSource = "rule";
+      } else {
+        // The setting runs the folder rule here as it does at create, so the sheet never promises a
+        // folder the create would refuse. A folder the child rule refuses is still where the default
+        // WOULD put it: shown as existing, with git's state, the way Herdr's own default is.
+        const set = await resolveSetFolderTarget({ dir, branch, repoRoot: repo.repoRoot, home, fs });
+        answer.defaultSource = "setting";
+        if (set.ok) answer.defaultTarget = await defaultTargetOf(repo.repoRoot, set.path, branch, fs);
+        else if (set.code === "worktree.target_exists" && set.path !== undefined) {
+          answer.defaultTarget = { path: set.path, exists: true };
+          if (set.detail !== undefined) answer.defaultTarget.reason = set.detail;
+        } else {
+          answer.defaultRefusal = apiError(set.code, folderRefusalDetail(set, dir));
+        }
+      }
       const parent = (url.searchParams.get("parent") ?? "").trim();
       if (parent !== "") {
         const outcome = await resolveParentTarget({ parent, branch, repoRoot: repo.repoRoot, home, fs: deps.fs });
@@ -7006,6 +8030,8 @@ export async function createWorktreeAt(
     harnesses?: Pick<HarnessProbe, "launch">;
     folders?: Pick<FolderSurface, "recordRecent">;
     wait?: PaneReadyOptions;
+    /** This machine's accounts (M101): an `account` on the body starts the agent under it. */
+    accounts?: Accounts;
   },
 ): Promise<Response> {
   const ae = req.headers.get("accept-encoding");
@@ -7041,10 +8067,11 @@ export async function createWorktreeAt(
   if (!parsedBase.ok) return refuse("worktree.invalid_base");
   const folder = parseFolderChoice(fields.folder);
   if (folder === null) return refuse("worktree.folder_invalid");
-  // `run` counts as named so a one-off line on a branch is refused (ADR 0095), never read as a shell.
-  const named = ["command", "harness", "shell", "run"].some((k) => fields[k] !== undefined && fields[k] !== null && fields[k] !== false);
+  // `run` counts as named so a one-off line on a branch is refused (ADR 0095), never read as a shell, and
+  // so do `account` and `signIn` (M101): alone they name no agent, and `pickLaunch` refuses them.
+  const named = ["command", "harness", "shell", "run", "account", "signIn"].some((k) => fields[k] !== undefined && fields[k] !== null && fields[k] !== false);
   const picked = named
-    ? await pickLaunch(fields, getLaunchers, deps.harnesses, null, leadRowGate(req, deps.viaCrew, home))
+    ? await pickLaunch(fields, getLaunchers, deps.harnesses, null, leadRowGate(req, deps.viaCrew, home), deps.accounts)
     : ({ kind: "shell", row: undefined } as const);
   if (picked instanceof Response) return picked;
   const cwd = askedFolder(fields.cwd, home);
@@ -7063,6 +8090,16 @@ export async function createWorktreeAt(
     const outcome = await resolveParentTarget({ parent: folder.parent, branch, repoRoot: repo.repoRoot, home, fs: deps.fs });
     if (!outcome.ok) return refuse(outcome.code, folderRefusalDetail(outcome, folder.parent));
     path = outcome.path;
+  }
+
+  // The default folder when the machine's "Worktree folder" setting is set: the same rule, run now.
+  // `path` stays the explicit parent only (it is what the sheet remembers); `target` is what is made.
+  let target = path;
+  const settingDir = folder.kind === "default" ? deps.folderSetting?.get() : undefined;
+  if (settingDir !== undefined) {
+    const outcome = await resolveSetFolderTarget({ dir: settingDir, branch, repoRoot: repo.repoRoot, home, fs: deps.fs });
+    if (!outcome.ok) return refuse(outcome.code, folderRefusalDetail(outcome, settingDir));
+    target = outcome.path;
   }
 
   // Checked again with no await between it and `track`, so two requests with one id that both got
@@ -7097,7 +8134,7 @@ export async function createWorktreeAt(
     receipts,
     deps.bases ?? memoryWorktreeBases(),
     deps.wait ?? {},
-    path,
+    target,
     { home, readHerdrConfig: deps.readHerdrConfig },
     remember,
   );
@@ -7352,6 +8389,103 @@ export async function serveLaunchCheckRoute(
   return json(checkRunLine(line) satisfies LaunchCheckResponse, req.headers.get("accept-encoding"));
 }
 
+// ── Accounts (M101, ADR 0141, bridge/accounts-routes.ts) ──────────────────────────────────────────
+//
+// Three routes: `GET /api/accounts` reads this machine's accounts, `POST /api/accounts` adds one and
+// `POST /api/accounts/remove` forgets one. The gate first, then the resolver (which forwards a `?host=`
+// call to the member whose folders they are), then THIS machine's own service. A bridge built with no
+// service, and every Windows host, answers the read with `accounts.unavailable`, and the app hides the
+// feature as it does for an older bridge.
+
+/** The accounts routes, or `null` when `pathname` is none of them. */
+export async function serveAccountsRoute(
+  req: Request,
+  pathname: string,
+  caller: Pick<RouteCaller, "gate" | "resolve" | "device" | "audit">,
+  accounts: Accounts | undefined,
+): Promise<Response | null> {
+  const ae = req.headers.get("accept-encoding");
+  if (pathname === "/api/accounts" && req.method === "GET") {
+    const denied = caller.gate("read");
+    if (denied) return denied;
+    const rt = await caller.resolve();
+    if (rt instanceof Response) return rt;
+    const body = accounts === undefined ? null : await accounts.body();
+    if (body === null) return json({ ok: false, ...apiError("accounts.unavailable") }, ae, 404);
+    return json(body, ae);
+  }
+  const act = pathname === "/api/accounts" ? "add" : pathname === "/api/accounts/remove" ? "remove" : null;
+  if (act === null || req.method !== "POST") return null;
+  const denied = caller.gate("write");
+  if (denied) return denied;
+  const rt = await caller.resolve();
+  if (rt instanceof Response) return rt;
+  if (accounts === undefined) return json({ ok: false, ...apiError("accounts.unavailable") }, ae, 404);
+  let body: JsonValue;
+  try {
+    // SAFETY: `Request.json()` output IS a JsonValue by construction; the service checks every field.
+    body = (await req.json()) as JsonValue;
+  } catch {
+    return text("bad body", 400);
+  }
+  const who = { device: caller.device(), audit: caller.audit, session: rt.name };
+  const answer = act === "add" ? await accounts.add(body, who) : await accounts.remove(body, who);
+  return json(answer.body, ae, answer.status);
+}
+
+// ── The "Worktree folder" setting (ADR 0093, note of 2026-11-13) ──────────────────────────────────
+//
+// Two routes: `GET /api/worktree/folder` reads this machine's setting and `POST /api/worktree/folder/set`
+// saves or clears it. The write is gated like every write (a read-only device sees it and cannot change
+// it) and chooses where checkouts land, so it is one audit line, with the act and never the path. Both
+// are session-scoped like the folder list: `caller.resolve()` forwards a `?host=` call to the member
+// whose disk the folder is on. The gate first, then the resolver, then this machine's own store.
+
+/** The setting's routes, or `null` when `pathname` is neither. */
+export async function serveWorktreeFolderRoute(
+  req: Request,
+  pathname: string,
+  caller: Pick<RouteCaller, "gate" | "resolve" | "device" | "audit">,
+  setting: WorktreeFolderSettingSurface,
+  deps: { home?: string; fs?: FolderFs; readHerdrConfig?: HerdrConfigRead } = {},
+): Promise<Response | null> {
+  const ae = req.headers.get("accept-encoding");
+  if (pathname === "/api/worktree/folder" && req.method === "GET") {
+    const denied = caller.gate("read");
+    if (denied) return denied;
+    const rt = await caller.resolve();
+    if (rt instanceof Response) return rt;
+    return json(await worktreeFolderAnswer(setting, deps), ae);
+  }
+  if (pathname === "/api/worktree/folder/set" && req.method === "POST") {
+    const denied = caller.gate("write");
+    if (denied) return denied;
+    const rt = await caller.resolve();
+    if (rt instanceof Response) return rt;
+    let body: JsonValue;
+    try {
+      // SAFETY: `Request.json()` output IS a JsonValue by construction; `parseWorktreeFolderBody`
+      // accepts one storable string or null and nothing else.
+      body = (await req.json()) as JsonValue;
+    } catch {
+      return text("bad body", 400);
+    }
+    const parsed = parseWorktreeFolderBody(body);
+    if (parsed === undefined) return text("bad body", 400);
+    const { saved, answer } = await saveWorktreeFolder(setting, parsed, deps);
+    if (!answer.ok) return json(answer, ae);
+    if (!saved) return text("could not save", 500);
+    caller.audit.record({
+      action: "worktree.folder",
+      session: rt.name,
+      device: caller.device(),
+      detail: { act: parsed.dir === null ? "clear" : "set" },
+    });
+    return json(answer, ae);
+  }
+  return null;
+}
+
 // ── The new-space folder list (#289, bridge/folders.ts) ──────────────────────────
 //
 // Two routes, one per act: `GET /api/folders` reads this machine's list, `POST /api/folders/star`
@@ -7453,6 +8587,63 @@ export async function serveFolderRoute(
     return json(foldersBody(folders), ae);
   }
   return null;
+}
+
+/** Who is asking `POST /api/notifications/clear`: the read gate, and the paired device it names. */
+export interface NotificationsClearCaller {
+  gate(): Response | null;
+  /** The requesting device's pairing label, or `null` (the host's own CLI credential names none). */
+  device(): string | null;
+}
+
+/** One session of this collie, as clear-all reaches it: its coordinator, its slot, its seen ledger. */
+export interface ClearSession {
+  /** The session's herd slot (`herdTagFor`), whose pane slots are `paneTag(herdTag, paneId)`. */
+  herdTag: string;
+  coordinator: Pick<NotificationCoordinator, "retractFinished" | "outstandingPaneIds">;
+  /** Stamp every pane of the session seen (`ActivityLedger.noteAllSeen`), answering the panes. */
+  markAllSeen(): string[];
+}
+
+/**
+ * `POST /api/notifications/clear`: what opening every pane of this collie through Collie does, as
+ * one request, and nothing that path does not.
+ *
+ * A pane read the page marks as seen does three things on the bridge: it stamps the pane seen (ADR
+ * 0003), the next poll's `retractSeen` then retracts a finished alert of that pane, and it tells push
+ * that the reading device's slot for the pane is shut (`Push.noteSeen`, rule 2, on a row whose page
+ * said `closesOwn`). This does the same for every pane of every session here: `noteAllSeen`, then
+ * `retractFinished` at once rather than at the next poll, then `noteSeen` for the asker. A pane whose
+ * alert is still out after that (blocked on the operator) is left as it is, slot included: its
+ * question stands, and its count stays in the icon.
+ *
+ * Read-level, like snooze: clearing what you have been told is not driving a terminal. A crew
+ * member's panes are not reached: their seen lives on that machine (ADR 0003) and this route is not
+ * forwarded (CREW_PROTOCOL.md §5). Answers the slots it cleared, for the page to close and zero as a
+ * pane read does (web/src/lib/clear-notifications.ts). Exported so the gate and the attribution are
+ * tested without a server.
+ */
+export function serveNotificationsClear(
+  caller: NotificationsClearCaller,
+  sessions: () => ClearSession[],
+  push: Pick<Push, "noteSeen">,
+  acceptEncoding: string | null,
+): Response {
+  const denied = caller.gate();
+  if (denied) return denied;
+  const device = caller.device();
+  const clearedSlots: string[] = [];
+  for (const { herdTag, coordinator, markAllSeen } of sessions()) {
+    const panes = markAllSeen();
+    coordinator.retractFinished();
+    const still = new Set(coordinator.outstandingPaneIds());
+    for (const paneId of panes) if (!still.has(paneId)) clearedSlots.push(paneTag(herdTag, paneId));
+  }
+  // After every retraction, as a read's `noteSeen` follows its own: a clear queued in the same burst
+  // finds the asker's slot shut when it flushes.
+  if (device !== null) for (const tag of clearedSlots) push.noteSeen(device, tag);
+  const body: NotificationsClearResponse = { clearedSlots };
+  return json(body, acceptEncoding);
 }
 
 // ── Machines (ADR 0084) ──────────────────────────────────────────────────────────
@@ -7667,7 +8858,7 @@ export async function launch(
   if (rawId !== undefined && !isRequestId(rawId)) return text("bad requestId", 400);
   const requestId = rawId;
   const replay = requestId === undefined ? null : earlierLaunch(receipts, requestId);
-  if (replay !== null) return json(await replay, ae);
+  if (replay !== null) return launchJson(await withinDeadline(replay, deps.deadline ?? {}), ae);
 
   const picked = await pickLaunch(
     fields,
@@ -7675,6 +8866,7 @@ export async function launch(
     deps.harnesses,
     { device, switches: deps.switches ?? (() => Promise.resolve({ ...DEFAULT_SWITCHES })) },
     leadRowGate(req, deps.viaCrew, deps.home ?? homedir()),
+    deps.accounts,
   );
   if (picked instanceof Response) return picked;
 
@@ -7707,13 +8899,23 @@ export async function launch(
     }
   }
   const row = picked.row;
-  const resolvedCwd = row?.cwd ?? asked ?? besidePane?.cwd ?? deps.sessionFolder ?? homedir();
+  // A sign-in start names no folder of the person's and runs in Collie's own empty one, never home or a
+  // neighbour's (M101). An explicit `cwd`, and a row's pinned folder, still win.
+  const signInDir = fields.signIn === true && deps.stateDir !== undefined ? signInFolder(deps.stateDir) : undefined;
+  if (signInDir !== undefined && row?.cwd === undefined && asked === undefined) {
+    const made = await (deps.fs?.makeDir ?? diskFolderFs.makeDir)(signInDir, 0o700).then(
+      () => true,
+      () => false,
+    );
+    if (!made) return json({ ok: false, ...apiError("launch.folder_missing", { folder: signInDir }) } satisfies CreateResponse, ae, 400);
+  }
+  const resolvedCwd = signInDir !== undefined ? (row?.cwd ?? asked ?? signInDir) : (row?.cwd ?? asked ?? besidePane?.cwd ?? deps.sessionFolder ?? homedir());
 
   // Checked again with no await between it and `track`, so two requests with one id that both got
   // past the check above cannot both start a launch.
   if (requestId !== undefined) {
     const again = earlierLaunch(receipts, requestId);
-    if (again !== null) return json(await again, ae);
+    if (again !== null) return launchJson(await withinDeadline(again, deps.deadline ?? {}), ae);
   }
   const work = runLaunch(herdr, engine, {
     row,
@@ -7729,34 +8931,45 @@ export async function launch(
     harness: picked.harness,
     launchWindow: deps.launchWindow,
     source: picked.source,
+    afterTyped: picked.afterTyped,
   });
   if (requestId !== undefined) receipts.track(requestId, work);
-  const answer = await work;
-  // A folder the sheet named that worked joins Recent, as a space created there does. Never a row's
-  // pinned folder, which the operator already wrote down, and never on a failure.
-  if (answer.ok && asked !== undefined && row?.cwd === undefined && deps.folders !== undefined) {
-    await deps.folders.recordRecent(answer.pane.cwd);
-  }
-  if (!answer.ok || picked.kind !== "run" || row === undefined) return json(answer, ae);
-  // A one-off run that worked joins this machine's history, at the top (ADR 0095). Only here: a
-  // refusal returned above, and a replay or a joined retry never reaches this line. A history that
-  // cannot be written does not undo a run that happened.
-  // A line that seems to carry a secret ran, and is not kept (bridge/recent-runs.ts).
-  if (deps.recentRuns !== undefined && !looksSecret(row.command)) {
-    const where = asked ?? besidePane?.cwd ?? null;
-    try {
-      const recorded = await deps.recentRuns.record({ line: row.command, cwd: where, at: Date.now(), noPrompts: picked.noPrompts === true });
-      if (recorded === "unwritable") console.warn("[launch] the one-off run is not in the history: commands-recent.json cannot be written");
-    } catch (err) {
-      console.warn(`[launch] the one-off run is not in the history: ${errorText(err)}`);
+  // What follows a launch that worked runs when the run ends, also after the deadline below has answered.
+  const afterLaunch = async (answer: LaunchAnswer): Promise<void> => {
+    // A folder the sheet named that worked joins Recent, as a space created there does. Never a row's
+    // pinned folder, which the operator already wrote down, and never on a failure.
+    if (answer.ok && asked !== undefined && row?.cwd === undefined && deps.folders !== undefined) {
+      await deps.folders.recordRecent(answer.pane.cwd);
     }
-  }
-  // The same run joins Sent as kind `run` (ADR 0107), on this machine, after the line was typed and
-  // Enter sent. The skip rules read the line as the phone sent it, before the run's own trim, so a
-  // leading space keeps it out here too. The store never throws and logs no line.
-  if (deps.sent !== undefined) {
-    await deps.sent.record(typeof fields.run === "string" ? fields.run : row.command, asked ?? besidePane?.cwd ?? null, "run");
-  }
+    if (!answer.ok || picked.kind !== "run" || row === undefined) return;
+    // A one-off run that worked joins this machine's history, at the top (ADR 0095). Only here: a
+    // refusal returned above, and a replay or a joined retry never reaches this line. A history that
+    // cannot be written does not undo a run that happened.
+    // A line that seems to carry a secret ran, and is not kept (bridge/recent-runs.ts).
+    if (deps.recentRuns !== undefined && !looksSecret(row.command)) {
+      const where = asked ?? besidePane?.cwd ?? null;
+      try {
+        const recorded = await deps.recentRuns.record({ line: row.command, cwd: where, at: Date.now(), noPrompts: picked.noPrompts === true });
+        if (recorded === "unwritable") console.warn("[launch] the one-off run is not in the history: commands-recent.json cannot be written");
+      } catch (err) {
+        console.warn(`[launch] the one-off run is not in the history: ${errorText(err)}`);
+      }
+    }
+    // The same run joins Sent as kind `run` (ADR 0107), on this machine, after the line was typed and
+    // Enter sent. The skip rules read the line as the phone sent it, before the run's own trim, so a
+    // leading space keeps it out here too. The store never throws and logs no line.
+    if (deps.sent !== undefined) {
+      await deps.sent.record(typeof fields.run === "string" ? fields.run : row.command, asked ?? besidePane?.cwd ?? null, "run");
+    }
+  };
+  const answer = await withinDeadline(
+    work.then(async (made) => {
+      await afterLaunch(made);
+      return made;
+    }),
+    deps.deadline ?? {},
+  );
+  if (!answer.ok || picked.kind !== "run" || row === undefined) return launchJson(answer, ae);
   return json({ ...answer, noPrompts: picked.noPrompts === true } satisfies CreateResponse, ae);
 }
 
@@ -7780,7 +8993,9 @@ export interface LaunchDeps {
   /** This machine's home, for a leading `~` in `cwd`. */
   home?: string;
   /** The disk, for "is that folder there". Absent: the real one. */
-  fs?: Pick<FolderFs, "isDirectory">;
+  fs?: Pick<FolderFs, "isDirectory"> & Partial<Pick<FolderFs, "makeDir">>;
+  /** This instance's state folder: a sign-in start with no folder runs in `sign-in` under it. Absent: as any other start. */
+  stateDir?: string;
   /** The operator's `[phone]` switches; only `run` is read here. Absent: the defaults (run on). */
   switches?: () => Promise<LauncherSwitches>;
   /** Where a one-off run that worked is recorded (ADR 0095). Absent: nothing is recorded. */
@@ -7791,6 +9006,10 @@ export interface LaunchDeps {
   launchWindow?: Pick<LaunchWindow, "mark"> | undefined;
   /** The operator's folder for this session (`spaces.toml` `[folders]`), checked to exist. Absent: home. */
   sessionFolder?: string;
+  /** The clock the member's one deadline ({@link MEMBER_DEADLINE_MS}) runs on; production passes nothing. */
+  deadline?: LookClock;
+  /** This machine's accounts (M101). Absent: a launch that names one is `accounts.unavailable`. */
+  accounts?: Accounts;
 }
 
 /**
@@ -7798,12 +9017,17 @@ export interface LaunchDeps {
  * new id. SYNCHRONOUS up to that `null` on purpose: the caller's second check must not yield between
  * the look and its `track`, or two requests with one id could both start a launch.
  */
-function earlierLaunch(receipts: LaunchReceiptSurface, requestId: string): Promise<CreateResponse> | null {
-  const stored = receipts.get(requestId);
-  if (stored) return Promise.resolve(launchReplay(stored));
+function earlierLaunch(receipts: LaunchReceiptSurface, requestId: string): Promise<LaunchAnswer> | null {
+  // The run in flight first: while it goes its receipt is `pending`, and a second request joins it.
   const running = receipts.inflight(requestId);
-  if (running === undefined) return null;
-  return running.then((answer) => (answer.ok ? { ...answer, replayed: true } : answer));
+  if (running !== undefined) return running.then((answer) => (answer.ok ? { ...answer, replayed: true } : answer));
+  const stored = receipts.get(requestId);
+  if (stored === undefined) return null;
+  // No run in flight and no pane to name (the bridge stopped, or the create could not be confirmed): the
+  // pane may exist, and a second create under this id would make a second one.
+  // The retap answers the words the first answer ended with.
+  if (isUnsettled(stored)) return Promise.resolve(unknownCreate(stored.text ?? LAUNCH_UNKNOWN_TEXT));
+  return Promise.resolve(launchReplay(stored));
 }
 
 /** Which of the four kinds a launch body names, and the line it types. */
@@ -7815,12 +9039,16 @@ type PickedLaunch = {
   harness?: string;
   /** `lead` when the row is one the lead carried over the crew link (ADR 0127 point 3). */
   source?: "lead";
+  /** Runs once the line is typed into the new pane: a launch with an account notes the pane (M101). */
+  afterTyped?: (session: string, paneId: string) => void;
 };
 
 /** Whether a carried lead row is taken, and the home its `~` is read under (ADR 0127 point 3). */
 interface LeadRowGate {
   fromLead: boolean;
   home: string;
+  /** The call came over the crew link, from this member's lead: a sign-in start is then refused (M101 spec 06). */
+  viaCrew: boolean;
 }
 
 /**
@@ -7829,7 +9057,7 @@ interface LeadRowGate {
  * an old lead never adds: it forwards a phone's body, `row` and all, unchanged.
  */
 function leadRowGate(req: Request, viaCrew: boolean | undefined, home: string): LeadRowGate {
-  return { fromLead: viaCrew === true && leadRowMarked(req.headers), home };
+  return { fromLead: viaCrew === true && leadRowMarked(req.headers), home, viaCrew: viaCrew === true };
 }
 
 /** What a one-off `run` is checked against: who asks, and the operator's switch (ADR 0095). */
@@ -7856,6 +9084,7 @@ async function pickLaunch(
   harnesses: Pick<HarnessProbe, "launch"> | undefined,
   runGate: RunGate | null,
   leadGate: LeadRowGate,
+  accounts?: Accounts,
 ): Promise<PickedLaunch | Response> {
   const command = typeof fields.command === "string" ? fields.command.trim() : "";
   const harness = typeof fields.harness === "string" ? fields.harness.trim() : "";
@@ -7864,6 +9093,17 @@ async function pickLaunch(
   const run = fields.run !== undefined && fields.run !== null;
   const named = [command !== "", harness !== "", shell, run].filter(Boolean).length;
   if (named !== 1) return text("bad body", 400);
+  // An account (M101) is only ever a built-in start: never a shell, a one-off line or a hand-written row.
+  const accountField = fields.account;
+  if (accountField !== undefined && accountField !== null && (typeof accountField !== "string" || accountField === "")) return text("bad body", 400);
+  const account = typeof accountField === "string" ? accountField : undefined;
+  const signIn = fields.signIn === true;
+  const withAccount = account !== undefined || signIn;
+  if (withAccount && (shell || run)) return text("bad body", 400);
+  // A sign-in start is for the machine the phone talks to (M101 spec 06, decision 1): one that came over
+  // the crew link is refused like any other misuse of the field, before anything runs. An account alone
+  // still crosses, and is resolved below against THIS machine's own accounts.
+  if (signIn && leadGate.viaCrew) return text("bad body", 400);
   if (shell) return { kind: "shell", row: undefined };
   if (run) return pickRun(fields.run, runGate);
   if (harness !== "") {
@@ -7871,13 +9111,26 @@ async function pickLaunch(
     if (known === undefined) {
       return json({ ok: false, ...apiError("launch.unknown_harness", { harness }) } satisfies CreateResponse, null, 400);
     }
-    return { kind: "harness", row: { command: known.binary, label: known.label }, harness };
+    // No account and no sign-in: the line it always was, byte for byte.
+    if (!withAccount) return { kind: "harness", row: { command: known.binary, label: known.label }, harness };
+    const start = await accountStart(accounts, { harness, base: known.binary, account, signIn });
+    if (start instanceof Response) return start;
+    return { kind: "harness", row: { command: start.command, label: known.label }, harness, afterTyped: start.afterTyped };
   }
   // Live read, behind the same mtime cache the other operator files use — a new row in
   // `launchers.toml` is live on the bridge without a restart (an already-open tab needs a reload to
   // re-fetch its rows, the same property `commands.toml` has).
   const row = (await getLaunchers()).find((r) => r.command === command);
+  if (row && withAccount) {
+    // Only a recipe row a phone built from the bridge's own table (ADR 0094) takes an account: its line
+    // is Collie's, so the variable goes in front of it. A hand-written or operator row is never rewritten.
+    if (signIn || row.source !== "added" || row.addedAs !== "recipe" || row.harness === undefined) return text("bad body", 400);
+    const start = await accountStart(accounts, { harness: row.harness, base: row.command, account, signIn: false });
+    if (start instanceof Response) return start;
+    return { kind: "row", row: { ...row, command: start.command }, afterTyped: start.afterTyped };
+  }
   if (row) return { kind: "row", row };
+  if (withAccount) return text("bad body", 400);
   const carried = fields[ROW_FIELD];
   if (carried === undefined || carried === null) {
     return json({ ok: false, ...apiError("launch.not_allowlisted") } satisfies CreateResponse, null, 400);
@@ -7886,6 +9139,30 @@ async function pickLaunch(
   const lead = rowFromLead(carried, command, leadGate.home);
   if (lead === null) return text("bad body", 400);
   return { kind: "row", row: lead, source: "lead" };
+}
+
+/** The line a start with an account types, or the refusal, before anything runs (M101). */
+async function accountStart(
+  accounts: Accounts | undefined,
+  input: { harness: string; base: string; account: string | undefined; signIn: boolean },
+): Promise<{ command: string; afterTyped?: (session: string, paneId: string) => void } | Response> {
+  if (accounts === undefined) {
+    if (input.account === undefined) return { command: input.base };
+    return json({ ok: false, ...apiError("accounts.unavailable") } satisfies CreateResponse, null, 404);
+  }
+  const start = await accounts.startLine(input);
+  if (!start.ok) return json({ ok: false, ...apiError(start.code, start.detail) } satisfies CreateResponse, null, start.status);
+  const row = start.account;
+  const signInFor = start.signInFor;
+  if (row === undefined && signInFor === undefined) return { command: start.command };
+  return {
+    command: start.command,
+    afterTyped: (session, paneId) => {
+      if (row !== undefined) accounts.noteLaunch(session, paneId, row.harness, row.id);
+      // A sign-in start drops the account's identity and watches its pane (spec 04, decision 6).
+      if (signInFor !== undefined) accounts.noteSignIn(session, paneId, signInFor);
+    },
+  };
 }
 
 /** A one-off run's gates, in order, and the line it types (ADR 0095). */
@@ -7935,27 +9212,28 @@ export function freeSpaceName(name: string, spaces: readonly { label: string }[]
 }
 
 /** The half of a launch that touches the multiplexer, run at most once per `requestId`. */
-async function runLaunch(
-  herdr: MuxAdapter,
-  engine: StateEngine,
-  job: {
-    row: Launcher | undefined;
-    kind: PickedLaunch["kind"];
-    cwd: string;
-    besidePane: AgentView | undefined;
-    requestId: string | undefined;
-    audit: AuditLog;
-    device: string | null;
-    session: string;
-    receipts: LaunchReceiptSurface;
-    wait: PaneReadyOptions;
-    /** The harness id of a `harness` launch, and where its pane is marked once the line is typed. */
-    harness: string | undefined;
-    launchWindow: Pick<LaunchWindow, "mark"> | undefined;
-    /** `lead` for a row the lead carried (ADR 0127 point 3): the audit line says so. */
-    source?: "lead" | undefined;
-  },
-): Promise<CreateResponse> {
+interface RunLaunchJob {
+  row: Launcher | undefined;
+  kind: PickedLaunch["kind"];
+  cwd: string;
+  besidePane: AgentView | undefined;
+  requestId: string | undefined;
+  audit: AuditLog;
+  device: string | null;
+  session: string;
+  receipts: LaunchReceiptSurface;
+  wait: PaneReadyOptions;
+  /** The harness id of a `harness` launch, and where its pane is marked once the line is typed. */
+  harness: string | undefined;
+  launchWindow: Pick<LaunchWindow, "mark"> | undefined;
+  /** `lead` for a row the lead carried (ADR 0127 point 3): the audit line says so. */
+  source?: "lead" | undefined;
+  /** Runs once the line is typed (M101): a launch with an account notes its pane. */
+  afterTyped?: ((session: string, paneId: string) => void) | undefined;
+}
+
+async function runLaunch(herdr: MuxAdapter, engine: StateEngine, job: RunLaunchJob
+): Promise<LaunchAnswer> {
   const { row, besidePane, cwd } = job;
   const label = row?.label;
   // A row or an agent started in a NEW space names the space after its folder, the way Herdr names a
@@ -7966,13 +9244,34 @@ async function runLaunch(
   // from one folder would fail there, and on Herdr two equal names cannot be told apart.
   const folder = basename(cwd);
   const folderNamed = !besidePane && row !== undefined && job.kind !== "run" && folder !== "";
-  const outcome = besidePane
-    ? await herdr.createTab({ spaceId: besidePane.workspaceId, label, cwd })
-    : await herdr.createSpace({ cwd, label: folderNamed ? freeSpaceName(folder, engine.current().workspaces) : label });
-  if (!outcome.ok) {
-    return { ok: false, ...apiError("workspace.create_failed", { reason: outcome.detail }) };
-  }
-  const created = outcome.value;
+  // The receipt goes down `pending` before the create and settles after it (M100 spec 04); a create that
+  // timed out is looked up in the snapshot, never read as a failure.
+  const spaceLabel = folderNamed ? freeSpaceName(folder, engine.current().workspaces) : label;
+  const made = await createRecorded({
+    herdr,
+    receipts: job.receipts,
+    requestId: job.requestId,
+    wanted: besidePane ? { kind: "tab", spaceId: besidePane.workspaceId, cwd, label } : { kind: "space", cwd, label: spaceLabel },
+    failed: "workspace.create_failed",
+    clock: job.wait,
+    call: () => (besidePane ? herdr.createTab({ spaceId: besidePane.workspaceId, label, cwd }) : herdr.createSpace({ cwd, label: spaceLabel })),
+  });
+  if (!made.ok) return made.answer;
+  return guardPending(job.receipts, job.requestId, () => finishLaunch(herdr, engine, job, made));
+}
+
+/** The steps of a launch after its pane exists: the tab's name, the typed line, the audit line, the receipt. */
+async function finishLaunch(
+  herdr: MuxAdapter,
+  engine: StateEngine,
+  job: RunLaunchJob,
+  made: Extract<CreateMade, { ok: true }>,
+): Promise<LaunchAnswer> {
+  const { row, besidePane, cwd } = job;
+  const folder = basename(cwd);
+  const folderNamed = !besidePane && row !== undefined && job.kind !== "run" && folder !== "";
+  const label = row?.label;
+  const created = made.pane;
   if (folderNamed && label !== undefined && supportsCapability(herdr.capabilities, "renameTab")) {
     // Best effort: a tab left with the multiplexer's own name costs a label, never the launch.
     try {
@@ -7982,21 +9281,44 @@ async function runLaunch(
     }
   }
   if (row !== undefined) {
-    const sent = await typeIntoFreshShell(herdr, created.paneId, row.command, job.wait, job.kind === "run" ? "run" : "launch");
+    // A pane the create's own answer named is the one this launch made. A pane found in the snapshot is a
+    // guess, and a line typed into an agent's input box would be a message: it must read as a shell with
+    // no agent in it first, or nothing is typed and the outcome is unknown.
+    if (made.looked !== null) {
+      const shell =
+        made.looked.agent === "shell" && (await awaitPaneReady(herdr, created.paneId, { ...job.wait, accepts: endsInShellPrompt })).ready;
+      if (!shell) {
+        // The pane is there and nothing was typed: its own sentence, and the receipt keeps it for a retap.
+        if (job.requestId !== undefined) await job.receipts.record({ requestId: job.requestId, at: Date.now(), state: "unknown", text: LAUNCH_NO_PROMPT_TEXT });
+        return unknownCreate(LAUNCH_NO_PROMPT_TEXT);
+      }
+    }
+    const sent =
+      made.looked === null
+        ? await typeIntoFreshShell(herdr, created.paneId, row.command, job.wait, job.kind === "run" ? "run" : "launch")
+        : await sendReplySteps(herdr, created.paneId, row.command, true, ["Enter"]);
     if (!sent.ok) {
       // Best-effort rollback: a half-born pane whose command did not fully start must not linger as
-      // an empty shell nobody asked for. The rollback's own failure is swallowed because the original
-      // send error is the useful result and there is no safe second recovery action to take here.
+      // an empty shell nobody asked for. The rollback's own failure is not the result the client needs:
+      // the original send error is, and there is no safe second recovery action to take here.
+      let closed = false;
       try {
-        await herdr.closePane(created.paneId);
+        closed = (await herdr.closePane(created.paneId)).ok;
       } catch {
         // Swallowed: the failed send is the result the client needs; a second failure only obscures it.
+      }
+      // The pane is closed again, so the id may run again. A pane that could not be closed is still
+      // there, and the id must not make a second one: the receipt stays, as unknown.
+      if (job.requestId !== undefined) {
+        if (closed) await job.receipts.forget(job.requestId);
+        else await job.receipts.record({ requestId: job.requestId, at: Date.now(), state: "unknown" });
       }
       return { ok: false, error: sent.error, code: sent.code, detail: sent.detail };
     }
     // The line is typed and the agent is booting: until its input box is on screen, a send to this pane
     // waits for the agent's input box instead of going into the shell (the Send Protocol, `starting`).
     if (job.harness !== undefined) job.launchWindow?.mark(job.session, created.paneId, job.harness);
+    job.afterTyped?.(job.session, created.paneId);
   }
   // `command` is deliberately NOT added to `METADATA_KEYS` in audit.ts. Under
   // `COLLIE_AUDIT_CONTENT=none` it therefore redacts like every other content-bearing detail, and
@@ -8027,17 +9349,7 @@ async function runLaunch(
   const workspaceLabel = besidePane
     ? (engine.current().workspaces.find((w) => w.workspaceId === created.spaceId)?.label ?? created.spaceLabel)
     : created.spaceLabel;
-  if (job.requestId !== undefined) {
-    await job.receipts.record({
-      requestId: job.requestId,
-      at: Date.now(),
-      workspaceId: created.spaceId,
-      workspaceLabel,
-      paneId: created.paneId,
-      tabId: created.tabId,
-      cwd: created.cwd,
-    });
-  }
+  await settleCreate(job.receipts, job.requestId, created, workspaceLabel);
   return {
     ok: true,
     pane: {
@@ -8263,7 +9575,8 @@ export function guard(
     // The host's own CLI (`<stateDir>/local-secret`, bridge/local-secret.ts): a READ credential and
     // nothing else, from this host through no proxy only (`browserPairingGate`) — `local` answers
     // false otherwise. Asked first, so a
-    // `collie doctor` still reads while the registry is the thing that is broken.
+    // `collie doctor` still reads while the registry is the thing that is broken. Which reads it
+    // reaches is `apiFrontGate`'s question: only the routes in LOCAL_KEY_ROUTES (bridge/local-key.ts).
     if (level === "read" && pairing.local?.(token, req) === true) return null;
     try {
       if (pairing.resolve(token) === null) {
@@ -8291,7 +9604,7 @@ export function pairingUnavailable(): Response {
 /**
  * A peer or interface address in one spelling, so the two compare: lower case, no IPv6 zone
  * (`fe80::1%eth0`), and an IPv4 address a dual-stack listener reports in v4-mapped form
- * (`::ffff:100.64.0.3`) as the plain IPv4 one.
+ * (`::ffff:100.64.10.3`) as the plain IPv4 one.
  */
 export function normalizePeerAddress(address: string): string {
   const a = address.trim().toLowerCase().replace(/%.*$/, "");
@@ -8435,18 +9748,33 @@ interface DevicesResponseBody {
 
 /**
  * The `/api/*` routes that answer without the pairing credential, and nothing else (ADR 0086):
- * `GET`/`HEAD /api/health`, which the updater and monitors ask before anyone has a token, and
- * `POST /api/pair`, which is how a device gets one. Every other `/api/` path, known or not, any
- * method, any spelling, is gated by {@link apiFrontGate} before the dispatcher routes it.
+ * `GET`/`HEAD /api/health`, which the updater and monitors ask before anyone has a token,
+ * `POST /api/pair`, which is how a device gets one, and `POST /api/pair/request`, which is how an
+ * unpaired browser asks a paired phone for one (ADR 0139). Every other `/api/` path, known or not, any
+ * method, any spelling, is gated by {@link apiFrontGate} before the dispatcher routes it, except the
+ * one shape in {@link OPEN_API_PATTERNS}.
  */
 export const OPEN_API_ROUTES: readonly { readonly path: string; readonly methods: readonly string[] }[] = [
   { path: "/api/health", methods: ["GET", "HEAD"] },
   { path: "/api/pair", methods: ["POST"] },
+  { path: "/api/pair/request", methods: ["POST"] },
 ];
 
-/** Whether this method and path are one of {@link OPEN_API_ROUTES}. Exact path, exact method. */
+/**
+ * The open routes with an id in the path: `GET /api/pair/request/<id>`, the asking browser's poll, and
+ * `DELETE` of the same path, its cancel (ADR 0139). Their credential is the poll secret in a header,
+ * which only the request's creator holds; an unknown id and a wrong secret are the same 404.
+ */
+export const OPEN_API_PATTERNS: readonly { readonly pattern: RegExp; readonly methods: readonly string[] }[] = [
+  { pattern: PAIR_REQUEST_ROUTE, methods: ["GET", "DELETE"] },
+];
+
+/** Whether this method and path are one of {@link OPEN_API_ROUTES} (exact path, exact method) or {@link OPEN_API_PATTERNS}. */
 export function isOpenApiRoute(pathname: string, method: string): boolean {
-  return OPEN_API_ROUTES.some((r) => r.path === pathname && r.methods.includes(method));
+  return (
+    OPEN_API_ROUTES.some((r) => r.path === pathname && r.methods.includes(method)) ||
+    OPEN_API_PATTERNS.some((r) => r.pattern.test(pathname) && r.methods.includes(method))
+  );
 }
 
 /**
@@ -8471,7 +9799,18 @@ export function apiFrontGate(
 ): Response | null {
   if (!pathname.startsWith("/api/")) return null;
   if (isOpenApiRoute(pathname, req.method)) return null;
-  return guard(req, cfg, "read", pairing);
+  const denied = guard(req, cfg, "read", pairing);
+  if (denied) return denied;
+  // The bridge's own local key reaches only the routes marked in LOCAL_KEY_ROUTES (bridge/local-key.ts).
+  // Here, before any route matches and before any `?host=` forward, so the lead's key never reads a
+  // member's pane either, and a route added later is closed to the key until someone marks it.
+  if (isLocalRequest(req, pairing) && !isLocalKeyRoute(pathname, req.method)) return localKeyRefusal();
+  return null;
+}
+
+/** The 403 the local key meets on a route it may not reach: one code, whose sentence names the way in. */
+export function localKeyRefusal(): Response {
+  return jsonError(apiError("local.no_text"), 403, null);
 }
 
 /**
@@ -8487,7 +9826,7 @@ export interface PairingGate {
    * The device this token belongs to, or null. An expired token resolves to null. THROWS when the
    * registry cannot be read ({@link PairingStore.resolve}); the gate answers 503, never "not paired".
    */
-  resolve(token: string | null): { label: string } | null;
+  resolve(token: string | null): { label: string; tokenHash?: string } | null;
   /**
    * Whether this token belongs to a device whose expiry passed. Optional so a test may still pass a
    * two-line gate; {@link PairingStore} always answers it.
@@ -8536,6 +9875,15 @@ export function requestDevice(req: Request, cfg: Config, pairing?: PairingGate):
 }
 
 /**
+ * Whether `req` is the host's own CLI: the local read credential, from this host through no proxy
+ * ({@link browserPairingGate}'s `local`). A paired phone is never this, nor a request with no token.
+ */
+export function isLocalRequest(req: Request, pairing?: PairingGate): boolean {
+  if (pairing === undefined) return false;
+  return pairing.local?.(bearerToken(req.headers), req) === true;
+}
+
+/**
  * The label of the paired device that sent `req`, or null: no pairing on this bridge, no token, an
  * expired or unknown one, the host's own local credential, or a registry that cannot be read. Used
  * where a change is credited by name on screen (Settings → Voice, "Last changed by"), so it is the
@@ -8547,6 +9895,23 @@ export function pairedLabel(req: Request, pairing?: PairingGate): string | null 
   if (pairing.local?.(token, req) === true) return null;
   try {
     return pairing.resolve(token)?.label ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The id of the paired device's record that sent `req`, for the hill's answer (M96): `hillDeviceId` of
+ * its token hash, or null where {@link pairedLabel} is null or the gate names no record. Beside the label,
+ * so an answer still says which pairing gave it after a rename. Attribution, never a signature.
+ */
+export function pairedDeviceId(req: Request, pairing?: PairingGate): string | null {
+  if (pairing === undefined) return null;
+  const token = bearerToken(req.headers);
+  if (pairing.local?.(token, req) === true) return null;
+  try {
+    const tokenHash = pairing.resolve(token)?.tokenHash;
+    return tokenHash === undefined ? null : hillDeviceId(tokenHash);
   } catch {
     return null;
   }
@@ -8680,7 +10045,7 @@ export const SEND_MAX_TEXT = 64 * 1024;
 export function parseSendRequest(body: JsonValue | undefined): ({ pane: string; resendOf?: string } & SendRequest) | null {
   const fields = asJsonRecord(body);
   if (fields === null) return null;
-  const { id, pane, text: words, mode, rowsHash, revision, capAck, resendOf, when } = fields;
+  const { id, pane, text: words, mode, rowsHash, revision, capAck, resendOf, when, secret, override } = fields;
   if (typeof id !== "string" || !REQUEST_ID.test(id)) return null;
   if (typeof pane !== "string" || pane.length === 0 || pane.length > 256) return null;
   if (typeof words !== "string" || words.length > SEND_MAX_TEXT) return null;
@@ -8711,6 +10076,20 @@ export function parseSendRequest(body: JsonValue | undefined): ({ pane: string; 
     if (chosenWhen === undefined) return null;
     Object.assign(request, { when: chosenWhen });
   }
+  // A send into a sign-in field (`idle.frame.secret`): only `true` is a word.
+  if (secret !== undefined) {
+    if (secret !== true) return null;
+    Object.assign(request, { secret: true });
+  }
+  // The person's commit tap on a screen Collie could not read (M102 spec 01): only `true` is a word, and
+  // only on the shape of such a tap, a plain send or command that names the rows hash it saw. Any other
+  // shape is a bad request. Whether the request may carry the word is the protocol's to say (`fromPhone`).
+  if (override !== undefined) {
+    if (override !== true || rowsHash === undefined || resendOf !== undefined) return null;
+    if (when !== undefined && when !== null) return null;
+    if (secret !== undefined || (chosen !== "send" && chosen !== "command")) return null;
+    Object.assign(request, { override: true });
+  }
   return request;
 }
 
@@ -8729,6 +10108,15 @@ export function paneCanSteer(from: { readonly send?: unknown; readonly driver?: 
   return from.driver === undefined && from.send !== undefined && from.surface?.canSteer(paneId) === true;
 }
 
+/**
+ * Whether a pane of this session carries `askRoute` (M102 spec 14): a terminal session whose ask book
+ * answers a screen card's tap by id, through `POST /api/ask/<id>`, also when a lead forwards it. A
+ * program session answers through its driver and keeps its own route on a crew; it carries no mark.
+ */
+export function paneTakesAskRoute(from: { readonly driver?: unknown; readonly asks?: unknown }): boolean {
+  return from.driver === undefined && from.asks !== undefined;
+}
+
 /** What `sendRoute` reads of a session runtime: a {@link SessionRuntime} is one. */
 export interface SendRouteRuntime {
   readonly send?: SendProtocol;
@@ -8737,31 +10125,105 @@ export interface SendRouteRuntime {
   readonly name: string;
   readonly herdr: Pick<MuxAdapter, "controlTurn">;
   readonly engine: {
-    current(): { readonly agents: readonly Pick<AgentView, "paneId" | "agent">[]; readonly shellPanes?: readonly Pick<AgentView, "paneId">[] };
+    current(): { readonly agents: readonly (Pick<AgentView, "paneId" | "agent"> & { readonly status?: AgentView["status"]; readonly blockedBy?: AgentView["blockedBy"] })[]; readonly shellPanes?: readonly Pick<AgentView, "paneId">[] };
     noteInput(): void;
     pokeNow(): void;
   };
 }
 
+/**
+ * The send modes that put the person's own words into the session. Not a `command` (a `/compact` answers
+ * no question), and not a staged `append`/`replace`/`prepare` or a discard (C-N1, review 8).
+ */
+const SPOKE_MODES: ReadonlySet<SendRequest["mode"]> = new Set(["send", "submit"]);
+/** The outcomes of a send whose words reached the session now. Not `held`: it may still be cancelled or expire. */
+const SPOKE_OUTCOMES: ReadonlySet<string> = new Set(["effective", "sent", "steered"]);
+
+/** Whether one phone send counts as the person writing to the session (1.29.0, the Hill's quiet mark). */
+export function sendSpoke(mode: SendRequest["mode"], outcome: string): boolean {
+  return SPOKE_MODES.has(mode) && SPOKE_OUTCOMES.has(outcome);
+}
+
+/** The pane states in which a session waits for the person: no turn runs, and no question or dialog is open. */
+const WAITING_STATES: ReadonlySet<string> = new Set(["idle", "done"]);
+
+/**
+ * Whether the session waits for the person, by the bridge's last read of its pane: {@link WAITING_STATES},
+ * or `blocked` by an error (`blockedBy: "error"`), which also runs no turn and shows no dialog (PR 787).
+ */
+export function sessionWaited(pane: { readonly status?: AgentView["status"] | undefined; readonly blockedBy?: AgentView["blockedBy"] } | undefined): boolean {
+  const status = pane?.status;
+  if (status === undefined) return false;
+  return WAITING_STATES.has(status) || isErrorBlocked({ status, blockedBy: pane?.blockedBy });
+}
+
+/**
+ * Whether one phone send that spoke ALSO started the session's next turn (M96 spec 10): the Hill then
+ * closes that session's open cards with nothing typed. A positive reading only, from two sources that
+ * must agree: the bridge's own state read the pane waiting right before the send (`waited`, the
+ * WAITING_STATES), and the Send Protocol's receipt says the words went in as a new prompt, `effective`
+ * (the harness's own prompt edge took it) or `sent`, and not `queued` behind a running turn (a Stop may
+ * give a queued send back). A `steered` send joined the running turn and keeps the quiet mark only.
+ */
+export function sendStartedTurn(mode: SendRequest["mode"], outcome: string, read: { readonly queued: boolean; readonly waited: boolean }): boolean {
+  return sendSpoke(mode, outcome) && outcome !== "steered" && !read.queued && read.waited;
+}
+
 export async function sendRoute(
   rt: SendRouteRuntime,
   body: JsonValue | undefined,
-  context: { readonly audit: AuditLog; readonly device: string | null; readonly redact: boolean; readonly acceptEncoding: string | null },
+  context: {
+    readonly audit: AuditLog;
+    readonly device: string | null;
+    readonly redact: boolean;
+    readonly acceptEncoding: string | null;
+    /**
+     * Told once per send whose words reached a pane (`sendSpoke`): the Hill marks that session's open cards.
+     * `started` is `sendStartedTurn`: the send also started the session's next turn, and the Hill closes them.
+     */
+    readonly spoke?: (paneId: string, started: boolean) => void;
+    /**
+     * The agent views, for a send with a `view` field: given only by `POST /api/send` once the request
+     * passed the paired-device gate. Absent (any other caller, a crew route, a test), a `view` is refused 403.
+     */
+    readonly view?: { readonly service: AgentViewService; readonly addressOf: (paneId: string) => string | null };
+  },
 ): Promise<Response> {
+  const viewField = readViewSendField(asJsonRecord(body)?.view ?? undefined);
+  if (viewField !== undefined) {
+    if (context.view === undefined) return text(VIEW_PAIRED_ONLY, 403);
+    if (viewField === null) return text("bad send request", 400);
+    return await viewSendRoute(rt, body, { ...context, view: context.view, field: viewField });
+  }
   if (rt.driver !== undefined) return programSendRoute(rt, rt.driver, body, context);
-  if (rt.send === undefined) return text(SEND_OFF_TEXT, 404);
+  // A refusal before the Send Protocol leaves one record and names its code (M102 spec 14, I3).
+  const refuse = (res: Response, reason: RefusalReason, paneId?: string): Response => routeRefusal(res, { action: "send", reason, paneId: paneId ?? bodyPaneOf(body), session: rt.name, ...context });
+  if (rt.send === undefined) return refuse(text(SEND_OFF_TEXT, 404), "send_off");
   const request = parseSendRequest(body);
-  if (request === null) return text("bad send request", 400);
+  if (request === null) return refuse(text("bad send request", 400), "bad_body");
   const refusal = rawInputRefusal(rt.herdr);
-  if (refusal !== null) return json(refusal.body, context.acceptEncoding, refusal.status);
+  if (refusal !== null) return refuse(json(refusal.body, context.acceptEncoding, refusal.status), "no_raw_input", request.pane);
   // An agent pane's string picks its profile; a bare shell, or an agent with no profile, has none and is typed and Entered blind.
   const harness = replySendOf(rt).harnessOf(request.pane);
-  if (harness === null) return text("no such terminal pane", 404);
+  if (harness === null) return refuse(text("no such terminal pane", 404), "no_pane", request.pane);
   const { pane: paneId, resendOf, ...asked } = request;
   // `POST /api/send` is the phone's route: a person's send, the one caller that may steer (M69).
   let sendRequest: SendRequest = { ...asked, fromPhone: true };
   // A Send or Discard on a queued message that came back to the box (ADR 0122): `resendOf` names the
   // queued request, the mode is `submit` or `discard`, and the text is the bridge's own, unmasked.
+  // A retry of a Resend or of a returned card's Send whose answer was lost: the id is known, so its stored
+  // receipt is the answer, before the source row is looked for (the first try took that row away). Nothing
+  // is sent again. An id the store does not know falls through to the 404 below.
+  if (resendOf !== undefined) {
+    const stored = await rt.send.settledAnswer(sendRequest, { session: rt.name, paneId, harness });
+    if (stored !== null) {
+      if (stored.receipt !== undefined && stored.receipt.outcome !== "refused") {
+        rt.send.dismissReturned(resendOf);
+        rt.send.dismissHeld(rt.name, paneId, resendOf);
+      }
+      return json(context.redact ? maskedAnswer(stored) : stored, context.acceptEncoding);
+    }
+  }
   const returned = resendOf !== undefined && (asked.mode === "submit" || asked.mode === "discard") ? rt.send.returnedSource(rt.name, paneId, resendOf) : null;
   if (resendOf !== undefined && returned !== null) {
     const { when: _steer, ...plain } = asked;
@@ -8769,12 +10231,14 @@ export async function sendRoute(
   } else if (resendOf !== undefined) {
     // The stored text, unmasked: never the row the phone shows, which the redact setting may mask.
     const source = rt.send.resendSource(rt.name, paneId, resendOf);
-    if (source === null) return text("no such ended held send on this pane", 404);
+    if (source === null) return refuse(text("no such ended held send on this pane", 404), "no_held_send", paneId);
     // A Resend goes on the queued path, as the held send it repeats: never a steer (M69), so `when`
     // goes with `fromPhone`.
     const { when: _steer, ...plain } = asked;
     sendRequest = { ...plain, text: source.text, mode: source.mode };
   }
+  // Whether the session waited for the person right before this send, by the bridge's own last read.
+  const waited = sessionWaited(rt.engine.current().agents.find((agent) => agent.paneId === paneId));
   let answer = await rt.send.handle(sendRequest, { session: rt.name, paneId, harness });
   let receipt = answer.receipt;
   // The old row goes once the new request was taken; a refusal keeps it, text and all.
@@ -8793,14 +10257,104 @@ export async function sendRoute(
     const detail: AuditDetail = { mode: sendRequest.mode, outcome: receipt.outcome, textLength: receipt.textLength, probed: receipt.keys.includes("probe") };
     if (resendOf !== undefined) detail.resend = true;
     if (receipt.reason !== undefined) detail.reason = receipt.reason;
+    // The road the send took (M99 spec 03), only when a data try was made: `data`, or `screen` after one.
+    const path = rt.send.pathOf(sendRequest.id);
+    if (path !== null) detail.path = path;
     context.audit.record({ action: "send", paneId, session: rt.name, device: context.device, detail });
+    if (sendSpoke(sendRequest.mode, receipt.outcome)) context.spoke?.(paneId, sendStartedTurn(sendRequest.mode, receipt.outcome, { queued: receipt.queued === true, waited }));
     if (receipt.keys.length > 0) {
       rt.engine.noteInput();
       rt.engine.pokeNow();
     }
   }
-  const out = context.redact && answer.surface !== undefined ? { ...answer, surface: maskSurface(answer.surface) } : answer;
+  const out = context.redact ? maskedAnswer(answer) : answer;
   return json(out, context.acceptEncoding);
+}
+
+/**
+ * A send answer as it leaves a bridge that masks secret shapes: its surface masked, and the rows of a
+ * refused override (M102 spec 12) masked row by row. The rows hash stays the hash of the plain rows.
+ */
+export function maskedAnswer(answer: SendAnswer): SendAnswer {
+  const surface = answer.surface === undefined ? {} : { surface: maskSurface(answer.surface) };
+  const rows = answer.rows === undefined ? {} : { rows: answer.rows.map(redactText) };
+  return { ...answer, ...surface, ...rows };
+}
+
+/** A view send's refusal before the Send Protocol: HTTP 409 with the code, so the phone shows it and never retries. */
+function viewRefused(code: string, error: string, acceptEncoding: string | null): Response {
+  return json({ error, code, view: true }, acceptEncoding, 409);
+}
+
+/**
+ * A send from an agent view (SECURITY rules 2 to 6, 8): `{ id, pane, view: { trick, session, rev, control } }`
+ * for a tap, `{ id, pane, text, view: { trick, session } }` for typed text. The bridge builds the line from
+ * its own stored screen (`prepareSend`); the phone's `text` of a tap is never read. A refusal before the
+ * protocol answers 409 `{ error, code, view: true }`; a send that reached the protocol answers its receipt,
+ * as any send, with `view: { line }`, the exact text handed to the session. One audit line either way.
+ */
+async function viewSendRoute(
+  rt: SendRouteRuntime,
+  body: JsonValue | undefined,
+  context: {
+    readonly audit: AuditLog;
+    readonly device: string | null;
+    readonly redact: boolean;
+    readonly acceptEncoding: string | null;
+    readonly spoke?: (paneId: string, started: boolean) => void;
+    readonly view: { readonly service: AgentViewService; readonly addressOf: (paneId: string) => string | null };
+    readonly field: ViewSendField;
+  },
+): Promise<Response> {
+  const fields = asJsonRecord(body);
+  const id = fields?.id;
+  const paneId = fields?.pane;
+  const typed = asJsonString(fields?.text);
+  if (typeof id !== "string" || !REQUEST_ID.test(id) || typeof paneId !== "string" || paneId.length === 0 || paneId.length > 256) return text("bad send request", 400);
+  const tap = context.field.rev !== undefined;
+  if (!tap && (typed === undefined || typed.trim() === "" || typed.length > SEND_MAX_TEXT)) return text("bad send request", 400);
+  if (rt.driver !== undefined || rt.send === undefined) return viewRefused("wrong_session", "an agent view sends to a session with a screen only", context.acceptEncoding);
+  const refusal = rawInputRefusal(rt.herdr);
+  if (refusal !== null) return json(refusal.body, context.acceptEncoding, refusal.status);
+  const harness = replySendOf(rt).harnessOf(paneId);
+  const own = context.view.addressOf(paneId);
+  if (harness === null || own === null) return text("no such terminal pane", 404);
+  const plan = await context.view.service.prepareSend({ field: context.field, own, typed: tap ? null : (typed ?? null), device: context.device });
+  if (!plan.ok) {
+    context.audit.record({ action: "send", paneId, session: rt.name, device: context.device, detail: { mode: "send", outcome: "refused", reason: plan.code, view: context.field.trick } });
+    return viewRefused(plan.code, plan.error, context.acceptEncoding);
+  }
+  const mode: SendRequest["mode"] = plan.plain && isCommand(plan.line) ? "command" : "send";
+  const sendRequest: SendRequest = { id, text: plan.line, mode, fromPhone: plan.plain, view: { head: !plan.plain, check: plan.check } };
+  let receipt: SendReceipt | undefined;
+  let answer: Awaited<ReturnType<SendProtocol["handle"]>>;
+  try {
+    answer = await rt.send.handle(sendRequest, { session: rt.name, paneId, harness });
+    receipt = answer.receipt;
+  } finally {
+    plan.done({ rid: id, sent: receipt !== undefined && SPOKE_OUTCOMES.has(receipt.outcome), reason: receipt?.reason ?? (receipt === undefined ? "crash" : null), landed: viewLanded(receipt) });
+  }
+  if (receipt !== undefined) {
+    const detail: AuditDetail = { mode, outcome: receipt.outcome, textLength: receipt.textLength, view: plan.trick };
+    if (receipt.reason !== undefined) detail.reason = receipt.reason;
+    context.audit.record({ action: "send", paneId, session: rt.name, device: context.device, detail });
+    // A view's line marks the cards only: whether it started a turn is not read here (M96 spec 10).
+    if (plan.plain && sendSpoke(mode, receipt.outcome)) context.spoke?.(paneId, false);
+    if (receipt.keys.length > 0) {
+      rt.engine.noteInput();
+      rt.engine.pokeNow();
+    }
+  }
+  const out = context.redact ? maskedAnswer(answer) : answer;
+  // The receipt says how the keys ended: a line that landed but did not end `sent` carries its outcome (review 9 R7).
+  const landed = viewLanded(receipt);
+  return json({ ...out, view: landed === undefined ? { line: plan.line } : { line: plan.line, outcome: landed } }, context.acceptEncoding);
+}
+
+/** A view send whose keys landed but that did not end `sent`: its outcome, else undefined. */
+function viewLanded(receipt: SendReceipt | undefined): ViewSentOutcome | undefined {
+  if (receipt === undefined) return undefined;
+  return receipt.outcome === "typed_not_submitted" || receipt.outcome === "unknown" ? receipt.outcome : undefined;
 }
 
 /** What `stopRoute` reads of a session runtime: a {@link SessionRuntime} is one. */
@@ -8833,6 +10387,8 @@ export async function stopRoute(
   const detail: AuditDetail = { requestId, outcome: receipt.outcome, replayed: answer.replayed };
   if (receipt.reason !== undefined) detail.reason = receipt.reason;
   if (receipt.keys !== undefined) detail.keys = [...receipt.keys];
+  // The key went out while another bridge still wrote into the pane (M102 spec 16): the record says so.
+  if (answer.bypassed === true) detail.lock = "bypassed";
   context.audit.record({ action: "abort", paneId, session: context.session, device: context.device, detail });
   // A replay pressed nothing this time; a first tap that pressed makes the engine look again soon.
   if (receipt.keys !== undefined && !answer.replayed) {
@@ -8882,6 +10438,8 @@ export async function clearRoute(
     rt.engine.noteInput();
     rt.engine.pokeNow();
   }
+  // Another bridge writes into the pane (M102 spec 16): the phone also reads the code off the header.
+  if (receipt.reason === "pane_busy") return withRefusal(json(receipt, context.acceptEncoding), "bridge", "pane_busy");
   return json(receipt, context.acceptEncoding);
 }
 
@@ -8911,7 +10469,7 @@ async function programSendRoute(
     // The program took the text: read the layout again soon, so the phone sees the turn move.
     if (receipt.acknowledged !== undefined && answer.replayed !== true) rt.engine.pokeNow();
   }
-  const out = context.redact && answer.surface !== undefined ? { ...answer, surface: maskSurface(answer.surface) } : answer;
+  const out = context.redact ? maskedAnswer(answer) : answer;
   return json(out, context.acceptEncoding);
 }
 
@@ -8937,6 +10495,338 @@ export const WALKY_OLDER_MEMBER_TEXT = "that machine runs a Collie older than wa
  */
 export function walkyOlderMemberAnswer(memberVersion: string | null, ownVersion: string): Response | null {
   return olderThanWalky(memberVersion, ownVersion, compareSemver) ? text(WALKY_OLDER_MEMBER_TEXT, 404) : null;
+}
+
+/** What a hill route answers on a bridge built without it (M96). */
+export const HILL_OFF_TEXT = "the hill is not running on this bridge";
+/** What a hill route answers with `?host=`: the hill is not merged across the crew yet. */
+/** `?h=<member>` on the tricks switch route: the switch is this machine's, set on the member itself. */
+export const TRICKS_SWITCH_LOCAL_TEXT = "the tricks switch is this machine's only; set it on the machine itself";
+export const HILL_LOCAL_TEXT = "the hill reads this machine only for now; ask the machine itself";
+/** What the answer route says of a `rid` already used for another answer. */
+export const HILL_RID_REUSED = "request-id-reused: this rid already answered with another choice";
+/** What the answer route says when the first receipt could not be written: nothing closed, nothing typed. */
+export const HILL_UNSAVED_TEXT = "the answer could not be recorded on this machine, so nothing was sent";
+
+/** The snapshot with the hill's revision (M96) when there is one. Absent, the body is unchanged, byte for byte. */
+export function withHillRev(body: SnapshotResponse, rev: number | undefined): SnapshotResponse {
+  return rev === undefined ? body : { ...body, hillRev: rev };
+}
+
+/** What an agent view route answers on a bridge built without them. */
+export const VIEW_OFF_TEXT = "agent views are not running on this bridge";
+/** What an agent view route answers with `?host=`: views are not merged across the crew. */
+export const VIEW_LOCAL_TEXT = "agent views read this machine only; ask the machine itself";
+/** What the switch answers for a body of another shape. */
+export const VIEW_BAD_SWITCH = 'the body is { "trick": "<trick id>", "session": "<walky address>", "on": true | false }';
+/** What a view's switch or send answers a caller that is not a paired device with its own token. */
+export const VIEW_PAIRED_ONLY = "an agent view is switched and sent from a paired device only";
+
+/**
+ * The second gate of an agent view's switch and send (SECURITY rule 3): beyond the write gate, the
+ * request must carry a paired device's own token. The host's local credential, a device known only by a
+ * proxy header, and a bridge with no pairing at all are refused 403. Null when the request may go on.
+ */
+export function viewWriteGate(req: Request, pairing: PairingGate | undefined): Response | null {
+  return pairedLabel(req, pairing) === null ? text(VIEW_PAIRED_ONLY, 403) : null;
+}
+
+/** The snapshot with the agent views' revision when there is one. Absent, the body is unchanged, byte for byte. */
+export function withTrickViewsRev(body: SnapshotResponse, rev: number | undefined): SnapshotResponse {
+  return rev === undefined ? body : { ...body, trickViewsRev: rev };
+}
+
+/**
+ * `GET /api/trick-views?since=<rev>`: every view this bridge holds, keyed by (trick, session), with its
+ * switch, head, tail and screen. With `since` equal to the revision, `{ rev, unchanged: true, views: [] }`;
+ * with an older one, only the views that moved after it and the keys of every view held. The tricks are
+ * scanned first (inside their usual cadence), so a trick switched off reads off here at once.
+ * `session=<address>`, given once per session (at most {@link VIEW_LIST_SESSIONS_MAX}), narrows the answer
+ * and its keys to the sessions the phone shows; none given is every session, as before.
+ */
+export async function trickViewsListRoute(views: AgentViewService | undefined, since: string | null, acceptEncoding: string | null, sessions: readonly string[] = []): Promise<Response> {
+  if (views === undefined) return text(VIEW_OFF_TEXT, 404);
+  if (sessions.length > VIEW_LIST_SESSIONS_MAX || sessions.some((session) => session === "" || session.length > VIEW_SESSION_MAX)) return text(VIEW_BAD_SESSIONS, 400);
+  await views.settle();
+  const at = since === null || !/^\d{1,16}$/u.test(since) ? null : Number(since);
+  return json(views.answer(at, sessions.length === 0 ? null : sessions), acceptEncoding);
+}
+
+/** The most `session` names one read of the views may carry. */
+export const VIEW_LIST_SESSIONS_MAX = 16;
+/** What the read answers for a session list it does not take. */
+export const VIEW_BAD_SESSIONS = `give at most ${String(VIEW_LIST_SESSIONS_MAX)} session addresses, each 1 to ${String(VIEW_SESSION_MAX)} characters`;
+
+/**
+ * `POST /api/trick-views/switch`: the person turns one session's view of one trick on or off. 200 with the
+ * view as served, 400 for a body of another shape or on a crew member, 404 for an address that names no
+ * live agent session here, 409 when the trick does not pass the gate, 503 when the state could not be
+ * written. The gates' own 401 and 403 come before this. One audit line.
+ */
+export async function trickViewsSwitchRoute(views: AgentViewService | undefined, body: JsonValue | undefined, context: { readonly device: string | null; readonly acceptEncoding: string | null }): Promise<Response> {
+  if (views === undefined) return text(VIEW_OFF_TEXT, 404);
+  const read = readTrickViewSwitchBody(body);
+  if (read === null) return text(VIEW_BAD_SWITCH, 400);
+  const answer = await views.switch(read, context.device);
+  if (!answer.ok) return json({ error: answer.error, code: answer.code, view: true }, context.acceptEncoding, answer.status);
+  return json(answer.session, context.acceptEncoding);
+}
+
+/**
+ * `GET /api/trick-views/media/<set id>/<media id>`: the bytes of one picture of a view's screen, with the
+ * type the bridge read off them when it kept the file and the hill's image headers (`no-store`, a
+ * sandboxed CSP, `nosniff`). Each id is checked against its pattern before the service is asked, and the
+ * service builds a path only for a pair a held screen names, of a view that is on, passes its gate and is
+ * not stale. Every miss is the same 404.
+ */
+export function trickViewsMediaRoute(views: AgentViewService | undefined, set: string, mediaId: string): Response {
+  if (views === undefined) return text(VIEW_OFF_TEXT, 404);
+  if (!VIEW_SET_RE.test(set) || !VIEW_MEDIA_ID_RE.test(mediaId)) return text(HILL_MEDIA_MISSING, 404);
+  const file = views.mediaFile(set, mediaId);
+  if (file === null) return text(HILL_MEDIA_MISSING, 404);
+  return secure(new Response(file.bytes, { headers: { "content-type": file.mime, ...HILL_MEDIA_HEADERS } }));
+}
+
+/**
+ * The snapshot with what the phone needs of the hill. On: its revision, as {@link withHillRev}. Off (the
+ * Hill's switch): no revision, so the phone empties its list and the bar loses the Hill item, and
+ * `hillOff: true`, so the Hill's route and Settings say it is off. With the Hill on the body carries no
+ * `hillOff` key at all, so an install that never switched it keeps its bytes.
+ *
+ * Off, while the store holds a card of Collie's own about a trick (spec 14), the body also carries
+ * `trickCardsRev`: the phone reads `GET /api/hill`, which then serves only those cards, for Settings,
+ * Tricks, the Dashboard's line and the card's own page. Still no `hillRev`, so still no Hill item.
+ */
+export function withHill(body: SnapshotResponse, hill: Pick<HillService, "isOn" | "rev" | "trickCardsRev"> | undefined): SnapshotResponse {
+  if (hill === undefined) return body;
+  if (!hill.isOn()) {
+    const cards = hill.trickCardsRev();
+    return cards === undefined ? { ...body, hillOff: true } : { ...body, hillOff: true, trickCardsRev: cards };
+  }
+  return withHillRev(body, hill.rev());
+}
+
+/**
+ * `GET` and `POST /api/tricks/switch`: the switch for tricks as a whole (bridge/tricks/feature-switch.ts).
+ * `GET` (`write` null) answers `{ on }`. `POST` takes `{ "on": boolean }` and nothing else and answers `{ on }`
+ * as the switch now reads; 400 for another body, 409 on a Windows bridge (the gate stays first), 503 when the
+ * file could not be written, 404 with no tricks runner.
+ */
+export function tricksFeatureRoute(
+  tricks: Pick<TricksSurface, "switchedOn" | "switchTo" | "gateLine"> | undefined,
+  write: { readonly body: JsonValue | undefined } | null,
+  context: { readonly device: string | null; readonly acceptEncoding: string | null },
+): Response {
+  if (tricks === undefined) return text("not found", 404);
+  if (write === null) return json({ on: tricks.switchedOn() }, context.acceptEncoding);
+  const doc = asJsonObject(write.body);
+  const on = asJsonBoolean(doc?.on);
+  if (doc === undefined || on === undefined || Object.keys(doc).length !== 1) return text('bad request: the body is { "on": true } or { "on": false }', 400);
+  const gate = tricks.gateLine();
+  if (gate !== null) return text(gate, 409);
+  const now = tricks.switchTo(on, context.device);
+  if (now === null) return text("the tricks switch could not be saved on this machine; nothing changed", 503);
+  return json({ on: now }, context.acceptEncoding);
+}
+
+/** What the answer route says while the Hill is switched off: nothing was typed, and the decision stays open. */
+export const HILL_SWITCHED_OFF_TEXT = "the Hill is off on this Collie, so nothing was sent";
+
+/**
+ * `GET` and `POST /api/hill/switch`: the Hill's switch. `GET` (`write` null) answers `{ on }`. `POST`
+ * takes `{ "on": boolean }` and nothing else, and answers `{ on }` as the switch now reads; 400 for
+ * another body, 503 when the switch file could not be written.
+ */
+export function hillSwitchRoute(
+  hill: Pick<HillService, "isOn" | "switchTo"> | undefined,
+  write: { readonly body: JsonValue | undefined } | null,
+  context: { readonly device: string | null; readonly acceptEncoding: string | null },
+): Response {
+  if (hill === undefined) return text(HILL_OFF_TEXT, 404);
+  if (write === null) return json({ on: hill.isOn() }, context.acceptEncoding);
+  const doc = asJsonObject(write.body);
+  const on = asJsonBoolean(doc?.on);
+  if (doc === undefined || on === undefined || Object.keys(doc).length !== 1) return text("bad request: the body is { \"on\": true } or { \"on\": false }", 400);
+  const now = hill.switchTo(on, context.device);
+  if (now === null) return text("the Hill's switch could not be saved on this machine; nothing changed", 503);
+  return json({ on: now }, context.acceptEncoding);
+}
+
+/**
+ * `GET /api/hill?since=<rev>` (M96): every open decision and the newest closed ones. With `since` equal
+ * to the revision, only `{ rev, unchanged: true }`.
+ */
+export function hillListRoute(hill: HillService | undefined, since: string | null, acceptEncoding: string | null): Response {
+  if (hill === undefined) return text(HILL_OFF_TEXT, 404);
+  const list = hill.list();
+  if (since !== null && since === String(list.rev)) return json({ rev: list.rev, unchanged: true }, acceptEncoding);
+  // The crew state rides along (1.29.0); a change of it moves the revision, so `unchanged` stays true to it.
+  // Not from a member or a deposed lead: its own file is not the crew's state (C-N4).
+  const crewState = hill.servedCrewState();
+  return json(crewState === null ? list : { ...list, crewState }, acceptEncoding);
+}
+
+/**
+ * `GET` and `POST /api/hill/state` (1.29.0): the crew state. `GET` (`write` null) answers the state
+ * `{ state, at, by, told }`. `POST` takes `{ "state": "here" | "quiet" | "away" }` and nothing else and
+ * answers the state as it reads now; 400 for another body, 409 on a machine that is not the crew's lead,
+ * 503 when the file could not be written. The audit line `hill.state` names the device and the value.
+ */
+export function hillStateRoute(
+  hill: Pick<HillService, "servedCrewState" | "setCrewState"> | undefined,
+  write: { readonly body: JsonValue | undefined } | null,
+  context: { readonly device: string | null; readonly acceptEncoding: string | null },
+): Response {
+  if (hill === undefined) return text(HILL_OFF_TEXT, 404);
+  if (write === null) {
+    // A member or a deposed lead answers as its POST does (C-N4): the state lives on the lead.
+    const served = hill.servedCrewState();
+    return served === null ? text(HILL_STATE_ON_LEAD, 409) : json(served, context.acceptEncoding);
+  }
+  const doc = asJsonObject(write.body);
+  const state = doc?.state;
+  if (doc === undefined || !isHillCrewState(state) || Object.keys(doc).length !== 1) return text('bad request: the body is { "state": "here" }, "quiet" or "away"', 400);
+  const set = hill.setCrewState(state, context.device ?? "phone", context.device);
+  if (!set.ok) return text(set.error, set.notLead ? 409 : 503);
+  return json(set.crewState, context.acceptEncoding);
+}
+
+/**
+ * `POST /api/hill/state/tell` (1.29.0): "Tell all sessions now". The body is `{ "at": <ms> }`, the
+ * change of the crew state the phone showed. 200 `{ told }`, how many sessions walky typed the line into,
+ * once the sends settled (up to HILL_SEND_WAIT_MS); 409 with the
+ * words when the state moved, was told already, is `here`, or the Hill or WalkyTalky is off.
+ */
+export async function hillTellRoute(
+  hill: Pick<HillService, "tellAll"> | undefined,
+  body: JsonValue | undefined,
+  context: { readonly device: string | null; readonly acceptEncoding: string | null },
+): Promise<Response> {
+  if (hill === undefined) return text(HILL_OFF_TEXT, 404);
+  const doc = asJsonObject(body);
+  const at = asJsonNumber(doc?.at);
+  if (doc === undefined || at === undefined || !Number.isSafeInteger(at) || Object.keys(doc).length !== 1) return text('bad request: the body is { "at": <the time the crew state was set> }', 400);
+  const told = await hill.tellAll(at, context.device ?? "phone", context.device);
+  if (!told.ok) return text(told.error, 409);
+  return json({ told: told.told }, context.acceptEncoding);
+}
+
+/**
+ * `POST /api/hill/answer` (M96): one answer from the phone, by the receipt rules of the hill. 200 for
+ * every receipt the bridge wrote, 400 for a body of another shape, 409 for a `rid` used for another
+ * answer, 503 when the first receipt could not be written. The gates' own 401 and 403 come before this.
+ */
+export async function hillAnswerRoute(
+  hill: HillService | undefined,
+  body: JsonValue | undefined,
+  context: { readonly device: string | null; readonly deviceId?: string | null; readonly acceptEncoding: string | null },
+): Promise<Response> {
+  if (hill === undefined) return text(HILL_OFF_TEXT, 404);
+  const read = readAnswerRequest(body);
+  if (!read.ok) return text(read.error, 400);
+  const outcome = await hill.answer(read.request, read.id, context.device ?? "phone", context.deviceId ?? null);
+  switch (outcome.kind) {
+    case "receipt":
+      return json(outcome.receipt, context.acceptEncoding);
+    case "reused":
+      return text(HILL_RID_REUSED, 409);
+    case "unsaved":
+      return text(HILL_UNSAVED_TEXT, 503);
+    case "off":
+      return text(HILL_SWITCHED_OFF_TEXT, 409);
+    case "tricks-off":
+      return text(TRICKS_OFF_LINE, 409);
+  }
+}
+
+/** What the clear route says when the write failed: nothing was removed. */
+export const HILL_CLEAR_UNSAVED_TEXT = "the Hill could not be saved on this machine; nothing was cleared";
+/** The most ids one clear names. */
+export const HILL_CLEAR_IDS_MAX = 200;
+
+/**
+ * `POST /api/hill/clear/spoken` (1.29.0): `{}` or `{ "ids": [...] }` in (the cards the phone showed, C-N5),
+ * `{ cleared }` out. Withdraws and clears every open
+ * Decision the person answered in its session (`spokeAfter`); nothing is typed into any session. 409 on a
+ * member or a deposed lead, 503 when the Hill could not be saved.
+ */
+export function hillSpokenClearRoute(
+  hill: Pick<HillService, "clearSpoken"> | undefined,
+  body: JsonValue | undefined,
+  context: { readonly device: string | null; readonly acceptEncoding: string | null },
+): Response {
+  if (hill === undefined) return text(HILL_OFF_TEXT, 404);
+  const ids = readClearIds(body);
+  if (ids === undefined) return text(HILL_CLEAR_BAD_BODY, 400);
+  const answer = hill.clearSpoken(context.device, ids);
+  if (!answer.ok) return text(answer.error, answer.notLead ? 409 : 503);
+  return json({ cleared: answer.cleared }, context.acceptEncoding);
+}
+
+const HILL_CLEAR_BAD_BODY = 'bad request: the body is {} or { "ids": ["dc_..."] }';
+
+/** A Clear's body: `{}` (null, every one) or `{ "ids": [...] }`; undefined for any other shape. */
+function readClearIds(body: JsonValue | undefined): string[] | null | undefined {
+  const doc = asJsonObject(body);
+  if (doc === undefined || Object.keys(doc).some((key) => key !== "ids")) return undefined;
+  if (doc.ids === undefined) return null;
+  const raw = doc.ids;
+  if (!Array.isArray(raw) || raw.length > HILL_CLEAR_IDS_MAX) return undefined;
+  const ids: string[] = [];
+  for (const entry of raw) {
+    const id = asJsonString(entry);
+    if (id === undefined || !HILL_ID_RE.test(id)) return undefined;
+    ids.push(id);
+  }
+  return ids;
+}
+
+/**
+ * `POST /api/hill/clear`: remove closed decisions. The body is `{}` (every closed decision) or
+ * `{ "ids": ["dc_..."] }` (those, when closed). 200 `{ cleared, skipped }`: `cleared` is how many went,
+ * `skipped` the ids left alone, `open` for an open decision and `missing` for one this bridge does not
+ * hold. 400 for another body, 503 when the write failed. Works with the Hill off.
+ */
+export function hillClearRoute(
+  hill: Pick<HillService, "clear"> | undefined,
+  body: JsonValue | undefined,
+  context: { readonly device: string | null; readonly acceptEncoding: string | null },
+): Response {
+  if (hill === undefined) return text(HILL_OFF_TEXT, 404);
+  const ids = readClearIds(body);
+  if (ids === undefined) return text(HILL_CLEAR_BAD_BODY, 400);
+  const answer = hill.clear(ids, context.device);
+  if (answer === null) return text(HILL_CLEAR_UNSAVED_TEXT, 503);
+  return json({ cleared: answer.cleared.length, skipped: answer.skipped }, context.acceptEncoding);
+}
+
+/**
+ * The headers an image of the hill carries beside {@link secure}'s `nosniff` (M96). The Files view's
+ * picture headers, for the same reasons: `no-store` because the browser's cache outlives a pairing
+ * (`blobRoute`), a CSP that drops the answer into an opaque origin with nothing allowed in case the
+ * bytes are ever opened as a page, and `inline`.
+ */
+export const HILL_MEDIA_HEADERS = {
+  "cache-control": "no-store",
+  "content-security-policy": "default-src 'none'; sandbox",
+  "content-disposition": "inline",
+} as const;
+
+/** What the image route answers for any id it does not hold, well formed or not. */
+export const HILL_MEDIA_MISSING = "no such image";
+
+/**
+ * `GET /api/hill/media/<decision id>/<media id>` (M96): the bytes of one image of a decision, with
+ * the type the bridge read off them when it kept the file. Each id is checked against its pattern
+ * before the service is asked, and the service builds a path only for a pair its store holds. Every
+ * miss is the same 404.
+ */
+export function hillMediaRoute(hill: HillService | undefined, decisionId: string, mediaId: string): Response {
+  if (hill === undefined) return text(HILL_OFF_TEXT, 404);
+  if (!HILL_ID_RE.test(decisionId) || !HILL_MEDIA_ID_RE.test(mediaId)) return text(HILL_MEDIA_MISSING, 404);
+  const file = hill.mediaFile(decisionId, mediaId);
+  if (file === null) return text(HILL_MEDIA_MISSING, 404);
+  return secure(new Response(file.bytes, { headers: { "content-type": file.mime, ...HILL_MEDIA_HEADERS } }));
 }
 
 /** `POST /api/walky`: one message from the phone, as an operator, under the device's label. */
@@ -8996,6 +10886,49 @@ const WALKY_LIST_DEFAULT = 50;
 
 /** What the drop route answers on a crew member: the lead's phone forwards no take-back. */
 export const WALKY_DROP_LOCAL_TEXT = "a message held on a crew member is dropped on that machine";
+export const WALKY_DELIVER_LOCAL_TEXT = "a message held on a crew member is delivered on that machine";
+
+/**
+ * What a person reads when Deliver now did not deliver (spec 05). The phone puts a 409 line after "Not delivered.
+ * The message still waits and your text is unchanged." `not held` is a 410 and the phone prints its own line, for
+ * the message no longer waits and "still waits" would be untrue. `may have arrived` is the one end that is no
+ * refusal and no delivery: it answers 200 like a delivery, and the row says the rest.
+ */
+export const DELIVER_NOW_WORDS = {
+  busy: "The agent is busy. Try again when its turn ends.",
+  "not linked": "This session is not linked now.",
+  "not taken": "The session did not take it.",
+  "not held": "It no longer waits for your text.",
+  elsewhere: "It waits on another machine.",
+} as const satisfies Record<Exclude<DeliverNow["result"], "delivered" | "repeat" | "may have arrived">, string>;
+
+/**
+ * `POST /api/pane/<pane>/walky/<id>/deliver` (M99 spec 05, decision of 2026-11-13): the pane's owner hands
+ * one message held for their draft to the agent by data; the draft stays in the box. 200 with the result
+ * and the newest receipt when it went (`delivered`, `repeat`) or may have (`may have arrived`); 409 with
+ * the reason in words when it still waits (`busy`, `not linked`, `not taken`, `elsewhere`); 410 when it
+ * waits no more (`not held`: it went in by itself, or was dropped, cancelled or expired a moment before the
+ * tap); 404 for a pane or message this bridge does not have. One audit line, never the body and never the draft.
+ */
+export async function walkyDeliverRoute(
+  walky: WalkyService | undefined,
+  session: string,
+  paneId: string,
+  id: string,
+  context: { readonly audit: AuditLog; readonly device: string | null; readonly acceptEncoding: string | null },
+): Promise<Response> {
+  if (walky === undefined) return text(WALKY_OFF_TEXT, 404);
+  if (!isPaneId(paneId)) return text("bad pane", 400);
+  if (!isWalkyId(id)) return text("bad message id", 400);
+  const instance = walky.instanceOf(session, paneId);
+  if (instance === null) return text("no such pane", 404);
+  const answer = await walky.deliverNow(id, { session, paneId, instance });
+  context.audit.record({ action: "walky.deliverNow", paneId, session, device: context.device, detail: { id, result: answer.ok ? `${answer.result.target}: ${answer.result.result}` : answer.error } });
+  if (!answer.ok) return text(answer.error, 404);
+  const { result } = answer.result;
+  if (result === "delivered" || result === "repeat" || result === "may have arrived") return json({ result: answer.result }, context.acceptEncoding);
+  return text(DELIVER_NOW_WORDS[result], result === "not held" ? 410 : 409);
+}
 
 /** A take-back's answer as the phone reads it: `{ results }` (200), or the reason in a 404 or 403. */
 function walkyTakeBackResponse(answer: TakeBackAnswer, acceptEncoding: string | null): Response {
@@ -9143,14 +11076,14 @@ export async function reportContextRoute(
 /**
  * `POST /api/telemetry/trouble` once the write gate passed (M86 spec 05): one trouble signal from the
  * phone. A body that is not exactly `{ kind, harness, version, mux }` in their shapes, plus an optional
- * `screen` hash on a dialog signal, is a 400, plain text, because the phone never shows it. A good body is a 204 whether or not it was counted: with the
+ * `screen` hash on a dialog signal and an optional `pane` (and `session`) that only say which local pane to ask whether it is linked, is a 400, plain text, because the phone never shows it. A good body is a 204 whether or not it was counted: with the
  * ping off for any reason, nothing is stored. Undefined telemetry answers 503, like the setting route.
  */
 export function telemetryTroubleRoute(ping: Pick<Telemetry, "trouble"> | undefined, body: JsonValue | undefined): Response {
   if (!ping) return text("telemetry unavailable", 503);
-  const signal = parseTroubleSignal(body);
-  if (signal === null) return text("telemetry.trouble_invalid", 400);
-  ping.trouble(signal);
+  const parsed = parseTroubleBody(body);
+  if (parsed === null) return text("telemetry.trouble_invalid", 400);
+  ping.trouble(parsed.signal, parsed.where);
   return secure(new Response(null, { status: 204 }));
 }
 
@@ -9177,6 +11110,30 @@ export function heldCancelRoute(
   return json(answer satisfies HeldCancelAnswer, context.acceptEncoding, answer.result === "refused" ? 409 : 200);
 }
 
+/**
+ * `POST /api/pane/:id/arrived` once the write gate passed and the session resolved (M102 spec 01): the
+ * person's "It arrived" on a send of this pane whose receipt ended `unknown`. The receipt takes `word:
+ * "arrived"` beside its outcome. `{ word: "arrived" }` (200); a body with no good `requestId` is a 400; an
+ * id of another pane or nobody's is a 404, the two never told apart; a receipt that did not end `unknown`,
+ * or is already marked, is a 409. One audit line per answered request, with the result and never the text.
+ */
+export function arrivedRoute(
+  rt: Pick<SendRouteRuntime, "send" | "name">,
+  paneId: string,
+  body: JsonValue | undefined,
+  context: { readonly audit: AuditLog; readonly device: string | null; readonly acceptEncoding: string | null },
+): Response {
+  if (rt.send === undefined) return text(SEND_OFF_TEXT, 404);
+  const requestId = asJsonRecord(body)?.requestId;
+  if (typeof requestId !== "string" || !REQUEST_ID.test(requestId)) return text("bad body", 400);
+  const result = rt.send.markArrived(rt.name, paneId, requestId);
+  context.audit.record({ action: "send-arrived", paneId, session: rt.name, device: context.device, detail: { outcome: result } });
+  if (result === "not_found") return text("no such send on this pane", 404);
+  if (result === "not_unknown") return text("this send did not end unknown", 409);
+  if (result === "already") return text("this send is already marked", 409);
+  return json({ word: "arrived" }, context.acceptEncoding);
+}
+
 /** What `/api/ask/<id>` answers with the Send Protocol off: no ask is answerable, a 404 that says why. */
 export const ASK_OFF_TEXT = "asks are answered with the send protocol, which is off (COLLIE_SEND_PROTOCOL=0)";
 
@@ -9193,6 +11150,19 @@ function maskAskReply(reply: AskReply): AskReply {
   return masked;
 }
 
+/** What `POST /api/ask/<id>` writes beside its answer. */
+export interface AskRouteContext {
+  readonly audit: AuditLog;
+  readonly device: string | null;
+  readonly redact: boolean;
+  readonly acceptEncoding: string | null;
+  /**
+   * An answer that reached the pane is a person turn in its session (agent views rule 6, review 9 R3):
+   * a view's screen there, on a harness that reports no conversation, goes stale. A replay is no turn.
+   */
+  readonly personTurn?: (paneId: string) => void;
+}
+
 /**
  * `POST /api/ask/<id>` once the write gate passed and the session resolved (M56 spec 08). With the
  * Send Protocol off (no answerer on the runtime) the route is not there. Every outcome is a 200 with
@@ -9203,16 +11173,18 @@ export async function askRoute(
   rt: AskRouteRuntime,
   askId: string,
   body: JsonValue | undefined,
-  context: { readonly audit: AuditLog; readonly device: string | null; readonly redact: boolean; readonly acceptEncoding: string | null },
+  context: AskRouteContext,
 ): Promise<Response> {
   if (rt.driver !== undefined) return programAskRoute(rt, rt.driver, askId, body, context);
-  if (rt.asks === undefined) return text(ASK_OFF_TEXT, 404);
+  // A refusal before the ask book leaves one record and names its code (M102 spec 14, I3).
+  const refuse = (res: Response, reason: RefusalReason, paneId?: string): Response => routeRefusal(res, { action: "ask", reason, paneId: paneId ?? bodyPaneOf(body), session: rt.name, ...context });
+  if (rt.asks === undefined) return refuse(text(ASK_OFF_TEXT, 404), "send_off");
   const parsed = parseAnswerBody(askId, body);
-  if (parsed === null) return text("bad ask answer", 400);
+  if (parsed === null) return refuse(text("bad ask answer", 400), "bad_body");
   const refusal = rawInputRefusal(rt.herdr);
-  if (refusal !== null) return json(refusal.body, context.acceptEncoding, refusal.status);
+  if (refusal !== null) return refuse(json(refusal.body, context.acceptEncoding, refusal.status), "no_raw_input", parsed.pane);
   const harness = replySendOf(rt).harnessOf(parsed.pane);
-  if (harness === null) return text("no such terminal pane", 404);
+  if (harness === null) return refuse(text("no such terminal pane", 404), "no_pane", parsed.pane);
   const { pane: paneId, ...answer } = parsed;
   const reply = await rt.asks.handle(answer, { session: rt.name, paneId, harness });
   const receipt = reply.receipt;
@@ -9225,6 +11197,7 @@ export async function askRoute(
     if (receipt.keys.length > 0 && reply.replayed !== true) {
       rt.engine.noteInput();
       rt.engine.pokeNow();
+      context.personTurn?.(paneId);
     }
   }
   return json(context.redact ? maskAskReply(reply) : reply, context.acceptEncoding);
@@ -9240,12 +11213,13 @@ async function programAskRoute(
   driver: ProgramDriver,
   askId: string,
   body: JsonValue | undefined,
-  context: { readonly audit: AuditLog; readonly device: string | null; readonly redact: boolean; readonly acceptEncoding: string | null },
+  context: AskRouteContext,
 ): Promise<Response> {
+  const refuse = (res: Response, reason: RefusalReason, paneId?: string): Response => routeRefusal(res, { action: "ask", reason, paneId: paneId ?? bodyPaneOf(body), session: rt.name, ...context });
   const parsed = parseAnswerBody(askId, body);
-  if (parsed === null) return text("bad ask answer", 400);
+  if (parsed === null) return refuse(text("bad ask answer", 400), "bad_body");
   const harness = replySendOf(rt).harnessOf(parsed.pane);
-  if (harness === null) return text("no such conversation", 404);
+  if (harness === null) return refuse(text("no such conversation", 404), "no_pane", parsed.pane);
   const { pane: paneId, ...answer } = parsed;
   const reply = await driver.answer(answer, { session: rt.name, paneId, harness });
   const receipt = reply.receipt;
@@ -9254,13 +11228,37 @@ async function programAskRoute(
     if (receipt.reason !== undefined) detail.reason = receipt.reason;
     if (reply.replayed === true) detail.replayed = true;
     context.audit.record({ action: "ask", paneId, session: rt.name, device: context.device, detail });
-    if (receipt.outcome === "sent" && reply.replayed !== true) rt.engine.pokeNow();
+    if (receipt.outcome === "sent" && reply.replayed !== true) {
+      rt.engine.pokeNow();
+      context.personTurn?.(paneId);
+    }
   }
   return json(context.redact ? maskAskReply(reply) : reply, context.acceptEncoding);
 }
 
 function text(body: string, status: number): Response {
   return secure(new Response(body, { status }));
+}
+
+/**
+ * The pane a send or ask body names, for the record of a refusal before the body parsed: a short id
+ * string, never any other field of the body. Undefined when there is none.
+ */
+function bodyPaneOf(body: JsonValue | undefined): string | undefined {
+  const pane = asJsonRecord(body)?.pane;
+  return typeof pane === "string" && pane !== "" && pane.length <= 256 ? pane : undefined;
+}
+
+/**
+ * A send or ask refusal before its protocol ran (M102 spec 14, I3): one audit line with the code and
+ * no text, and the same code on the answer for the phone (`x-collie-reason`, `x-collie-by: bridge`).
+ */
+function routeRefusal(
+  res: Response,
+  at: { readonly action: "send" | "ask"; readonly reason: RefusalReason; readonly paneId: string | undefined; readonly session: string; readonly audit: AuditLog; readonly device: string | null },
+): Response {
+  recordRefusal(at.audit, { action: at.action, by: "bridge", outcome: "refused", reason: at.reason, paneId: at.paneId, session: at.session, device: at.device });
+  return withRefusal(res, "bridge", at.reason);
 }
 
 /**
@@ -9612,7 +11610,8 @@ nothing here and has no sign-in of its own.</p>
 this Collie, pair this device instead: run <code>collie pair</code> on the computer that runs
 Collie, then enter the code in Settings.</p>
 <p>If you are the operator: point this path at your proxy's sign-in flow. See <em>Serving Collie
-behind your own reverse proxy</em> in the README.</p>
+behind your own reverse proxy</em> in the README. If your front door signs in on every path and has
+no page here, set <code>COLLIE_AUTH_RETURN=1</code> and this address sends you back to Collie.</p>
 <p><a href="${base}">Back to Collie</a> · <a href="${base}settings/system">Open Settings</a></p>
 </body>
 </html>
@@ -9623,6 +11622,24 @@ behind your own reverse proxy</em> in the README.</p>
       headers: {
         "content-type": "text/html; charset=utf-8",
         "content-security-policy": CSP,
+        "cache-control": "no-store",
+      },
+    }),
+  );
+}
+
+/**
+ * What `/auth/` answers under `COLLIE_AUTH_RETURN=1`: a `303` to the mount, never cached.
+ *
+ * @param basePath The normalised mount (`/` or `/collie/`, ADR 0052). The only `location` it sends.
+ * @returns A redirect with no body, outside every gate, like the placeholder.
+ */
+export function reservedAuthReturn(basePath: string = "/"): Response {
+  return secure(
+    new Response(null, {
+      status: 303,
+      headers: {
+        location: basePath,
         "cache-control": "no-store",
       },
     }),

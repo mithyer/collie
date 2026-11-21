@@ -1,0 +1,34 @@
+{
+  "v": 1,
+  "harness": "pi",
+  "version": "1.3.0",
+  "legs": {
+    "solo-data": {
+      "model": "openrouter/anthropic/claude-haiku-4.5",
+      "skill": "de912ddeb566f5c4",
+      "recordedAt": "2026-11-14T04:02:53.593Z",
+      "cases": [
+        "claude.walky-broadcast",
+        "pi.load-older",
+        "pi.permission",
+        "pi.pick-many",
+        "pi.steer",
+        "pi.stop-pi",
+        "pi.stream-send",
+        "pi.walky-agents",
+        "pi.walky-busy",
+        "pi.walky-operator"
+      ]
+    },
+    "crew-data": {
+      "model": "openrouter/anthropic/claude-haiku-4.5",
+      "skill": "de912ddeb566f5c4",
+      "recordedAt": "2026-11-14T04:28:07.985Z",
+      "cases": [
+        "claude.walky-crew-agents",
+        "claude.walky-crew-broadcast",
+        "claude.walky-crew-member-to-lead"
+      ]
+    }
+  }
+}

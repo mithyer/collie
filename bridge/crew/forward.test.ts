@@ -15,7 +15,8 @@ import {
   forwardToPeer,
   MemberPaneReads,
   REPLY_OLD_MEMBER_TEXT,
-  SEND_OLD_MEMBER_DETAIL,
+  MEMBER_VERSION_HEADER,
+  sendOldMemberDetail,
   crewRouteFor,
   proxiedResponse,
   textAnswerOf,
@@ -25,12 +26,14 @@ import {
   ASK_BODY_READ_MAX,
 } from "./forward.ts";
 import type { JsonObject } from "../json.ts";
+import { MEMBER_DEADLINE_MS } from "../create-confirm.ts";
 import { LEAD_ROW_HEADER, LEAD_ROW_MARK, leadRowCarry } from "./launcher-rows.ts";
 import { crewDeviceOf } from "./peer-gate.ts";
 import { HISTORY_READ_BUDGET_MS } from "../mux/herdr-core/adapter.ts";
 import {
   crewTimeoutBudget,
   PANE_READ_BUDGET_MS,
+  CREATE_WRITE_BUDGET_MS,
   PANE_WRITE_BUDGET_MS,
   WORKTREE_WRITE_BUDGET_MS,
   WRITE_BUDGET_MS,
@@ -128,6 +131,7 @@ interface ForwardFailure {
   error: string;
   host?: string;
   lastSeenAt?: number | null;
+  memberVersion?: string;
 }
 
 /** Read a refusal body as the envelope forward.ts guarantees for it. */
@@ -257,6 +261,9 @@ describe("which routes cross a link", () => {
       "/api/subscribe",
       "/api/notifications/snooze",
       "/api/notifications/prefs",
+      // Clear all is opening every pane of the collie the phone talks to; a member keeps its own seen
+      // ledger and is not asked (ADR 0003, ADR 0042).
+      "/api/notifications/clear",
       "/api/update/check",
       // ADR 0084: the lead holds every machine's history and rules, so `?host=` addresses nothing.
       "/api/machines",
@@ -292,7 +299,7 @@ describe("which routes cross a link", () => {
     // The list IS the inventory of what crosses a link; `chat` joined it with the live window, and
     // `files` with the Files view (ADR 0083), `held` with the Cancel and Dismiss on a member's queued row (issue 740).
     expect(paneActions).toEqual([
-      "abort", "action", "answer", "changes", "chat", "clear", "close", "files", "focus", "held", "history", "keys", "pins", "rename", "reply", "send", "upload",
+      "abort", "action", "answer", "arrived", "changes", "chat", "clear", "close", "files", "focus", "held", "history", "keys", "pins", "rename", "reply", "send", "upload",
     ]);
     // The Cancel or Dismiss on a member's queued row changes that member's hold queue: a write, audited on
     // the lead under the member's own name for the act (issue 740).
@@ -301,6 +308,10 @@ describe("which routes cross a link", () => {
     expect(forwardAuditAction("pane/x/held", "GET")).toBeNull();
     expect(apiPathFor("pane/x/held")).toBe("/api/pane/x/held");
     expect(crewRouteFor("/api/pane/x/held/req00001")).toBeNull();
+    // The person's "It arrived" (M102 spec 01) writes the member's receipt, so it is a write audited under the member's own name.
+    expect(forwardKind("pane/x/arrived", "POST")).toBe("write");
+    expect(forwardAuditAction("pane/x/arrived", "POST")).toBe("send-arrived");
+    expect(apiPathFor("pane/x/arrived")).toBe("/api/pane/x/arrived");
     for (const action of paneActions) expect(crewRouteFor(`/api/pane/x/${action}`)).toBe(`pane/x/${action}`);
     const tabActions = tab.match(alternation)![1]!.split("|").toSorted();
     expect(tabActions).toEqual(["close", "rename"]);
@@ -798,8 +809,12 @@ describe("a text reply to a member that sent no Surface reader version (an older
         error: REPLY_OLD_MEMBER_TEXT,
         code: "reply.send_failed",
         detail: { reason: REPLY_OLD_MEMBER_TEXT },
-        send: { receipt: { outcome: "refused" }, offers: ["keys"], detail: SEND_OLD_MEMBER_DETAIL },
+        // The member's version, in the body and the sentence the phone shows (M102 spec 14 decision 4).
+        memberVersion: REACHABLE.version,
+        send: { receipt: { outcome: "refused" }, offers: ["keys"], detail: sendOldMemberDetail(REACHABLE.version) },
       });
+      expect(res.headers.get(MEMBER_VERSION_HEADER)).toBe(REACHABLE.version);
+      expect(res.headers.get("x-collie-reason")).toBe("member_old");
       expect(calls).toHaveLength(0);
     }
   });
@@ -814,9 +829,9 @@ describe("a text reply to a member that sent no Surface reader version (an older
     // What the phone makes of it: a refusal, nothing typed, and the bridge's own sentence under it.
     const reply = readSendReply(body.send);
     expect(reply).not.toBeNull();
-    expect(readSend(reply!)).toMatchObject({ clear: false, note: "refused", detail: SEND_OLD_MEMBER_DETAIL });
+    expect(readSend(reply!)).toMatchObject({ clear: false, note: "refused", detail: "This machine runs Collie 1.0.0-alpha.12, which cannot take a send from the phone yet. Update it from the Crew page." });
     // The lead says why no forward followed the tap: one `reply` line naming the member.
-    expect(audit).toEqual([{ action: "reply", host: "laptop", paneId: "w1:p1", session: "main", outcome: "old_member" }]);
+    expect(audit).toEqual([{ action: "reply", host: "laptop", paneId: "w1:p1", session: "main", outcome: "old_member", reason: "member_old", by: "lead" }]);
     expect(calls).toHaveLength(0);
   });
 
@@ -904,6 +919,105 @@ describe("a write to a member that is not reachable (§10.3)", () => {
     expect(res.status).toBe(503);
     expect((await failureBody(res)).code).toBe("host_incompatible");
     expect(calls).toHaveLength(0);
+  });
+
+  // 2026-11-16: a tap on a member's pane left no line on any machine. A write the lead refuses here
+  // must say so in the lead's own audit, as the refusal of an old member's text does.
+  test("the lead writes its own audit line for a write it refuses before the dial, the hold card's answer included", async () => {
+    const cases: [PeerState, string, string, Record<string, string>][] = [
+      [DEAD, "/api/ask/ask-0123456789abcd?host=laptop&session=main", `{"pane":"w1:p1","hash":"0abc12","optionId":"1","origin":"person_tap","via":"hold-card"}`, { action: "ask", outcome: "refused", reason: "member_unreachable", by: "lead" }],
+      [SKEWED, "/api/pane/w1:p1/keys?host=laptop&session=main", `{"keys":["1"]}`, { action: "keys", outcome: "incompatible", reason: "member_incompatible", by: "lead" }],
+    ];
+    for (const [state, path, body, want] of cases) {
+      const { transport, calls } = transportOf(() => ok(new Response("{}")));
+      const audit: unknown[] = [];
+      const [req, url] = post(path, body);
+      const res = await forward(req, url, { transport, state, audit: (entry) => audit.push(entry) });
+      expect(res.status).toBe(503);
+      expect(calls).toHaveLength(0);
+      expect(audit).toEqual([{ ...want, host: "laptop", paneId: "w1:p1", session: "main" }]);
+      // The phone gets the same reason, and that the lead refused (M102 spec 14).
+      expect(res.headers.get("x-collie-reason")).toBe(want.reason!);
+      expect(res.headers.get("x-collie-by")).toBe("lead");
+    }
+  });
+
+  // M102 spec 14: a dial that failed said `unknown` and nothing more. The record now names what the lead
+  // learned, a time-out apart from a broken link, and the phone gets the same code.
+  test("a write whose dial failed records one reason code: a time-out, a lost link, a dial that never left", async () => {
+    const cases: [PeerOutcome<Response>, string, string][] = [
+      [{ ok: false, state: "unreachable", reason: "timed out after 6400ms", timedOut: true, receivedAt: 2 }, "unknown", "link_timeout"],
+      [{ ok: false, state: "unreachable", reason: "socket hang up", receivedAt: 2 }, "unknown", "link_lost"],
+      [{ ok: false, state: "unreachable", reason: "no crew secret", attempted: false, receivedAt: 2 }, "refused", "link_refused"],
+    ];
+    for (const [failure, outcome, reason] of cases) {
+      const { transport } = transportOf(() => failure);
+      const audit: unknown[] = [];
+      const [req, url] = post("/api/ask/ask-0123456789abcd?host=laptop&session=main", `{"pane":"w1:p1","hash":"0abc12","optionId":"1","origin":"person_tap"}`);
+      const res = await forward(req, url, { transport, audit: (entry) => audit.push(entry) });
+      expect(audit).toEqual([{ action: "ask", host: "laptop", paneId: "w1:p1", session: "main", outcome, reason, by: "lead" }]);
+      expect(res.headers.get("x-collie-reason")).toBe(reason);
+      expect(res.headers.get("x-collie-by")).toBe("lead");
+    }
+  });
+
+  test("a member's own refusal code reaches the phone as the member's, and the lead's line names it", async () => {
+    const refused = new Response(`{"receipt":{"outcome":"refused"}}`, { status: 404, headers: { "content-type": "application/json", "x-collie-reason": "no_pane", "x-collie-by": "bridge" } });
+    const { transport } = transportOf(() => ok(refused));
+    const audit: unknown[] = [];
+    const [req, url] = post("/api/ask/ask-0123456789abcd?host=laptop&session=main", `{"pane":"w1:p9","hash":"0abc12","optionId":"1","origin":"person_tap"}`);
+    const res = await forward(req, url, { transport, audit: (entry) => audit.push(entry) });
+    expect(res.status).toBe(404);
+    expect(res.headers.get("x-collie-reason")).toBe("no_pane");
+    expect(res.headers.get("x-collie-by")).toBe("member");
+    // A refused write names the version the member runs.
+    expect(res.headers.get(MEMBER_VERSION_HEADER)).toBe(REACHABLE.version);
+    expect(audit).toEqual([{ action: "ask", host: "laptop", paneId: "w1:p9", session: "main", outcome: "http 404", reason: "no_pane", by: "member" }]);
+  });
+
+  // The keys route's `expected_prompt` may be a list of literal parts (stage/1116, bridge/prompt-binding.ts).
+  // The forward reads no part of it: the body reaches the member byte for byte, and the member's own
+  // refusal code still comes back as the member's.
+  test("a keys write with the list form of expected_prompt streams on whole, and a member refusal keeps its code", async () => {
+    const body = `{"keys":["1"],"expected_prompt":["Do you want to proceed?","1. Yes"]}`;
+    const refused = new Response(`{"ok":false}`, { status: 409, headers: { "content-type": "application/json", "x-collie-reason": "no_raw_input" } });
+    const { transport, calls } = transportOf(() => ok(refused));
+    const audit: unknown[] = [];
+    const [req, url] = post("/api/pane/w1:p1/keys?host=laptop", body);
+    const res = await forward(req, url, { transport, surfaceVersion: null, audit: (entry) => audit.push(entry) });
+    expect(await new Response(calls[0]?.init.body).text()).toBe(body);
+    expect(res.headers.get("x-collie-reason")).toBe("no_raw_input");
+    expect(res.headers.get("x-collie-by")).toBe("member");
+    expect(audit).toEqual([{ action: "keys", host: "laptop", paneId: "w1:p1", outcome: "http 409", reason: "no_raw_input", by: "member" }]);
+  });
+
+  test("a member header that names no known code is not passed on, and is not recorded", async () => {
+    const odd = new Response("nope", { status: 400, headers: { "x-collie-reason": "anything at all" } });
+    const { transport } = transportOf(() => ok(odd));
+    const audit: unknown[] = [];
+    const [req, url] = post("/api/pane/w1:p1/keys?host=laptop", `{"keys":["1"]}`);
+    const res = await forward(req, url, { transport, audit: (entry) => audit.push(entry) });
+    expect(res.headers.get("x-collie-reason")).toBeNull();
+    expect(audit).toEqual([{ action: "keys", host: "laptop", paneId: "w1:p1", outcome: "http 400" }]);
+  });
+
+  test("an incompatible member's refusal names the version it runs, when it reported one", async () => {
+    const { transport } = transportOf(() => ok(new Response("{}")));
+    const [req, url] = post("/api/pane/w1:p1/keys?host=laptop", `{"keys":["Enter"]}`);
+    const res = await forward(req, url, { transport, state: { ...SKEWED, version: "1.27.3" } });
+    const body = await failureBody(res);
+    expect(body.memberVersion).toBe("1.27.3");
+    expect(String(body.error)).toContain("Collie 1.27.3");
+    expect(res.headers.get(MEMBER_VERSION_HEADER)).toBe("1.27.3");
+  });
+
+  test("a read refused for no reason writes no audit line, and a star refused before the dial writes none either", async () => {
+    const { transport } = transportOf(() => ok(new Response("{}")));
+    const audit: unknown[] = [];
+    const [req, url] = post("/api/folders/star?host=laptop", `{"folder":"/srv/a","starred":true}`);
+    await forward(req, url, { transport, state: DEAD, audit: (entry) => audit.push(entry) });
+    // A star is a preference neither side audits (forwardAuditAction answers null).
+    expect(audit).toEqual([]);
   });
 
   test("a star onto a member that is not reachable is refused before it is attempted", async () => {
@@ -1073,7 +1187,7 @@ function budgeted(workMs: number) {
 }
 
 describe("a forwarded write carries its own budget (§10.1)", () => {
-  test("every write route dials on its budget: a pane's on PANE_WRITE_BUDGET_MS, the rest on WRITE_BUDGET_MS", async () => {
+  test("every write route dials on its budget: a pane's on PANE_WRITE_BUDGET_MS, a create's on CREATE_WRITE_BUDGET_MS, the rest on WRITE_BUDGET_MS", async () => {
     // §5's write routes, one of each shape `forwardKind` decides on.
     const writes = [
       "/api/pane/w1:p1/reply",
@@ -1095,8 +1209,31 @@ describe("a forwarded write carries its own budget (§10.1)", () => {
       const [req, url] = post(`${path}?host=laptop`, "{}");
       await forward(req, url, { transport });
       expect(calls).toHaveLength(1);
-      expect(calls[0]!.budgetMs).toBe(path.startsWith("/api/pane/") ? PANE_WRITE_BUDGET_MS : WRITE_BUDGET_MS);
+      const creates = ["/api/tab", "/api/workspace", "/api/launch"];
+      const expected = path.startsWith("/api/pane/") ? PANE_WRITE_BUDGET_MS : creates.includes(path) ? CREATE_WRITE_BUDGET_MS : WRITE_BUDGET_MS;
+      expect(calls[0]!.budgetMs).toBe(expected);
     }
+  });
+
+  test("a create's budget sits above the member's own deadline, which answers first (M100 spec 04)", () => {
+    // The member's steps add up to more than any budget; the member's one deadline is what ends its wait,
+    // and the lead gives it room for the link on top. The run itself is driven in create-unconfirmed.test.ts.
+    expect(CREATE_WRITE_BUDGET_MS).toBeGreaterThan(MEMBER_DEADLINE_MS);
+    // And inside the phone's own 20 s mutation budget, so the lead's deadline still fires first.
+    expect(CREATE_WRITE_BUDGET_MS).toBeLessThan(20_000);
+    expect(budgetOf("write", "launch")).toBe(CREATE_WRITE_BUDGET_MS);
+    expect(budgetOf("write", "tab")).toBe(CREATE_WRITE_BUDGET_MS);
+    expect(budgetOf("write", "workspace")).toBe(CREATE_WRITE_BUDGET_MS);
+    // A tab's rename and close, and every other route, keep the plain write budget.
+    expect(budgetOf("write", "tab/w1/rename")).toBe(WRITE_BUDGET_MS);
+  });
+
+  test("a launch the member answers after 7 s (its own wait for the shell) is delivered, not a 504", async () => {
+    const dial = budgeted(7000);
+    const [req, url] = post("/api/launch?host=laptop", `{"command":"claude","requestId":"0b9e6a1c-3f2d-4c5e-8a7b-1d2e3f4a5b6c"}`);
+    const res = await forward(req, url, { transport: dial.transport });
+    expect(res.status).toBe(200);
+    expect(dial.calls).toEqual([CREATE_WRITE_BUDGET_MS]);
   });
 
   test("a reply that the member answers after 7 s (a send on a herdr-core member) is delivered, not a 504", async () => {
@@ -1152,7 +1289,7 @@ describe("a forwarded write carries its own budget (§10.1)", () => {
     const [req, url] = post("/api/launch?host=laptop", `{"id":"claude"}`);
     const res = await forward(req, url, { transport: dial.transport });
     expect(res.status).toBe(200);
-    expect(dial.calls).toEqual([WRITE_BUDGET_MS]);
+    expect(dial.calls).toEqual([CREATE_WRITE_BUDGET_MS]);
   });
 
   test("…and on the poll budget it did NOT — the regression this closes", async () => {
@@ -1661,5 +1798,178 @@ describe("the added-launcher routes stay on the lead; only the forget crosses th
     expect(forwardKind("launchers/added/forget-device")).toBe("write");
     expect(crewRouteFor("/api/launchers/added/list")).toBeNull();
     expect(crewRouteFor("/api/launchers/added/")).toBeNull();
+  });
+});
+
+// ── Accounts across the link (M101 spec 06) ──────────────────────────────────────────────────────
+//
+// Only the LIST crosses: `GET /api/accounts`, the member's own rows, for the pick in New. The add, the
+// remove and any other path under it stay on the machine that answers the phone. The lead stores none of
+// the member's answer: no audit line, no log line, no mask pass, nothing but the receipt time.
+
+describe("accounts across the link: only the list crosses (M101 spec 06)", () => {
+  const ROWS = JSON.stringify({
+    harnesses: [{ id: "claude", label: "Claude Code", select: "CLAUDE_CONFIG_DIR", kinds: ["shared", "own"], newFolder: "~/.claude-{slug}" }],
+    accounts: [
+      { id: "claude:default", harness: "claude", label: "", kind: "default", folder: "~/.claude", startLine: "claude", windows: [], seenAt: null, live: false, identity: { signedIn: true, email: "person@example.com", plan: "max" } },
+    ],
+    found: [],
+  });
+
+  test("the list is a GET-only route: the lead forwards it and the member dispatches it, for a GET alone", () => {
+    expect(crewRouteFor("/api/accounts", "GET")).toBe("accounts");
+    expect(apiPathFor("accounts", "GET")).toBe("/api/accounts");
+    // A caller that does not name its method never reaches a GET-only route.
+    expect(crewRouteFor("/api/accounts")).toBeNull();
+    expect(apiPathFor("accounts")).toBeNull();
+    // A read, attempted against a stale member too, on the read budget, audited on neither side, never masked.
+    expect(forwardKind("accounts", "GET")).toBe("read");
+    expect(budgetOf("read", "accounts")).toBeUndefined();
+    expect(forwardAuditAction("accounts", "GET")).toBeNull();
+    expect(textAnswerOf("accounts")).toBeNull();
+    expect(forwardPaneId("accounts")).toBeUndefined();
+  });
+
+  test("the add, the remove and every other accounts path are refused on both sides, whatever the method", () => {
+    const refused: [string, string][] = [
+      ["POST", "accounts"],
+      ["PUT", "accounts"],
+      ["DELETE", "accounts"],
+      ["POST", "accounts/remove"],
+      ["GET", "accounts/remove"],
+      ["GET", "accounts/claude:default"],
+      ["POST", "accounts/rename"],
+      ["POST", "accounts/sign-in"],
+      ["GET", "accounts/"],
+      ["GET", "accounts/../launchers"],
+    ];
+    for (const [method, route] of refused) {
+      expect([method, route, crewRouteFor(`/api/${route}`, method)]).toEqual([method, route, null]);
+      expect([method, route, apiPathFor(route, method)]).toEqual([method, route, null]);
+    }
+  });
+
+  test("an add or a remove with ?host= is refused by the lead with the sentence it had, and nothing is dialled", async () => {
+    for (const path of ["/api/accounts?host=laptop", "/api/accounts/remove?host=laptop"]) {
+      const { transport, calls } = transportOf(() => ok(Response.json({ ok: true })));
+      const audited: unknown[] = [];
+      const [req, url] = post(path, JSON.stringify({ requestId: "6f1c2a4e-3b5d-4c7e-9f00-112233445566", harness: "claude", label: "W", kind: "own", path: "~/.claude-w", id: "x" }), { "content-type": "application/json" });
+      const res = await forward(req, url, { transport, audit: (e) => audited.push(e) });
+      expect(res.status).toBe(501);
+      // SAFETY: a refusal the lead makes is `forwardError`'s JSON, `{ ok, code, error, host }`.
+      const body = (await res.json()) as { code: ForwardErrorCode; error: string };
+      expect(body.code).toBe("route_not_federated");
+      expect(body.error).toBe(`route ${url.pathname} is not available across a crew link`);
+      expect(calls).toEqual([]);
+      expect(audited).toEqual([]);
+    }
+  });
+
+  test("the list reaches the member without `host`, and its rows come back byte for byte; the lead keeps nothing", async () => {
+    const { transport, calls } = transportOf(() => ok(new Response(ROWS, { status: 200, headers: { "content-type": "application/json", etag: '"m1"' } })));
+    const audited: unknown[] = [];
+    const logged: string[] = [];
+    const masked: string[] = [];
+    const exchanges: number[] = [];
+    const [req, url] = get("/api/accounts?host=laptop&session=work");
+    const res = await forward(req, url, {
+      transport,
+      audit: (e) => audited.push(e),
+      paneReads: new MemberPaneReads((line) => logged.push(line)),
+      mask: (answer, body) => {
+        masked.push(answer);
+        return body;
+      },
+      onExchange: (at) => exchanges.push(at),
+    });
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe(ROWS);
+    expect(res.headers.get("etag")).toBe('"m1"');
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.route).toBe("accounts");
+    expect(calls[0]!.params).toEqual({ session: "work" });
+    expect(calls[0]!.init.method).toBe("GET");
+    expect(calls[0]!.init.body).toBeUndefined();
+    expect(calls[0]!.budgetMs).toBeUndefined();
+    // Decision 3: no audit line, no log line, no pass over the rows. Only the receipt time is kept.
+    expect(audited).toEqual([]);
+    expect(logged).toEqual([]);
+    expect(masked).toEqual([]);
+    expect(exchanges).toEqual([1]);
+  });
+
+  test("a stale member is still asked, and a failed ask leaves no line either", async () => {
+    const { transport, calls } = transportOf(() => ({ ok: false, state: "unreachable", reason: "timeout", attempted: true, receivedAt: 1 }));
+    const audited: unknown[] = [];
+    const logged: string[] = [];
+    const [req, url] = get("/api/accounts?host=laptop");
+    const res = await forward(req, url, { transport, state: DEAD, audit: (e) => audited.push(e), paneReads: new MemberPaneReads((line) => logged.push(line)) });
+    expect(calls).toHaveLength(1);
+    expect(res.status).toBe(503);
+    expect(audited).toEqual([]);
+    expect(logged).toEqual([]);
+  });
+
+  test("an old member (no route) and a Windows member answer 404, which reaches the phone as 404, the quiet no-feature answer", async () => {
+    // A 1.28.x member's peer surface: the route is not on its list, so its own `not found`.
+    // A Windows member: its own accounts route answers `accounts.unavailable`.
+    const answers = [
+      { body: { error: "not found" }, code: undefined },
+      { body: { ok: false, error: "this machine offers no profiles", code: "accounts.unavailable" }, code: "accounts.unavailable" },
+    ];
+    for (const { body, code } of answers) {
+      const { transport } = transportOf(() => ok(Response.json(body, { status: 404 })));
+      const [req, url] = get("/api/accounts?host=laptop");
+      const res = await forward(req, url, { transport });
+      expect(res.status).toBe(404);
+      // SAFETY: the test's member answered one of the two JSON objects above, passed on byte for byte.
+      expect(((await res.json()) as { code?: string }).code).toBe(code);
+    }
+  });
+
+  test("a launch with an account crosses with its body unchanged, `account` included; the carry does not touch it", async () => {
+    const carry = leadRowCarry(() => Promise.resolve([]), "/var/home/op");
+    const body = JSON.stringify({ requestId: "r-acct", harness: "claude", account: "6f1c2a4e-3b5d-4c7e-9f00-112233445566", cwd: "~/src/app" });
+    const { transport, calls } = transportOf(() => ok(Response.json({ ok: true })));
+    const [req, url] = post("/api/launch?host=laptop", body, { "content-type": "application/json" });
+    const written = await carry.request(req);
+    expect(written.leadRow).toBe(false);
+    await forward(written.request, url, { transport, leadRow: written.leadRow });
+    expect(calls[0]!.route).toBe("launch");
+    expect(await new Response(calls[0]!.init.body).text()).toBe(body);
+  });
+
+  test("every web call that names /api/accounts: a ?host= one has a forwardable route, every other one a pinned refusal", () => {
+    // Decision 7. The web's own calls, read from its source, so a new scoped call cannot land without a route here.
+    const api = readFileSync(join(import.meta.dir, "..", "..", "web", "src", "lib", "api.ts"), "utf8");
+    const calls = api
+      .split(/\nexport (?:async )?function /u)
+      .slice(1)
+      .filter((fn) => fn.includes('"/api/accounts'))
+      .map((fn) => ({
+        name: fn.slice(0, fn.indexOf("(")),
+        path: fn.match(/"(\/api\/accounts[^"?]*)"/u)![1]!,
+        method: fn.match(/method:\s*"([A-Z]+)"/u)?.[1] ?? "GET",
+        scoped: /withScope\(\s*"\/api\/accounts/u.test(fn),
+      }));
+    expect(calls.map((c) => [c.name, c.method, c.path, c.scoped])).toEqual([
+      ["fetchAccounts", "GET", "/api/accounts", true],
+      ["addAccount", "POST", "/api/accounts", false],
+      ["removeAccount", "POST", "/api/accounts/remove", false],
+    ]);
+    const pinnedRefusals = new Set(["POST /api/accounts", "POST /api/accounts/remove"]);
+    for (const c of calls) {
+      const route = crewRouteFor(c.path, c.method);
+      if (c.scoped) {
+        expect(route).not.toBeNull();
+        expect(apiPathFor(route!, c.method)).toBe(c.path);
+        continue;
+      }
+      expect(route).toBeNull();
+      expect(pinnedRefusals.has(`${c.method} ${c.path}`)).toBe(true);
+    }
+    // And the bridge serves no accounts path beyond those, so a new one has to be decided here first.
+    const server = readFileSync(join(import.meta.dir, "..", "server.ts"), "utf8");
+    expect([...new Set(server.match(/"\/api\/accounts[^"]*"/gu))].toSorted()).toEqual(['"/api/accounts"', '"/api/accounts/remove"']);
   });
 });

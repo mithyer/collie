@@ -6,8 +6,9 @@ import { isAbsolute, join, posix } from "node:path";
 import { BEACON_DIR_MODE, beaconFileName, beaconKey, beaconsDir, EDGE_FILE, EDGE_MAX_AGE_MS, EDGE_SPOOL_MAX, edgesDir } from "../bridge/beacon/paths.ts";
 import { HOOK_TARGET_FILE, HOOK_TARGETS_MAX, hookTargetsDir, parseHookTarget, type HookTargetRecord } from "../bridge/beacon/hook-targets.ts";
 import { edgeModelOf } from "../bridge/beacon/parse.ts";
-import { procStatPath, startTimeProbe, type StartTimeCommand } from "../bridge/beacon/liveness.ts";
+import { procStatPath, readStartTimeWith, startTimeProbe, type StartTimeCommand } from "../bridge/beacon/liveness.ts";
 import { HOST } from "../bridge/host.ts";
+import { win32ProcessInfo, win32StartTime } from "../bridge/win32-process.ts";
 import {
   BEACON_SCHEMA_VERSION,
   EDGE_SCHEMA_VERSION,
@@ -23,7 +24,7 @@ import { loadProfiles } from "../web/src/lib/surface/profile.ts";
 import { takeContextReading, takeSessionStart } from "./context-reading.ts";
 import { agentHolds, agentSettingsPath, managedSettingsPath, projectSettingsPaths } from "./hold-entry.ts";
 import type { JsonObject, JsonValue } from "../bridge/json.ts";
-import type { CliContext, Environment } from "./context.ts";
+import type { CliContext } from "./context.ts";
 import { EXIT } from "./io.ts";
 import { privateDir } from "./private-dir.ts";
 import type { Files } from "./sys.ts";
@@ -48,7 +49,8 @@ export { privateDir };
 // `SessionEnd` runs on a 1.5 s default budget, which sets the shape of the work: one environment
 // read, one parse, one probe for the pid's start time, one atomic write. No network, and nothing that
 // can block on another process. The probe is a `/proc` read on Linux; on macOS, which has no `/proc`,
-// it is one `ps` run (about 20 ms) with a 1 s timeout (`bridge/beacon/liveness.ts`, M80 spec 11).
+// it is one `ps` run (about 20 ms) with a 1 s timeout (`bridge/beacon/liveness.ts`, M80 spec 11); on
+// Windows it is an in-process kernel32 call (issue 798).
 //
 // ── THE PAYLOAD, AS CAPTURED (2026-08-20, `claude -p` under a throwaway CLAUDE_CONFIG_DIR) ─────────
 //
@@ -65,8 +67,8 @@ export { privateDir };
 // without either, and `idle_prompt` fires ~60 s after a response in an INTERACTIVE session only.
 // Their field lists are the documented ones (code.claude.com/docs/en/hooks.md, read 2026-08-20), and
 // this verb reads neither: `hook_event_name` and `session_id` are the only fields it touches, plus the
-// context-reading fields below (`transcript_path`, `source`, `model`, `context_tokens`). `model` also
-// rides on the `SessionStart` edge, so the pane names its model before its first turn (below).
+// context-reading fields below (`transcript_path`, `source`, `context_tokens`). `model` rides on the
+// `SessionStart` edge, so the pane names its model before its first turn (below).
 // `agent_id` (present only for a SUBAGENT's events) was absent from every captured payload, which is
 // the case the gate below is for.
 //
@@ -79,14 +81,18 @@ export { privateDir };
 // (Ubuntu, Debian) the shell forks the command and waits, so `process.ppid` is the shell, which is
 // gone as soon as `collie` exits (issue 689). {@link agentPidOf} climbs past such a shell to the first
 // ancestor that is not one, and falls back to `process.ppid` whenever it cannot read a process.
+// Windows has no exec: Claude Code runs a hook through Git Bash (`bash.exe`, and Git's `bin\bash.exe`
+// may itself be a launcher that starts `usr\bin\bash.exe`), and a shell there waits as the hook's
+// parent instead of replacing itself, so the climb matters on Windows too (issue 798).
 
 // ── THE CONTEXT READING (.adr/0115, amended 2026-10-24) ───────────────────────────────────────────
 //
 // Besides the beacon and the edge, this verb notes the session's context use for the dots above the
-// belt, with no statusLine (`cli/context-reading.ts` has the whole rule):
+// belt, against the window the wrapped statusLine stated (`cli/context-reading.ts` has the whole rule;
+// with no stated window there is no context dot):
 //
-//  - `SessionStart` reads `source`, `model` and `context_tokens`: the window the model names, a context
-//    that is unknown after a compact or a clear, a context known at once after a resume or a fork.
+//  - `SessionStart` reads `source` and `context_tokens`: a context that is unknown after a compact or
+//    a clear, a context known at once after a resume or a fork.
 //  - `Stop` and the tool event (`PostToolUse`, registered by `--hold-permissions`) read the END of the
 //    transcript, `transcript_path` in the payload, for the token counts of the last assistant line.
 //    The path is a hint to check: an absolute `.jsonl` file under the Claude config root once every
@@ -94,102 +100,10 @@ export { privateDir };
 //
 // A refusal, a missing file and a full disk are all "no reading", and exit 0 as everywhere in this verb.
 
-/** The marker namespace of a Herdr pane, which is the Herdr adapter's registry key. */
-const HERDR_NAMESPACE = "herdr";
-
-/**
- * The marker namespace of a herdr-core terminal, which is that adapter's registry key. A literal, not
- * an import, because this verb runs on every hook event and must stay a handful of module loads;
- * `cli/beacon.test.ts` pins it to the adapter's own constant.
- */
-export const HERDR_CORE_NAMESPACE = "herdr-core";
-
-/**
- * Where a multiplexer's pane identity lives in the environment of a process running inside it.
- *
- * THE GATE IS THIS TABLE, and it is consulted BEFORE stdin is read. An agent in a plain terminal has
- * none of these variables, so it costs one process spawn and no file — which is what makes the
- * global hook install (`cli/hooks.ts`) affordable.
- *
- * `pane` is stored RAW, exactly as `BeaconMarker` requires: `%7` for tmux, a bare integer for zellij.
- * Any prefixing a multiplexer's Collie ids need (zellij's `terminal_`) belongs to that adapter's
- * matcher at the join (M11/03) — the emitter cannot know which multiplexer this Collie drives, and a
- * value rewritten here could never be un-rewritten there.
- */
-interface MuxEnvMarker {
-  /** The mux registry's own key (`bridge/mux/registry.ts`) — tmux, zellij. */
-  readonly namespace: string;
-  /** The variable holding the pane id. Its absence is what "not in this multiplexer" means. */
-  readonly paneVar: string;
-  /** The variable holding the addressing space — see {@link BeaconMarker.scope}. */
-  readonly scopeVar: string;
-  /** The scope value inside that variable, for a variable that carries more than the scope. */
-  scopeOf(raw: string): string;
-}
-
-const MUX_ENV_MARKERS: readonly MuxEnvMarker[] = [
-  {
-    namespace: "tmux",
-    paneVar: "TMUX_PANE",
-    // `$TMUX` is `<socket-path>,<server-pid>,<session-index>` and only the first field is the server
-    // socket — which is what `BeaconMarker.scope` is defined to hold. The server pid changes nothing
-    // about which panes exist, so carrying it would make the scope differ from the one the adapter
-    // addresses tmux with.
-    scopeVar: "TMUX",
-    scopeOf: (raw) => raw.split(",")[0] ?? raw,
-  },
-  {
-    namespace: "tern",
-    paneVar: "TERN_PANE",
-    scopeVar: "TERN_PANE_SOCKET",
-    scopeOf: (raw) => raw,
-  },
-  {
-    namespace: "zellij",
-    paneVar: "ZELLIJ_PANE_ID",
-    // zellij pane ids are per-session integers, so the session name IS the addressing space.
-    scopeVar: "ZELLIJ_SESSION_NAME",
-    scopeOf: (raw) => raw,
-  },
-  {
-    // Herdr exports its own wire id (`w54:pW`) and the socket of the server that owns the pane
-    // (M56 spec 11). Herdr names its agents itself, so a Herdr marker never names a pane's agent: it
-    // places the hook edges on a Herdr pane, and nothing else.
-    namespace: HERDR_NAMESPACE,
-    paneVar: "HERDR_PANE_ID",
-    scopeVar: "HERDR_SOCKET_PATH",
-    scopeOf: (raw) => raw,
-  },
-  {
-    // The new Herdr core exports the terminal's address and the socket of the core that owns it
-    // (M74 spec 04, probed 2026-10-29 on hc 0.1.14). A core terminal started from inside the Herdr
-    // TUI inherits that TUI's variables too, so a pane can carry both markers; each names only its own.
-    namespace: HERDR_CORE_NAMESPACE,
-    paneVar: "HC_TERMINAL_ID",
-    scopeVar: "HC_TERMINAL_SOCKET",
-    scopeOf: (raw) => raw,
-  },
-];
-
-/**
- * Every multiplexer this process can see itself inside — a LIST, because nesting is real (tmux inside
- * zellij and the other way round) and the emitter cannot know which one Collie is driving.
- *
- * A namespace whose scope variable is missing is skipped rather than given a default: without the
- * addressing space, `%7` from another tmux server would join to this pane's agent.
- */
-export function readEnvMarkers(env: Environment): BeaconMarker[] {
-  const markers: BeaconMarker[] = [];
-  for (const source of MUX_ENV_MARKERS) {
-    const pane = env[source.paneVar]?.trim();
-    const rawScope = env[source.scopeVar]?.trim();
-    if (!pane || !rawScope) continue;
-    const scope = source.scopeOf(rawScope).trim();
-    if (scope === "") continue;
-    markers.push({ namespace: source.namespace, scope, pane });
-  }
-  return markers;
-}
+// The marker table moved to `bridge/beacon/env-markers.ts` (M99 spec 01), so the inside wire reads
+// the same table. Re-exported here: every verb that reads markers imports them from this module.
+export { HERDR_CORE_NAMESPACE, readEnvMarkers } from "../bridge/beacon/env-markers.ts";
+import { HERDR_NAMESPACE, readEnvMarkers } from "../bridge/beacon/env-markers.ts";
 
 /**
  * One Claude Code hook event, and what it says the agent is doing.
@@ -312,6 +226,8 @@ export interface PidProbeDeps {
   readonly platform?: NodeJS.Platform;
   /** Runs a probe command: its stdout, or null when it failed. Defaults to {@link runStartTimeCommand}. */
   readonly run?: (command: StartTimeCommand, pid: number) => string | null;
+  /** The in-process read on Windows (issue 798). Defaults to kernel32's `win32StartTime`. */
+  readonly native?: (pid: number) => number | null;
 }
 
 /**
@@ -339,8 +255,13 @@ export interface ProcessInfo {
   readonly ppid: number;
 }
 
-/** Names of the shells a hook command may run through (`comm`, so no path). */
-const SHELL_COMMS: ReadonlySet<string> = new Set(["sh", "dash", "bash", "zsh", "ksh", "ash", "busybox"]);
+/**
+ * Names of the shells a hook command may run through (`comm`, so no path). On Windows the reader
+ * reports the executable's name in lower case without `.exe`, so Git's `bash.exe`, `cmd.exe` and
+ * PowerShell meet the same list. None of these replaces itself with the command on Windows: there is
+ * no exec, so the shell waits as the hook's parent and is gone with it (issue 798).
+ */
+export const SHELL_COMMS: ReadonlySet<string> = new Set(["sh", "dash", "bash", "zsh", "ksh", "ash", "busybox", "cmd", "powershell", "pwsh"]);
 
 /** How many shells {@link agentPidOf} climbs past. `sh -c` under a wrapper is two at most; the third is slack. */
 const SHELL_HOPS_MAX = 3;
@@ -388,11 +309,16 @@ export function parsePsProcess(text: string): ProcessInfo | null {
   return comm === "" ? null : { comm, ppid: Number(match[1]) };
 }
 
-/** Linux and macOS' process reader; any other platform, and any failure, is null (no climb). */
-export function readProcessInfo(pid: number): ProcessInfo | null {
+/**
+ * The process reader of Linux, macOS and Windows (kernel32, `bridge/win32-process.ts`, which reports a
+ * parent only when it started no later than the child); any other platform, and any failure, is null
+ * (no climb).
+ */
+export function readProcessInfo(pid: number, platform: NodeJS.Platform = HOST.platform): ProcessInfo | null {
   try {
-    if (HOST.platform === "linux") return parseProcStatProcess(readFileSync(procStatPath(pid), "utf8"));
-    if (HOST.platform !== "darwin") return null;
+    if (platform === "win32") return win32ProcessInfo(pid);
+    if (platform === "linux") return parseProcStatProcess(readFileSync(procStatPath(pid), "utf8"));
+    if (platform !== "darwin") return null;
     const text = execFileSync("/bin/ps", ["-o", "ppid=,comm=", "-p", String(pid)], {
       encoding: "utf8",
       env: { LC_ALL: "C" },
@@ -408,21 +334,20 @@ export function readProcessInfo(pid: number): ProcessInfo | null {
 /**
  * The pid's start time, from the platform's probe (`bridge/beacon/liveness.ts`): the stat file on
  * Linux, one `ps -o lstart=` run on macOS (`darwin`), where there is no stat file (M80 spec 11,
- * issue 647).
+ * issue 647), and kernel32's creation time on Windows (issue 798).
  *
  * It is not optional in the record (`BeaconRecord.pidStartTime`) and it must not be faked: a beacon
  * carrying a start time no probe will ever return reads as EXPIRED for its whole life, which would
  * present a working agent as a dead one. So an unreadable start time means NO BEACON — the reader's
- * honest answer to an absent file is already the right one. That is every host other than Linux and
- * macOS (Windows among them), and any probe that failed.
+ * honest answer to an absent file is already the right one. That is every host other than Linux,
+ * macOS and Windows, and any probe that failed.
  */
 export function readPidStartTime(deps: Pick<BeaconEmitDeps, "files" | "pidProbe">, pid: number): number | null {
-  const probe = startTimeProbe(deps.pidProbe?.platform ?? HOST.platform);
-  const stat = deps.files.read(probe.stat.path(pid));
-  if (stat !== null) return probe.stat.parse(stat);
-  if (probe.command === null) return null;
-  const text = (deps.pidProbe?.run ?? runStartTimeCommand)(probe.command, pid);
-  return text === null ? null : probe.command.parse(text);
+  return readStartTimeWith(startTimeProbe(deps.pidProbe?.platform ?? HOST.platform), pid, {
+    readText: (path) => deps.files.read(path),
+    native: deps.pidProbe?.native ?? win32StartTime,
+    run: deps.pidProbe?.run ?? runStartTimeCommand,
+  });
 }
 
 /**
@@ -586,13 +511,13 @@ function takeReading(deps: BeaconEmitDeps, payload: JsonObject, stateDirs: () =>
   takeContextReading(deps, { session, transcriptPath: asJsonString(payload.transcript_path), harness: BEACON_HARNESS }, stateDirs, (deps.now ?? Date.now)());
 }
 
-/** What a `SessionStart` says about the window and the context. Never throws. */
+/** What a `SessionStart` says about the context. Never throws. */
 function takeStart(deps: BeaconEmitDeps, payload: JsonObject, stateDirs: () => string[]): void {
   const session = readField(payload, "session_id", SESSION_ID);
   if (session === null) return;
   takeSessionStart(
     deps,
-    { session, harness: BEACON_HARNESS, source: asJsonString(payload.source), model: asJsonString(payload.model), contextTokens: asJsonNumber(payload.context_tokens) },
+    { session, harness: BEACON_HARNESS, source: asJsonString(payload.source), contextTokens: asJsonNumber(payload.context_tokens) },
     stateDirs,
     (deps.now ?? Date.now)(),
   );

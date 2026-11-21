@@ -1,4 +1,4 @@
-import { cleanup, render, screen, within } from "@testing-library/react";
+import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
 import { WalkyLogProvider, WalkyPanesProvider } from "@/components/walky-log";
@@ -39,7 +39,7 @@ describe("WalkySheet", () => {
     expect(inside.getByText("agent")).toBeInTheDocument();
     expect(inside.getByText("collie-workspace#fix-465")).toBeInTheDocument();
     expect(inside.getByText("typed into the pane")).toBeInTheDocument();
-    expect(inside.getByText(/signed by bluefin/)).toBeInTheDocument();
+    expect(inside.getByText(/signed by lodge/)).toBeInTheDocument();
     // The other row was not typed, and says why.
     expect(screen.getByText("waiting in the inbox, not typed: dialog open")).toBeInTheDocument();
   });
@@ -59,8 +59,8 @@ describe("WalkySheet", () => {
     const user = userEvent.setup();
     const row: WalkyRow = {
       ...fixtureWalkyAgent,
-      from: { ...fixtureWalkyAgent.from, address: "bluefin/w6:p3#k3f9" },
-      to: "bluefin/w1:p1#zz99",
+      from: { ...fixtureWalkyAgent.from, address: "lodge/w6:p3#k3f9" },
+      to: "lodge/w1:p1#zz99",
     };
     const props = sheet([row]);
     expect(screen.getByText("Tests are green on fix-465. You can merge.")).toBeInTheDocument();
@@ -68,7 +68,7 @@ describe("WalkySheet", () => {
     await user.click(screen.getByRole("button", { name: /^Reply/ }));
     // Reply hands the row as it stands: its sender's address keeps the token.
     expect(props.onReply).toHaveBeenCalledExactlyOnceWith(row);
-    expect(vi.mocked(props.onReply).mock.calls[0]?.[0].from.address).toBe("bluefin/w6:p3#k3f9");
+    expect(vi.mocked(props.onReply).mock.calls[0]?.[0].from.address).toBe("lodge/w6:p3#k3f9");
   });
 
   it("offers Reply on the agent message only, and hands the row to the caller", async () => {
@@ -226,7 +226,7 @@ describe("WalkySheet with rows in both directions", () => {
     if (row === undefined) throw new Error("no rows");
     const inside = within(row);
     // No live pane is known here, so the target shows as the address, as it always did.
-    expect(inside.getByText("Sent to bluefin/w6:p3")).toBeInTheDocument();
+    expect(inside.getByText("Sent to lodge/w6:p3")).toBeInTheDocument();
     expect(inside.getByText("typed into the pane")).toBeInTheDocument();
     expect(inside.getByText("Merged. Thanks.")).toBeInTheDocument();
     expect(inside.queryByText("agent")).toBeNull();
@@ -241,7 +241,7 @@ describe("WalkySheet with rows in both directions", () => {
     const received = rowsOf().filter((r) => r.getAttribute("data-direction") === "received");
     expect(received).toHaveLength(2);
     expect(received[1] && within(received[1]).getByText("collie-workspace#fix-465")).toBeInTheDocument();
-    expect(received[1] && within(received[1]).getByText(/signed by bluefin/)).toBeInTheDocument();
+    expect(received[1] && within(received[1]).getByText(/signed by lodge/)).toBeInTheDocument();
     expect(screen.getAllByRole("button", { name: /^Reply/ })).toHaveLength(1);
   });
 
@@ -283,10 +283,12 @@ describe("a held message's two ways out (M62 spec 03)", () => {
 
   it("offers Cancel on the operator's held message and Drop on an agent's, nothing on a sent or settled row", () => {
     sheet([operatorHeld, agentHeld, sentHeld, { ...fixtureWalkySent, id: "wt_s3ntaaaa0002" }], { self: fixtureWalkySelf, onCancel: vi.fn(), onDrop: vi.fn() });
-    expect(screen.getByRole("button", { name: "Cancel the message to bluefin/w1:p1" })).toHaveTextContent("Cancel");
+    expect(screen.getByRole("button", { name: "Cancel the message to lodge/w1:p1" })).toHaveTextContent("Cancel");
     expect(screen.getByRole("button", { name: "Drop the message from collie-workspace#fix-465" })).toHaveTextContent("Drop");
     expect(screen.getAllByRole("button", { name: /^(Cancel|Drop) the message/ })).toHaveLength(2);
-    expect(screen.getAllByText("held: that session has unsent text")).toHaveLength(3);
+    // The two received rows read in the owner's words; the row this pane sent keeps "that session".
+    expect(screen.getAllByText("Waiting, because you have unsent text")).toHaveLength(2);
+    expect(screen.getAllByText("held: that session has unsent text")).toHaveLength(1);
   });
 
   it("hands the row to onCancel or onDrop, and shows the line the caller answers with", async () => {
@@ -322,10 +324,10 @@ function livePane(over: Partial<AgentView> = {}): AgentView {
     tabId: "w6:t1",
     agent: "claude",
     status: "idle",
-    cwd: "/home/altan/collie",
+    cwd: "/home/dev/collie",
     focused: false,
     kind: "agent",
-    host: "bluefin",
+    host: "lodge",
     ...over,
   };
 }
@@ -334,7 +336,7 @@ function namedSheet(panes: AgentView[], rows: readonly WalkyRow[]) {
   const open = vi.fn();
   render(
     <WalkyLogProvider rows={rows}>
-      <WalkyPanesProvider value={{ live: { panes, lead: "bluefin" }, open }}>
+      <WalkyPanesProvider value={{ live: { panes, lead: "lodge" }, open }}>
         <WalkySheet open onClose={vi.fn()} onReply={vi.fn()} canReply self={fixtureWalkySelf} />
       </WalkyPanesProvider>
     </WalkyLogProvider>,
@@ -359,10 +361,10 @@ describe("WalkySheet names sessions", () => {
   });
 
   it("resolves a sent row from the message's `to` with its token: a replaced pane is not named by its newcomer", () => {
-    // fixtureWalkySent.to is `bluefin/w6:p3#k3f9`, its receipt target the bare `bluefin/w6:p3`.
+    // fixtureWalkySent.to is `lodge/w6:p3#k3f9`, its receipt target the bare `lodge/w6:p3`.
     namedSheet([livePane({ paneLabel: "newcomer", instance: "n3w1" })], [fixtureWalkySent]);
     expect(screen.queryByText("Sent to newcomer")).toBeNull();
-    expect(screen.getByText("Sent to bluefin/w6:p3")).toBeInTheDocument();
+    expect(screen.getByText("Sent to lodge/w6:p3")).toBeInTheDocument();
     cleanup();
     namedSheet([livePane({ paneLabel: "plumbing", instance: "k3f9" })], [fixtureWalkySent]);
     expect(screen.getByText("Sent to plumbing")).toBeInTheDocument();
@@ -370,7 +372,7 @@ describe("WalkySheet names sessions", () => {
 
   it("draws a live session in the body as a chip that opens its pane, and leaves a claim as text", async () => {
     const user = userEvent.setup();
-    const row: WalkyRow = { ...fixtureWalkyAgent, body: "Look at bluefin/w6:p3#k3f9, not at ghost/w1:p1." };
+    const row: WalkyRow = { ...fixtureWalkyAgent, body: "Look at lodge/w6:p3#k3f9, not at ghost/w1:p1." };
     const panes = [livePane({ paneLabel: "plumbing", instance: "k3f9" })];
     const open = namedSheet(panes, [row]);
     const body = document.querySelector<HTMLElement>('[data-slot="walky-sheet-body"]');
@@ -383,16 +385,16 @@ describe("WalkySheet names sessions", () => {
   });
 
   it("keeps an address without its token as written, adds the name after it, and draws no button", () => {
-    const row: WalkyRow = { ...fixtureWalkyAgent, body: "Look at w6:p3 and bluefin/w6:p3." };
+    const row: WalkyRow = { ...fixtureWalkyAgent, body: "Look at w6:p3 and lodge/w6:p3." };
     namedSheet([livePane({ paneLabel: "plumbing", instance: "k3f9" })], [row]);
     const body = document.querySelector('[data-slot="walky-sheet-body"]');
-    expect(body).toHaveTextContent("Look at w6:p3 (plumbing) and bluefin/w6:p3 (plumbing).");
+    expect(body).toHaveTextContent("Look at w6:p3 (plumbing) and lodge/w6:p3 (plumbing).");
     expect(body?.querySelector("button")).toBeNull();
   });
 
   it("words a held reason for a person", () => {
     namedSheet([], [{ ...fixtureWalkyAgent, receipt: { ...fixtureWalkyAgent.receipt, state: "accepted", reason: "turn running" } }]);
-    expect(screen.getByText("held: that session is busy")).toBeInTheDocument();
+    expect(screen.getByText("Waiting, because the agent is busy")).toBeInTheDocument();
   });
 });
 
@@ -404,6 +406,8 @@ describe("the walky talky switch at the head of the sheet (M89 spec 04)", () => 
     expect(switchOf()).toHaveAttribute("aria-checked", "true");
     expect(screen.getByText("Off: other agents cannot message this session. You still can.")).toBeInTheDocument();
     expect(document.querySelector('[data-slot="walky-off"] svg.lucide-walky-talky')).not.toBeNull();
+    // Other agents' messages are typed into this session: the chip after the label, the switch keeps its name.
+    expect(document.querySelector('[data-slot="walky-off"] [data-slot="token-use"]')?.textContent).toBe("Uses agent tokens");
     cleanup();
     sheet([fixtureWalkyAgent], { walkyOff: true, onWalkyOff: vi.fn(async () => null) });
     expect(switchOf()).toHaveAttribute("aria-checked", "false");
@@ -479,5 +483,136 @@ describe("the walky talky switch at the head of the sheet (M89 spec 04)", () => 
     sheet([fixtureWalkyAgent], { canReply: false, walkyOff: true });
     expect(screen.queryByRole("switch")).toBeNull();
     expect(document.querySelector('[data-slot="walky-off"]')).toBeNull();
+  });
+});
+
+// ── DELIVER NOW, FOR A LINKED SESSION (prototype) ─────────────────────────────
+
+describe("Deliver now on a held message of a linked pane", () => {
+  const heldReceipt = (row: WalkyRow): WalkyRow => ({ ...row, receipt: { ...row.receipt, state: "accepted", reason: "draft present" } });
+  const agentHeld = heldReceipt(fixtureWalkyAgent);
+  const operatorHeld = heldReceipt(fixtureWalkyOperator);
+  const sentHeld = heldReceipt(fixtureWalkySent);
+  const deliver = (id: string) => screen.queryAllByRole("button", { name: /^Deliver the message from/ }).filter((el) => el.closest(`[data-id="${id}"]`) !== null);
+  const GATES = { self: fixtureWalkySelf, onDrop: vi.fn(), linked: true };
+
+  it("shows beside Drop on a held received row, and on nothing that is not held, received and linked", () => {
+    sheet([agentHeld, sentHeld, fixtureWalkyOperator], { ...GATES, onDeliverNow: vi.fn(async () => {}) });
+    expect(deliver(agentHeld.id)).toHaveLength(1);
+    expect(deliver(agentHeld.id)[0]).toHaveTextContent("Deliver now");
+    expect(screen.getByRole("button", { name: /^Drop the message/ })).toBeInTheDocument();
+    // A sent row held at the far pane, and a received row that is not held: nothing.
+    expect(screen.queryAllByRole("button", { name: /^Deliver the message from/ })).toHaveLength(1);
+  });
+
+  it("is also offered on the operator's own held message, which keeps its Cancel", () => {
+    sheet([operatorHeld], { ...GATES, onCancel: vi.fn(), onDeliverNow: vi.fn(async () => {}) });
+    expect(deliver(operatorHeld.id)).toHaveLength(1);
+    expect(screen.getByRole("button", { name: /^Cancel the message/ })).toBeInTheDocument();
+  });
+
+  it("is hidden when the pane is not linked, without a handler, and without a write", () => {
+    sheet([agentHeld], { ...GATES, linked: false, onDeliverNow: vi.fn(async () => {}) });
+    expect(screen.queryByRole("button", { name: /^Deliver the message from/ })).toBeNull();
+    // Today's row: Reply and Drop, in one line, no wrapping rule added.
+    expect(screen.getByRole("button", { name: /^Drop the message/ })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /^Drop the message/ }).parentElement).not.toHaveClass("flex-wrap");
+    cleanup();
+    sheet([agentHeld], { ...GATES });
+    expect(screen.queryByRole("button", { name: /^Deliver the message from/ })).toBeNull();
+    cleanup();
+    sheet([agentHeld], { ...GATES, canReply: false, onDeliverNow: vi.fn(async () => {}) });
+    expect(screen.queryByRole("button", { name: /^Deliver the message from/ })).toBeNull();
+  });
+
+  it("calls back with the message id, and is disabled while the call is in flight", async () => {
+    const user = userEvent.setup();
+    let finish: () => void = () => {};
+    const onDeliverNow = vi.fn(() => new Promise<void>((resolve) => (finish = resolve)));
+    sheet([agentHeld], { ...GATES, onDeliverNow });
+    const button = deliver(agentHeld.id)[0]!;
+    await user.click(button);
+    expect(onDeliverNow).toHaveBeenCalledExactlyOnceWith(agentHeld.id);
+    expect(button).toBeDisabled();
+    expect(button).toHaveAttribute("aria-busy", "true");
+    // The word stays in the box, hidden under the spinner, so the button keeps its width.
+    expect(button).toHaveTextContent("Deliver now");
+    await user.click(button);
+    expect(onDeliverNow).toHaveBeenCalledTimes(1);
+    finish();
+  });
+
+  it("stays taken after the call answers, until the row stops being held", async () => {
+    const user = userEvent.setup();
+    const onDeliverNow = vi.fn(async () => {});
+    const view = render(
+      <WalkyLogProvider rows={[agentHeld]}>
+        <WalkySheet open onClose={vi.fn()} onReply={vi.fn()} canReply {...GATES} onDeliverNow={onDeliverNow} />
+      </WalkyLogProvider>,
+    );
+    await user.click(screen.getByRole("button", { name: /^Deliver the message from/ }));
+    await waitFor(() => expect(onDeliverNow).toHaveBeenCalled());
+    expect(screen.getByRole("button", { name: /^Deliver the message from/ })).toBeDisabled();
+    // The list is read again: the receipt moved, the hold is over, and the row says so with no button.
+    const delivered: WalkyRow = { ...fixtureWalkyAgent, receipt: { ...fixtureWalkyAgent.receipt, state: "delivered" } };
+    view.rerender(
+      <WalkyLogProvider rows={[delivered]}>
+        <WalkySheet open onClose={vi.fn()} onReply={vi.fn()} canReply {...GATES} onDeliverNow={onDeliverNow} />
+      </WalkyLogProvider>,
+    );
+    expect(screen.queryByRole("button", { name: /^Deliver the message from/ })).toBeNull();
+  });
+
+  it("shows the failure under the row in the sheet's words, and frees the button", async () => {
+    const user = userEvent.setup();
+    sheet([agentHeld], { ...GATES, onDeliverNow: vi.fn(async () => Promise.reject(new Error("The agent did not take it."))) });
+    await user.click(screen.getByRole("button", { name: /^Deliver the message from/ }));
+    expect(await screen.findByText("Not delivered. The message still waits and your text is unchanged. The agent did not take it.")).toBeInTheDocument();
+    expect(document.querySelector('[data-slot="walky-deliver-note"]')).toHaveAttribute("role", "status");
+    expect(screen.getByRole("button", { name: /^Deliver the message from/ })).toBeEnabled();
+  });
+
+  it("a message that no longer waited at the tap gets one neutral line, no failure words, and a free button", async () => {
+    const user = userEvent.setup();
+    const onDeliverNow = vi.fn(async () => "gone" as const);
+    sheet([agentHeld], { ...GATES, onDeliverNow });
+    await user.click(screen.getByRole("button", { name: /^Deliver the message from/ }));
+    expect(await screen.findByText("This message no longer waits for your text.")).toBeInTheDocument();
+    expect(document.querySelector('[data-slot="walky-deliver-gone"]')).toHaveAttribute("role", "status");
+    expect(screen.queryByText(/Not delivered/)).toBeNull();
+    expect(screen.queryByText(/still waits/)).toBeNull();
+    expect(screen.getByRole("button", { name: /^Deliver the message from/ })).toBeEnabled();
+  });
+
+  it("says before the tap where the message goes, what happens to the person's text and what the agent does", () => {
+    sheet([agentHeld], { ...GATES, onDeliverNow: vi.fn(async () => {}) });
+    const row = document.querySelector<HTMLElement>(`[data-id="${agentHeld.id}"]`)!;
+    expect(within(row).getByText("Waiting, because you have unsent text")).toBeInTheDocument();
+    expect(within(row).getByText("The agent gets it now and starts on it. Your text stays in the box.")).toBeInTheDocument();
+  });
+
+  it("shows no helper line when the pane is not linked, and none on a row that is not held", () => {
+    sheet([agentHeld], { ...GATES, linked: false, onDeliverNow: vi.fn(async () => {}) });
+    expect(document.querySelector('[data-slot="walky-deliver-help"]')).toBeNull();
+    cleanup();
+    sheet([fixtureWalkyAgent], { ...GATES, onDeliverNow: vi.fn(async () => {}) });
+    expect(document.querySelector('[data-slot="walky-deliver-help"]')).toBeNull();
+  });
+
+  it("reads a message handed over as data as delivered with the text kept, never as typed", () => {
+    const viaData: WalkyRow = { ...fixtureWalkyAgent, receipt: { ...fixtureWalkyAgent.receipt, state: "delivered", overDraft: true } };
+    sheet([viaData], { ...GATES, onDeliverNow: vi.fn(async () => {}) });
+    expect(screen.getByText("Delivered. Your text is still in the box.")).toBeInTheDocument();
+    expect(screen.queryByText(/typed into the pane/)).toBeNull();
+  });
+
+  it("offers nothing on a message that waits for a running turn, and nothing on one waiting for another reason", () => {
+    const busy: WalkyRow = { ...agentHeld, receipt: { ...agentHeld.receipt, reason: "turn running" } };
+    const other: WalkyRow = { ...agentHeld, id: "wt_he1dh01dh02d", receipt: { ...agentHeld.receipt, id: "wt_he1dh01dh02d", reason: "resting" } };
+    sheet([busy, other], { ...GATES, onDeliverNow: vi.fn(async () => {}) });
+    expect(screen.queryByRole("button", { name: /^Deliver the message from/ })).toBeNull();
+    expect(document.querySelector('[data-slot="walky-deliver-help"]')).toBeNull();
+    // Drop stays: the row is as it was.
+    expect(screen.getAllByRole("button", { name: /^Drop the message/ })).toHaveLength(2);
   });
 });

@@ -8,6 +8,7 @@ import { setStatus } from "@/lib/status";
 import { stampTopology } from "@/lib/poll-intent";
 import { panePath, type NavExtras } from "@/lib/nav";
 import { mintRequestId } from "@/lib/worktree-name";
+import { createRequestId, holdCreateId, releaseCreateId, type CreateAction } from "@/lib/create-intent";
 import { startupHarness } from "@/lib/agent-startup";
 import { useNav } from "@/hooks/use-nav";
 import {
@@ -21,11 +22,41 @@ import { usePairing } from "@/lib/pairing";
 import { paneScopeKey, scopeKey, type Scope } from "@/lib/scope";
 import { useOptionalRootData } from "@/lib/route-data";
 
+/**
+ * Run a quick create under the id of its action (lib/create-intent.ts). An answer, a success or a
+ * plain refusal, ends the id. No answer (no reply, a network error, a 504) keeps it for 30 seconds,
+ * so a retap of the same action sends the same id and the bridge replays the first pane, joins the
+ * run in flight or says it is unknown, never a second create.
+ */
+async function withCreateId<TAnswer>(
+  scope: Scope | undefined,
+  action: CreateAction,
+  run: (requestId: string) => Promise<TAnswer>,
+): Promise<TAnswer> {
+  const requestId = createRequestId(scope, action);
+  try {
+    const answer = await run(requestId);
+    releaseCreateId(scope, action);
+    return answer;
+  } catch (e) {
+    if (api.outcomeUnknown(e)) holdCreateId(scope, action, requestId);
+    else releaseCreateId(scope, action);
+    throw e;
+  }
+}
+
 /** What the New page asks `start` to do. Exactly one `what`; `branch` makes it a new branch first. */
 export interface StartAsk {
   what: api.StartWhat;
   /** An agent row's existing harness metadata; never inferred from its command line. */
   rowHarness?: string;
+  /**
+   * An added account's id (M101), for an agent started by id (`what.kind === "harness"`). Absent for
+   * Default and for every other start, so a request without an account is built exactly as before.
+   */
+  account?: string;
+  /** Type the agent's sign-in line instead of the plain start (the Accounts pages). Only with `what.kind === "harness"`. */
+  signIn?: true;
   /** The folder, as typed or picked; absent is home (or a row's pinned folder). */
   cwd?: string;
   /** One id per intent, minted by the page and kept by a retry of the same ask. */
@@ -48,7 +79,8 @@ export interface StartAsk {
  * `unknown`: no answer that says whether it ran (ADR 0091).
  */
 export type StartOutcome =
-  | { kind: "done" }
+  /** `paneId`: the pane the start opened, on a plain start (Change login ends that sign-in session). */
+  | { kind: "done"; paneId?: string }
   | { kind: "refused"; message: string }
   | { kind: "unknown" };
 
@@ -144,7 +176,9 @@ export function useSpaceActions(canWrite?: () => boolean) {
         kind: "shell",
       };
       const noun = what === "tab" ? t("space.noun.tab") : t("space.noun.space");
-      setStatus(t("space.create.ready", { what: noun }), "success");
+      // "Launch your agent" is wrong where the phone launched one: the new pane's header says "Starting…"
+      // for that (`agentLaunch` below), so the ready line stays out of its way.
+      if (harness === undefined) setStatus(t("space.create.ready", { what: noun }), "success");
       // A topology write: whichever view the operator lands back on (the tab strip they just left,
       // the dashboard behind it) should not wait out an idle-timed gap to show the new pane.
       stampTopology();
@@ -192,7 +226,8 @@ export function useSpaceActions(canWrite?: () => boolean) {
       creatingTabRef.current.add(key);
       setCreatingTab(new Set(creatingTabRef.current));
       try {
-        open(await api.createTab(workspaceId, {}, scope), "tab", scope);
+        const action: CreateAction = { kind: "tab", workspaceId, cwd: undefined, label: undefined };
+        open(await withCreateId(scope, action, (requestId) => api.createTab(workspaceId, { requestId }, scope)), "tab", scope);
       } catch (e) {
         setStatus(describeThrownError(e), "error");
       } finally {
@@ -221,7 +256,8 @@ export function useSpaceActions(canWrite?: () => boolean) {
       setCreatingSpace(true);
       const scope = at ?? scopeRef.current;
       try {
-        open(await api.createWorkspace(opts, scope), "space", scope);
+        const action: CreateAction = { kind: "space", cwd: opts.cwd, label: opts.label };
+        open(await withCreateId(scope, action, (requestId) => api.createWorkspace({ ...opts, requestId }, scope)), "space", scope);
       } catch (e) {
         setStatus(describeThrownError(e), "error");
       } finally {
@@ -258,7 +294,15 @@ export function useSpaceActions(canWrite?: () => boolean) {
         }
         if (ask.branch !== undefined) {
           const res = await api.createWorktreeAt(
-            { cwd: ask.branch.cwd, branch: ask.branch.name, base: ask.branch.base, folder: ask.branch.folder, requestId: ask.requestId, what: ask.what },
+            {
+              cwd: ask.branch.cwd,
+              branch: ask.branch.name,
+              base: ask.branch.base,
+              folder: ask.branch.folder,
+              requestId: ask.requestId,
+              what: ask.what,
+              account: ask.account,
+            },
             scope,
           );
           if (!res.ok) return { kind: "refused", message: describeApiError(res) };
@@ -269,16 +313,20 @@ export function useSpaceActions(canWrite?: () => boolean) {
         // A machine older than 1.19.0 starts no plain shell by id: its own space create opens one.
         // A starter makes no tab by hand and ignores the pane, so it is a space whatever was asked.
         const beside = ask.what.kind === "starter" ? undefined : ask.beside;
-        const cwd = ask.cwd === undefined ? {} : { cwd: ask.cwd };
+        const cwd = ask.cwd === undefined ? { requestId: ask.requestId } : { cwd: ask.cwd, requestId: ask.requestId };
         const res =
           ask.what.kind === "shell" && ask.legacyShell === true
             ? beside === undefined
               ? await api.createWorkspace(cwd, scope)
               : await api.createTab(beside.workspaceId, cwd, scope)
-            : await api.startLaunch(ask.what, { cwd: ask.cwd, requestId: ask.requestId, besidePaneId: beside?.paneId }, scope);
+            : await api.startLaunch(
+                ask.what,
+                { cwd: ask.cwd, requestId: ask.requestId, besidePaneId: beside?.paneId, account: ask.account, signIn: ask.signIn },
+                scope,
+              );
         if (!res.ok) return { kind: "refused", message: describeApiError(res) };
         open(res, beside === undefined ? "space" : "tab", scope, startupHarness(ask.what, ask.rowHarness));
-        return { kind: "done" };
+        return { kind: "done", paneId: res.pane.paneId };
       } catch (e) {
         if (api.outcomeUnknown(e)) return { kind: "unknown" };
         return { kind: "refused", message: describeThrownError(e) };
@@ -313,7 +361,9 @@ export function useSpaceActions(canWrite?: () => boolean) {
       setLaunching(new Set(launchingRef.current));
       const scope = scopeRef.current;
       try {
-        open(await api.launch(command, beside, scope), beside !== undefined ? "tab" : "space", scope, rowHarness);
+        const action: CreateAction = { kind: "launch", command, beside };
+        const created = await withCreateId(scope, action, (requestId) => api.launch(command, beside, scope, requestId));
+        open(created, beside !== undefined ? "tab" : "space", scope, rowHarness);
       } catch (e) {
         setStatus(describeThrownError(e), "error");
       } finally {

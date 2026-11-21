@@ -249,9 +249,9 @@ describe("the sidebar", () => {
     expect(aside.dataset.slot).toBe("wide-sidebar");
     expect(aside.className).toContain("bg-card");
     expect(aside.style.width).toBe("320px");
-    // One word: Collie in the text colour, then three inked letters (components/wordmark.tsx).
-    expect(q(aside, '[data-slot="sidebar-word"]')?.textContent).toBe("ColliePWA");
-    expect([...aside.querySelectorAll(".wordmark-ink")].map((el) => el.textContent)).toEqual(["P", "W", "A"]);
+    // One image: Collie in the text colour, then three inked letters (components/collie-wordmark.tsx).
+    expect(q(aside, '[data-slot="sidebar-word"] svg')?.getAttribute("aria-label")).toBe("ColliePWA");
+    expect([...aside.querySelectorAll(".wordmark-ink")].map((el) => el.classList[1])).toEqual(["wordmark-ink-p", "wordmark-ink-w", "wordmark-ink-a"]);
     expect(q(aside, '[data-slot="sidebar-mark"] [data-slot="collie-mark"]')).not.toBeNull();
     expect(q(container, '[data-testid="chat"]')?.dataset.inStrip).toBe("true");
     // The header moved into the focused column, and the mark is not drawn twice.
@@ -288,6 +288,41 @@ describe("the sidebar", () => {
     const { container } = await mount("w1:p1", 1200);
     const list = q(container, '[data-slot="wide-sidebar"] > div.overflow-y-auto')!;
     expect(list.className).toMatch(/(^|\s)relative(\s|$)/);
+  });
+
+  it("leads its list with the session filter, sticky across the sidebar, and the rail has none", async () => {
+    // Five rows are read, not searched: the field comes with a sixth.
+    const { container: few } = await mount("w1:p1", 1200);
+    expect(q(few, 'aside [data-slot="session-filter"]')).toBeNull();
+    cleanup();
+    extraAgents = [pane("w2:p2", "w2", "beta")];
+    const { container } = await mount("w1:p1", 1200);
+    const block = q(container, 'aside[data-slot="wide-sidebar"] [data-slot="session-filter"]')!;
+    expect(block).not.toBeNull();
+    expect(block.getAttribute("role")).toBe("search");
+    expect(block.className).toEqual(expect.stringContaining("sticky"));
+    expect(block.className).toEqual(expect.stringContaining("top-0 -mx-2 px-2"));
+    expect(within(block).getByRole("textbox", { name: "Filter sessions" })).not.toHaveFocus();
+
+    // Typed into, it narrows the list; closed to the rail, the field and its query are gone.
+    fireEvent.change(within(block).getByRole("textbox"), { target: { value: "beta" } });
+    expect(sidebarRow(container, A1)).toBeNull();
+    expect(sidebarRow(container, B1)).not.toBeNull();
+    fireEvent.click(q(container, '[data-slot="sidebar-toggle"]')!);
+    const rail = await waitFor(() => {
+      const el = q(container, 'aside[data-slot="rail"]');
+      expect(el).not.toBeNull();
+      return el!;
+    });
+    expect(q(rail, '[data-slot="session-filter"]')).toBeNull();
+    fireEvent.click(q(container, '[data-slot="sidebar-toggle"]')!);
+    const reopened = await waitFor(() => {
+      const el = q(container, 'aside[data-slot="wide-sidebar"] [data-slot="session-filter"]');
+      expect(el).not.toBeNull();
+      return el!;
+    });
+    expect(within(reopened).getByRole("textbox")).toHaveValue("");
+    expect(sidebarRow(container, A1)).not.toBeNull();
   });
 
   it("is 264 px wide at medium", async () => {

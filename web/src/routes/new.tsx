@@ -2,6 +2,7 @@ import { Icon } from "@/components/icons/icon";
 import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { useLocation } from "react-router";
 
+import { PickCaption } from "@/components/accounts-meter";
 import { AgentIcon } from "@/components/agent-icon";
 import { RouteHeader } from "@/components/app-header";
 import { useCrew } from "@/components/crew-provider";
@@ -26,6 +27,7 @@ import { useNav } from "@/hooks/use-nav";
 import { useNoPromptsGuard } from "@/hooks/use-no-prompts-guard";
 import { useSpaceActions } from "@/hooks/use-spaces";
 import { checkRun, clearRecentRuns, planWorktree, removeRecentRun, type StartWhat } from "@/lib/api";
+import { accountName, accountsKey, addedOf, useAccounts } from "@/lib/accounts";
 import { describeApiError, describeThrownError } from "@/lib/api-error-message";
 import { paneBranchName, startFromChoices } from "@/lib/branch-off";
 import { useFolders } from "@/lib/folders";
@@ -34,6 +36,7 @@ import { HOST_TEXT_CLASSES, hostSlot, isMultiHost, leadHost, paneScope } from "@
 import { t } from "@/lib/i18n";
 import { launchersKey, useLaunchers } from "@/lib/launchers";
 import { mutate } from "@/lib/mutate";
+import { useRememberedAnswer } from "@/lib/remembered-shape";
 import { useMuxCapability } from "@/lib/mux-capability";
 import { homePath, newAddPath, readNewAt } from "@/lib/nav";
 import {
@@ -70,6 +73,7 @@ import {
   whatKey,
   whatLabel,
   type CommandPick,
+  type LastStart,
   type Kind,
   type Offer,
   type OfferItem,
@@ -173,11 +177,24 @@ function NewPage({ search }: { search: string }) {
     screenless: !chosenGrid.capable,
   });
   const home = loaded ? launchers.home : "";
+  // Accounts (M101) of the CHOSEN machine: a crew member's accounts are its own. A 404 or a failed read
+  // leaves `accounts.body` null, and the page below is exactly as it was.
+  const accounts = useAccounts(target);
+  const accountsLoaded = accounts.loadedFor === accountsKey(target);
   const { folders, star } = useFolders(target, true);
   const again = useMemo(() => readAgain(machineKey), [machineKey]);
   // Again counts only while the machine still offers what it started, and (for a worktree) can still make one.
   const usable = again !== null && loaded && offered(offer, again.what) ? again : null;
-  const againOffered = usable !== null && (usable.branch === null || offer.branchBlocked === null);
+  // CALM LOAD (row 3). The device already holds the record (`readAgain`, localStorage), so the row is
+  // drawn open on the FIRST frame from it, before the launcher read ends, and the page below it does not
+  // move when the read lands. The read can only CLOSE it (a start the machine no longer offers, a worktree
+  // it cannot make), through `Collapse`. Until then the row is drawn but cannot be tapped (`readyToUse`):
+  // every check that guards a tap needs the read's offer, and none of them is skipped.
+  const readyToUse = loaded;
+  // The words for what it started: the page's own label once the offer is in, and before that the label
+  // the record kept, so the line does not change when the read lands.
+  const againWhat = again === null ? "" : loaded ? whatLabel(again.what, offer, t("newPage.shell")) : again.label;
+  const againOffered = again !== null && (loaded ? usable !== null : true) && (again.branch === null || offer.branchBlocked === null);
 
   // ── The form ──────────────────────────────────────────────────────────────────────────────────
   // Agent or Command is a segment; each half keeps its own pick, so going back and forth loses neither.
@@ -194,6 +211,35 @@ function NewPage({ search }: { search: string }) {
   const command = commandChoice(offer, commandPick ?? keyToWhat(at.pick), usable);
   const what: StartWhat | null = whatFor(kind, agentItem, command, typedLine);
   const chosenItem = what === null ? undefined : itemOf(offer, what);
+  // The account pick (M101): only for a built-in agent started by id, and only where that agent has at
+  // least one ADDED account on this machine. A hand-written row, a starter and a shell never carry one.
+  // The pick is an id; one that is not among this agent's added accounts reads as Default, so a switch of
+  // agent or machine needs no reset.
+  const [accountPick, setAccountPick] = useState<string | null>(null);
+  const addedHere = accountsLoaded && kind === "agent" && !offer.startersOnly && what?.kind === "harness" ? addedOf(accounts.body, what.id) : [];
+  const accountsShown = addedHere.length > 0;
+  const accountRow = accountsShown ? (addedHere.find((a) => a.id === accountPick) ?? null) : null;
+  const accountDefault = accountsShown && what?.kind === "harness" ? accounts.body?.accounts.find((a) => a.harness === what.id && a.kind === "default") : undefined;
+  const accountId = accountRow?.id;
+  const accountCaptionRow = accountRow ?? accountDefault;
+  // CALM LOAD (row 17). The profiles are read after the first paint, so the pick used to open in the
+  // middle of the page. This device remembers one flag (lib/remembered-shape.ts): the last read on the
+  // front machine showed the pick for the agent the page had chosen. While the read is in flight and
+  // the flag is true, the pick's box is held open from the first frame for a built-in agent, an agent by
+  // id, which is what could carry profiles; the read then fills the box or closes it. Before the launcher
+  // read the agent is not known yet, so the one the address or Again names stands in for it. The flag is
+  // written only for the agent the page chose itself, never for one the person moved to on this visit,
+  // and only for the front machine: a crew member's profiles are its own, and one flag cannot speak for them.
+  const frontMachine = target.host === undefined && target.session === undefined;
+  const heldWhat: StartWhat | null = what ?? (loaded ? null : (keyToWhat(agentPick ?? at.pick) ?? again?.what ?? null));
+  const couldCarryProfiles = kind === "agent" && !offer.startersOnly && heldWhat?.kind === "harness";
+  const accountsRead = accountsLoaded && (accounts.status === "ready" || accounts.status === "unavailable");
+  const pickMemory = useRememberedAnswer(
+    "new-profile-pick",
+    frontMachine && accountsRead && agentPick === null && kind === "agent" && !offer.startersOnly && what?.kind === "harness" ? accountsShown : undefined,
+    target.host,
+  );
+  const accountsReserved = frontMachine && !accountsLoaded && pickMemory === true && couldCarryProfiles;
   // In a space, the folder starts as the space's own pane's: the bridge would take it when none is named.
   const [cwd, setCwd] = useState(() => from?.cwd ?? besidePane?.cwd ?? readAgain(machineKey)?.cwd ?? "");
   // Whether the person changed the Folder field on this visit. A Recent pick fills the folder with the
@@ -290,6 +336,10 @@ function NewPage({ search }: { search: string }) {
     else if (folderKind === "parent" && current.parentTarget !== undefined) {
       if (current.parentTarget.ok) targetPath = current.parentTarget.path;
       else branchProblem = describeApiError(current.parentTarget);
+    } else if (folderKind === "default" && current.defaultRefusal !== undefined) {
+      // The machine's "Worktree folder" setting broke since it was saved: no folder is promised, and a
+      // create would refuse it with these words.
+      branchProblem = describeApiError(current.defaultRefusal);
     } else if (folderKind === "default" && current.defaultTarget !== undefined) {
       targetPath = current.defaultTarget.path;
       if (current.defaultTarget.exists) {
@@ -309,7 +359,8 @@ function NewPage({ search }: { search: string }) {
 
 
   // ── The summary line ──────────────────────────────────────────────────────────────────────────
-  const shownWhat = what === null ? "" : summaryWhat(what, offer, t("newPage.shell"));
+  const baseWhat = what === null ? "" : summaryWhat(what, offer, t("newPage.shell"));
+  const shownWhat = accountRow === null ? baseWhat : t("accounts.new.summaryWhat", { what: baseWhat, account: accountRow.label });
   // The FULL path the bridge will use: a name with no leading / or ~ is a folder under home, and the
   // line says so before Start, so nothing is rewritten silently.
   const folderText = shortenHome(pinned ?? folderShown(cwd, home), home);
@@ -348,12 +399,13 @@ function NewPage({ search }: { search: string }) {
           what,
           cwd: showWhere ? cwd.trim() : "",
           branch: branchActive ? { name: branchName.trim(), base: JSON.stringify(base), folder: folderChoice } : null,
+          account: accountId,
         });
   const retrying = phase === "unknown" && lastAsk.current === fingerprint;
   const blocked = what === null || refusal !== undefined || !loaded || branchProblem !== null;
 
   /** Start `ask`. On `done` the phone has already moved to the new pane (`useSpaceActions`), so the page just remembers it. */
-  async function run(ask: { what: StartWhat; cwd: string; branch: boolean }, print: string) {
+  async function run(ask: { what: StartWhat; cwd: string; branch: boolean; account?: string }, print: string) {
     if (startingRef.current) return;
     startingRef.current = true;
     if (lastAsk.current !== print) requestId.current = mintRequestId();
@@ -365,6 +417,7 @@ function NewPage({ search }: { search: string }) {
       {
         what: ask.what,
         rowHarness: ask.what.kind === "row" && kindOf(ask.what, offer) === "agent" ? itemOf(offer, ask.what)?.harness : undefined,
+        account: ask.account,
         cwd: sendCwd,
         requestId: requestId.current,
         legacyShell: legacy,
@@ -375,14 +428,16 @@ function NewPage({ search }: { search: string }) {
     );
     startingRef.current = false;
     if (outcome.kind === "done") {
-      rememberAgain(machineKey, {
+      const last: LastStart = {
         what: ask.what,
         label: whatLabel(ask.what, offer, t("newPage.shell")),
         // A row with a fixed folder remembers none: Again runs it where the operator pinned it.
         cwd: itemOf(offer, ask.what)?.cwd !== undefined || !takesFolder(ask.what) ? null : (sendCwd ?? null),
         branch: ask.branch ? { folder: folderChoice } : null,
         at: Date.now(),
-      });
+      };
+      if (ask.account !== undefined) last.account = ask.account;
+      rememberAgain(machineKey, last);
       rememberKind(machineKey, kindOf(ask.what, offer));
       setPhase("idle");
       return;
@@ -397,7 +452,7 @@ function NewPage({ search }: { search: string }) {
   // to say whether it skips prompts: a history entry carries the bridge's answer from its first run, and
   // a typed line gets it from `checkRun` (`known`), asked BEFORE the first run (ADR 0095, amendment).
   const { guard, sheet: noPromptsSheet } = useNoPromptsGuard();
-  function begin(ask: { what: StartWhat; cwd: string; branch: boolean }, print: string, known?: { noPrompts: boolean }) {
+  function begin(ask: { what: StartWhat; cwd: string; branch: boolean; account?: string }, print: string, known?: { noPrompts: boolean }) {
     const item = itemOf(offer, ask.what);
     guard({
       item:
@@ -412,7 +467,7 @@ function NewPage({ search }: { search: string }) {
   }
 
   /** A typed line: ask the machine what it is (a read), then the same guard as every other start. */
-  async function checkThenBegin(ask: { what: StartWhat; cwd: string; branch: boolean }, print: string) {
+  async function checkThenBegin(ask: { what: StartWhat; cwd: string; branch: boolean; account?: string }, print: string) {
     if (ask.what.kind !== "run" || checkingRef.current) return;
     checkingRef.current = true;
     setChecking(true);
@@ -439,7 +494,7 @@ function NewPage({ search }: { search: string }) {
 
   function startNow() {
     if (blocked || what === null || busy) return;
-    const ask = { what, cwd: showWhere ? cwd.trim() : "", branch: branchActive };
+    const ask = { what, cwd: showWhere ? cwd.trim() : "", branch: branchActive, account: accountId };
     if (command.kind === "typed" && kind === "shell") void checkThenBegin(ask, fingerprint);
     else begin(ask, fingerprint);
   }
@@ -447,6 +502,9 @@ function NewPage({ search }: { search: string }) {
   /** Again: a plain start runs at once; a worktree start fills the form with a fresh name. */
   function useAgain() {
     if (again === null || busy) return;
+    // The account Again started with, while that machine still lists it for that agent (M101).
+    const againAccount = againAccountOf(again);
+    setAccountPick(againAccount ?? null);
     setKindPick(kindOf(again.what, offer));
     let typedAgain = false;
     if (kindOf(again.what, offer) === "agent") setAgentPick(whatKey(again.what));
@@ -464,10 +522,15 @@ function NewPage({ search }: { search: string }) {
       if (again.branch.folder.kind === "parent") setParentPick(again.branch.folder.parent);
       return;
     }
-    const print = startFingerprint({ machine: machineKey, what: again.what, cwd: again.cwd ?? "", branch: null });
-    const ask = { what: again.what, cwd: again.cwd ?? "", branch: false };
+    const print = startFingerprint({ machine: machineKey, what: again.what, cwd: again.cwd ?? "", branch: null, account: againAccount });
+    const ask = { what: again.what, cwd: again.cwd ?? "", branch: false, account: againAccount };
     if (typedAgain) void checkThenBegin(ask, print);
     else begin(ask, print);
+  }
+
+  function againAccountOf(last: { what: StartWhat; account?: string }): string | undefined {
+    if (last.account === undefined || last.what.kind !== "harness") return undefined;
+    return addedOf(accounts.body, last.what.id).some((a) => a.id === last.account) ? last.account : undefined;
   }
 
   function chooseKind(next: Kind) {
@@ -554,15 +617,13 @@ function NewPage({ search }: { search: string }) {
             <button
               type="button"
               onClick={useAgain}
-              disabled={busy}
+              disabled={busy || !readyToUse}
               className="flex min-h-14 w-full items-center gap-3 rounded-md border border-border bg-muted px-3 py-2 text-left transition-colors active:bg-muted/70 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"
             >
               <Icon name="reuse-last" className="size-5 shrink-0 text-muted-foreground" aria-hidden />
               <span className="flex min-w-0 flex-1 flex-col">
                 <span className="truncate text-sm font-medium">
-                  {again.branch === null
-                    ? t("newPage.again", { what: whatLabel(again.what, offer, t("newPage.shell")) })
-                    : t("newPage.againBranch", { what: whatLabel(again.what, offer, t("newPage.shell")) })}
+                  {again.branch === null ? t("newPage.again", { what: againWhat }) : t("newPage.againBranch", { what: againWhat })}
                 </span>
                 <span className="truncate font-mono text-xs text-muted-foreground">
                   {shortenHome(again.cwd ?? (home || "~"), home)}
@@ -598,6 +659,7 @@ function NewPage({ search }: { search: string }) {
               disabled={busy}
             />
           ) : kind === "agent" ? (
+            <>
             <Select
               aria-label={t("newPage.kind.agent")}
               value={agentItem?.key ?? ""}
@@ -612,6 +674,36 @@ function NewPage({ search }: { search: string }) {
                 </option>
               ))}
             </Select>
+            <Collapse open={accountsShown || accountsReserved}>
+              {accountsReserved ? (
+                // The box the pick will fill, with nothing live in it: the same 44px select and the caption's
+                // one-line floor (a border, `p-3` and one 16px row), until the read says what to draw.
+                <div data-slot="account-pick-reserved" aria-hidden className="flex flex-col gap-2 pt-2">
+                  <div className="h-11 rounded-lg border border-border" />
+                  <div className="rounded-md border border-border p-3">
+                    <div className="h-4" />
+                  </div>
+                </div>
+              ) : accountsShown ? (
+                <div data-slot="account-pick" className="flex flex-col gap-2 pt-2">
+                  <Select
+                    aria-label={t("accounts.new.label")}
+                    value={accountRow?.id ?? accountDefault?.id ?? ""}
+                    lead={<Icon name="mod-icon-user" className="size-4" aria-hidden />}
+                    onChange={(event) => setAccountPick(event.target.value)}
+                  >
+                    {accountDefault !== undefined && <option value={accountDefault.id}>{accountName(accountDefault)}</option>}
+                    {addedHere.map((a) => (
+                      <option key={a.id} value={a.id}>
+                        {accountName(a)}
+                      </option>
+                    ))}
+                  </Select>
+                  {accountCaptionRow !== undefined && <PickCaption row={accountCaptionRow} />}
+                </div>
+              ) : null}
+            </Collapse>
+            </>
           ) : (
             <CommandPicker
               options={commandOptions(offer, t("newPage.shell.option"))}
@@ -883,7 +975,7 @@ function MachineSelect({
   );
 }
 
-interface BranchBlockProps {
+export interface BranchBlockProps {
   on: boolean;
   /** Why the switch cannot be turned on here, or `null`. */
   blocked: Unavailable | null;
@@ -906,7 +998,7 @@ interface BranchBlockProps {
 }
 
 /** "New worktree": the switch, then the name, where it starts, and where its folder goes. */
-function BranchBlock(p: BranchBlockProps) {
+export function BranchBlock(p: BranchBlockProps) {
   const switchId = useId();
   const noteId = useId();
   // The machine's own sentence is said beside the machine select, so it is not said twice here.

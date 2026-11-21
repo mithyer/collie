@@ -25,6 +25,24 @@ describe("HeaderStatus — swaps the title for a live status, in place", () => {
     expect(screen.getByText("webapp › main")).toBeInTheDocument();
   });
 
+  it("keeps the title and shows a status published `beside` next to it, announced, for its time (M104)", () => {
+    render(
+      <HeaderStatus>
+        <span>webapp › main</span>
+      </HeaderStatus>,
+    );
+    act(() => setStatus("Sent", "success", undefined, true));
+    expect(screen.getByText("webapp › main")).toBeInTheDocument();
+    const status = screen.getByRole("status");
+    expect(status).toHaveTextContent("Sent");
+    expect(status).toHaveAttribute("aria-live", "polite");
+    // It lies over the line's free room: no box of its own in the flow, so the header keeps its height.
+    expect(status).toHaveClass("absolute");
+    act(() => vi.advanceTimersByTime(2600));
+    expect(screen.queryByRole("status")).toBeNull();
+    expect(screen.getByText("webapp › main")).toBeInTheDocument();
+  });
+
   it("replaces the title with the status text, announced, while one is live", () => {
     render(
       <HeaderStatus>
@@ -92,7 +110,7 @@ describe("HeaderStatus — error opens the detail sheet instead of dismissing on
         <span>webapp › main</span>
       </HeaderStatus>,
     );
-    act(() => setStatus("connection refused: dial tcp 100.64.0.5:22: no route to host", "error"));
+    act(() => setStatus("connection refused: dial tcp 192.0.2.5:22: no route to host", "error"));
 
     const detailButton = screen.getByRole("button", { name: "Show the whole message" });
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
@@ -102,7 +120,7 @@ describe("HeaderStatus — error opens the detail sheet instead of dismissing on
     expect(screen.getByRole("dialog")).toBeInTheDocument();
     expect(
       within(screen.getByRole("dialog")).getByText(
-        "connection refused: dial tcp 100.64.0.5:22: no route to host",
+        "connection refused: dial tcp 192.0.2.5:22: no route to host",
       ),
     ).toBeInTheDocument();
   });
@@ -173,5 +191,76 @@ describe("HeaderStatus — error opens the detail sheet instead of dismissing on
     act(() => clearStatus());
     act(() => setStatus("Working on it", "info"));
     expect(screen.queryByRole("button", { name: "Show the whole message" })).not.toBeInTheDocument();
+  });
+});
+
+// A CONDITION is a state of the screen, not an event: the pane's "Starting…" while an agent launches.
+// It rides in the same box as an event, in the note look, and an event outranks it.
+describe("HeaderStatus — a condition holds the title while it is true", () => {
+  const starting = { text: "Starting…", tone: "note" } as const;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    clearStatus();
+  });
+  afterEach(() => {
+    act(() => clearStatus());
+    vi.useRealTimers();
+  });
+
+  it("replaces the title, announced, in the note look with the info icon and no dismiss button", () => {
+    const { container } = render(
+      <HeaderStatus condition={starting}>
+        <span>webapp › main</span>
+      </HeaderStatus>,
+    );
+    expect(screen.queryByText("webapp › main")).not.toBeInTheDocument();
+    const line = screen.getByRole("status");
+    expect(line).toHaveTextContent("Starting…");
+    expect(line).toHaveAttribute("aria-live", "polite");
+    expect(line.className).toContain("text-status-info");
+    expect(line.querySelector("svg")).not.toBeNull();
+    expect(screen.queryByRole("button")).toBeNull();
+    // The same box as an event's, so the title never changes height when either shows.
+    expect(container.querySelector('[data-slot="header-condition"]')?.className).toContain("min-h-11");
+  });
+
+  it("gives the title back when the condition ends", () => {
+    const { rerender } = render(
+      <HeaderStatus condition={starting}>
+        <span>webapp › main</span>
+      </HeaderStatus>,
+    );
+    rerender(
+      <HeaderStatus>
+        <span>webapp › main</span>
+      </HeaderStatus>,
+    );
+    expect(screen.getByText("webapp › main")).toBeInTheDocument();
+    expect(screen.queryByRole("status")).toBeNull();
+  });
+
+  it("gives way to an event status, and comes back when the event clears", () => {
+    render(
+      <HeaderStatus condition={starting}>
+        <span>webapp › main</span>
+      </HeaderStatus>,
+    );
+    act(() => setStatus("Sent", "success"));
+    expect(screen.getByRole("status")).toHaveTextContent("Sent");
+    expect(screen.queryByText("Starting…")).toBeNull();
+    act(() => clearStatus());
+    expect(screen.getByRole("status")).toHaveTextContent("Starting…");
+  });
+
+  it("keeps the condition over a word published beside the title: there is no name for it to stand beside", () => {
+    render(
+      <HeaderStatus condition={starting}>
+        <span>webapp › main</span>
+      </HeaderStatus>,
+    );
+    act(() => setStatus("Sent", "success", undefined, true));
+    expect(screen.getByRole("status")).toHaveTextContent("Starting…");
+    expect(screen.queryByText("Sent")).toBeNull();
   });
 });

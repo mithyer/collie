@@ -1,6 +1,7 @@
 import { apiError } from "../error-codes.ts";
 import type { JsonObject, JsonValue } from "../json.ts";
 import { MASK_VERSION } from "../redact.ts";
+import { REASON_HEADER, REFUSED_BY_HEADER, isRefusalReason, withRefusal, type RefusalReason } from "../refusal.ts";
 import { MAX_UPLOAD_OVERHEAD, uploadTooLarge } from "../uploads.ts";
 import { DEVICE_HEADER, encodeDeviceHeader } from "./admission.ts";
 import { LEAD_ROW_HEADER, LEAD_ROW_MARK } from "./launcher-rows.ts";
@@ -9,6 +10,7 @@ import {
   type CrewParams,
   type PeerFailure,
   type PeerOutcome,
+  CREATE_WRITE_BUDGET_MS,
   PANE_READ_BUDGET_MS,
   PANE_WRITE_BUDGET_MS,
   WORKTREE_WRITE_BUDGET_MS,
@@ -51,20 +53,45 @@ import { HOST_PARAM, type PeerState } from "./registry.ts";
  *
  * The mapping is the identity minus the `/api/` prefix — `/api/pane/w1:p1/reply` →
  * `pane/w1:p1/reply` — because §5's peer table IS the phone's route table re-exposed 1:1. The
- * allowlist below is therefore the whole of the federation-visible surface, and everything §5
- * excludes (`subscribe`, `notifications/*`, `update/check`, `config`, `snapshot`) is excluded here
- * by simply not appearing: push subscriptions live on the lead, notification policy is one crew-wide
+ * allowlist below, with its GET-only half ({@link FORWARDABLE_GET_ONLY}, which needs `method`), is
+ * therefore the whole of the federation-visible surface, and everything §5 excludes (`subscribe`,
+ * `notifications/*`, `update/check`, `config`, `snapshot`) is excluded here by simply not appearing: push subscriptions live on the lead, notification policy is one crew-wide
  * setting, update checking is per-machine, and `snapshot` is merged rather than proxied.
  *
  * The pane id is carried through **verbatim, still percent-encoded**: it is a Herdr pane id on the
  * peer's registry and never a path on anybody's disk, and re-encoding it here is how `w1:p1` on the
  * lead would quietly become something else on the peer.
  */
-export function crewRouteFor(pathname: string): string | null {
+export function crewRouteFor(pathname: string, method?: string): string | null {
   if (!pathname.startsWith("/api/")) return null;
   const route = pathname.slice("/api/".length);
-  return FORWARDABLE.some((re) => re.test(route)) ? route : null;
+  return crosses(route, method) ? route : null;
 }
+
+/**
+ * Whether `route` crosses the link for `method`: any route of {@link FORWARDABLE}, and a route of
+ * {@link FORWARDABLE_GET_ONLY} for a GET only. No method (a caller that does not say) is never a GET,
+ * so the GET-only routes stay closed to it.
+ */
+function crosses(route: string, method: string | undefined): boolean {
+  if (FORWARDABLE.some((re) => re.test(route))) return true;
+  return method === "GET" && FORWARDABLE_GET_ONLY.some((re) => re.test(route));
+}
+
+/**
+ * The routes that cross the link for a GET and for nothing else, on both sides: the lead forwards no
+ * other method on them ({@link crewRouteFor}), and the member's peer surface dispatches no other method
+ * on them ({@link apiPathFor}). The same local path also takes writes the crew link must never carry.
+ */
+const FORWARDABLE_GET_ONLY: readonly RegExp[] = [
+  // Accounts (M101 spec 06): `GET /api/accounts` is the list of the member's OWN accounts, read where the
+  // folders are, so the pick in New shows the chosen machine's accounts. Only the list crosses. The add
+  // (`POST /api/accounts`) and the remove (`POST /api/accounts/remove`) stay on the machine that answers
+  // the phone: the lead refuses them `route_not_federated`, and a member's surface answers them 404. A
+  // member that predates it (1.28.x) answers 404 too, which the phone reads as "no accounts here" and
+  // hides the pick, as on a Windows member, which answers its own 404 `accounts.unavailable`.
+  /^accounts$/,
+];
 
 /**
  * The route grammars, mirroring `PANE_ROUTE` / `TAB_ACTION_ROUTE` in bridge/server.ts one-for-one.
@@ -84,7 +111,9 @@ const FORWARDABLE: readonly RegExp[] = [
   // (a read), a POST pins a block and a DELETE drops one (writes). Additive-optional the same way.
   // `held` (issue 740): the Cancel or Dismiss on a queued row, a WRITE (`DELETE`) to the member whose hold
   // queue keeps the row. Additive-optional the same way: a member that predates it answers 404.
-  /^pane\/[^/]+(?:\/(?:reply|keys|upload|close|rename|history|chat|changes|files|focus|answer|send|abort|clear|action|pins|held))?$/,
+  // `arrived` (M102), the person's "It arrived" on a send Collie cannot tell, a WRITE to the member whose store
+  // keeps the receipt; additive-optional, a member that predates it answers 404.
+  /^pane\/[^/]+(?:\/(?:reply|keys|upload|close|rename|history|chat|changes|files|focus|answer|send|abort|clear|action|pins|held|arrived))?$/,
   // One picture under the Files root, as bytes (ADR 0090): off the disk of the member that owns the
   // pane or the space, like the Files read it sits beside. Mirrors `PANE_FILES_IMAGE_ROUTE` and
   // `WORKSPACE_FILES_IMAGE_ROUTE` in bridge/server.ts one-for-one. Additive-optional (§7.1).
@@ -114,6 +143,11 @@ const FORWARDABLE: readonly RegExp[] = [
   // `unsupported` through its own route, as a launch does.
   /^worktree$/,
   /^worktree\/plan$/,
+  // The "Worktree folder" setting (ADR 0093, note of 2026-11-13): one per machine, so a `?host=` read or
+  // write reaches the member whose disk the folder is on. Additive-optional (§7.1): a member that
+  // predates it answers 404.
+  /^worktree\/folder$/,
+  /^worktree\/folder\/set$/,
   // The Changes view asked by workspace (ADR 0065): read-only git over the folder of a space that
   // lives on ONE member, so a `?host=` call is proxied like `pane/:id/changes`. Mirrors
   // `WORKSPACE_CHANGES_ROUTE` in bridge/server.ts one-for-one.
@@ -217,9 +251,13 @@ function isPaneRead(action: string | undefined): action is undefined | "history"
   return action === undefined || action === "history" || action === "chat" || action === "changes" || action === "files";
 }
 
-/** The inverse of {@link crewRouteFor}, for the peer dispatching a crew route into its own routes. */
-export function apiPathFor(route: string): string | null {
-  return FORWARDABLE.some((re) => re.test(route)) ? `/api/${route}` : null;
+/**
+ * The inverse of {@link crewRouteFor}, for the peer dispatching a crew route into its own routes. The
+ * peer passes the request's method, so a GET-only route ({@link FORWARDABLE_GET_ONLY}) is dispatched
+ * for a GET alone, whatever the lead sent.
+ */
+export function apiPathFor(route: string, method?: string): string | null {
+  return crosses(route, method) ? `/api/${route}` : null;
 }
 
 /**
@@ -280,6 +318,8 @@ export function forwardKind(route: string, method?: string): ForwardKind {
   // this lead has not heard from in a while, never refused before it is tried (§10.3's "a READ to a
   // dead member is still attempted").
   if (route === "launchers") return "read";
+  // The member's accounts list (M101 spec 06) changes nothing there: a read, tried against a stale member too.
+  if (route === "accounts") return "read";
   // The line check is a POST that changes nothing: attempted even against a stale member, never refused
   // before it is tried (§10.3).
   if (route === "launch/check") return "read";
@@ -295,6 +335,9 @@ export function forwardKind(route: string, method?: string): ForwardKind {
   if (route === "folders/browse") return "read";
   // The worktree plan reads git on the member and creates nothing (ADR 0126): a read, like the browser.
   if (route === "worktree/plan") return "read";
+  // The setting's read changes nothing; its set writes that member's file.
+  if (route === "worktree/folder") return "read";
+  if (route === "worktree/folder/set") return "write";
   // A blob read serves a file off the owning member's disk and changes nothing there — the same
   // shape as `pane/:id/history`, and attempted against a stale member for the same reason (§10.3).
   if (route.startsWith("blobs/")) return "read";
@@ -317,14 +360,19 @@ export function forwardKind(route: string, method?: string): ForwardKind {
 /** `pane/<id>`: the read of one pane's screen, the one read whose member-side work can outlast a poll. */
 const PANE_SCREEN_ROUTE = /^pane\/[^/]+$/;
 
+/** The routes that make a pane: a launch, a tab, a space. Each carries its own request id. */
+const CREATE_ROUTES: ReadonlySet<string> = new Set(["launch", "tab", "workspace"]);
+
 /**
  * The explicit budget a forwarded request dials on: {@link PANE_WRITE_BUDGET_MS} for a write to a pane (a send on a
  * herdr-core member costs about 6.4 s), {@link WORKTREE_WRITE_BUDGET_MS} for a worktree create (git and a new
- * space), {@link WRITE_BUDGET_MS} for every other write, {@link PANE_READ_BUDGET_MS}
+ * space), {@link CREATE_WRITE_BUDGET_MS} for a launch, a tab or a space create (the member's own waits sum
+ * to more than 5 s), {@link WRITE_BUDGET_MS} for every other write, {@link PANE_READ_BUDGET_MS}
  * for a pane's screen read, none for every other read (the transport's own poll budget and bootstrap credit).
  */
 export function budgetOf(kind: ForwardKind, route: string): number | undefined {
   if (kind === "write" && route === "worktree") return WORKTREE_WRITE_BUDGET_MS;
+  if (kind === "write" && CREATE_ROUTES.has(route)) return CREATE_WRITE_BUDGET_MS;
   // An ask answer may walk a dialog with keys on the member (ASK_LOCK_MS), so it dials on a pane write's budget.
   if (kind === "write") return route.startsWith("pane/") || ASK_ROUTE.test(route) ? PANE_WRITE_BUDGET_MS : WRITE_BUDGET_MS;
   return PANE_SCREEN_ROUTE.test(route) ? PANE_READ_BUDGET_MS : undefined;
@@ -359,6 +407,9 @@ export function forwardAuditAction(route: string, method?: string): string | nul
   // The member's own create writes `worktree.create`; its plan is a read.
   if (route === "worktree") return "worktree.create";
   if (route === "worktree/plan") return null;
+  // The member writes the same line for the setting's write; its read is a read.
+  if (route === "worktree/folder") return null;
+  if (route === "worktree/folder/set") return "worktree.folder";
   // `launch` writes either `workspace.launch` or `tab.launch`, decided by the body a route string
   // alone can't see — this generic name is the LEAD's own line about the forward (§12's "plus the
   // target host"), and the peer's own audit line is the accurate record of which one ran.
@@ -367,6 +418,9 @@ export function forwardAuditAction(route: string, method?: string): string | nul
   if (route === "launch/recent/remove") return "launch.recent.remove";
   if (route === "launch/recent/clear") return "launch.recent.clear";
   if (route === "launchers" || route === "launch/check") return null;
+  // The accounts list is a read, audited on neither side, and its rows (an email among them) are the
+  // member's: the lead writes no line about them (M101 spec 06).
+  if (route === "accounts") return null;
   // The member writes the same two names for Sent's writes (ADR 0107); its list is a read.
   if (route === "sent/remove") return "sent.remove";
   if (route === "sent/clear") return "sent.clear";
@@ -384,6 +438,8 @@ export function forwardAuditAction(route: string, method?: string): string | nul
   // The member writes `send-cancel` for the Cancel or Dismiss on a queued row (bridge/server.ts
   // `heldCancelRoute`, issue 740), so the lead's line names the same act. Only a DELETE is one.
   if (/^pane\/[^/]+\/held$/.test(route)) return method === undefined || method === "DELETE" ? "send-cancel" : null;
+  // The member writes `send-arrived` for the person's "It arrived" (bridge/server.ts `arrivedRoute`, M102).
+  if (/^pane\/[^/]+\/arrived$/.test(route)) return "send-arrived";
   const action = route.split("/")[2];
   if (isPaneRead(action)) return null; // reads, and a read is audited on neither side
   // close, rename and focus namespace themselves on the peer's own handler; the rest stay bare.
@@ -419,7 +475,37 @@ export type ForwardAuditEntry = {
   paneId?: string;
   session?: string;
   outcome: string;
+  /**
+   * The refusal's reason code (bridge/refusal.ts, M102 spec 14), when the forward was refused or its
+   * outcome is unknown: on the lead before or after the dial (`by: "lead"`), or the member's own code
+   * from its `x-collie-reason` header (`by: "member"`). Absent for a write that went through.
+   */
+  reason?: RefusalReason;
+  by?: "lead" | "member";
 };
+
+/** One forward row's detail: what the lead learned, and who refused and why. A type, so it is an `AuditDetail`. */
+export type ForwardAuditDetail = {
+  forwarded: string;
+  by?: "lead" | "member";
+  reason?: RefusalReason;
+};
+
+/** The audit detail of one forward row: what the lead learned, and who refused and why when one did. */
+export function forwardAuditDetail(entry: ForwardAuditEntry): ForwardAuditDetail {
+  const detail: ForwardAuditDetail = { forwarded: entry.outcome };
+  if (entry.reason !== undefined) {
+    detail.by = entry.by ?? "lead";
+    detail.reason = entry.reason;
+  }
+  return detail;
+}
+
+/**
+ * The version a member last reported, on the lead's refusals for its version (M102 spec 14 decision 4),
+ * in the header the phone reads beside the reason. Absent when the member reported none.
+ */
+export const MEMBER_VERSION_HEADER = "x-collie-member-version";
 
 /**
  * The headers a forwarded request carries. An allowlist, not a copy: a browser's `cookie`,
@@ -484,6 +570,9 @@ export function forwardHeaders(req: Request, device?: string | null): Headers {
  */
 const PROXIED_RESPONSE_HEADERS = [
   "content-type",
+  // A member's refusal code (bridge/refusal.ts): kept, so the phone reads the member's own reason.
+  // Its author header is NOT copied: the lead sets `x-collie-by: member` itself (`forwardToPeer`).
+  REASON_HEADER,
   "etag",
   "cache-control",
   "vary",
@@ -588,20 +677,39 @@ export function forwardError(
 export function refuseWriteBeforeAttempt(state: PeerState): Response | null {
   if (state.health === "reachable") return null;
   if (state.health === "incompatible") {
-    return forwardError(
-      "host_incompatible",
-      `host ${state.memberId} speaks a crew protocol this build cannot: ${state.reason ?? "version mismatch"}`,
-      503,
-      { host: state.memberId, lastSeenAt: state.lastSeenAt },
+    // The member's version, when it reported one, so the phone can say which Collie it runs (M102 spec 14).
+    const runs = state.version === null ? "" : ` (it runs Collie ${state.version})`;
+    const extra: JsonObject = { host: state.memberId, lastSeenAt: state.lastSeenAt };
+    if (state.version !== null) extra.memberVersion = state.version;
+    return withVersion(
+      withRefusal(forwardError("host_incompatible", `host ${state.memberId} speaks a crew protocol this build cannot${runs}: ${state.reason ?? "version mismatch"}`, 503, extra), "lead", "member_incompatible"),
+      state.version,
     );
   }
-  return forwardError(
+  return withRefusal(forwardError(
     "host_unreachable",
     `host ${state.memberId} is unreachable${state.lastSeenAt === null ? "" : ` (last seen ${new Date(state.lastSeenAt).toISOString()})`}` +
       `${state.reason === null ? "" : `: ${state.reason}`}`,
     503,
     { host: state.memberId, lastSeenAt: state.lastSeenAt },
-  );
+  ), "lead", "member_unreachable");
+}
+
+/** The response with {@link MEMBER_VERSION_HEADER} set when the version is known. */
+function withVersion(res: Response, version: string | null | undefined): Response {
+  if (version !== null && version !== undefined && version !== "") res.headers.set(MEMBER_VERSION_HEADER, version);
+  return res;
+}
+
+/**
+ * The reason code of a dial that failed (M102 spec 14): what the lead learned, as one code. A time-out
+ * is told apart from a broken link, so the record says whether the member was slow or gone.
+ */
+export function failureReason(failure: PeerFailure): RefusalReason {
+  if (failure.state === "incompatible") return "member_incompatible";
+  if (failure.state === "unreachable" && failure.attempted === false) return "link_refused";
+  if (failure.state === "unreachable" && failure.timedOut === true) return "link_timeout";
+  return "link_lost";
 }
 
 /**
@@ -839,6 +947,12 @@ export const REPLY_OLD_MEMBER_TEXT = "that machine runs an older Collie and cann
  */
 export const SEND_OLD_MEMBER_DETAIL = "This machine runs an older Collie and cannot take a send from the phone yet. Update it from the Crew page.";
 
+/** {@link SEND_OLD_MEMBER_DETAIL} for a member whose version the lead knows (M102 spec 14 decision 4). */
+export function sendOldMemberDetail(version: string | null | undefined): string {
+  if (version === null || version === undefined || version === "") return SEND_OLD_MEMBER_DETAIL;
+  return `This machine runs Collie ${version}, which cannot take a send from the phone yet. Update it from the Crew page.`;
+}
+
 /**
  * The lead's answer to a text submit for a member with no Surface reader: the reply route's old
  * refusal for an old reader, and beside it, under `send`, a Send Protocol answer the phone reads (an
@@ -846,15 +960,17 @@ export const SEND_OLD_MEMBER_DETAIL = "This machine runs an older Collie and can
  * carried no `send`, and the phone said "a body this phone cannot read". No receipt is stored: the
  * request never left the lead, and the phone's request id stays the phone's.
  */
-function oldMemberRefusal(requestId: string | null): Response {
+function oldMemberRefusal(requestId: string | null, version: string | null | undefined): Response {
   const receipt: JsonObject = { outcome: "refused" };
   if (requestId !== null) receipt.requestId = requestId;
-  const send: JsonObject = { receipt, offers: ["keys"], detail: SEND_OLD_MEMBER_DETAIL };
-  const refusal = { ok: false, textDelivered: false, ...apiError("reply.send_failed", { reason: REPLY_OLD_MEMBER_TEXT }), send };
-  return new Response(JSON.stringify(refusal), {
+  const send: JsonObject = { receipt, offers: ["keys"], detail: sendOldMemberDetail(version) };
+  const refusal: JsonObject = { ok: false, textDelivered: false, ...apiError("reply.send_failed", { reason: REPLY_OLD_MEMBER_TEXT }), send };
+  if (version !== null && version !== undefined && version !== "") refusal.memberVersion = version;
+  const res = new Response(JSON.stringify(refusal), {
     status: 200,
     headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" },
   });
+  return withVersion(withRefusal(res, "lead", "member_old"), version);
 }
 
 /**
@@ -907,12 +1023,14 @@ async function askPaneOf(req: Request): Promise<string | undefined> {
  * `receipt.outcome: "unknown"` exactly as it reads the member's own unknown, in its own words, and it
  * does not retry; neither does the lead. A 200 like every answer of the ask route, never a link error.
  */
-export function askUnknownAnswer(route: string): Response {
+export function askUnknownAnswer(route: string, why?: RefusalReason): Response {
   const receipt: JsonObject = { askId: route.slice("ask/".length), outcome: "unknown", reason: "no_evidence" };
-  return new Response(JSON.stringify({ receipt }), {
+  const res = new Response(JSON.stringify({ receipt }), {
     status: 200,
     headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" },
   });
+  // The receipt keeps the ask route's own reason, which the phone reads; the link's code rides beside it.
+  return why === undefined ? res : withRefusal(res, "lead", why);
 }
 
 /**
@@ -940,7 +1058,7 @@ async function isTextSubmit(req: Request, route: string): Promise<boolean> {
  * function is called from inside the request path of the lead's only front door.
  */
 export async function forwardToPeer(req: Request, url: URL, deps: ForwardDeps): Promise<Response> {
-  const route = crewRouteFor(url.pathname);
+  const route = crewRouteFor(url.pathname, req.method);
   if (route === null) {
     // Not a federated route. Reached only if a caller wires a route into the host gate without
     // adding it to §5's table — a bug, answered legibly rather than by forwarding something the
@@ -953,7 +1071,27 @@ export async function forwardToPeer(req: Request, url: URL, deps: ForwardDeps): 
   const kind = forwardKind(route, req.method);
   if (kind === "write") {
     const refusal = refuseWriteBeforeAttempt(deps.state);
-    if (refusal !== null) return refusal;
+    if (refusal !== null) {
+      // The lead writes its own line for a write it refused before the dial, as for every forward it
+      // refuses: the phone shows the refusal's words, and the audit says why no forward followed the
+      // tap. Without it a tap refused here left no trace on either machine (2026-11-16).
+      const action = forwardAuditAction(route, req.method);
+      if (action !== null && deps.audit !== undefined) {
+        const entry: ForwardAuditEntry = {
+          action,
+          host: deps.link.memberId,
+          outcome: deps.state.health === "incompatible" ? "incompatible" : "refused",
+          reason: deps.state.health === "incompatible" ? "member_incompatible" : "member_unreachable",
+          by: "lead",
+        };
+        const paneId = forwardPaneId(route) ?? (ASK_ROUTE.test(route) ? await askPaneOf(req) : undefined);
+        const session = url.searchParams.get("session");
+        if (paneId !== undefined) entry.paneId = paneId;
+        if (session !== null) entry.session = session;
+        deps.audit(entry);
+      }
+      return refusal;
+    }
   }
 
   // A text reply to a member with no Surface reader (an older build) is refused here, before any dial:
@@ -963,14 +1101,14 @@ export async function forwardToPeer(req: Request, url: URL, deps: ForwardDeps): 
   // member, `forwarded: "old_member"`, so the audit says why no forward followed the tap.
   if (deps.surfaceVersion === null && (await isTextSubmit(req, route))) {
     if (deps.audit !== undefined) {
-      const entry: ForwardAuditEntry = { action: "reply", host: deps.link.memberId, outcome: "old_member" };
+      const entry: ForwardAuditEntry = { action: "reply", host: deps.link.memberId, outcome: "old_member", reason: "member_old", by: "lead" };
       const paneId = forwardPaneId(route);
       const session = url.searchParams.get("session");
       if (paneId !== undefined) entry.paneId = paneId;
       if (session !== null) entry.session = session;
       deps.audit(entry);
     }
-    return oldMemberRefusal(await textSubmitId(req));
+    return oldMemberRefusal(await textSubmitId(req), deps.state.version);
   }
 
   // An ask answer names its pane in the body, not the route: read here, before the body streams on.
@@ -1034,13 +1172,17 @@ export async function forwardToPeer(req: Request, url: URL, deps: ForwardDeps): 
   const action = forwardAuditAction(route, req.method);
   const paneId = forwardPaneId(route) ?? askPane;
   const session = url.searchParams.get("session");
-  const record = (result: string): void => {
+  const record = (result: string, refusal?: { readonly reason: RefusalReason; readonly by: "lead" | "member" }): void => {
     if (action === null || deps.audit === undefined) return;
     // Assigned, never conditionally spread: an absent pane/session must leave the key off the entry
     // rather than record it as `undefined`.
     const entry: ForwardAuditEntry = { action, host: deps.link.memberId, outcome: result };
     if (paneId !== undefined) entry.paneId = paneId;
     if (session !== null) entry.session = session;
+    if (refusal !== undefined) {
+      entry.reason = refusal.reason;
+      entry.by = refusal.by;
+    }
     deps.audit(entry);
   };
 
@@ -1056,17 +1198,22 @@ export async function forwardToPeer(req: Request, url: URL, deps: ForwardDeps): 
         : outcome.state === "unreachable" && outcome.attempted === false
           ? "refused"
           : "unknown";
-    record(learned);
+    // One code for what the lead learned (M102 spec 14): a time-out is no longer the bare `unknown`.
+    const why = failureReason(outcome);
+    record(learned, { reason: why, by: "lead" });
     // An ask answer that may have landed comes back in the ask route's own shape, which the phone reads.
-    if (kind === "write" && learned === "unknown" && ASK_ROUTE.test(route)) return askUnknownAnswer(route);
+    if (kind === "write" && learned === "unknown" && ASK_ROUTE.test(route)) return askUnknownAnswer(route, why);
     if (kind === "read" && paneId !== undefined) deps.paneReads?.record(deps.link.memberId, paneId, response.status, `${outcome.state}: ${outcome.reason}`);
-    return response;
+    return withRefusal(response, "lead", why);
   }
 
   // The peer answered. That is a receipt, and it is stamped before the body has been streamed on:
   // `receivedAt` is when the response landed on this lead, not when the phone finished reading it.
   deps.onExchange?.(outcome.receivedAt);
-  record(`http ${outcome.value.status}`);
+  // A member that refused says why in its own header (bridge/refusal.ts): the lead's line names it and the member.
+  const memberReason = outcome.value.headers.get(REASON_HEADER);
+  const memberRefusal = memberReason !== null && isRefusalReason(memberReason) ? { reason: memberReason, by: "member" as const } : undefined;
+  record(`http ${outcome.value.status}`, memberRefusal);
   if (kind === "read" && paneId !== undefined) deps.paneReads?.record(deps.link.memberId, paneId, outcome.value.status, "the member answered it");
   const answered =
     answer === null || deps.mask === undefined
@@ -1074,6 +1221,12 @@ export async function forwardToPeer(req: Request, url: URL, deps: ForwardDeps): 
       : withSaltedTag(await maskedAnswer(outcome.value, answer, deps.mask, deps.link.memberId));
   // The phone's own `accept-encoding` — never the peer's, which was pinned to `identity` on the way
   // out. Compression is decided once per hop (.adr/0023).
-  return proxiedResponse(answered, req.headers.get("accept-encoding"));
+  const proxied = proxiedResponse(answered, req.headers.get("accept-encoding"));
+  // The member's refusal, marked as the member's; a refused write also names the member's version.
+  if (memberRefusal !== undefined) proxied.headers.set(REFUSED_BY_HEADER, "member");
+  // A header that names no known code is not passed on: the phone reads only the list's codes.
+  else proxied.headers.delete(REASON_HEADER);
+  if (kind === "write" && outcome.value.status >= 400) withVersion(proxied, deps.state.version);
+  return proxied;
 }
 

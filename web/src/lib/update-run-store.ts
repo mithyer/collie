@@ -54,6 +54,10 @@ import type { UpdateCheckResponse, UpdateCrewMember, UpdateInfo, UpdateRun } fro
 // {@link noteCrewRunBegun}, and until the first legs of the NEW run arrive, for at most
 // {@link CREW_BEGUN_MS}, the store answers "a crew run with no legs yet" and sets aside the reading it
 // held at the tap. That reading is the old run's, and the bridge's own `begin` just cleared it.
+//
+// That beat is a SECOND piece of state beside the polls. It is bounded, it lives in this one place,
+// and it expires on its own. A third piece of state would be the signal that "one reducer and one
+// shared poll" (ADR 0044) has stopped describing the screen.
 
 /**
  * How often the standby door is asked while a run is in flight (M20/08).
@@ -439,7 +443,7 @@ function arm(): void {
  * `X-Crew-Preflight: fresh`, and a member whose banked verdict is unknown is refused its turn
  * (`bridge/crew/follow.ts`, `eligible`). So a phone that stops asking can leave a member sitting on
  * `waiting` with nothing on either machine saying why. Measured on the real crew: the lead granted
- * at 13:50:23, minibuch was told at 13:52:48, and did the work in four seconds.
+ * at 13:50:23, workshop was told at 13:52:48, and did the work in four seconds.
  *
  * `hooks/use-polling.ts` already reads the subject this way (`runInFlight(...) || crewMoving(...)`).
  * This is the same question, asked of the legs this store has already reconciled — and it must be

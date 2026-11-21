@@ -24,7 +24,7 @@
 //     rests on, and the fake would be lying if it minted fresh ones.
 
 import type { AgentStatus } from "../../types.ts";
-import type { MuxConformanceFixture, MuxConformanceWorld, MuxWrite } from "../conformance.ts";
+import type { MuxConformanceFixture, MuxConformanceWorld, MuxWrite, MuxWriteFailure } from "../conformance.ts";
 import { HerdrMux } from "./adapter.ts";
 import type {
   CreatedShell,
@@ -39,6 +39,7 @@ import type {
   WireTab,
   WireWorkspace,
 } from "./client.ts";
+import { HerdrNoReply, HerdrTimeout } from "./client.ts";
 
 const IDLE: AgentStatus = "idle";
 
@@ -67,12 +68,30 @@ function notFound(method: string, code: string, id: string): Error {
 }
 
 /**
+ * What the client gives for a dead socket: the dial's own error. On Linux and macOS the client dials
+ * with Bun.connect, which says "Failed to connect" with the system code (ECONNREFUSED for a socket
+ * nobody listens on, ENOENT for a missing one; read off Bun 2026-11-13). Nothing went out, so the
+ * adapter answers `unreachable`.
+ */
+function dialRefused(): Error {
+  return Object.assign(new Error("Failed to connect"), { code: "ECONNREFUSED", errno: -111, syscall: "connect" });
+}
+
+/**
  * A Herdr control socket, in memory, behaving as the documented one does.
  *
  * Implements {@link HerdrRpc} — the narrow shape `HerdrMux` depends on — so the adapter under test is
  * the real one, unmodified.
  */
 export class FakeHerdr implements HerdrRpc {
+  /**
+   * The next text write fails once (M100 spec 03): `stall` gets no answer in time, `refuse` is told no,
+   * `closed` loses its connection after the request went out.
+   */
+  nextWrite: MuxWriteFailure | null = null;
+  /** The next key write fails once, the same three ways (M100 spec 03). */
+  nextKeys: MuxWriteFailure | null = null;
+
   private workspaces: WireWorkspace[] = [];
   private tabs: WireTab[] = [];
   private panes: WirePane[] = [];
@@ -81,6 +100,10 @@ export class FakeHerdr implements HerdrRpc {
   private readonly processes = new Map<string, WireForegroundProcess[]>();
   private readonly subscribers = new Set<Subscriber>();
   private readonly recorded: MuxWrite[] = [];
+  /** Every `worktree.open` the adapter asked for, in order. */
+  readonly worktreeOpens: { cwd: string; path: string; label?: string }[] = [];
+  /** The space `worktree.open` made for each checkout path, so a second open finds it. */
+  private readonly openedWorktrees = new Map<string, CreatedShell>();
   /** Never decreases, and never reused — so a fresh pane can never land on a dead pane's id. */
   private minted = 0;
   /** False while the adapter's connection is down: every RPC rejects, as a closed socket does. */
@@ -208,7 +231,7 @@ export class FakeHerdr implements HerdrRpc {
   }
 
   async sessionSnapshot(): Promise<WireSnapshot> {
-    this.assertConnected("session.snapshot");
+    this.assertConnected();
     return {
       version: "0.7.5",
       protocol: 16,
@@ -219,12 +242,12 @@ export class FakeHerdr implements HerdrRpc {
   }
 
   async listWorkspaces(): Promise<WireWorkspace[]> {
-    this.assertConnected("workspace.list");
+    this.assertConnected();
     return this.workspaces;
   }
 
   async listPanes(): Promise<WirePane[]> {
-    this.assertConnected("pane.list");
+    this.assertConnected();
     return this.panes;
   }
 
@@ -233,7 +256,7 @@ export class FakeHerdr implements HerdrRpc {
   }
 
   async listTabs(): Promise<WireTab[]> {
-    this.assertConnected("tab.list");
+    this.assertConnected();
     return this.tabs;
   }
 
@@ -268,11 +291,21 @@ export class FakeHerdr implements HerdrRpc {
 
   async sendPaneText(paneId: string, text: string): Promise<void> {
     this.pane("pane.send_text", paneId);
+    const failing = this.nextWrite;
+    this.nextWrite = null;
+    if (failing === "stall") throw new HerdrTimeout("pane.send_text", 5000);
+    if (failing === "closed") throw new HerdrNoReply("pane.send_text");
+    if (failing === "refuse") throw new Error("herdr pane.send_text: internal_error: the pane did not take the input");
     this.recorded.push({ paneId, kind: "text", payload: [text] });
   }
 
   async sendPaneKeys(paneId: string, keys: string[]): Promise<void> {
     this.pane("pane.send_keys", paneId);
+    const failing = this.nextKeys;
+    this.nextKeys = null;
+    if (failing === "stall") throw new HerdrTimeout("pane.send_keys", 5000);
+    if (failing === "closed") throw new HerdrNoReply("pane.send_keys");
+    if (failing === "refuse") throw new Error("herdr pane.send_keys: internal_error: the pane did not take the keys");
     this.recorded.push({ paneId, kind: "keys", payload: [...keys] });
   }
 
@@ -335,6 +368,23 @@ export class FakeHerdr implements HerdrRpc {
     };
   }
 
+  /**
+   * `worktree.open`: the same space a `workspace.create` makes, and the call recorded so a test can
+   * see that the adapter asked for it. A checkout that is already open answers with the space that
+   * shows it, as Herdr does (`already_open: true`), and opens no second one. The fixture keeps no
+   * other worktree record.
+   */
+  async openWorktree(opts: { cwd: string; path: string; label?: string }): Promise<CreatedShell> {
+    this.worktreeOpens.push(opts);
+    const open = this.openedWorktrees.get(opts.path);
+    if (open !== undefined) return open;
+    const created = opts.label === undefined
+      ? await this.createWorkspace({ cwd: opts.path })
+      : await this.createWorkspace({ cwd: opts.path, label: opts.label });
+    this.openedWorktrees.set(opts.path, created);
+    return created;
+  }
+
   subscribeEvents(opts: SubscribeOptions): EventStream {
     const subscriber: Subscriber = { opts, down: false };
     this.subscribers.add(subscriber);
@@ -347,26 +397,26 @@ export class FakeHerdr implements HerdrRpc {
 
   // ── Internals ──────────────────────────────────────────────────────────────
 
-  private assertConnected(method: string): void {
-    if (!this.connected) throw new Error(`herdr ${method}: connection closed before reply`);
+  private assertConnected(): void {
+    if (!this.connected) throw dialRefused();
   }
 
   private pane(method: string, paneId: string): WirePane {
-    this.assertConnected(method);
+    this.assertConnected();
     const pane = this.panes.find((candidate) => candidate.pane_id === paneId);
     if (pane === undefined) throw notFound(method, "pane_not_found", paneId);
     return pane;
   }
 
   private tab(method: string, tabId: string): WireTab {
-    this.assertConnected(method);
+    this.assertConnected();
     const tab = this.tabs.find((candidate) => candidate.tab_id === tabId);
     if (tab === undefined) throw notFound(method, "tab_not_found", tabId);
     return tab;
   }
 
   private workspace(method: string, workspaceId: string): WireWorkspace {
-    this.assertConnected(method);
+    this.assertConnected();
     const workspace = this.workspaces.find((candidate) => candidate.workspace_id === workspaceId);
     if (workspace === undefined) throw notFound(method, "workspace_not_found", workspaceId);
     return workspace;
@@ -485,6 +535,13 @@ export const herdrConformanceFixture: MuxConformanceFixture = {
     return Promise.resolve({
       adapter,
       writes: () => fake.writes(),
+      failNextWrite: (how: MuxWriteFailure) => {
+        fake.nextWrite = how;
+      },
+      failNextKeys: (how: MuxWriteFailure) => {
+        fake.nextKeys = how;
+      },
+      connection: true,
       reconnect: () => fake.reconnect(),
       restartMux: () => fake.restartMux(),
       renameOutOfBand: (paneId, label) => fake.renameOutOfBand(paneId, label),

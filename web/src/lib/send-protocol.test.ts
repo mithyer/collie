@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest";
 import { parseJsonObject, type JsonObject } from "./json";
 import { capSentence, isCommand, offerMode, readHeldCancelAnswer, readSend, readSendReceipts, readSendReply, readSurface, receiptLabelKey, noteKey, receiptSentence, sendNote, surfaceNote, type SendReply } from "./send-protocol";
-import { STALE_SCREEN, type SendReceiptRow } from "./surface/send";
+import { CODE_REJECTED_PLAIN, rejectionDetail } from "./surface/secret-field";
+import { RECEIPT_DETAIL_MAX, STALE_SCREEN, type SendReceiptRow } from "./surface/send";
 import type { Surface } from "./surface/surface";
 
 const RUNNING: Surface = { revision: 3, turn: "running", modal: "none", composer: "empty" };
@@ -86,18 +87,27 @@ describe("readSend", () => {
   };
 
   it("only sent and effective clear the draft, and a cleared send says nothing about the screen", () => {
-    expect(readSend(reply("sent", null))).toEqual({ clear: true, note: "sent", offers: [], surface: null, detail: null, toCard: false, cap: null });
+    expect(readSend(reply("sent", null))).toEqual({ clear: true, note: "sent", offers: [], surface: null, detail: null, toCard: false, cap: null, step: null, waits: false });
     expect(readSend(reply("effective", null)).clear).toBe(true);
     expect(readSend(reply("unknown", "bound")).clear).toBe(false);
   });
 
   // The review's F3: the bridge's English detail is dropped for every `unconfirmed`, so the notice's own
   // sentence travels as a cause the phone translates. An answer without it keeps the generic sentence.
+  it("the phone never arms an override (Send anyway) for a Submit, whose text is already in the box (the M102 review, F)", () => {
+    const unreadable: Surface = { revision: 1, turn: "idle", modal: "unreadable", composer: "empty" };
+    const notFree = (offers: string[] = ["keys"]): JsonObject => ({ receipt: { outcome: "refused", reason: "not_free" }, offers, rowsHash: "ab12", surface: parseJsonObject(JSON.stringify(unreadable)) ?? {} });
+    expect(readSend(readSendReply(notFree())!, "send").offers).toEqual(["commit"]);
+    expect(readSend(readSendReply(notFree())!, "submit").offers).toEqual([]);
+    // Not even a commit the bridge itself offered: a commit is always sent with `override`.
+    expect(readSend(readSendReply(notFree(["commit", "keys"]))!, "submit").offers).toEqual([]);
+  });
+
   it("a refusal with the notice cause says the number would answer the notice, and keeps the commit offer", () => {
     const body: JsonObject = { receipt: { outcome: "refused", reason: "unconfirmed" }, offers: ["commit", "keys"], cause: "notice_key", detail: "That message would answer the notice above the box." };
     expect(readSend(readSendReply(body)!)).toMatchObject({ clear: false, note: "noticeKey", offers: ["commit"], detail: null });
     const running: JsonObject = { receipt: { outcome: "refused", reason: "unconfirmed" }, offers: ["keys"], cause: "notice_key" };
-    // No commit offered (a running turn, a Replace): the sentence names the card and the turn's end, not Type here.
+    // No commit offered (a running turn, a Replace): the sentence names the card and the turn's end, not Send anyway.
     expect(readSend(readSendReply(running)!)).toMatchObject({ note: "noticeKeyHeld", offers: [], detail: null });
     expect(readSend(reply("refused", "unconfirmed", ["commit", "keys"])).note).toBe("unconfirmed");
   });
@@ -136,7 +146,7 @@ describe("readSend", () => {
     const body: JsonObject = { receipt: { outcome: "sent", queued: true }, offers: [] };
     const queued = readSendReply(body)!;
     expect(queued.queued).toBe(true);
-    expect(readSend(queued)).toEqual({ clear: true, note: "queued", offers: [], surface: null, detail: null, toCard: false, cap: null });
+    expect(readSend(queued)).toEqual({ clear: true, note: "queued", offers: [], surface: null, detail: null, toCard: false, cap: null, step: null, waits: false });
     expect(readSendReply({ receipt: { outcome: "sent", queued: "yes" }, offers: [] })!.queued).toBe(false);
     expect(reply("sent", null).queued).toBe(false);
   });
@@ -152,9 +162,12 @@ describe("readSend", () => {
     const detail = "Collie cannot read this screen. Check the pane, then tap Type here.";
     const unreadable: Surface = { revision: 1, turn: "idle", modal: "unreadable", composer: "empty" };
     expect(readSend(reply("refused", "unconfirmed", ["commit", "keys"], { surface: unreadable, detail })).detail).toBeNull();
-    for (const reason of ["stale_surface", "busy", "pane_gone", "draft_present"]) {
+    for (const reason of ["stale_surface", "pane_gone", "draft_present"]) {
       expect(readSend(reply("refused", reason, ["commit"], { detail: "The bridge's line." })).detail).toBeNull();
     }
+    // busy: the plain "still running" line goes; a full hold queue names its count and stays (M102 spec 02).
+    expect(readSend(reply("refused", "busy", [], { detail: "Another send on this pane is still running." })).detail).toBeNull();
+    expect(readSend(reply("refused", "busy", [], { detail: "This pane already holds 5 messages." })).detail).toBe("This pane already holds 5 messages.");
     // not_free: the plain line goes, a line that names what is open stays.
     expect(readSend(reply("refused", "not_free", [], { surface: RUNNING, detail: "The input box is not free." })).detail).toBeNull();
     expect(readSend(reply("refused", "not_free", [], { surface: RUNNING, detail: "Something is open at the input box." })).detail).toBe("Something is open at the input box.");
@@ -177,8 +190,9 @@ describe("readSend", () => {
     expect(readSend(reply("refused", "draft_present", ["append", "replace", "cancel"]))).toMatchObject({ clear: false, note: "draft", offers: ["append", "replace", "cancel"] });
     // A command onto a draft is offered Replace and Cancel only, and its sentence names only those.
     expect(readSend(reply("refused", "draft_present", ["replace", "cancel"]))).toMatchObject({ clear: false, note: "draftCommand", offers: ["replace", "cancel"] });
-    // A draft the bridge found no frame for offers the key pad alone: no strip button, so the plain sentence stays.
-    expect(readSend(reply("refused", "draft_present", ["keys"]))).toMatchObject({ note: "draft", offers: [] });
+    // A draft the bridge found no frame for, or one too long to empty in one request, offers the key pad
+    // alone: its own sentence, and Empty the box is the step (M102 spec 02).
+    expect(readSend(reply("refused", "draft_present", ["keys"]))).toMatchObject({ note: "draftUnseen", offers: [], step: "emptyBox" });
     expect(readSend(reply("refused", "stale_surface", ["keys"]))).toMatchObject({ clear: false, note: "moved", offers: [] });
     expect(readSend(reply("refused", "not_free")).note).toBe("notFree");
     expect(readSend(reply("refused", "bound")).note).toBe("bound");
@@ -228,7 +242,7 @@ describe("a held send (M56 spec 15)", () => {
   const reply = (outcome: string) => readSendReply({ receipt: { outcome }, offers: [], detail: "The agent is working. The bridge holds it." })!;
 
   it("a held answer clears the draft, says held, and carries no offers, no detail and no refusal", () => {
-    expect(readSend(reply("held"))).toEqual({ clear: true, note: "held", offers: [], surface: null, detail: null, toCard: false, cap: null });
+    expect(readSend(reply("held"))).toEqual({ clear: true, note: "held", offers: [], surface: null, detail: null, toCard: false, cap: null, step: null, waits: false });
   });
 
   it("expired and cancelled keep the draft and say so, with no offers", () => {
@@ -317,8 +331,8 @@ describe("the session page's rows (send drill 3)", () => {
   it("the cap's refusal reads as the cap's sentence with the receipt's numbers; a plain unconfirmed one keeps the generic sentence", () => {
     const plain: SendReceiptRow = { ...base, outcome: "refused", reason: "unconfirmed" };
     const capped: SendReceiptRow = { ...plain, cap: { count: 5, limit: 5, harness: "codex", version: "-" } };
-    expect(receiptSentence(plain, say)).toBe("composer.protocol.unconfirmed");
-    expect(receiptSentence(capped, say)).toBe(`composer.protocol.capConfirm ${JSON.stringify({ count: "5", harness: "codex", version: "\u0000" })}`);
+    expect(receiptSentence(plain, say)).toBe("composer.protocol.unconfirmedPast");
+    expect(receiptSentence(capped, say)).toBe(`composer.protocol.capConfirmPast ${JSON.stringify({ count: "5", harness: "codex", version: "\u0000" })}`);
     expect(receiptSentence({ ...base, outcome: "sent" }, say)).toBeNull();
   });
 
@@ -331,6 +345,16 @@ describe("the session page's rows (send drill 3)", () => {
     expect(rows.receipts[0]?.late).toBe("returned");
     expect(rows.receipts[1] && "late" in rows.receipts[1]).toBe(false);
     expect(rows.receipts[1] && receiptSentence(rows.receipts[1], say)).toBe("sendReceipts.queued");
+  });
+
+  it("the person's word (M102 spec 01) is read off a row and off an answer's receipt only as a known word", () => {
+    const wire = { requestId: "r1abcdefgh", at: 5, mode: "send", outcome: "unknown", keys: ["Enter"], gapsMs: {}, harness: "claude", version: "2.1.301" };
+    const rows = readSendReceipts({ receipts: [{ ...wire, word: "arrived" }, { ...wire, requestId: "r2abcdefgh", word: "override" }, { ...wire, requestId: "r3abcdefgh", word: "trust-me" }, { ...wire, requestId: "r4abcdefgh" }] });
+    expect(rows.receipts.map((row) => row.word)).toEqual(["arrived", "override", undefined, undefined]);
+    expect(rows.receipts[2] && "word" in rows.receipts[2]).toBe(false);
+    expect(readSendReply({ receipt: { outcome: "sent", word: "override" }, offers: [] })?.word).toBe("override");
+    const plain = readSendReply({ receipt: { outcome: "sent", word: "teleported" }, offers: [] });
+    expect(plain && "word" in plain).toBe(false);
   });
 
   it("a send queued behind the turn wears Sent and says it was queued; queued is read off the wire only when true", () => {
@@ -496,5 +520,45 @@ describe("a steer (M69)", () => {
     expect(receiptSentence({ ...base, outcome: "refused", reason: "steer_not_allowed" }, say)).toBe("composer.steer.notAllowed");
     const rows = readSendReceipts({ receipts: [{ requestId: "r1abcdefgh", at: 5, mode: "send", outcome: "steered", keys: ["Enter"], gapsMs: {}, harness: "pi", version: "1.3.0" }] });
     expect(rows.receipts[0]?.outcome).toBe("steered");
+  });
+});
+
+describe("a sign-in code the agent did not take (M102 spec 05)", () => {
+  const CODE = "FAKEcodeAbCdEfGhIjKlMnOpQrStUvWxYz0123456789#FAKEstate";
+  const refused = (detail: string): SendReply => {
+    const read = readSendReply({ receipt: { outcome: "refused", reason: "code_rejected", keys: ["Enter"] }, offers: ["keys"], detail });
+    if (read === null) throw new Error("the wire answer was not readable");
+    return read;
+  };
+
+  it("the agent's words show under the phone's sentence", () => {
+    const reading = readSend(refused("OAuth error: That code wasn't accepted."));
+    expect(reading).toMatchObject({ clear: false, note: "codeRejected", detail: "OAuth error: That code wasn't accepted." });
+    expect(noteKey(reading.note)).toBe("composer.protocol.codeRejected");
+  });
+
+  it("the plain sentence the bridge sends where the words held the code stands alone: no second line", () => {
+    expect(readSend(refused(CODE_REJECTED_PLAIN)).detail).toBeNull();
+  });
+
+  it("words that hold the code, or a run of six of its characters, are dropped; five are not", () => {
+    expect(rejectionDetail(`OAuth error: ${CODE} is invalid`, CODE, RECEIPT_DETAIL_MAX)).toBeNull();
+    expect(rejectionDetail(`OAuth error: code ${CODE.slice(10, 16)} expired`, CODE, RECEIPT_DETAIL_MAX)).toBeNull();
+    // A code the screen wrapped is still found: whitespace is left out of both sides.
+    expect(rejectionDetail(`OAuth error: ${CODE.slice(0, 4)} ${CODE.slice(4, 9)}`, CODE, RECEIPT_DETAIL_MAX)).toBeNull();
+    expect(rejectionDetail(`OAuth error: ${CODE.slice(10, 15)}`, CODE, RECEIPT_DETAIL_MAX)).toBe(`OAuth error: ${CODE.slice(10, 15)}`);
+  });
+
+  it("a code shorter than six characters is looked for whole; an empty code keeps the words", () => {
+    expect(rejectionDetail("OAuth error: code 4F2a is invalid", "4F2a", RECEIPT_DETAIL_MAX)).toBeNull();
+    expect(rejectionDetail("OAuth error: code 4F2 is invalid", "4F2a", RECEIPT_DETAIL_MAX)).toBe("OAuth error: code 4F2 is invalid");
+    expect(rejectionDetail("OAuth error: no code", "", RECEIPT_DETAIL_MAX)).toBe("OAuth error: no code");
+  });
+
+  it("words that do not hold the code are cut to a receipt's detail", () => {
+    const long = `OAuth error: ${"it was not accepted, ".repeat(30)}`;
+    const kept = rejectionDetail(long, CODE, RECEIPT_DETAIL_MAX)!;
+    expect([...kept]).toHaveLength(RECEIPT_DETAIL_MAX);
+    expect(long.startsWith(kept)).toBe(true);
   });
 });

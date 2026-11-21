@@ -150,7 +150,7 @@ describe("ThemePickerControl", () => {
     it("lists every refusal of a refused file, names the key, and offers only Close", async () => {
       const { ThemePickerControl } = await load();
       const { container } = render(<ThemePickerControl />);
-      const bad = JSON.stringify({ version: 5, id: "x", name: "X", light: { background: "#ffffff" }, bogus: 1 });
+      const bad = JSON.stringify({ version: 6, id: "x", name: "X", light: { background: "#ffffff" }, bogus: 1 });
       pick(container, fileOf(bad));
       const dialog = await screen.findByRole("dialog", { name: "This file was not imported" });
       expect(within(dialog).getAllByRole("listitem")).toHaveLength(2);
@@ -1051,7 +1051,7 @@ describe("ThemePickerControl and the header character", () => {
     pick(container, fileOf(JSON.stringify({ ...copy("odd", "Odd"), version: 4, character: "Dog" })));
     const dialog = await screen.findByRole("dialog", { name: "This file was not imported" });
     expect(dialog).toHaveTextContent("The character choice is not valid.");
-    expect(dialog).toHaveTextContent('"character" must be one of: collie, kawaii, kawaii-tilt, pixel, glass, glass-front, sheep, owl.');
+    expect(dialog).toHaveTextContent('"character" must be one of: collie, collie-collar, collie-blaze, kawaii, kawaii-tilt, pixel, glass, glass-front, sheep, owl.');
   });
 
   it("exports a theme with a character as version 4, and the file imports back to the same theme", async () => {

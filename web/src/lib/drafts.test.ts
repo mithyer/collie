@@ -1,4 +1,4 @@
-import { clearDraft, fitsDraftStore, loadDraft, loadDraftEntry, pruneDrafts, saveDraft, __resetDraftPrune } from "./drafts";
+import { clearDraft, clearPutBack, fillEmptyDraft, fitsDraftStore, loadDraft, loadDraftEntry, loadPutBack, pruneDrafts, saveDraft, savePutBack, __resetDraftPrune } from "./drafts";
 
 // The per-pane composer draft store. It is the only reason a reply survives walking over to another
 // tab mid-composition, so the cases below pin the three things that would silently lose one: the
@@ -299,5 +299,77 @@ describe("drafts", () => {
       expect(loadDraft(undefined, "w1:p1")).toBeNull();
       expect(localStorage.getItem(KEY)).toBeNull();
     });
+  });
+});
+
+describe("Put back, stored with the draft (the M102 review 3)", () => {
+  const item = (draft: string) => ({ draft, chips: [], line: draft });
+
+  it("keeps every text in order, per pane, across a reload of the page (the memory tier gone)", () => {
+    savePutBack(undefined, "w1:p1", [item("first"), item("second")]);
+    __resetDraftPrune();
+    expect(loadPutBack(undefined, "w1:p1").map((back) => back.draft)).toEqual(["first", "second"]);
+    expect(loadPutBack(undefined, "w1:p2")).toEqual([]);
+    expect(loadPutBack({ host: "other" }, "w1:p1")).toEqual([]);
+  });
+
+  it("survives the draft prune while young, goes with it at 48 hours, and goes on the password clear", () => {
+    savePutBack(undefined, "w1:p1", [item("first")]);
+    pruneDrafts(Date.now() + 60_000);
+    __resetDraftPrune();
+    expect(loadPutBack(undefined, "w1:p1")).toHaveLength(1);
+    pruneDrafts(Date.now() + 49 * 60 * 60 * 1000);
+    __resetDraftPrune();
+    expect(loadPutBack(undefined, "w1:p1")).toEqual([]);
+    savePutBack(undefined, "w1:p1", [item("again")]);
+    clearPutBack(undefined, "w1:p1");
+    expect(loadPutBack(undefined, "w1:p1")).toEqual([]);
+  });
+});
+
+// A trick's `does = "draft"` button (1.29.1) fills a reply box only when it is empty, never overwrites and never
+// appends: the person's own words always win, and nothing is written when the box holds any.
+describe("fillEmptyDraft", () => {
+  const VALUE = "Run the tests,\n  then tell me what failed.  ";
+
+  it("fills an empty box with the value exactly, line breaks and spaces kept", () => {
+    expect(fillEmptyDraft(undefined, "w1:p1", VALUE)).toBe(true);
+    expect(loadDraftEntry(undefined, "w1:p1")).toEqual({ text: VALUE, attachments: [], next: 1 });
+  });
+
+  it("refuses a box that holds words and leaves the draft as it was", () => {
+    saveDraft(undefined, "w1:p1", "my own half reply");
+    const before = localStorage.getItem(KEY);
+    expect(fillEmptyDraft(undefined, "w1:p1", VALUE)).toBe(false);
+    expect(loadDraft(undefined, "w1:p1")).toBe("my own half reply");
+    expect(localStorage.getItem(KEY)).toBe(before);
+  });
+
+  it("refuses a box that holds only a chip, and keeps the chip", () => {
+    saveDraft(undefined, "w1:p1", "", [{ n: 1, path: "/tmp/a.png", name: "a.png", kind: "image" }], 2);
+    expect(fillEmptyDraft(undefined, "w1:p1", VALUE)).toBe(false);
+    const held = loadDraftEntry(undefined, "w1:p1");
+    expect(held?.text).toBe("");
+    expect(held?.attachments.map((a) => a.name)).toEqual(["a.png"]);
+  });
+
+  it("a box of only spaces counts as empty, as the composer reads it", () => {
+    saveDraft(undefined, "w1:p1", "   ");
+    expect(fillEmptyDraft(undefined, "w1:p1", VALUE)).toBe(true);
+    expect(loadDraft(undefined, "w1:p1")).toBe(VALUE);
+  });
+
+  it("lands on the pane's own address: another machine's pane of the same id keeps its words", () => {
+    saveDraft({ host: "badger" }, "w1:p1", "badger's words");
+    expect(fillEmptyDraft({ host: "badger" }, "w1:p1", VALUE)).toBe(false);
+    expect(fillEmptyDraft(undefined, "w1:p1", VALUE)).toBe(true);
+    expect(loadDraft({ host: "badger" }, "w1:p1")).toBe("badger's words");
+    expect(loadDraft(undefined, "w1:p1")).toBe(VALUE);
+  });
+
+  it("a second fill never appends: the first text stays, the second is refused", () => {
+    expect(fillEmptyDraft(undefined, "w1:p1", "first")).toBe(true);
+    expect(fillEmptyDraft(undefined, "w1:p1", "second")).toBe(false);
+    expect(loadDraft(undefined, "w1:p1")).toBe("first");
   });
 });

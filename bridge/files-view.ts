@@ -6,7 +6,10 @@
 // a read, then one `lstat` per path, and nothing opened ({@link existingPaths}).
 //
 // ── THE THIRD PLACE A CLIENT VALUE BECOMES A PATH ───────────────────────────────────────────────
-// The law in bridge/journal/files.ts names three places, and this is the third. Its bound:
+// The law in bridge/journal/files.ts names four places, and this is the third (the journal, Changes,
+// this view, and a branch's folder). Others reuse this bound and add none: the folder browser, with
+// home as the root, and a trick's file input (bridge/tricks/inputs.ts), which reads through
+// {@link listFolder} and {@link readFileBytes} under the pane's Files root. Its bound:
 //
 //   1. The ROOT is never the client's. It is the folder bridge/changes-root.ts picks off the live
 //      snapshot for the pane's workspace (the mux's folder, else the panes' common folder), or the
@@ -27,7 +30,9 @@
 //      the requested segments AND on the real path, and case-folded on every host, so `.GIT`, a
 //      Windows `.git.`, a link into the state folder, or a link named `notes` that leads to a
 //      sibling's `PAIRED-DEVICES.json` all land on the same refusal. A sibling's config `.env` and
-//      every other credential file under the root are NOT covered (ADR 0083).
+//      every other credential file under the root are NOT covered (ADR 0083): `.env` and
+//      `config.toml` are common names for a file the operator owns, and hiding every one would hide
+//      the operator's own. The device gate guards them, and pairing is what closes it.
 //
 // Every refusal is the same answer, `unknown-path`: absent, outside, denied, a folder read as a file
 // and a file listed as a folder cannot be told apart by anything the client sees.
@@ -427,6 +432,42 @@ export async function readImage(ctx: FilesContext, path: string): Promise<FilesR
     const picture: ImageReadAnswer = { available: true, kind: "image", type, bytes: head.bytes, size: head.size };
     if (head.mtimeMs !== undefined) picture.mtimeMs = head.mtimeMs;
     return picture;
+  } catch {
+    return UNKNOWN_PATH;
+  }
+}
+
+// ── Bytes ───────────────────────────────────────────────────────────────────────────────────────
+
+/** What a byte read comes to: the file's first bytes, a file over the cap, or a root that is not there. */
+export type FileBytesAnswer =
+  | { available: false; reason: "no-folder" }
+  | { available: true; kind: "bytes"; bytes: Uint8Array; size: number; mtimeMs?: number }
+  | { available: true; kind: "too-large"; size: number };
+
+/**
+ * One file under the root as its raw bytes, at most `max` of them (a trick's inputs, M99), through
+ * exactly the checks {@link readImage} runs: the same root, the same shape rule, the same real-path
+ * containment and deny list, the same no-follow open of a regular file checked again on the handle.
+ * A file over `max` answers `too-large` before it is opened, and again when it grew in between.
+ */
+export async function readFileBytes(ctx: FilesContext, path: string, max: number): Promise<FilesResult<FileBytesAnswer>> {
+  const r = await resolveRoot(ctx);
+  if (r === null) return { available: false, reason: "no-folder" };
+  const segments = parseRelPath(path, r.host);
+  if (segments === null || segments.length === 0) return UNKNOWN_PATH;
+  try {
+    const real = await checkedTarget(segments, r);
+    if (real === null) return UNKNOWN_PATH;
+    const st = await r.fs.stat(real).catch(() => null);
+    if (st === null || !st.isFile()) return UNKNOWN_PATH;
+    if (st.size > max) return { available: true, kind: "too-large", size: st.size };
+    const head = await r.fs.readHead(real, max, openedFileAllowed(segments, r, real));
+    if (head === null) return UNKNOWN_PATH;
+    if (head.size > max) return { available: true, kind: "too-large", size: head.size };
+    const answer: FileBytesAnswer = { available: true, kind: "bytes", bytes: head.bytes, size: head.size };
+    if (head.mtimeMs !== undefined) answer.mtimeMs = head.mtimeMs;
+    return answer;
   } catch {
     return UNKNOWN_PATH;
   }

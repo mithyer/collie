@@ -68,6 +68,7 @@ import {
   muxGone,
   muxOk,
   muxRefused,
+  muxUnconfirmed,
   muxUnreachable,
   muxUnsupported,
   type MuxAck,
@@ -87,7 +88,7 @@ import {
   type MuxTabRequest,
   type MuxWatchOptions,
 } from "../types.ts";
-import { resolveZellijBinary, SpawnZellijExec } from "./exec.ts";
+import { resolveZellijBinary, SpawnZellijExec, TIMED_OUT_CODE } from "./exec.ts";
 import { EXTENDED_ONLY_CHORDS } from "../keys.ts";
 import { toZellijKey, ZELLIJ_UNSENDABLE_KEYS } from "./keys.ts";
 import { zellijBeaconMatcher } from "./markers.ts";
@@ -364,7 +365,13 @@ export class ZellijMux implements MuxAdapter {
     }
     const gone = await this.livePane(paneId);
     if (gone !== null) return gone;
-    return this.ack(writeCharsArgs(paneId, text));
+    const call: ZellijCall = await this.session.run(writeCharsArgs(paneId, text));
+    // A `write-chars` that ran out of budget was killed, maybe after it wrote: `unconfirmed`, never a
+    // refusal, and the caller's next read decides (MuxRefusal).
+    if (call.ok && call.result.code === TIMED_OUT_CODE) {
+      return muxUnconfirmed(`zellij did not confirm the text written to ${paneId} in time (${call.result.stderr.trim()}). It may still arrive, so it was not written again.`);
+    }
+    return this.ackOf(call);
   }
 
   /**
@@ -393,7 +400,13 @@ export class ZellijMux implements MuxAdapter {
     if (translated.length === 0) return muxAck();
     const gone = await this.livePane(paneId);
     if (gone !== null) return gone;
-    return this.ack(sendKeysArgs(paneId, translated));
+    const call: ZellijCall = await this.session.run(sendKeysArgs(paneId, translated));
+    // A `send-keys` that ran out of budget was killed, maybe after the keys went: `unconfirmed`, never
+    // sent again, and the caller's next read decides (M100 spec 03).
+    if (call.ok && call.result.code === TIMED_OUT_CODE) {
+      return muxUnconfirmed(`zellij did not confirm the keys on ${paneId} in time (${call.result.stderr.trim()}). They may still arrive, so they were not sent again.`);
+    }
+    return this.ackOf(call);
   }
 
   /**
@@ -434,16 +447,21 @@ export class ZellijMux implements MuxAdapter {
     if (request.spaceId !== ZELLIJ_SPACE_ID) return muxGone(`no such space: ${request.spaceId}`);
     const created = await this.session.run(newTabArgs(request.label, request.cwd));
     if (!created.ok) return muxUnreachable(created.detail);
+    // A `new-tab` killed on its budget may have made the tab: not a failure, so the route looks (bridge/create-confirm.ts).
+    if (created.result.code === TIMED_OUT_CODE) return muxUnconfirmed(created.result.stderr.trim());
     const tabNumber = Number.parseInt(created.result.stdout.trim(), 10);
     if (!Number.isInteger(tabNumber)) {
-      return muxRefused(`zellij created a tab and reported no id: ${created.result.stdout.trim() || created.result.stderr.trim()}`);
+      return muxUnconfirmed(`zellij created a tab and reported no id: ${created.result.stdout.trim() || created.result.stderr.trim()}`);
     }
+    // The tab is made; only its pane is not yet known. The route finds it in the snapshot, so a listing that
+    // fails here is `unconfirmed` and not a failure of a create that worked.
     const listing = await this.session.run(ZELLIJ_LIST_PANES_ARGS);
-    if (!listing.ok) return muxUnreachable(listing.detail);
+    if (!listing.ok) return muxUnconfirmed(listing.detail);
     const panes = parsePaneList(listing.result.stdout);
-    if (panes === null) return muxUnreachable("zellij's pane listing was not readable after the tab was created");
+    if (panes === null) return muxUnconfirmed("zellij's pane listing was not readable after the tab was created");
     const fresh = panes.find((pane) => pane.tabNumber === tabNumber && !pane.exited);
-    if (fresh === undefined) return muxRefused(`zellij created tab ${String(tabNumber)} and it holds no pane`);
+    // The tab is made and no pane is in it yet: not a failure, the route looks (bridge/create-confirm.ts).
+    if (fresh === undefined) return muxUnconfirmed(`zellij created tab ${String(tabNumber)} and it holds no pane`);
     return muxOk({
       paneId: fresh.paneId,
       spaceId: ZELLIJ_SPACE_ID,
@@ -594,7 +612,11 @@ export class ZellijMux implements MuxAdapter {
 
   /** One fire-and-forget zellij verb, as the contract's acknowledgement or refusal. */
   private async ack(args: readonly string[]): Promise<MuxAck> {
-    const call: ZellijCall = await this.session.run(args);
+    return this.ackOf(await this.session.run(args));
+  }
+
+  /** One zellij call's answer as the contract's acknowledgement or refusal. */
+  private ackOf(call: ZellijCall): MuxAck {
     if (!call.ok) return muxUnreachable(call.detail);
     // A non-zero exit that survived the session check is zellij refusing the arguments themselves —
     // an unsupported key name is the one the probe found (keys.ts).
@@ -697,6 +719,8 @@ function toMuxPane(
     paneId: raw.paneId,
     spaceId: ZELLIJ_SPACE_ID,
     spaceLabel: sessionLabel,
+    // The session name is always the operator's own or zellij's generated one, never a fallback.
+    spaceNamed: true,
     spaceNumber: 1,
     tabId: tabId(raw.tabNumber),
     // `pane_cwd`, read live by zellij 0.44 and later; empty when it reports none (protocol.ts).

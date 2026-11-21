@@ -39,6 +39,11 @@ const KEYS = [
   "COLLIE_GROK_ROOT",
   "COLLIE_HERMES_ROOT",
   "COLLIE_OPENCLAW_ROOT",
+  "COLLIE_MUSE_ROOT",
+  "COLLIE_DSH_ROOT",
+  "DSH_HOME",
+  "COLLIE_MCODE_ROOT",
+  "MINIMAX_DATA_DIR",
   // Each harness's own home var participates in journal-root resolution, so the suite must own them
   // too — otherwise a developer with CODEX_HOME set gets different results than CI.
   "CODEX_HOME",
@@ -63,6 +68,7 @@ const KEYS = [
   "COLLIE_STATE_DIR",
   "COLLIE_MULTI_SESSION",
   "COLLIE_SKIP_SERVE",
+  "COLLIE_AUTH_RETURN",
   "COLLIE_MAX_UPLOAD_MB",
   "COLLIE_UPLOAD_EXTRA_TYPES",
   "HERDR_SOCKET_PATH",
@@ -108,6 +114,7 @@ describe("loadConfig", () => {
     expect(cfg.journalRoots.hermes).toEqual([join(homedir(), ".hermes")]);
     expect(cfg.journalRoots.kiro).toEqual([join(homedir(), ".kiro", "sessions")]);
     expect(cfg.journalRoots.openclaw).toEqual([join(homedir(), ".openclaw")]);
+    expect(cfg.journalRoots.mcode).toEqual([join(homedir(), ".minimax", "v2", "sessions")]);
     expect(cfg.journalRoots.agy).toEqual([join(homedir(), ".gemini", "antigravity-cli")]);
     expect(cfg.submitKeys).toEqual(["Enter"]);
     expect(cfg.trustedUser).toBe("");
@@ -289,6 +296,23 @@ describe("loadConfig", () => {
     expect(loadConfig().journalRoots.kiro).toEqual(["/srv/work/sessions", "/srv/personal/sessions"]);
   });
 
+  test("MiniMax Code follows MINIMAX_DATA_DIR, and a blank one is not a relative root", () => {
+    // Given: the program's own data dir is relocated.
+    process.env.MINIMAX_DATA_DIR = "/srv/mcode";
+    // When: Collie resolves the journal roots.
+    expect(loadConfig().journalRoots.mcode).toEqual([join("/srv/mcode", "v2", "sessions")]);
+    // Then: a blank or spaces-only value counts as unset, as mcode counts it, and the default is a
+    // real path rather than v2/sessions relative to the bridge's own folder.
+    for (const blank of ["", "   "]) {
+      process.env.MINIMAX_DATA_DIR = blank;
+      expect(loadConfig().journalRoots.mcode).toEqual([join(homedir(), ".minimax", "v2", "sessions")]);
+    }
+    // And the Collie override still wins over both.
+    process.env.MINIMAX_DATA_DIR = "/srv/mcode";
+    process.env.COLLIE_MCODE_ROOT = "/elsewhere/sessions";
+    expect(loadConfig().journalRoots.mcode).toEqual(["/elsewhere/sessions"]);
+  });
+
   test("Kiro blank roots fall back to its home, as Kiro does with a blank KIRO_HOME", () => {
     // Given: a blank Collie override and a KIRO_HOME of spaces.
     process.env.COLLIE_KIRO_ROOT = " , ";
@@ -404,18 +428,18 @@ describe("loadConfig", () => {
     expect(loadConfig().cacheWarnSeconds).toBe(300);
   });
 
-  test("COLLIE_WALKY_PAIR_LIMIT defaults to 6, takes 1 to 100 and falls back to 6 outside that or off a number", () => {
-    expect(loadConfig().walkyPairLimit).toBe(6);
+  test("COLLIE_WALKY_PAIR_LIMIT defaults to 12, takes 1 to 100 and falls back to 12 outside that or off a number", () => {
+    expect(loadConfig().walkyPairLimit).toBe(12);
     process.env.COLLIE_WALKY_PAIR_LIMIT = "2";
     expect(loadConfig().walkyPairLimit).toBe(2);
     process.env.COLLIE_WALKY_PAIR_LIMIT = "100";
     expect(loadConfig().walkyPairLimit).toBe(100);
     process.env.COLLIE_WALKY_PAIR_LIMIT = "0";
-    expect(loadConfig().walkyPairLimit).toBe(6);
+    expect(loadConfig().walkyPairLimit).toBe(12);
     process.env.COLLIE_WALKY_PAIR_LIMIT = "101";
-    expect(loadConfig().walkyPairLimit).toBe(6);
+    expect(loadConfig().walkyPairLimit).toBe(12);
     process.env.COLLIE_WALKY_PAIR_LIMIT = "many";
-    expect(loadConfig().walkyPairLimit).toBe(6);
+    expect(loadConfig().walkyPairLimit).toBe(12);
   });
 
   test("uses the default upload cap when unset, and resolves COLLIE_MAX_UPLOAD_MB to bytes", () => {
@@ -475,11 +499,11 @@ describe("loadConfig", () => {
   });
 
   test("parses discovered Tailscale hosts and the two fail-closed opt-outs", () => {
-    process.env.COLLIE_TAILSCALE_HOSTS = "host.tailnet.ts.net,100.64.0.1";
+    process.env.COLLIE_TAILSCALE_HOSTS = "host.tailnet.ts.net,100.64.10.1";
     process.env.COLLIE_ALLOW_ANY_HOST = "1";
     process.env.COLLIE_TRUSTED_USER_OPTIONAL = "1";
     const cfg = loadConfig();
-    expect(cfg.tailscaleHosts).toEqual(["host.tailnet.ts.net", "100.64.0.1"]);
+    expect(cfg.tailscaleHosts).toEqual(["host.tailnet.ts.net", "100.64.10.1"]);
     expect(cfg.allowAnyHost).toBe(true);
     expect(cfg.trustedUserOptional).toBe(true);
   });
@@ -520,13 +544,13 @@ describe("listenFailureLine", () => {
   });
 
   test("a tailnet host that no interface holds gets the hint", () => {
-    const line = listenFailureLine({ ...base, host: "100.64.0.8", door: "standby door" });
-    expect(line).toContain("standby door cannot listen on 100.64.0.8:8787");
+    const line = listenFailureLine({ ...base, host: "100.64.10.8", door: "standby door" });
+    expect(line).toContain("standby door cannot listen on 100.64.10.8:8787");
     expect(line).toContain("address not on any interface yet (is Tailscale up?)");
   });
 
   test("a tailnet host that an interface holds gets no hint", () => {
-    expect(listenFailureLine({ ...base, host: "100.64.0.8", interfaces: ["127.0.0.1", "100.64.0.8"] })).not.toContain("Tailscale");
+    expect(listenFailureLine({ ...base, host: "100.64.10.8", interfaces: ["127.0.0.1", "100.64.10.8"] })).not.toContain("Tailscale");
   });
 
   test("a missing code is said in words", () => {
@@ -615,7 +639,7 @@ describe("resolveBridgeHost", () => {
   });
 
   test("an explicit COLLIE_HOST is used verbatim — a peer's tailnet address, say", () => {
-    expect(resolveBridgeHost({ COLLIE_HOST: "100.64.0.8" })).toBe("100.64.0.8");
+    expect(resolveBridgeHost({ COLLIE_HOST: "100.64.10.8" })).toBe("100.64.10.8");
   });
 
   test("explicitly empty is passed through, not defaulted — the wildcard-bind case", () => {
@@ -674,6 +698,14 @@ describe("normaliseBasePath — COLLIE_BASE_PATH as the bridge mounts it", () =>
     expect(loadConfig().basePath).toBe("/collie/");
     delete process.env.COLLIE_BASE_PATH;
     expect(loadConfig().basePath).toBe("/");
+  });
+});
+
+describe("COLLIE_AUTH_RETURN — /auth/ goes back to the app", () => {
+  test("off unless the operator sets it", () => {
+    expect(loadConfig().authReturn).toBe(false);
+    process.env.COLLIE_AUTH_RETURN = "1";
+    expect(loadConfig().authReturn).toBe(true);
   });
 });
 

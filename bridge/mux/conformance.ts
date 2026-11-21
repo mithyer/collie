@@ -47,6 +47,7 @@ import {
   type MuxPane,
   type MuxRefusalOutcome,
   type MuxSnapshot,
+  type MuxSpaceRequest,
   type MuxSubscription,
   muxUnsupported,
 } from "./types.ts";
@@ -150,6 +151,31 @@ export interface MuxConformanceWorld {
    */
   pokeTopology?(): void;
   pokePane?(paneId: string): void;
+  /**
+   * The multiplexer's NEXT text write fails, once (M100 spec 03): `stall` is a call that gets no
+   * answer in time (a hung server, a full socket: what the adapter's own time budget turns into a
+   * time-out), `refuse` is the multiplexer answering no, and `closed` is a connection that closes
+   * after the request went out and before the answer (asked only of a world with {@link connection}).
+   * The write after it goes through as usual.
+   *
+   * Optional only for a world whose adapter declares no `typeText`: there is no text write to fail.
+   * Every other world owes it, and {@link aWriteTimeOutIsNotARefusal} fails one that has none.
+   */
+  failNextWrite?(how: MuxWriteFailure): void;
+  /**
+   * The multiplexer's NEXT key write fails, once, the same ways as {@link failNextWrite}. Optional
+   * only for a world whose adapter declares no `sendKeys`; {@link aKeyTimeOutIsNotARefusal} fails any
+   * other world that has none.
+   */
+  failNextKeys?(how: MuxWriteFailure): void;
+  /**
+   * True when the adapter sends each request over a connection to the multiplexer, which can close
+   * (or fail with a socket error, which the clients read the same way) after the request went out and
+   * before the answer. Such a world owes `closed` in
+   * {@link failNextWrite} and {@link failNextKeys}. A world whose adapter runs one process per call
+   * leaves it out: a process that exits answers, and a process that hangs is a time-out.
+   */
+  connection?: true;
   /** Tear the world down. Idempotent. */
   close(): Promise<void>;
 }
@@ -780,6 +806,64 @@ const declaredCapabilitiesWork: MuxWorldCheck = {
   },
 };
 
+/** What a `createSpace` answered, as far as a caller can tell it apart from another answer. */
+interface SpaceAnswer {
+  readonly outcome: string;
+  readonly valueKeys: readonly string[];
+  readonly cwd: string | null;
+  readonly spaceLabel: string | null;
+  readonly spacesAdded: number;
+}
+
+/** Ask one fresh world for one space, and write down everything about the answer that is not an id. */
+async function spaceAnswerIn(fixture: MuxConformanceFixture, request: MuxSpaceRequest): Promise<SpaceAnswer> {
+  const world = await fixture.create();
+  try {
+    const { adapter } = world;
+    const before = (await adapter.snapshot()).spaces.length;
+    const answer = await adapter.createSpace(request);
+    const after = (await adapter.snapshot()).spaces.length;
+    if (!answer.ok) {
+      return { outcome: `refused:${answer.reason}`, valueKeys: [], cwd: null, spaceLabel: null, spacesAdded: after - before };
+    }
+    return {
+      outcome: "ok",
+      valueKeys: Object.keys(answer.value).toSorted(),
+      cwd: answer.value.cwd,
+      spaceLabel: answer.value.spaceLabel,
+      spacesAdded: after - before,
+    };
+  } finally {
+    await world.close();
+  }
+}
+
+/**
+ * The contract's *A worktree space* rule: `MuxSpaceRequest.worktree` is a fact an adapter MAY use and
+ * MUST NOT be changed by. Run against every adapter, whether it claims `createSpace` or not: the
+ * answer with the fact equals the answer without it, in outcome (ok, or the same refusal reason), in
+ * the shape of the value, in the folder and label it reports, and in how many spaces it added.
+ * Two fresh worlds, so the first call cannot change the second.
+ */
+const aWorktreeFactChangesNothingTheCallerSees: MuxWorldCheck = {
+  name: "a space request that names a worktree is answered like one that does not",
+  async run(fixture) {
+    const plain: MuxSpaceRequest = { cwd: "/tmp/conformance-worktree", label: "conformance-worktree" };
+    const withFact: MuxSpaceRequest = { ...plain, worktree: { repoRoot: "/tmp/conformance-repo" } };
+    const [without, withIt] = [await spaceAnswerIn(fixture, plain), await spaceAnswerIn(fixture, withFact)];
+    const problems: string[] = [];
+    for (const field of ["outcome", "cwd", "spaceLabel", "spacesAdded"] as const) {
+      if (without[field] !== withIt[field]) {
+        problems.push(`${field} is ${String(without[field])} without the worktree fact and ${String(withIt[field])} with it`);
+      }
+    }
+    if (without.valueKeys.join() !== withIt.valueKeys.join()) {
+      problems.push(`the answer carries [${without.valueKeys.join(", ")}] without the fact and [${withIt.valueKeys.join(", ")}] with it`);
+    }
+    return problems;
+  },
+};
+
 const declaredPaneFactsArePopulated: MuxWorldCheck = {
   name: "a declared pane fact is actually populated",
   run(fixture) {
@@ -967,6 +1051,93 @@ const unsupportedKeysAreRefused: MuxWorldCheck = {
       if (key === null) return [...problems, "every key in the alphabet is declared unsupported"];
       const sent = await adapter.writeKeys(pane.paneId, [key]);
       if (!sent.ok) problems.push(`"${key}" is not declared unsupported but answered ${describeRefusal(sent)}`);
+      return problems;
+    });
+  },
+};
+
+/**
+ * How {@link MuxConformanceWorld.failNextWrite} and {@link MuxConformanceWorld.failNextKeys} make the next
+ * write fail: no answer in time, a no from the multiplexer, or a connection closed after the request went out.
+ */
+export type MuxWriteFailure = "stall" | "refuse" | "closed";
+
+/**
+ * The contract for a write or a key (M100 spec 03): a write or a key whose request went out and got no
+ * answer, by a time-out or by a closed connection, answers `unconfirmed`; a multiplexer that cannot be
+ * reached answers `unreachable`. The text may have reached the pane before the multiplexer stopped
+ * answering, and a refusal tells the Send Protocol that nothing was typed, so a person's Resend would
+ * type it twice. A write the multiplexer answered with a no stays a refusal, and is never
+ * `unconfirmed`: nothing landed, and a retry is safe.
+ *
+ * The closed connection applies to an adapter with a connection ({@link MuxConformanceWorld.connection}).
+ * The adapters that run one process per call (tmux, zellij, Tern) have no such case: the process
+ * exits with an answer or runs out of time, and the time-out is already checked here.
+ */
+const aWriteTimeOutIsNotARefusal: MuxWorldCheck = {
+  name: "a text write whose call times out or loses its connection answers `unconfirmed`; one the multiplexer refuses answers a refusal",
+  run(fixture) {
+    return inWorld(fixture, async (world) => {
+      const { adapter } = world;
+      if (!declares(adapter, "typeText")) return [];
+      const fail = world.failNextWrite?.bind(world);
+      if (fail === undefined) return ["the adapter declares typeText, and the fixture's world cannot make a write time out or be refused (failNextWrite)"];
+      const pane = livePanes(await adapter.snapshot()).at(0);
+      if (pane === undefined) return ["the fixture's world has no pane to write to"];
+      const problems: string[] = [];
+      fail("stall");
+      const stalled = await adapter.typeText(pane.paneId, "stalled");
+      if (stalled.ok) problems.push("a text write whose call timed out answered ok");
+      if (!stalled.ok && stalled.reason !== "unconfirmed") problems.push(`a text write whose call timed out answered ${describeRefusal(stalled)}, not \`unconfirmed\``);
+      fail("refuse");
+      const refused = await adapter.typeText(pane.paneId, "refused");
+      if (refused.ok) problems.push("a text write the multiplexer refused answered ok");
+      if (!refused.ok && refused.reason === "unconfirmed") problems.push("a text write the multiplexer refused answered `unconfirmed`, as if it may have landed");
+      if (world.connection === true) {
+        fail("closed");
+        const closed = await adapter.typeText(pane.paneId, "closed");
+        if (closed.ok) problems.push("a text write whose connection closed before the answer answered ok");
+        if (!closed.ok && closed.reason !== "unconfirmed") problems.push(`a text write whose connection closed before the answer answered ${describeRefusal(closed)}, not \`unconfirmed\``);
+      }
+      const after = await adapter.typeText(pane.paneId, "after");
+      if (!after.ok) problems.push(`the write after a failed one answered ${describeRefusal(after)}: the failure is one write's, not the pane's`);
+      return problems;
+    });
+  },
+};
+
+/**
+ * The same rule for keys (M100 spec 03): keys whose call timed out, or whose connection closed after
+ * the request went out, may still land, so the write answers `unconfirmed`. A submit key that answered a refusal here would end a send as "typed, not submitted"
+ * with a Resend offer, and the Resend would press it twice. Keys the multiplexer refused stay a refusal.
+ */
+const aKeyTimeOutIsNotARefusal: MuxWorldCheck = {
+  name: "a key write whose call times out or loses its connection answers `unconfirmed`; one the multiplexer refuses answers a refusal",
+  run(fixture) {
+    return inWorld(fixture, async (world) => {
+      const { adapter } = world;
+      if (!declares(adapter, "sendKeys")) return [];
+      const fail = world.failNextKeys?.bind(world);
+      if (fail === undefined) return ["the adapter declares sendKeys, and the fixture's world cannot make a key write time out or be refused (failNextKeys)"];
+      const pane = livePanes(await adapter.snapshot()).at(0);
+      if (pane === undefined) return ["the fixture's world has no pane to press keys in"];
+      const problems: string[] = [];
+      fail("stall");
+      const stalled = await adapter.writeKeys(pane.paneId, ["Enter"]);
+      if (stalled.ok) problems.push("a key write whose call timed out answered ok");
+      if (!stalled.ok && stalled.reason !== "unconfirmed") problems.push(`a key write whose call timed out answered ${describeRefusal(stalled)}, not \`unconfirmed\``);
+      fail("refuse");
+      const refused = await adapter.writeKeys(pane.paneId, ["Enter"]);
+      if (refused.ok) problems.push("a key write the multiplexer refused answered ok");
+      if (!refused.ok && refused.reason === "unconfirmed") problems.push("a key write the multiplexer refused answered `unconfirmed`, as if it may have landed");
+      if (world.connection === true) {
+        fail("closed");
+        const closed = await adapter.writeKeys(pane.paneId, ["Enter"]);
+        if (closed.ok) problems.push("a key write whose connection closed before the answer answered ok");
+        if (!closed.ok && closed.reason !== "unconfirmed") problems.push(`a key write whose connection closed before the answer answered ${describeRefusal(closed)}, not \`unconfirmed\``);
+      }
+      const after = await adapter.writeKeys(pane.paneId, ["Enter"]);
+      if (!after.ok) problems.push(`the key write after a failed one answered ${describeRefusal(after)}: the failure is one write's, not the pane's`);
       return problems;
     });
   },
@@ -1188,6 +1359,7 @@ const focusFollowsTheMultiplexer: MuxWorldCheck = {
 export const MUX_WORLD_CHECKS: readonly MuxWorldCheck[] = [
   refreshSeesASilentChange,
   declaredCapabilitiesWork,
+  aWorktreeFactChangesNothingTheCallerSees,
   declaredPaneFactsArePopulated,
   aPrintedTitleIsNeverAnOperatorLabel,
   identitySurvivesPerturbation,
@@ -1195,6 +1367,8 @@ export const MUX_WORLD_CHECKS: readonly MuxWorldCheck[] = [
   sendsKeepTheirOrder,
   unsupportedKeysAreRefused,
   aGonePaneAnswersGone,
+  aWriteTimeOutIsNotARefusal,
+  aKeyTimeOutIsNotARefusal,
   revisionMovesWithContent,
   scrollbackReachesFurther,
   watchKeepsItsPromise,

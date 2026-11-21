@@ -4,17 +4,21 @@ import type { MouseEvent as ReactMouseEvent, PointerEvent as ReactPointerEvent }
 import { buzz } from "@/lib/haptics";
 
 // Hold a pill this long before the press counts as a long-press. Long enough that a tap or a scroll
-// fling never trips it, short enough to feel intentional rather than sluggish.
-const LONG_PRESS_MS = 450;
+// fling never trips it, short enough to feel intentional rather than sluggish. 500, since the hitbox
+// investigation: a press of 440ms or more used to open the sheet and no pane, and a slow tap is a
+// tap. The hold now has to be meant, and the look below says it is coming from 250ms.
+const LONG_PRESS_MS = 500;
 // Movement past this (px, from the press origin) cancels the pending long-press — that's a scroll or
 // a drag, not a hold. Keeps the strip's horizontal scroll working: a sideways pan cancels the timer.
 // Sized for a thumb: finger jitter during a deliberate hold is easily 10–15px, so a stricter bound
 // cancelled real holds on a phone; a scroll still moves well past this before the timer would fire.
-const MOVE_CANCEL_PX = 16;
+export const MOVE_CANCEL_PX = 16;
 // The press starts to SHOW only after this. A plain tap lifts well before it, so a tap never
 // flashes the hold's look; a finger still down past it is a hold in the making, and from here to the
 // hold's own mark the element eases toward "pressed" (`data-holding`, index.css `THE HOLD, SHOWN`).
-export const HOLD_FEEDBACK_DELAY_MS = 150;
+// 250, since the hitbox investigation: a slow tap (measured up to 300ms) is no hold, and the look is
+// what tells a person that holding on will open the sheet, so it comes after the slowest tap.
+export const HOLD_FEEDBACK_DELAY_MS = 250;
 // A press that moved further than this is no tap. Stricter than the hold's bound: a tap is short, so a thumb has no
 // time to wander, and a scroll that starts on the element has passed 8px before the finger lifts.
 const TAP_MOVE_PX = 8;
@@ -31,6 +35,12 @@ interface LongPressOptions {
    * (components/stream-block.tsx).
    */
   showHold?: boolean | "touch";
+  /**
+   * When the hold's look starts, in ms after `pointerdown`. Default {@link HOLD_FEEDBACK_DELAY_MS}, so a plain tap
+   * never flashes it. 0 shows it at the press: a control that is only ever held (the yes to a trick's code) shows
+   * its whole hold as progress.
+   */
+  feedbackDelayMs?: number;
   /**
    * Runs on the `pointerup` that ends a TAP: a primary press that did not become a hold, did not move past
    * `tapMoveTolerance` and was not cancelled. The movement is judged by the same gate the hold's is, so a scroll that
@@ -79,6 +89,7 @@ export function useLongPress(
     moveTolerance = MOVE_CANCEL_PX,
     onReleaseAfterLongPress,
     showHold = true,
+    feedbackDelayMs = HOLD_FEEDBACK_DELAY_MS,
     onTap,
     tapMoveTolerance = TAP_MOVE_PX,
   }: LongPressOptions = {},
@@ -146,10 +157,13 @@ export function useLongPress(
       timer.current = setTimeout(fire, delayMs);
       if (feedback.current !== null) clearTimeout(feedback.current);
       const show = showHold === "touch" ? e.pointerType === "touch" || e.pointerType === "pen" : showHold;
-      feedback.current =
-        show && delayMs > HOLD_FEEDBACK_DELAY_MS ? setTimeout(() => setHolding(true), HOLD_FEEDBACK_DELAY_MS) : null;
+      feedback.current = null;
+      if (show && delayMs > feedbackDelayMs) {
+        if (feedbackDelayMs <= 0) setHolding(true);
+        else feedback.current = setTimeout(() => setHolding(true), feedbackDelayMs);
+      }
     },
-    [onLongPress, delayMs, fire, showHold, onTap],
+    [onLongPress, delayMs, fire, showHold, onTap, feedbackDelayMs],
   );
 
   // THE ONE MOVEMENT GATE. A press that wanders past a bound is a scroll or a drag: past the hold's bound it is no
@@ -224,7 +238,7 @@ export function useLongPress(
     // Present (as `""`) only while held, so a resting element carries neither attribute nor style.
     "data-holding": holding ? "" : undefined,
     // The fill runs over the time LEFT to the hold's mark, so it reaches "pressed" as the hold fires.
-    style: holding ? { animationDuration: `${delayMs - HOLD_FEEDBACK_DELAY_MS}ms` } : undefined,
+    style: holding ? { animationDuration: `${delayMs - feedbackDelayMs}ms` } : undefined,
   };
 }
 

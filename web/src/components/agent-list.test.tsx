@@ -16,7 +16,17 @@ import { workspacePrefKey } from "./agent-list";
 import { paneRowKey } from "@/lib/hosts";
 import { currentPins, setPinned } from "@/lib/pins";
 import { setMachineHidden, useHiddenMachines } from "@/lib/hidden-machines";
+import { __resetDashFilter } from "@/lib/dash-filter";
+import { __resetPinHint } from "@/lib/pin-hint";
 import type { AgentStatus, AgentView, MuxConfig, ServerSummary } from "@/lib/types";
+
+// The filter's own switch, for the one test that renders the list with the feature's code path off:
+// every other test runs the real `filterOffered`.
+const filterSwitch = vi.hoisted(() => ({ off: false }));
+vi.mock("@/lib/pane-filter", async (importOriginal) => {
+  const real = await importOriginal<typeof import("@/lib/pane-filter")>();
+  return { ...real, filterOffered: (count: number) => !filterSwitch.off && real.filterOffered(count) };
+});
 
 function agent(
   paneId: string,
@@ -163,8 +173,8 @@ describe("AgentList — two axes, urgency then workspace", () => {
     // The title still carries line 1's weight and truncates on its own — the spare width is
     // `PaneMeta`'s `ml-auto` now, not the name's own `flex-1` (2026-09-14, so the unseen dot can
     // sit right after the name instead of at the far end of the row).
-    expect(screen.getByText("rewrite the loader").className).toMatch(/truncate/);
-    expect(screen.getByText("rewrite the loader").closest("[data-slot]")).toHaveAttribute(
+    expect(screen.getByText("rewrite the loader").closest('[data-glide="name"]')!.className).toMatch(/truncate/);
+    expect(screen.getByText("rewrite the loader").closest('[data-slot="agent-row-title"]')).toHaveAttribute(
       "data-slot",
       "agent-row-title",
     );
@@ -463,6 +473,20 @@ describe("AgentList — the empty herd", () => {
   it("says only 'Disconnected' when it cannot date the data", () => {
     render(<AgentList agents={[]} onOpen={vi.fn()} error />);
     expect(screen.getByText("Disconnected")).toBeInTheDocument();
+    // An outage is not a refusal: no pairing block.
+    expect(screen.queryByRole("button", { name: "Pair with your phone" })).toBeNull();
+  });
+
+  // ADR 0139: an unpaired browser, and one the bridge refused ("Access refused"), get the phone block.
+  it("offers pairing with a phone beside `collie pair` when the bridge asked to be paired", () => {
+    render(<AgentList agents={[]} onOpen={vi.fn()} error notPaired />);
+    expect(screen.getByText("collie pair")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Pair with your phone" })).toBeInTheDocument();
+  });
+
+  it("offers it under Access refused too", () => {
+    render(<AgentList agents={[]} onOpen={vi.fn()} error refused />);
+    expect(screen.getByRole("button", { name: "Pair with your phone" })).toBeInTheDocument();
   });
 });
 
@@ -495,11 +519,11 @@ describe("AgentList — an older bridge with no timestamps", () => {
 const prefKeyOf = (p: AgentView) => workspacePrefKey(groupPanesByWorkspace([p])[0]!);
 
 // The workspace filter (issue #527): a button naming the choice, and the sheet of checks it opens.
-const filterButton = () => screen.getByRole("button", { name: /^Workspace / });
+const filterButton = () => screen.getByRole("button", { name: /^Space / });
 /** The open sheet; the first call opens it. A tap leaves it open, so later calls find the same one. */
 const filterSheet = () => {
-  if (screen.queryByRole("dialog", { name: "Workspaces" }) === null) fireEvent.click(filterButton());
-  return screen.getByRole("dialog", { name: "Workspaces" });
+  if (screen.queryByRole("dialog", { name: "Spaces" }) === null) fireEvent.click(filterButton());
+  return screen.getByRole("dialog", { name: "Spaces" });
 };
 /** Every row of the sheet, checks and actions alike, as the words it shows (the Close button has a label). */
 const filterRowNames = () =>
@@ -518,12 +542,12 @@ describe("AgentList — the workspace filter", () => {
     agent("c", "idle", { workspaceId: "w3", workspaceLabel: "three", workspaceNumber: 3, tabId: "w3:t1" }),
   ];
 
-  it("is one button named Workspace that opens a sheet: All workspaces, then one check per workspace in the list's order", () => {
+  it("is one button named Space that opens a sheet: All spaces, then one check per workspace in the list's order", () => {
     render(<AgentList agents={two} onOpen={vi.fn()} />);
-    expect(filterButton()).toHaveAccessibleName("Workspace All workspaces");
-    expect(screen.queryByRole("dialog", { name: "Workspaces" })).toBeNull();
-    expect(filterRowNames()).toEqual(["All workspaces", "one", "two"]);
-    expect(filterCheck("All workspaces")).toBeChecked();
+    expect(filterButton()).toHaveAccessibleName("Space All spaces");
+    expect(screen.queryByRole("dialog", { name: "Spaces" })).toBeNull();
+    expect(filterRowNames()).toEqual(["All spaces", "one", "two"]);
+    expect(filterCheck("All spaces")).toBeChecked();
     expect(filterCheck("one")).not.toBeChecked();
     // No chip strip any more: the filter is this button alone.
     expect(screen.queryByRole("navigation", { name: /spaces/i })).toBeNull();
@@ -537,7 +561,7 @@ describe("AgentList — the workspace filter", () => {
       agent("d", "idle", { workspaceId: "w4", workspaceLabel: "four", workspaceNumber: 4, tabId: "w4:t1" }),
     ];
     render(<AgentList agents={states} onOpen={vi.fn()} />);
-    expect(filterRowNames()).toEqual(["All workspaces", "one · needs you", "two · working", "three · unseen", "four"]);
+    expect(filterRowNames()).toEqual(["All spaces", "one · needs you", "two · working", "three · unseen", "four"]);
   });
 
   it("keeps a hidden workspace hidden when Herdr renumbers its id", () => {
@@ -547,7 +571,7 @@ describe("AgentList — the workspace filter", () => {
     expect(headings()).not.toContain("one");
   });
 
-  it("chooses a workspace on a tap; All workspaces returns to all", async () => {
+  it("chooses a workspace on a tap; All spaces returns to all", async () => {
     const user = userEvent.setup();
     const onIsolate = vi.fn();
     const key = prefKeyOf(two[0]!);
@@ -560,9 +584,9 @@ describe("AgentList — the workspace filter", () => {
     // Chosen: only "one"'s group is left on screen, and the sheet checks it.
     expect(headings()).toEqual(["one"]);
     expect(filterCheck("one")).toBeChecked();
-    expect(filterCheck("All workspaces")).not.toBeChecked();
+    expect(filterCheck("All spaces")).not.toBeChecked();
 
-    await user.click(filterCheck("All workspaces"));
+    await user.click(filterCheck("All spaces"));
     expect(onIsolate).toHaveBeenLastCalledWith([]);
   });
 
@@ -585,7 +609,7 @@ describe("AgentList — the workspace filter", () => {
     expect(filterCheck("one")).toBeChecked();
     expect(filterCheck("two")).toBeChecked();
     expect(filterCheck("three")).not.toBeChecked();
-    expect(filterCheck("All workspaces")).not.toBeChecked();
+    expect(filterCheck("All spaces")).not.toBeChecked();
   });
 
   it("unchecks one of two and keeps the other", async () => {
@@ -598,19 +622,19 @@ describe("AgentList — the workspace filter", () => {
     expect(onIsolate).toHaveBeenCalledExactlyOnceWith([kTwo]);
   });
 
-  it("names the choice on the closed button: All workspaces, the names while few, a count past two", () => {
+  it("names the choice on the closed button: All spaces, the names while few, a count past two", () => {
     const keys = three.map(prefKeyOf);
     const { rerender } = render(<AgentList agents={three} onOpen={vi.fn()} />);
-    expect(filterButton()).toHaveAccessibleName("Workspace All workspaces");
+    expect(filterButton()).toHaveAccessibleName("Space All spaces");
     rerender(<AgentList agents={three} onOpen={vi.fn()} isolated={[keys[0]!]} />);
-    expect(filterButton()).toHaveAccessibleName("Workspace one");
+    expect(filterButton()).toHaveAccessibleName("Space one");
     rerender(<AgentList agents={three} onOpen={vi.fn()} isolated={[keys[0]!, keys[1]!]} />);
-    expect(filterButton()).toHaveAccessibleName("Workspace one, two");
+    expect(filterButton()).toHaveAccessibleName("Space one, two");
     // Stored in another order, named in the list's.
     rerender(<AgentList agents={three} onOpen={vi.fn()} isolated={[keys[1]!, keys[0]!]} />);
-    expect(filterButton()).toHaveAccessibleName("Workspace one, two");
+    expect(filterButton()).toHaveAccessibleName("Space one, two");
     rerender(<AgentList agents={three} onOpen={vi.fn()} isolated={keys} />);
-    expect(filterButton()).toHaveAccessibleName("Workspace 3 workspaces");
+    expect(filterButton()).toHaveAccessibleName("Space 3 spaces");
   });
 
   it("unchecking the last chosen workspace asks for all of them", async () => {
@@ -625,16 +649,16 @@ describe("AgentList — the workspace filter", () => {
   it("ignores a stale key beside a live one, and the label names only the live one", () => {
     render(<AgentList agents={two} onOpen={vi.fn()} isolated={["gone\u0000nowhere", prefKeyOf(two[1]!)]} />);
     expect(headings()).toEqual(["two"]);
-    expect(filterButton()).toHaveAccessibleName("Workspace two");
+    expect(filterButton()).toHaveAccessibleName("Space two");
     expect(filterCheck("two")).toBeChecked();
     expect(filterCheck("one")).not.toBeChecked();
   });
 
-  it("shows every workspace when every chosen key is stale, and says All workspaces", () => {
+  it("shows every workspace when every chosen key is stale, and says All spaces", () => {
     render(<AgentList agents={two} onOpen={vi.fn()} isolated={["gone\u0000nowhere", "gone\u0000too"]} />);
     expect(headings()).toEqual(["one", "two"]);
-    expect(filterButton()).toHaveAccessibleName("Workspace All workspaces");
-    expect(filterCheck("All workspaces")).toBeChecked();
+    expect(filterButton()).toHaveAccessibleName("Space All spaces");
+    expect(filterCheck("All spaces")).toBeChecked();
   });
 
   it("stays open after a tap, so several workspaces are chosen in one visit", async () => {
@@ -643,17 +667,17 @@ describe("AgentList — the workspace filter", () => {
     filterSheet();
     expect(filterButton()).toHaveAttribute("aria-expanded", "true");
     await user.click(filterCheck("one"));
-    expect(screen.getByRole("dialog", { name: "Workspaces" })).toBeInTheDocument();
-    await user.click(filterCheck("All workspaces"));
-    expect(screen.getByRole("dialog", { name: "Workspaces" })).toBeInTheDocument();
+    expect(screen.getByRole("dialog", { name: "Spaces" })).toBeInTheDocument();
+    await user.click(filterCheck("All spaces"));
+    expect(screen.getByRole("dialog", { name: "Spaces" })).toBeInTheDocument();
     // The close button is how it goes away.
-    await user.click(within(screen.getByRole("dialog", { name: "Workspaces" })).getByRole("button", { name: "Close" }));
-    expect(screen.queryByRole("dialog", { name: "Workspaces" })).toBeNull();
+    await user.click(within(screen.getByRole("dialog", { name: "Spaces" })).getByRole("button", { name: "Close" }));
+    expect(screen.queryByRole("dialog", { name: "Spaces" })).toBeNull();
   });
 
   it("has no way to hide a workspace (the sheet has no long press), and offers none when none is hidden", () => {
     render(<AgentList agents={two} onOpen={vi.fn()} onToggleHidden={vi.fn()} />);
-    expect(filterRowNames()).not.toContain("Show hidden workspaces");
+    expect(filterRowNames()).not.toContain("Show hidden spaces");
   });
 
   it("keeps a hidden workspace in the sheet, marked hidden, with its group dropped from the list", () => {
@@ -662,7 +686,7 @@ describe("AgentList — the workspace filter", () => {
     // "one" no longer has a heading — its rows are gone from the list.
     expect(headings()).toEqual(["two"]);
     // Its row is still there, and says so.
-    expect(filterRowNames()).toEqual(["All workspaces", "one · hidden", "two"]);
+    expect(filterRowNames()).toEqual(["All spaces", "one · hidden", "two"]);
   });
 
   it("brings every hidden workspace back from one row, and leaves the choice on what it was", async () => {
@@ -672,10 +696,10 @@ describe("AgentList — the workspace filter", () => {
     const hidden = two.map(prefKeyOf);
     render(<AgentList agents={two} onOpen={vi.fn()} hidden={hidden} onToggleHidden={onToggleHidden} onIsolate={onIsolate} />);
     filterSheet();
-    await user.click(within(filterSheet()).getByRole("button", { name: "Show hidden workspaces" }));
+    await user.click(within(filterSheet()).getByRole("button", { name: "Show hidden spaces" }));
     expect(onToggleHidden.mock.calls.map((c) => c[0])).toEqual(hidden);
     expect(onIsolate).not.toHaveBeenCalled();
-    expect(filterCheck("All workspaces")).toBeChecked();
+    expect(filterCheck("All spaces")).toBeChecked();
   });
 
   it("checks a hidden workspace to see it alone: isolate wins over hide", async () => {
@@ -889,12 +913,12 @@ describe("AgentList — hiding a machine", () => {
     protocol: "ok",
     lastSeenAt: 1_000,
   });
-  const servers = [member("bluefin", true), member("workshop"), member("attic")];
+  const servers = [member("lodge", true), member("workshop"), member("attic")];
   const on = (host: string, workspaceId: string, workspaceLabel: string, workspaceNumber: number) =>
     ({ host, workspaceId, workspaceLabel, workspaceNumber, tabId: `${workspaceId}:t1` }) as const;
   const herd = [
-    agent("w1:p1", "idle", { ...on("bluefin", "w1", "collie", 1), sessionName: "lead-idle" }),
-    agent("w1:p2", "blocked", { ...on("bluefin", "w1", "collie", 1), sessionName: "lead-stuck" }),
+    agent("w1:p1", "idle", { ...on("lodge", "w1", "collie", 1), sessionName: "lead-idle" }),
+    agent("w1:p2", "blocked", { ...on("lodge", "w1", "collie", 1), sessionName: "lead-stuck" }),
     agent("w1:p1", "blocked", { ...on("workshop", "w1", "moonward", 1), sessionName: "peer-stuck" }),
     agent("w2:p1", "idle", { ...on("workshop", "w2", "docs", 2), sessionName: "peer-idle" }),
     agent("w1:p1", "working", { ...on("attic", "w1", "attic-ws", 1), sessionName: "attic-busy" }),
@@ -940,7 +964,7 @@ describe("AgentList — hiding a machine", () => {
       <AgentList agents={herd} servers={servers} hiddenMachines={["workshop"]} isolated={[isolated]} onOpen={vi.fn()} />,
     );
     expect(headings()).toEqual(["docs"]);
-    expect(filterRowNames()).toEqual(["All workspaces", "collie · needs you", "Show workshop's panes", "docs", "attic-ws · working"]);
+    expect(filterRowNames()).toEqual(["All spaces", "collie · needs you", "Show workshop's panes", "docs", "attic-ws · working"]);
     expect(filterCheck("docs")).toBeChecked();
   });
 
@@ -971,7 +995,7 @@ describe("AgentList — hiding a machine", () => {
 
   it("never hides the machine the dashboard addresses: the lead when ?h= is absent", () => {
     const { rerender } = render(
-      <AgentList agents={herd} servers={servers} hiddenMachines={["bluefin", "workshop"]} onOpen={vi.fn()} />,
+      <AgentList agents={herd} servers={servers} hiddenMachines={["lodge", "workshop"]} onOpen={vi.fn()} />,
     );
     expect(headings()).toEqual(["collie", "attic-ws"]);
     // On workshop the stored lead comes back into force, and workshop itself shows.
@@ -979,7 +1003,7 @@ describe("AgentList — hiding a machine", () => {
       <AgentList
         agents={herd}
         servers={servers}
-        hiddenMachines={["bluefin", "workshop"]}
+        hiddenMachines={["lodge", "workshop"]}
         addressedHost="workshop"
         onOpen={vi.fn()}
       />,
@@ -1002,9 +1026,9 @@ describe("AgentList — hiding a machine", () => {
 
   it("swaps a hidden machine's workspaces for one \"Show <machine>'s panes\" option, at their place", () => {
     render(<AgentList agents={herd} servers={servers} hiddenMachines={["workshop"]} onOpen={vi.fn()} />);
-    expect(filterRowNames()).toEqual(["All workspaces", "collie · needs you", "Show workshop's panes", "attic-ws · working"]);
-    // It is an action, not a place: the filter stays on All workspaces.
-    expect(filterCheck("All workspaces")).toBeChecked();
+    expect(filterRowNames()).toEqual(["All spaces", "collie · needs you", "Show workshop's panes", "attic-ws · working"]);
+    // It is an action, not a place: the filter stays on All spaces.
+    expect(filterCheck("All spaces")).toBeChecked();
   });
 
   it("draws no such option for a hidden machine with no panes", () => {
@@ -1040,7 +1064,7 @@ describe("AgentList — hiding a machine", () => {
     await user.click(standIn("workshop"));
     expect(headings()).toEqual(["collie", "moonward", "docs", "attic-ws"]);
     expect(within(filterSheet()).queryByRole("button", { name: /^Show workshop/ })).toBeNull();
-    expect(filterCheck("All workspaces")).toBeChecked();
+    expect(filterCheck("All spaces")).toBeChecked();
   });
 });
 
@@ -1054,7 +1078,7 @@ describe("AgentList — the heading's new tab (M40/03)", () => {
     clearStatus();
   });
 
-  const LEAD = "bluefin";
+  const LEAD = "lodge";
   const PEER = "workshop";
   const servers: ServerSummary[] = [
     { id: LEAD, name: LEAD, isLead: true, reachable: true, protocol: "ok", lastSeenAt: 1_000 },
@@ -1555,5 +1579,338 @@ describe("AgentList — the order select", () => {
     expect(summaryLine().parentElement!.querySelector(".invisible")).not.toBeNull();
     const selectRow = filterButton().closest("div.relative")!.parentElement!;
     expect(selectRow.querySelector(".invisible")).not.toBeNull();
+  });
+});
+
+// THE FILTER (M97 spec 04): a field over the Dashboard's session rows, a loose match, the matched letters marked.
+describe("AgentList — the session filter", () => {
+  const at = (paneId: string, workspaceId: string, workspaceLabel: string, workspaceNumber: number, over: Partial<AgentView> = {}): AgentView =>
+    agent(paneId, "idle", {
+      workspaceId,
+      workspaceLabel,
+      workspaceNumber,
+      tabId: `${workspaceId}:t1`,
+      cwd: `/home/you/${workspaceLabel}`,
+      ...over,
+    });
+  const RELEASE = at("w1:p1", "w1", "collie-workspace", 1, { sessionName: "release notes", gitHead: { kind: "branch", name: "fix/748-sheet" } });
+  const TRIAGE = at("w1:p2", "w1", "collie-workspace", 1, { sessionName: "triage" });
+  const API = at("w2:p1", "w2", "moonward", 2, { sessionName: "api server", agent: "codex" });
+  const MIGRATE = at("w2:p2", "w2", "moonward", 2, { sessionName: "migrations" });
+  const LANDING = at("w3:p1", "w3", "webapp", 3, { sessionName: "landing page", status: "blocked", lastActiveAt: 500, lastSeenAt: 1 });
+  const HEROES = at("w3:p2", "w3", "webapp", 3, { sessionName: "heroes", status: "working" });
+  const AGENTS = [RELEASE, TRIAGE, API, MIGRATE, LANDING, HEROES];
+  const SHELLS = [at("w1:p8", "w1", "collie-workspace", 1, { agent: "shell", kind: "shell", status: "unknown", sessionName: "dev server" })];
+
+  const field = () => screen.getByRole("textbox", { name: "Filter sessions" });
+  const magnifier = () => screen.queryByRole("button", { name: "Filter sessions" });
+  const keys = (c: HTMLElement) => [...c.querySelectorAll<HTMLElement>("button[id^='pane-row-']")].map((b) => b.id);
+  const idOf = (p: AgentView) => `pane-row-${paneRowKey(p).replace(/[^A-Za-z0-9_-]/gu, "_")}`;
+  const headingTexts = () => screen.queryAllByRole("heading", { level: 2 }).map((h) => h.firstChild?.textContent ?? h.textContent);
+  const list = (over: Partial<React.ComponentProps<typeof AgentList>> = {}) => (
+    <AgentList agents={AGENTS} shellPanes={SHELLS} onOpen={vi.fn()} filterEntry="always" {...over} />
+  );
+
+  beforeEach(() => {
+    __resetDashFilter();
+    __resetPinHint();
+  });
+  afterEach(() => {
+    filterSwitch.off = false;
+  });
+
+  it("renders exactly what it rendered before while the query is empty, in both entries", () => {
+    // `useId` numbers differ between two renders; the markup is compared with them blanked.
+    const blank = (html: string) => html.replace(/_r_[a-z0-9]+_/gu, "_id_");
+    for (const entry of ["button", "always"] as const) {
+      filterSwitch.off = true;
+      const off = render(list({ filterEntry: entry }));
+      expect(off.container.querySelector('[data-slot="session-filter"]')).toBeNull();
+      const before = blank(off.container.innerHTML);
+      off.unmount();
+
+      filterSwitch.off = false;
+      const on = render(list({ filterEntry: entry }));
+      // The feature's own parts come out; what is left is the markup of the list without them.
+      on.container.querySelector('[data-slot="toggle-button"]')?.parentElement?.remove();
+      on.container.querySelector('[data-slot="session-filter"]')?.parentElement?.remove();
+      expect(blank(on.container.innerHTML)).toBe(before);
+      expect(on.container.querySelector("mark")).toBeNull();
+      on.unmount();
+    }
+  });
+
+  it("draws no magnifier and no field on five rows or fewer, and the bar is what it was", () => {
+    const five = [RELEASE, TRIAGE, API, MIGRATE, LANDING];
+    const { container, rerender } = render(<AgentList agents={five} onOpen={vi.fn()} />);
+    expect(magnifier()).toBeNull();
+    expect(screen.queryByRole("textbox")).toBeNull();
+    const before = container.innerHTML;
+    rerender(<AgentList agents={five} onOpen={vi.fn()} filterEntry="always" />);
+    expect(container.innerHTML).toBe(before);
+    rerender(<AgentList agents={[...five, HEROES]} onOpen={vi.fn()} />);
+    expect(magnifier()).not.toBeNull();
+  });
+
+  it("counts the shell panes among the session rows", () => {
+    render(<AgentList agents={[RELEASE, TRIAGE, API, MIGRATE, LANDING]} shellPanes={SHELLS} onOpen={vi.fn()} />);
+    expect(magnifier()).not.toBeNull();
+  });
+
+  describe("the magnifier entry", () => {
+    it("sits at the end of the control bar, a 44px toggle, and opens the field on a tap with the caret in it", async () => {
+      const user = userEvent.setup();
+      render(list({ filterEntry: "button", onOrderChange: vi.fn() }));
+      const button = magnifier()!;
+      expect(button).toHaveClass("size-11");
+      expect(button).toHaveAttribute("aria-pressed", "false");
+      expect(button.parentElement!.parentElement).toBe(filterButton().closest("div.relative")!.parentElement);
+      expect(screen.queryByRole("textbox")).toBeNull();
+      await user.click(button);
+      await waitFor(() => expect(field()).toHaveFocus());
+    });
+
+    it("closes on a second tap, keeping the query, and reads pressed while a query is set", async () => {
+      const user = userEvent.setup();
+      const { container } = render(list({ filterEntry: "button" }));
+      await user.click(magnifier()!);
+      await waitFor(() => expect(field()).toHaveFocus());
+      await user.type(field(), "moon");
+      expect(magnifier()).toHaveAttribute("aria-pressed", "true");
+      await user.click(magnifier()!);
+      await waitFor(() => expect(screen.queryByRole("textbox")).toBeNull());
+      // The field is gone, the filter stands, and the button says so.
+      expect(magnifier()).toHaveAttribute("aria-pressed", "true");
+      expect(keys(container)).toEqual([API, MIGRATE].map(idOf));
+    });
+
+    it("closes on Escape on an empty field, after the first Escape cleared the query", async () => {
+      const user = userEvent.setup();
+      render(list({ filterEntry: "button" }));
+      await user.click(magnifier()!);
+      await waitFor(() => expect(field()).toHaveFocus());
+      await user.type(field(), "moon");
+      await user.keyboard("{Escape}");
+      expect(field()).toHaveValue("");
+      expect(screen.getByRole("textbox")).toBeInTheDocument();
+      await user.keyboard("{Escape}");
+      await waitFor(() => expect(screen.queryByRole("textbox")).toBeNull());
+      expect(magnifier()).toHaveAttribute("aria-pressed", "false");
+    });
+
+    it("the always entry draws no magnifier and takes no focus", () => {
+      render(list({ filterEntry: "always" }));
+      expect(magnifier()).toBeNull();
+      expect(field()).not.toHaveFocus();
+    });
+
+    it("the Changes tab keeps both parts as invisible slots", () => {
+      const { container } = render(list({ filterEntry: "button", renderBody: () => <p>changes</p> }));
+      expect(screen.queryByRole("button", { name: "Filter sessions" })).toBeNull();
+      expect(container.querySelector('[data-slot="toggle-button"]')!.closest(".invisible")).not.toBeNull();
+    });
+  });
+
+  it("the Changes tab keeps the always field as an invisible slot", () => {
+    const { container } = render(list({ filterEntry: "always", renderBody: () => <p>changes</p> }));
+    expect(screen.queryByRole("textbox")).toBeNull();
+    expect(container.querySelector('[data-slot="session-filter"]')!.closest(".invisible")).not.toBeNull();
+  });
+
+  it("keeps a row by its name, marks the matched letters, and keeps the row's height class", async () => {
+    const user = userEvent.setup();
+    const { container } = render(list());
+    await user.type(field(), "rel");
+    expect(keys(container)).toEqual([RELEASE].map(idOf));
+    expect([...container.querySelectorAll("mark")].map((m) => m.textContent)).toEqual(["rel"]);
+    expect(container.querySelector(`#${idOf(RELEASE)} > div`)!.className).toMatch(/(?:^|\s)h-11(?=\s|$)/);
+    expect(headingTexts()).toEqual(["collie-workspace"]);
+  });
+
+  it("finds a row by its branch and marks it on the branch line", async () => {
+    const user = userEvent.setup();
+    const { container } = render(list());
+    await user.type(field(), "fix");
+    expect(keys(container)).toEqual([RELEASE].map(idOf));
+    const branch = container.querySelector('[data-slot="branch-label"]')!;
+    expect([...branch.querySelectorAll("mark")].map((m) => m.textContent)).toEqual(["fix"]);
+  });
+
+  it("names a field the row does not draw on line 2, in the same slot, with the letters marked", async () => {
+    const user = userEvent.setup();
+    const { container } = render(list());
+    await user.type(field(), "codex");
+    expect(keys(container)).toEqual([API].map(idOf));
+    const via = container.querySelector('[data-slot="agent-row-via"]')!;
+    expect(via.textContent).toBe("codex");
+    expect(via.previousElementSibling?.textContent).toBe("agent");
+    expect([...via.querySelectorAll("mark")].map((m) => m.textContent)).toEqual(["codex"]);
+    const slot = via.parentElement!;
+    expect(slot).toHaveAttribute("data-slot", "agent-row-detail");
+    expect(slot.className).toMatch(/(?:^|\s)h-4(?=\s|$)/);
+    expect(container.querySelector(`#${idOf(API)} > div`)!.className).toMatch(/(?:^|\s)h-11(?=\s|$)/);
+  });
+
+  it("names the folder when only the folder matched (the row draws no folder)", async () => {
+    const user = userEvent.setup();
+    const odd = at("w9:p1", "w9", "scratch", 9, { sessionName: "notes", cwd: "/srv/zebra-farm" });
+    const { container } = render(list({ agents: [...AGENTS, odd] }));
+    await user.type(field(), "zebra");
+    expect(keys(container)).toEqual([odd].map(idOf));
+    const via = container.querySelector('[data-slot="agent-row-via"]')!;
+    expect(via.previousElementSibling?.textContent).toBe("folder");
+    expect(via.textContent).toBe("zebra-farm");
+  });
+
+  it("with drawn-only does not search the folder", async () => {
+    const user = userEvent.setup();
+    const odd = at("w9:p1", "w9", "scratch", 9, { sessionName: "notes", cwd: "/srv/zebra-farm" });
+    const { container } = render(list({ agents: [...AGENTS, odd], filterHidden: "drawn-only" }));
+    await user.type(field(), "zebra");
+    expect(keys(container)).toEqual([]);
+  });
+
+  it("keeps the groups in place order and drops the groups left empty with their headings", async () => {
+    const user = userEvent.setup();
+    const { container } = render(list());
+    await user.type(field(), "moon");
+    expect(keys(container)).toEqual([API, MIGRATE].map(idOf));
+    expect(headingTexts()).toEqual(["moonward"]);
+  });
+
+  it("does not re-sort by score in the default order", async () => {
+    const user = userEvent.setup();
+    const { container } = render(list());
+    await user.type(field(), "e");
+    const shown = keys(container);
+    expect(shown.length).toBeGreaterThan(1);
+    // The rows left are the unfiltered list's rows, in the unfiltered list's order.
+    await user.clear(field());
+    const whole = keys(container);
+    expect(shown).toEqual(whole.filter((id) => shown.includes(id)));
+  });
+
+  it("in best-first order draws one flat list with no workspace headings", async () => {
+    const user = userEvent.setup();
+    const { container } = render(list({ filterOrder: "best" }));
+    await user.type(field(), "server");
+    // A tie keeps the place order: the shell sits in the first workspace, before moonward.
+    expect(keys(container)).toEqual([SHELLS[0]!, API].map(idOf));
+    expect(headingTexts()).toEqual([]);
+  });
+
+  it("hides the pin hint while a query is set", async () => {
+    const user = userEvent.setup();
+    const { container } = render(list({ onHold: vi.fn() }));
+    const hint = () => container.querySelector('[data-slot="notice"]');
+    expect(hint()).not.toBeNull();
+    await user.type(field(), "rel");
+    expect(hint()).toBeNull();
+  });
+
+  it("filters Pinned in place and drops the group when no pinned row matches", async () => {
+    const user = userEvent.setup();
+    const all = [...AGENTS, ...SHELLS];
+    setPinned(TRIAGE, true, all, 1);
+    setPinned(API, true, all, 2);
+    const { container } = render(list({ pins: currentPins() }));
+    expect(keys(container).slice(0, 2)).toEqual([TRIAGE, API].map(idOf));
+    await user.type(field(), "api");
+    expect(keys(container)).toEqual([API].map(idOf));
+    expect(screen.queryByRole("region", { name: "Pinned" })).not.toBeNull();
+    await user.clear(field());
+    await user.type(field(), "mig");
+    expect(keys(container)).toEqual([MIGRATE].map(idOf));
+    expect(screen.queryByRole("region", { name: "Pinned" })).toBeNull();
+  });
+
+  it("combines with the needs-you switch: those narrow first, the count is against what is left", async () => {
+    const user = userEvent.setup();
+    const { container } = render(list({ needsYouOnly: true }));
+    expect(keys(container)).toEqual([LANDING].map(idOf));
+    await user.type(field(), "l");
+    expect(keys(container)).toEqual([LANDING].map(idOf));
+    expect(screen.getByText("1 of 1")).toBeInTheDocument();
+    await user.clear(field());
+    await user.type(field(), "moon");
+    expect(keys(container)).toEqual([]);
+    expect(screen.getByText(/No session matches “moon”/)).toBeInTheDocument();
+  });
+
+  it("combines with the workspace choice: the chosen workspace's rows only", async () => {
+    const user = userEvent.setup();
+    const moonward = workspacePrefKey(groupPanesByWorkspace([API])[0]!);
+    const { container } = render(list({ isolated: [moonward], onIsolate: vi.fn() }));
+    await user.type(field(), "a");
+    // `a` matches names in other workspaces too; only moonward's rows are in play.
+    expect(keys(container).every((k) => [API, MIGRATE].map(idOf).includes(k))).toBe(true);
+    expect(screen.getByText(/ of 2$/)).toBeInTheDocument();
+  });
+
+  it("counts what it shows against the rows left, politely", async () => {
+    const user = userEvent.setup();
+    render(list());
+    const count = () => document.querySelector('[data-slot="session-filter-count"]')!;
+    expect(count()).toHaveAttribute("aria-live", "polite");
+    await user.type(field(), "moon");
+    expect(count()).toHaveTextContent("2 of 7");
+  });
+
+  it("opens the first row shown on Enter, through the row's own navigation, and does nothing on an empty field", async () => {
+    const user = userEvent.setup();
+    const onOpen = vi.fn();
+    render(list({ onOpen }));
+    await user.click(field());
+    await user.keyboard("{Enter}");
+    expect(onOpen).not.toHaveBeenCalled();
+    await user.type(field(), "moon{Enter}");
+    expect(onOpen).toHaveBeenCalledTimes(1);
+    // SAFETY: the list calls `onOpen(pane, rowElement)`; the mock recorded exactly those two arguments.
+    const [pane, row] = onOpen.mock.calls[0] as [AgentView, HTMLElement];
+    expect(pane).toBe(API);
+    expect(row.id).toBe(idOf(API));
+  });
+
+  it("says nothing matches, in the list's place, with a way out", async () => {
+    const user = userEvent.setup();
+    const { container } = render(list());
+    await user.type(field(), "zzz");
+    expect(keys(container)).toEqual([]);
+    expect(screen.getByText("No session matches “zzz”.")).toBeInTheDocument();
+    await user.click(within(container.querySelector('[data-slot="session-filter-empty"]')!).getByRole("button", { name: "Clear filter" }));
+    expect(field()).toHaveValue("");
+    expect(keys(container)).toHaveLength(AGENTS.length + SHELLS.length);
+  });
+
+  it("jumps to a needs-you row the query hides by clearing the query first", async () => {
+    const user = userEvent.setup();
+    Element.prototype.scrollIntoView = vi.fn();
+    const { container } = render(list());
+    await user.type(field(), "moon");
+    await user.click(screen.getByRole("button", { name: /1 needs you/i }));
+    expect(field()).toHaveValue("");
+    await waitFor(() => expect(container.querySelector(`#${idOf(LANDING)}`)).toBeInTheDocument());
+  });
+
+  it("keeps the query in the store for the host scope, so a remount finds it, and stores nothing on the device", async () => {
+    const user = userEvent.setup();
+    const first = render(list({ scope: { host: "h1" } }));
+    await user.type(field(), "moon");
+    first.unmount();
+    const second = render(list({ scope: { host: "h1" } }));
+    expect(field()).toHaveValue("moon");
+    expect(keys(second.container)).toEqual([API, MIGRATE].map(idOf));
+    second.unmount();
+    // Another machine's Dashboard holds its own.
+    render(list({ scope: { host: "h2" } }));
+    expect(field()).toHaveValue("");
+    expect(JSON.stringify({ ...localStorage })).not.toContain("moon");
+    expect(JSON.stringify({ ...sessionStorage })).not.toContain("moon");
+  });
+
+  it("a caller that owns the query is not read from the store", () => {
+    const { container } = render(list({ filter: { query: "moon", open: true, setQuery: vi.fn(), setOpen: vi.fn() } }));
+    expect(field()).toHaveValue("moon");
+    expect(keys(container)).toEqual([API, MIGRATE].map(idOf));
   });
 });

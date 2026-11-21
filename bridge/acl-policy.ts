@@ -81,6 +81,7 @@ const KNOWN_NAMES: ReadonlySet<string> = new Set([
   "crew-ops.json",
   "crew-runtime.json",
   "crew-trust.json",
+  "diag-composer.jsonl",
   "folders.json",
   "local-secret",
   "machine-alerts.json",
@@ -145,7 +146,13 @@ const KNOWN_FOLDERS: ReadonlyMap<string, RegExp> = new Map([
   ["uploads", /^[A-Za-z0-9_-]+-[0-9a-z]+-[0-9a-f]{8}\.[A-Za-z0-9]+$/],
   ["fonts", /^[^\\/]+\.woff2$/i],
   ["acl-backups", /^acl-backup-.+\.sddl$/i],
+  // The folder a sign-in start runs in (`signInFolder`, bridge/account-folder.ts): always empty, so no file name fits.
+  ["sign-in", /(?!)/],
   ["whistle", /^whistle\.(?:cact|json|lock)$|^whistle\.cact\.\d+\.\d+\.part$|^whistle\.json\.\d+\.\d+\.tmp$/],
+  // Collie tricks (M94, bridge/tricks/paths.ts): the switch file and its temporary. A `tricks/` that also
+  // holds a trick's own state folder, or the config folder's `tricks/` with the operator's trick folders,
+  // has subfolders and so is not Collie's by this one-level rule: checked, never changed.
+  ["tricks", /^switches\.json(?:\.tmp)?$/],
 ]);
 
 /**

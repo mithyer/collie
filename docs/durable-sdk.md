@@ -372,7 +372,7 @@ An opener that does not read it makes `withCollie` throw, because no call would 
 | --- | --- | --- |
 | `registry` | Your registry. Required. What you install in it later reaches every open session | None |
 | `risky` | The tool names that need the phone's yes. Required | None |
-| `words` | The words of a call's question, as for `riskGuard` | "<tool> wants to run", Allow and Deny |
+| `words` | The words of a call's question, as for `riskGuard` | "`<tool>` wants to run", Allow and Deny |
 | `timeoutMs` | How long the phone has. Past it the question closes as timed out and the call is blocked | No limit |
 | `onTimeout` | Called with the tool name and the question's title when a question timed out | None |
 | `journal` | The journal to use. For a test | The session's own World |
@@ -416,4 +416,4 @@ on the durable agent's home, in Collie's own words. Update the older side.
 
 The package is published under the npm dist-tag experimental until the wire leaves its experimental status. The
 latest tag carries no promise. If the package is ever retired ([the exit](durable-agents.md#the-exit)), it is deprecated
-([ADR 0105](../.adr/0105-the-durable-sdk-is-an-npm-package.md)).
+([ADR 0146](../.adr/0146-a-durable-agent-is-a-session-with-no-screen-that-acts-by-id.md)).

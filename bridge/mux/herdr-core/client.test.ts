@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { asJsonObject, asJsonString, parseJsonObject } from "../../../web/src/lib/json.ts";
 import type { JsonObject, JsonValue } from "../../json.ts";
-import { defaultHcSocket, HcClient, HcError, HcTimeout, parseTerminal, readHcCore, type WireEvent } from "./client.ts";
+import { defaultHcSocket, HcClient, HcError, HcNoReply, HcTimeout, parseTerminal, readHcCore, type WireEvent } from "./client.ts";
 
 // A unix-socket stand-in for the core, speaking the two modes HC_API.md records: plain JSON-RPC
 // lines, and framed mode after `hello {framed:true}`. Enough of each to prove the client's wire.
@@ -179,9 +179,48 @@ describe("HcClient over a unix socket", () => {
     try {
       await client.hello();
     } catch (err) {
-      caught = err instanceof HcError ? "core" : err instanceof Error ? "transport" : "other";
+      caught = err instanceof HcError ? "core" : err instanceof HcNoReply ? "no reply" : err instanceof Error ? "transport" : "other";
     }
     expect(caught).toBe("transport");
+  });
+
+  // M100 spec 03: a reset after the request went out is the same "not sure" as a close. A stand-in that
+  // never reads and closes resets the connection; node:net reports it as an ECONNRESET error.
+  test("a connection reset after the request went out rejects with HcNoReply, with the error's words", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "hc-client-"));
+    const path = join(dir, "core.sock");
+    const server = createServer({ pauseOnConnect: true }, (socket) => {
+      socket.on("error", () => {});
+      setTimeout(() => socket.destroy(), 50);
+    });
+    await new Promise<void>((resolve) => server.listen(path, resolve));
+    try {
+      let caught: Error | null = null;
+      try {
+        await new HcClient(path, 2000).pressKeys("t1", ["enter"]);
+      } catch (err) {
+        if (err instanceof Error) caught = err;
+      }
+      expect(caught).toBeInstanceOf(HcNoReply);
+      expect(caught?.message).toStartWith("herdr-core terminal.keys: ");
+    } finally {
+      server.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // M100 spec 03: the request went out, so the core may have acted on it.
+  test("a connection the core closes after the request went out rejects with HcNoReply and the old words", async () => {
+    const core = stand((socket) => socket.destroy());
+    const client = new HcClient(core.path, 2000);
+    let caught: Error | null = null;
+    try {
+      await client.pressKeys("t1", ["enter"]);
+    } catch (err) {
+      if (err instanceof Error) caught = err;
+    }
+    expect(caught).toBeInstanceOf(HcNoReply);
+    expect(caught?.message).toBe("herdr-core terminal.keys: connection closed before the answer");
   });
 });
 

@@ -4,6 +4,7 @@ import type { ComponentType, ReactNode } from "react";
 import { CollieMark } from "@/components/collie-mark";
 import type { MarkProps } from "@/components/mark-contract";
 import { useMarkId } from "@/lib/mark";
+import { useMarkMotion } from "@/lib/mark-motion";
 import type { MarkId } from "@/lib/mark-ids";
 
 // THE HEADER LOGO, which a theme may choose (its `character`). Every mark is generated
@@ -11,15 +12,24 @@ import type { MarkId } from "@/lib/mark-ids";
 // hand-written around them and takes the contract's props (`state`, `beads`, `turn`, `ref` and the
 // rest) and hands every one to the mark it picks, `ref` included (React 19 passes it as a prop).
 //
-// WHICH MARK. The `mark` prop when given (the theme preview draws the previewed theme's own
-// character, not the worn one's); otherwise `useMarkId()`, the one resolver (`lib/mark.ts`): the worn
-// theme's `character`, then Collie. There is no device setting (ADR 0136).
+// WHICH MARK. The `mark` prop when given (the theme preview and the Character page draw a named
+// character, not the worn one's); otherwise `useMarkId()`, the one resolver (`lib/mark.ts`): this
+// device's choice in Settings > Appearance > Character, then the worn theme's `character`, then Collie
+// (ADR 0136).
 //
 // ONLY COLLIE IS IN THE ENTRY BUNDLE. The others are dynamic imports, so a device that never wears
 // a theme with one never downloads it. They are named exports of their generated files and mapped to the
 // `default` React.lazy wants. Until a chunk arrives the host draws an empty box of exactly the mark's
 // size, so the header does not shift when the drawing lands. `preloadMark` starts the fetch early
 // (at startup, after the theme is settled) so that box is rarely seen.
+//
+// THE TWO COLLIE COAT VARIANTS (`collie-collar`, `collie-blaze`) are the Collie mark with another head:
+// `collieFamilyMark` in `collie-mark.tsx` builds them on the same runtime and the same stylesheet, so
+// they stay lazy chunks like the rest and cost the entry bundle nothing.
+//
+// HOW IT MOVES AT REST. `useMarkMotion` (`lib/mark-motion.ts`) hands a resting mark `drift="always"`, or
+// `turn={0}` when this device or the worn theme says still, the page is hidden or the system asks for
+// reduced motion. A mark that is live, idle or told its `turn` by the caller is drawn as asked.
 //
 // WHAT STAYS THE COLLIE MARK. The boot splash, the idle lock, the agent-start handoff and the tour
 // sheet import `CollieMark` directly and never call this. The favicon, the app icon and the splash
@@ -37,6 +47,10 @@ type ChunkedMarkId = Exclude<MarkId, "collie">;
  */
 function loadChunk(id: ChunkedMarkId) {
   switch (id) {
+    case "collie-collar":
+      return import("./collie-collar-mark").then((m) => ({ default: m.CollieCollarMark }));
+    case "collie-blaze":
+      return import("./collie-blaze-mark").then((m) => ({ default: m.CollieBlazeMark }));
     case "kawaii":
       return import("./kawaii-mark").then((m) => ({ default: m.KawaiiMark }));
     case "kawaii-tilt":
@@ -56,6 +70,8 @@ function loadChunk(id: ChunkedMarkId) {
 
 /** One `lazy` per mark, made once: a fresh `lazy()` per render would suspend on every render. */
 const LAZY = {
+  "collie-collar": lazy(() => loadChunk("collie-collar")),
+  "collie-blaze": lazy(() => loadChunk("collie-blaze")),
   kawaii: lazy(() => loadChunk("kawaii")),
   "kawaii-tilt": lazy(() => loadChunk("kawaii-tilt")),
   pixel: lazy(() => loadChunk("pixel")),
@@ -116,7 +132,10 @@ export interface BrandMarkProps extends MarkProps {
   mark?: MarkId;
 }
 
-export function BrandMark({ mark, ...props }: BrandMarkProps) {
+export function BrandMark({ mark, ...given }: BrandMarkProps) {
+  // A resting mark drifts at all times while the page is visible, unless this device or the worn theme
+  // says still (`lib/mark-motion.ts`). The fallback and every chunk get the props as resolved here.
+  const props = useMarkMotion(given);
   const resolved = useMarkId();
   const id = mark ?? resolved;
   if (id === "collie") return <CollieMark {...props} />;

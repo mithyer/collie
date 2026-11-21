@@ -7,9 +7,10 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AuditLog } from "../audit.ts";
-import type { JsonValue } from "../../web/src/lib/json.ts";
+import { isRefusalReason, REFUSAL_REASONS } from "../refusal.ts";
+import { parseJsonObject, type JsonValue } from "../../web/src/lib/json.ts";
 import { muxAck, muxOk, type MuxAck, type MuxGrid, type MuxOutcome } from "../mux/types.ts";
-import { ASK_OFF_TEXT, askRoute, heldCancelRoute, parseSendRequest, REPLY_OFF_TEXT, replySendOf, replyThroughProtocol, SEND_MAX_TEXT, SEND_OFF_TEXT, sendReceiptsRoute, sendRoute, type AskRouteRuntime, type SendRouteRuntime } from "../server.ts";
+import { ASK_OFF_TEXT, askRoute, paneTakesAskRoute, heldCancelRoute, parseSendRequest, REPLY_OFF_TEXT, replySendOf, replyThroughProtocol, SEND_MAX_TEXT, SEND_OFF_TEXT, sendReceiptsRoute, sendRoute, type AskRouteRuntime, type SendRouteRuntime } from "../server.ts";
 import { readFileSync } from "node:fs";
 import { parseAnsi } from "../../web/src/lib/ansi.ts";
 import { splitLines } from "../../web/src/lib/blocks.ts";
@@ -39,6 +40,30 @@ describe("parseSendRequest", () => {
       // SAFETY: each case is plain JSON data, a JsonValue.
       expect(parseSendRequest({ ...good, capAck: bad } as JsonValue)).toBeNull();
     }
+  });
+
+  test("takes secret only as true: a send into a sign-in field (M56, /login)", () => {
+    expect(parseSendRequest({ ...good, secret: true })).toEqual({ ...good, mode: "send", secret: true });
+    for (const bad of [false, "yes", 1, null]) {
+      // SAFETY: each case is plain JSON data, a JsonValue.
+      expect(parseSendRequest({ ...good, secret: bad } as JsonValue)).toBeNull();
+    }
+  });
+
+  test("takes override only as true, and only with a rows hash on a plain send or command (M102 spec 01)", () => {
+    const commit = { ...good, rowsHash: "0abc12" };
+    expect(parseSendRequest({ ...commit, override: true })).toEqual({ ...commit, mode: "send", override: true });
+    expect(parseSendRequest({ ...commit, mode: "command", override: true })).toEqual({ ...commit, mode: "command", override: true });
+    for (const bad of [false, "yes", 1, null, []]) {
+      // SAFETY: each case is plain JSON data, a JsonValue.
+      expect(parseSendRequest({ ...commit, override: bad } as JsonValue)).toBeNull();
+    }
+    // No rows hash, a resend, a steer, a secret, or a staged mode: the shape of no commit tap at all.
+    expect(parseSendRequest({ ...good, override: true })).toBeNull();
+    expect(parseSendRequest({ ...commit, override: true, resendOf: "route-old-0001" })).toBeNull();
+    expect(parseSendRequest({ ...commit, override: true, when: "steer" })).toBeNull();
+    expect(parseSendRequest({ ...commit, override: true, secret: true })).toBeNull();
+    for (const mode of ["append", "replace", "submit", "discard", "prepare"]) expect(parseSendRequest({ ...commit, override: true, mode })).toBeNull();
   });
 
   test("takes when: steer, refuses any other word, and never takes the caller's word for fromPhone (M69)", () => {
@@ -82,7 +107,8 @@ function idlePane() {
     ["> earlier", "", RULE, box === "" ? "❯ \u001b[2mTry something\u001b[0m" : `❯ ${box}`, RULE, "  status row"].join("\n");
   return {
     written,
-    readGrid: (paneId: string): Promise<MuxOutcome<MuxGrid>> => Promise.resolve(muxOk({ paneId, text: render(), truncated: false, revision })),
+    // %7 is the engine's bare shell pane: a shell prompt, which the blind road types into.
+    readGrid: (paneId: string): Promise<MuxOutcome<MuxGrid>> => Promise.resolve(muxOk({ paneId, text: paneId === "%7" ? "$ ls\nnotes.txt\n$ " : render(), truncated: false, revision })),
     typeText: (_paneId: string, text: string): Promise<MuxAck> => {
       written.push(text);
       box += text;
@@ -100,7 +126,7 @@ function idlePane() {
   };
 }
 
-function runtime(withSend: boolean, dir: string, holds?: HoldStore) {
+function runtime(withSend: boolean, dir: string, holds?: HoldStore, status?: "idle" | "working" | "blocked" | "done" | "unknown") {
   const pane = idlePane();
   let clock = 0;
   const store = new RequestStore(join(dir, "sends"), () => clock);
@@ -123,7 +149,7 @@ function runtime(withSend: boolean, dir: string, holds?: HoldStore) {
     : undefined;
   let pokes = 0;
   const engine = {
-    current: () => ({ agents: [{ paneId: "%1", agent: "claude" }], shellPanes: [{ paneId: "%7" }] }),
+    current: () => ({ agents: [status === undefined ? { paneId: "%1", agent: "claude" } : { paneId: "%1", agent: "claude", status }], shellPanes: [{ paneId: "%7" }] }),
     noteInput: () => undefined,
     pokeNow: () => {
       pokes++;
@@ -152,6 +178,31 @@ function auditLines() {
 }
 
 describe("sendRoute", () => {
+  test("tells the Hill a send that spoke, and whether it started the next turn of a session that waited (M96 spec 10)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "collie-route-"));
+    try {
+      for (const [status, started] of [
+        ["idle", true],
+        ["done", true],
+        ["working", false],
+        ["blocked", false],
+        ["unknown", false],
+        [undefined, false],
+      ] as const) {
+        const { rt } = runtime(true, join(dir, String(status)), undefined, status);
+        const { audit } = auditLines();
+        const told: Array<[string, boolean]> = [];
+        const res = await sendRoute(rt, { id: `route-turn-${String(status).padEnd(4, "x").slice(0, 4)}`, pane: "%1", text: "go ahead" }, { audit, device: "phone", redact: false, acceptEncoding: null, spoke: (paneId, s) => void told.push([paneId, s]) });
+        // SAFETY: the route answers the Send Protocol's answer as JSON; only `receipt.outcome` is read.
+        const body = (await res.json()) as { receipt?: { outcome: string } };
+        expect(body.receipt?.outcome).toBe("sent");
+        expect(told).toEqual([["%1", started]]);
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   test("with the flag off the route is not there: a 404 that says why, and nothing is read", async () => {
     const dir = mkdtempSync(join(tmpdir(), "collie-route-"));
     try {
@@ -161,7 +212,8 @@ describe("sendRoute", () => {
       expect(res.status).toBe(404);
       expect(await res.text()).toBe(SEND_OFF_TEXT);
       expect(pane.written).toEqual([]);
-      expect(lines).toEqual([]);
+      // Nothing is read; the refusal leaves its one record with the code (M102 spec 14).
+      expect(lines.map((line) => JSON.parse(line).detail)).toEqual([{ by: "bridge", outcome: "refused", reason: "send_off" }]);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -227,6 +279,56 @@ describe("sendRoute", () => {
   });
 });
 
+// M102 spec 14 (I3): a 400 or a 404 of the send and ask routes stored nothing, so a refused tap left no
+// trace. Each now leaves one audit line with the code, the pane when the body names one, and no text.
+describe("a refusal before the protocol leaves one record with its code", () => {
+  const detailOf = (line: string) => parseJsonObject(line) ?? {};
+
+  test("the send route: a bad body, an unknown pane, a screenless pane and a Resend of nothing", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "collie-route-"));
+    try {
+      const { rt } = runtime(true, dir);
+      const { audit, lines } = auditLines();
+      const context = { audit, device: "phone", redact: false, acceptEncoding: null };
+      const cases: [SendRouteRuntime, JsonValue, number, string, string | undefined][] = [
+        [rt, { id: "x", pane: "%1", text: "a secret word" }, 400, "bad_body", "%1"],
+        [rt, { id: "route-rec-0001", pane: "%9", text: "a secret word" }, 404, "no_pane", "%9"],
+        [{ ...rt, herdr: { controlTurn: () => Promise.reject(new Error("never called")) } }, { id: "route-rec-0002", pane: "%1", text: "a secret word" }, 409, "no_raw_input", "%1"],
+        [rt, { id: "route-rec-0003", pane: "%1", text: "", resendOf: "route-rec-9999" }, 404, "no_held_send", "%1"],
+        [{ ...rt, send: undefined }, { id: "route-rec-0004", pane: "%1", text: "a secret word" }, 404, "send_off", "%1"],
+      ];
+      for (const [runtimeOf, body, status, reason, paneId] of cases) {
+        const before = lines.length;
+        const res = await sendRoute(runtimeOf, body, context);
+        expect(res.status).toBe(status);
+        expect(res.headers.get("x-collie-reason")).toBe(reason);
+        expect(res.headers.get("x-collie-by")).toBe("bridge");
+        expect(lines.length - before).toBe(1);
+        const line = detailOf(lines.at(-1)!);
+        expect(line).toMatchObject({ action: "send", session: "main", device: "phone", detail: { by: "bridge", outcome: "refused", reason } });
+        expect(line.paneId).toBe(paneId!);
+        expect(lines.at(-1)).not.toContain("secret");
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("a terminal pane with an ask book marks askRoute; a program pane and a session with no ask book do not (decision 2)", () => {
+    expect(paneTakesAskRoute({ asks: {} })).toBe(true);
+    expect(paneTakesAskRoute({ asks: {}, driver: {} })).toBe(false);
+    expect(paneTakesAskRoute({})).toBe(false);
+  });
+
+  test("every code a record writes is in the one exported list", () => {
+    for (const reason of ["bad_body", "no_pane", "no_raw_input", "no_held_send", "send_off", "member_unreachable", "link_timeout", "foreign-mux", "no_markers"]) {
+      expect(isRefusalReason(reason)).toBe(true);
+    }
+    expect(isRefusalReason("anything at all")).toBe(false);
+    expect(new Set(REFUSAL_REASONS).size).toBe(REFUSAL_REASONS.length);
+  });
+});
+
 describe("the reply route runs the protocol (M56 spec 06)", () => {
   const context = (audit: AuditLog) => ({ audit, device: "phone", redact: false, acceptEncoding: null });
 
@@ -262,6 +364,20 @@ describe("the reply route runs the protocol (M56 spec 06)", () => {
       const prepared = await (await replyThroughProtocol(replySendOf(rt), "%1", "main", { text: "", submit: true, mode: "prepare", id: "phone-req-0002" }, context(audit))).json();
       expect(prepared).toMatchObject({ ok: true, send: { offers: [], surface: { turn: "idle", modal: "none", composer: "empty" } } });
       expect((await replyThroughProtocol(replySendOf(rt), "%1", "main", { text: "x", submit: true, mode: "shout" }, context(audit))).status).toBe(400);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("a reply that names no request id is no phone's tap: an override in its body is dropped, never recorded (M102 spec 01)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "collie-route-"));
+    try {
+      const { rt } = runtime(true, dir);
+      const seen = spyHandle(rt);
+      const { audit } = auditLines();
+      await replyThroughProtocol(replySendOf(rt), "%1", "main", { text: "from an agent", submit: true, rowsHash: "0abc12", override: true }, context(audit));
+      await replyThroughProtocol(replySendOf(rt), "%1", "main", { text: "from the phone", submit: true, id: "phone-req-0009", rowsHash: "0abc12", override: true }, context(audit));
+      expect(seen.map((request) => [request.fromPhone, request.override])).toEqual([[undefined, undefined], [true, true]]);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -510,6 +626,40 @@ describe("a Resend through sendRoute (M56 spec 15 review, H7)", () => {
     }
   });
 
+  test("a Resend whose answer was lost answers its stored receipt on the retry, sends nothing twice, and an unknown id stays a 404", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "collie-route-"));
+    try {
+      const { audit } = auditLines();
+      const context = { audit, device: null, redact: true, acceptEncoding: null };
+      const holds = new HoldStore(join(dir, "held"));
+      const { rt, pane, store } = runtime(true, dir, holds);
+      const accepted = store.accept({ id: "route-lost-0001", session: "main", paneId: "%1", paneGeneration: "gen", surfaceRevision: 0, mode: "send", text: "the words of the held send" });
+      const { reason: _crash, ...receipt } = SendProtocol.crashReceipt(accepted.record);
+      store.hold("route-lost-0001", { ...receipt, outcome: "held" });
+      holds.add({ id: "route-lost-0001", session: "main", paneId: "%1", harness: "claude", mode: "send", text: "the words of the held send", revision: 0, command: false });
+      holds.end("route-lost-0001", "expired");
+      // The first try goes through and takes the old row away; its answer never reaches the phone.
+      const first = await sendRoute(rt, { id: "route-lost-0002", pane: "%1", text: "", resendOf: "route-lost-0001" }, context);
+      expect(first.status).toBe(200);
+      const firstBody = await first.json();
+      expect(firstBody).toMatchObject({ receipt: { requestId: "route-lost-0002", outcome: "sent" } });
+      expect(holds.get("route-lost-0001")).toBeNull();
+      expect(pane.written).toEqual(["the words of the held send"]);
+      // The retry carries the same id: the stored receipt comes back, not a 404, and nothing is typed again.
+      const retry = await sendRoute(rt, { id: "route-lost-0002", pane: "%1", text: "", resendOf: "route-lost-0001" }, context);
+      expect(retry.status).toBe(200);
+      const retryBody = await retry.json();
+      expect(retryBody).toMatchObject({ replayed: true, receipt: { requestId: "route-lost-0002", outcome: "sent" } });
+      expect(retryBody.receipt).toEqual(firstBody.receipt);
+      expect(pane.written).toEqual(["the words of the held send"]);
+      // A request id the store never saw, naming a row that is gone, is still a 404.
+      expect((await sendRoute(rt, { id: "route-lost-0003", pane: "%1", text: "", resendOf: "route-lost-0001" }, context)).status).toBe(404);
+      expect(pane.written).toEqual(["the words of the held send"]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   test("a Resend that asks to steer goes as a plain send: no when and no fromPhone reach the protocol (M69)", async () => {
     const dir = mkdtempSync(join(tmpdir(), "collie-route-"));
     try {
@@ -601,7 +751,9 @@ describe("askRoute", () => {
       const res = await askRoute(off, "ask-0123456789abcd", { pane: "%1", hash: "00", optionId: "1", origin: "person_tap" }, { audit, device: null, redact: false, acceptEncoding: null });
       expect(res.status).toBe(404);
       expect(await res.text()).toBe(ASK_OFF_TEXT);
-      expect(lines).toEqual([]);
+      // One record of the refusal, with its code and no text (M102 spec 14).
+      expect(lines.map((line) => JSON.parse(line).detail)).toEqual([{ by: "bridge", outcome: "refused", reason: "send_off" }]);
+      expect(res.headers.get("x-collie-reason")).toBe("send_off");
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -621,15 +773,33 @@ describe("askRoute", () => {
       const body = await res.json();
       expect(body.receipt).toMatchObject({ askId: ask.id, outcome: "sent", keys: ["1"] });
       expect(keys).toEqual(["1"]);
-      expect(lines).toHaveLength(1);
-      expect(lines[0]).toContain('"action":"ask"');
-      expect(lines[0]).toContain('"optionId":"1"');
-      expect(lines[0]).not.toContain("mkfifo");
+      // The 400 and the 404 above each left one record (M102 spec 14); then the answer's own line.
+      expect(lines).toHaveLength(3);
+      expect(lines[2]).toContain('"action":"ask"');
+      expect(lines[2]).toContain('"optionId":"1"');
+      expect(lines[2]).not.toContain("mkfifo");
       // The same answer again is the stored receipt: audited as a replay, and no key leaves.
       const again = await askRoute(rt, ask.id, { pane: "%1", hash: ask.hash, optionId: "1", origin: "person_tap" }, context);
       expect((await again.json()).replayed).toBe(true);
       expect(keys).toEqual(["1"]);
-      expect(lines[1]).toContain('"replayed":true');
+      expect(lines[3]).toContain('"replayed":true');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("rule 6 of agent views (review 9 R3, ask door): an answer whose keys reached the pane is a person turn in its session; a replay is none", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "collie-route-"));
+    try {
+      const { rt, poll } = askRuntime(dir);
+      const ask = poll();
+      const { audit } = auditLines();
+      const turns: string[] = [];
+      const context = { audit, device: "phone", redact: false, acceptEncoding: null, personTurn: (paneId: string) => turns.push(paneId) };
+      expect((await askRoute(rt, ask.id, { pane: "%1", hash: ask.hash, optionId: "1", origin: "person_tap" }, context)).status).toBe(200);
+      expect(turns).toEqual(["%1"]);
+      await askRoute(rt, ask.id, { pane: "%1", hash: ask.hash, optionId: "1", origin: "person_tap" }, context);
+      expect(turns).toEqual(["%1"]);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

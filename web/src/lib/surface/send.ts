@@ -7,6 +7,7 @@
 
 import { asJsonNumber, asJsonObject, asJsonString, type JsonValue } from "../json";
 import type { ProfileStatus } from "./profile";
+import type { MenuSign } from "./menu-sign";
 import { modalWord, type Surface, type SurfaceReason } from "./surface";
 
 /**
@@ -45,6 +46,8 @@ export const SEND_REASONS = [
   // does not say it queues), or the text is a command its profile does not queue. A bridge with a
   // hold queue (M56 spec 15) holds such a send instead; only a Submit of a box in a turn is refused.
   "turn_running",
+  // refused (M102 spec 12): an override met a menu or a yes/no prompt on the screen; nothing typed
+  "menu_open",
   // typed_not_submitted: the text is in the box, Enter was not sent
   "mismatch",
   "changed",
@@ -56,12 +59,19 @@ export const SEND_REASONS = [
   // modal it cannot tell (`unreadable`). The text is in the box; no key was pressed.
   "dialog_open",
   "unreadable",
+  // typed_not_submitted (M102 spec 12): the person's override on a screen Collie cannot read; the text
+  // is in place and Collie pressed no Enter. The person presses Enter on the Keys pad, the screen above.
+  "override",
   // unknown: the request ended without evidence either way. `bound` also refuses: an S0 past its own
   // bound (2 reads, 1200 ms) ends `refused(bound)`, since nothing was written yet.
   "bound",
   "crash",
   "lost_lock",
   "no_evidence",
+  // unknown (M102 spec 16): the bridge stopped (a crash, a kill) after the request's first key and before
+  // its end. Text may be in the box and Enter may not have been pressed; the same id is never typed again.
+  // A request the bridge stopped before any key keeps `crash`.
+  "interrupted",
   // unknown: a send queued behind a running turn met a dialog as its Enter went out; the dialog may
   // have taken the Enter, so the person checks the card before answering it
   "dialog_after_enter",
@@ -71,6 +81,19 @@ export const SEND_REASONS = [
   // refused (M69): a steer from a caller that is not a person's send from the phone (walky talky, a
   // hook, the CLI): an agent's text never steers a turn
   "steer_not_allowed",
+  // refused (agent views): a text whose line starts with an agent view's head, `[view:<id> <address>]
+  // from operator:` or the old `[morph `, on any door but the view's own send (one head, one door)
+  "bad_head",
+  // refused (agent views): a send from a view whose screen, switch or trick moved before the first key,
+  // read under the pane lock; nothing was typed, and nothing retries it
+  "stale_view",
+  // refused (M102 spec 05): a sign-in code went into the agent's field and was submitted, and the
+  // agent's own error row says it did not take it (the profile's `idle.signInErrors`). The one refusal
+  // after the submit key: the agent refused it, not Collie, and the detail is the agent's words.
+  "code_rejected",
+  // refused (2026-11-17): a sign-in code (`secret`) where S0 reads no sign-in field the reader knows (the
+  // field closed, or the pane has no profile). Before any key: the code never reaches the agent's box.
+  "no_secret_field",
 ] as const;
 export type SendReason = (typeof SEND_REASONS)[number];
 
@@ -116,6 +139,12 @@ export interface SendRequestBody {
   readonly id: string;
   readonly pane: string;
   readonly text: string;
+  /**
+   * A send from an agent view (lib/agent-view/wire.ts `ViewSendField`): `{ trick, session }` with typed
+   * text, `{ trick, session, rev, control }` for a tap. The bridge builds the line itself; a tap's `text`
+   * is never read. Only `POST /api/send` on the lead takes it.
+   */
+  readonly view?: { readonly trick: string; readonly session: string; readonly rev?: number; readonly control?: string } | undefined;
   readonly mode?: SendMode;
   /** The hash of the rows the person saw, from a `prepare` or an `unconfirmed` answer. */
   readonly rowsHash?: string | undefined;
@@ -135,6 +164,16 @@ export interface SendRequestBody {
    * turn a steer goes as a plain send and its receipt says `sent`.
    */
   readonly when?: SendWhen | undefined;
+  /**
+   * The text goes into a sign-in field (the Surface's `field: "secret"`): the bridge keeps no line of it
+   * and sends it on screen only. Absent on every other send.
+   */
+  readonly secret?: true | undefined;
+  /**
+   * The person's commit tap on a screen Collie could not read (M102 spec 01): the receipt then says
+   * `word: "override"`. Only with `rowsHash`; the bridge refuses it with any other shape.
+   */
+  readonly override?: true | undefined;
 }
 
 /**
@@ -231,6 +270,37 @@ export interface SendReceipt {
    */
   readonly late?: SendLate;
   /**
+   * The person's word on this send (see {@link SEND_WORDS}): `override` when the commit of a manual
+   * Send typed past a screen Collie could not read, `arrived` when the person marked an `unknown`
+   * send as arrived. The outcome stays what Collie saw. Written only by a request that carries the
+   * person's tap; absent on every other receipt.
+   */
+  readonly word?: SendWord;
+  /**
+   * Set on an `unknown` whose text went out with its submit key, on a harness whose profile names a
+   * prompt event (`edges.events` maps one to `prompt`): until this time, epoch ms, the agent's own
+   * prompt event with the same text hash settles the receipt as `effective` (M102 spec 13). The window
+   * is the open receipt's own (`receiptWindowMs` in edges.ts: 30 s, or 10 minutes for a send queued
+   * behind a turn). Dropped when the event settles it; past the time, the receipt stays `unknown`.
+   */
+  readonly awaitingEventUntil?: number;
+  /**
+   * Set on a `typed_not_submitted(override)` that typed into a box holding a draft (M102 spec 12): the
+   * person's text went after text Collie may not have read, so the phone can say so. Absent otherwise.
+   */
+  readonly draftSeen?: true;
+  /**
+   * Set on a blind-road `menu_open` (M102 spec 12): which sign the generic menu sign read and on which
+   * screen row. Never the row's text.
+   */
+  readonly menuSign?: MenuSign;
+  /**
+   * Set on a `typed_not_submitted(override)` that found the text in the box already, left there by an
+   * earlier send of it (a Submit refused for a popup, then Send anyway): nothing was typed a second
+   * time. The person presses Enter on the key pad. Absent otherwise.
+   */
+  readonly textAlreadyTyped?: true;
+  /**
    * Set on a send a program session took (M56 spec 14): the request id the program acknowledged.
    * The driver passes the request id to the program unchanged, so it equals `requestId`. Absent on
    * every send into a screen.
@@ -259,6 +329,15 @@ export const SEND_LATES = ["returned"] as const;
  */
 export const RETURNED_CARD_DROPPED = "The box no longer holds this message. Collie removed its card and pressed nothing.";
 export type SendLate = (typeof SEND_LATES)[number];
+
+/**
+ * The person's word, beside what Collie saw (M102 spec 01). `override`: the person tapped through a
+ * stop on a screen Collie could not read (the manual Send's commit). `arrived`: the person said an
+ * `unknown` send arrived. The outcome never changes because of it, and a report and the tally never
+ * read it as proof.
+ */
+export const SEND_WORDS = ["override", "arrived"] as const;
+export type SendWord = (typeof SEND_WORDS)[number];
 
 /** The longest {@link SendReceipt.detail} a receipt keeps. */
 export const RECEIPT_DETAIL_MAX = 240;
@@ -329,6 +408,16 @@ export interface SendReceiptRow {
   readonly queued?: true;
   /** Set when a queued send came back to the box and never became a prompt (see {@link SendReceipt.late}). */
   readonly late?: SendLate;
+  /** The person's word on the send, beside the outcome (see {@link SendReceipt.word}). */
+  readonly word?: SendWord;
+  /** Until when the agent's prompt event may still settle an `unknown` (see {@link SendReceipt.awaitingEventUntil}). */
+  readonly awaitingEventUntil?: number;
+  /** The override typed after a draft (see {@link SendReceipt.draftSeen}). */
+  readonly draftSeen?: true;
+  /** The sign a blind-road `menu_open` read (see {@link SendReceipt.menuSign}). */
+  readonly menuSign?: MenuSign;
+  /** The override found its text in the box already (see {@link SendReceipt.textAlreadyTyped}). */
+  readonly textAlreadyTyped?: true;
   /** The line of a refusal or a `typed_not_submitted` (see {@link SendReceipt.detail}). */
   readonly detail?: string;
   /** What the bridge saw at that end, four words (see {@link SendReceipt.saw}). */
@@ -377,7 +466,24 @@ export interface HeldRow {
    * profile would take a message in a turn, but not on a version it cannot name. `collie doctor` says why.
    */
   readonly versionUnread?: true;
+  /**
+   * Set when the request is the one typed line of a WalkyTalky message: the message's id (`wt_` and 12
+   * characters). The message has its own places on the phone (the held mark above the box and the
+   * pane's Messages sheet), so the held list does not draw this row, and never gives its text back to
+   * the box as the person's words. Absent on a person's own send and on a row a bridge before this
+   * field held.
+   */
+  readonly walky?: string;
+  /**
+   * Set on a row still `held` two minutes or more after it was held (M102 spec 12, decision 6): it still
+   * waits for a free read, and the phone shows the live screen, "Send it now" and Cancel beside it.
+   * Absent on every other row and from a bridge before this field.
+   */
+  readonly heldLong?: true;
 }
+
+/** How long a request is held before its row says {@link HeldRow.heldLong}. */
+export const HELD_LONG_MS = 120_000;
 
 /** What `DELETE /api/send/<id>` answers (M56 spec 15): a held request cancelled, or an ended row dismissed. */
 export interface HeldCancelAnswer {
@@ -417,6 +523,14 @@ export interface SendAnswer {
   /** Which rule decided the answer, when the reason alone does not say it. Optional: an older phone
    *  reads the reason and its own sentence for it. */
   readonly cause?: SendCause;
+  /**
+   * The rows {@link rowsHash} covers, as plain text, on a refused override (M102 spec 12: `menu_open`,
+   * `stale_surface`): the screen now, so the next tap binds to what the person sees. Only on the live
+   * answer; a receipt never keeps a row, so a replay has none.
+   */
+  readonly rows?: readonly string[];
+  /** The sign a blind-road `menu_open` read (see {@link SendReceipt.menuSign}). */
+  readonly menuSign?: MenuSign;
 }
 
 /**
@@ -435,6 +549,13 @@ export const SEND_CAUSES = ["notice_key", "stale_screen", "short_pane", "late_ke
 export type SendCause = (typeof SEND_CAUSES)[number];
 
 /**
+ * The bridge's line for a `busy` refusal of a send while another send on the pane runs. The phone reads
+ * it as "wait for the other send": its Send again waits until the screen moves on (M102 spec 02). A
+ * full hold queue is `busy` too, with its own line, and that one is shown under the sentence.
+ */
+export const ANOTHER_SEND = "Another send on this pane is still running.";
+
+/**
  * The bridge's line for a `stale_screen` refusal (2026-10-25). The phone says it in its own words; a
  * line that adds to it (a probe character that may remain in the box) gets its own sentence too.
  */
@@ -445,6 +566,8 @@ export const STALE_SCREEN = "The screen shows an input box that does not take ke
  * A command onto a draft (`command`) is offered Replace and Cancel only: Add would send the draft with the command at its end.
  */
 export function offersFor(outcome: SendOutcome, reason: SendReason | undefined, framed: boolean, command = false): SendOffer[] {
+  // An override typed on a screen Collie could not read (M102 spec 12): Collie presses no key there, Enter included.
+  if (outcome === "typed_not_submitted" && reason === "override") return ["keys"];
   if (outcome === "refused" && reason === "draft_present") return framed ? (command ? ["replace", "cancel"] : ["append", "replace", "cancel"]) : ["keys"];
   if (outcome === "refused" && reason === "unconfirmed") return ["commit", "keys"];
   // Every reason: the person reads the screen and decides; with no frame the bridge binds both to the rows hash.
@@ -455,6 +578,9 @@ export function offersFor(outcome: SendOutcome, reason: SendReason | undefined, 
 
 /** A request id the bridge accepts: letters, digits, `-` and `_`, 8 to 64 of them. It names a file. */
 export const REQUEST_ID = /^[A-Za-z0-9_-]{8,64}$/;
+
+/** A WalkyTalky message id as {@link HeldRow.walky} carries it: `wt_` and 12 characters of [a-z0-9] (bridge/walky/types.ts `WALKY_ID` is the same shape). */
+export const WALKY_MESSAGE_ID = /^wt_[a-z0-9]{12}$/u;
 
 /** The paste-end sequence a pasted chunk must never carry. */
 const PASTE_END = "\u001b[201~";

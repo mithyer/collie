@@ -99,7 +99,7 @@ The config file groups every setting under a `[section]`. The environment name o
 | `push` | the three Web Push (VAPID) values |
 | `uploads` | the attachment size cap and the extra text types accepted |
 | `journal` | where each harness keeps its own session log |
-| `crew` | the budgets a lead gives a member, and a peer's own browser |
+| `crew` | the budgets a lead gives a member, a peer's own browser, and whether the lead's tricks may read a member's files (`crew_trick_reads`) |
 | `standby` | the deputy's second door: port, bind address, arming |
 | `update` | where releases come from, how many versions stay, a GitHub token for the release check |
 | `serve` | whether Collie publishes the front door, on what, and under which path (`base_path`) |
@@ -310,12 +310,15 @@ turn starts or ends. A tap on the dimmed button does nothing and sends nothing. 
 stop key has no button. Stop does not type anything and does not send a message. It presses the
 agent's own stop key, once, and tells you what happened.
 
-A Stop needs two taps. The first tap arms the button: the word changes to **Stop?** and the button
-keeps its size. Tap it again within four seconds to stop the turn. A second tap that lands at once,
-within 0.4 seconds, counts as the same touch and is ignored. If you wait, the arm lapses and nothing
-is pressed. The arm also lapses when you open another pane, and the button goes dim when the turn
-ends. While the second tap is in flight the button takes no more taps, so a quick third tap cannot
-press a second Stop.
+To stop a turn, hold the button for two seconds. While you hold, the button fills from one edge to
+the other, and the turn stops when the fill is complete. If you lift your finger earlier, nothing is
+pressed, and the button says **Hold** for a moment. A sideways scroll of the belt also ends the hold.
+The button keeps its size all the time. The hold ends when you open another pane, and the button goes
+dim when the turn ends. While the Stop is in flight the button takes no more presses, so a second hold
+cannot press a second Stop.
+
+With a keyboard or a screen reader, Stop takes two presses, because neither can hold. The first press
+changes the word to **Stop?**. Press again within four seconds to stop the turn.
 
 Which key stops a turn is the harness's own choice, and the harness profile holds it. Most agents
 stop on Escape, some on Ctrl+C, and some need Escape twice. The profile decides, not this page.
@@ -566,6 +569,8 @@ them. An agent that is not on the machine's login `PATH` stays in the list, disa
 installed". For another terminal agent, declare a row for it as above: it shows in the **Command**
 select under **Shell**, starts in a pane like any command, and Collie shows no status for it.
 
+MiniMax Code (`mcode`) is in the list as an experiment: it works where the multiplexer names an `mcode` pane, today the Herdr core.
+
 To verify, reload the dashboard and look under the herd. If a row fails to load,
 `journalctl --user -u collie -n 20` prints the error.
 
@@ -649,6 +654,166 @@ every add, rename and removal.
 > **Caution.** A row that skips permission prompts carries a "No prompts" badge. Each device asks
 > once before it first starts that row, and shows the command, the folder and the machine. Set
 > `adds = false` on the lead to turn off every phone-added row.
+
+### Profiles
+
+Keep a second login of one agent beside the first, and pick it when you start a session. Open
+**Settings**, then **Profiles**. With no profile added, nothing else changes.
+
+A profile is a named folder that holds one login at a time. Each agent has a **Default** profile: its
+normal folder, started with nothing set. Add a profile in one of two kinds:
+
+- **Shared** (Claude Code only): Collie makes a new folder, `~/.claude-<name>`, and links the default
+  folder's setup and history into it. Your sessions, `/resume`, skills, commands, plugins, hooks,
+  `settings.json`, `CLAUDE.md` and the prompt history stay one set. Only the login and the agent's
+  per-profile state are the profile's own.
+  The shared profile also reads the Default folder's `settings.json`. A key helper, an environment block
+  or a forced organisation in that file applies to the shared profile too. Use an own folder when the
+  two logins must not share settings or history.
+- **Own**: a folder you already use, taken as it is. Collie writes nothing into it. A folder that does
+  not exist yet is made empty.
+
+| Agent | What picks the folder | Kinds |
+| --- | --- | --- |
+| Claude Code | `CLAUDE_CONFIG_DIR` | Shared, Own |
+| Codex | `CODEX_HOME` | Own |
+| pi | `PI_CODING_AGENT_DIR` | Own |
+| Grok | `GROK_HOME` | Own |
+
+To sign in, start a session with the new profile. The agent shows its own sign-in in the pane:
+Claude Code asks for a theme and then the login method, Codex offers a browser sign-in or a device
+code, pi says to run `/login`, and Grok shows a code to approve in a browser. The first start of a new
+Claude Code profile asks for a text style before the sign-in. Open Keys and press Enter to keep the one
+it suggests. Some sign-ins need a browser on that machine. Claude Code and Grok also try to open that
+page in a browser on the machine that runs the bridge.
+
+A Claude Code profile shows who is signed in: the email under the profile's name in the list, and on
+its page the full address with the plan, for example "Max". The bridge asks Claude Code itself, with
+`claude auth status` run with the profile's folder, and reads only the sign-in flag, the email and the
+plan from its answer. It opens no login file for this. It asks only where Claude Code has run before,
+that is where its state file `.claude.json` exists. Any other profile reads "Not signed in" without
+asking, so the command creates no files in a profile Claude Code has never started in. The answer is
+kept in memory and shown on the phone only, and it is not written to disk or to the audit log. An
+answer older than a minute is shown at once and checked again in the background. **Sign in again** on a profile that is signed in starts
+`claude /login`, which opens the login menu. Codex, pi and Grok do not say which login they hold, so
+their profiles show no email.
+
+A sign-in session started from the Profiles page does not start in your home folder. It starts in an
+empty folder of Collie's own, `sign-in` in the instance's state folder (`~/.local/state/collie/sign-in`
+unless `COLLIE_STATE_DIR` moves it). The agent may still ask whether you trust that folder. Either
+answer is fine for a sign-in.
+
+The New page lets you pick the profile for an agent and for a row you built from its options. A row
+you wrote by hand starts as you wrote it. A Claude Code session started from a desktop terminal with
+the profile's line (shown on the profile's page) gets the profile's tag too, once its hooks report
+the folder.
+
+A shared Claude Code profile keeps three things per profile, because Claude Code keeps them in the
+profile's own `.claude.json`: project trust, MCP servers added with `claude mcp add`, and the theme.
+A link Collie could not make, because the profile folder already holds that name, is listed on the
+profile's page. Collie never replaces it.
+
+The history of an own folder is found with no restart and no `.env` line. An own Claude Code folder
+may have no Collie hooks yet; its page says so and shows the line that installs them.
+
+**Remove** forgets the profile's name only. The folder, its links and its login stay.
+
+#### Change the login of a profile
+
+When one login has run out of usage and another has some left, you can move a profile to the other
+login without a new session. Open the profile's page and tap **Change login**. In a session, tap the
+session's name and then **Change login**: it opens the same page for the profile that session runs
+under. The page shows who is signed in now and, for Claude Code, how many sessions of the profile run.
+
+**Change login** starts the agent's own sign-in for the profile's folder, in the same way as **Sign in
+again**. The phone shows the agent's sign-in screens as cards. Pick the login method, tap **Open
+sign-in page** to sign in with the other login in your browser, and paste the code into the
+**Sign-in code** field. The button opens only the agent's own sign-in address; any other address is
+shown as text to copy. Then go back to the Change login page and tap **Finish**. Collie closes the
+sign-in session, asks the agent who is signed in, and shows the result. When the list already shows a
+new email, the page finishes by itself.
+
+- **Claude Code**: running sessions of the profile continue on the new login from their next message.
+  Claude Code itself loads a changed login before each request, so no session needs a restart and each
+  keeps its conversation.
+- **Codex, pi and Grok**: the new login is used by sessions you start after the change. Start a new
+  session to use it.
+
+The old login stays until the new sign-in succeeds. If you cancel, enter a wrong code or leave the
+sign-in, the profile stays signed in as before, and the result says "Still signed in as" with the
+same email. The sign-in address and the code are not stored, logged or sent anywhere else. The
+agent writes the new login into the profile's folder; Collie does not open that file.
+
+On a crew member's session there is no **Change login** row, because profiles are per machine. Change
+the login on the member's own Collie.
+
+> **Note.** Profiles are per machine. A crew member's profiles are its own, and the New page reads
+> the profiles of the machine you start on. Windows offers no profiles yet.
+>
+> On tmux and zellij, the first start of a new Claude Code profile shows the terminal view, not the
+> sign-in card, until the agent has signed in. Type the code with the keys there. The phone treats that
+> text as an ordinary message.
+
+### Use several accounts of one agent
+
+Two Claude subscriptions, a work and a personal Codex, a second set of pi providers: give each
+account its own launcher row. Each row starts the agent with a different folder for its login and
+settings. Collie does not switch accounts. The agent keeps the login in the folder you name.
+
+```toml
+[[launchers]]
+command = "CLAUDE_CONFIG_DIR=~/.claude-work claude"
+label = "Claude Code, work"
+harness = "claude"
+
+[[launchers]]
+command = "CODEX_HOME=~/.codex-work codex"
+label = "Codex, work"
+harness = "codex"
+
+[[launchers]]
+command = "PI_CODING_AGENT_DIR=~/.pi-work pi"
+label = "pi, work"
+harness = "pi"
+
+[[launchers]]
+command = "omp --profile work"
+label = "omp, work"
+harness = "omp"
+```
+
+Collie types the `command` into a fresh shell, so a leading `VAR=value` sets the variable for that
+one program, as it does in bash, zsh and fish. The `harness` key lists the row under **Agent** with
+that agent's mark. Your plain **Claude Code** entry keeps the default account, so a personal login
+needs no row.
+
+| Agent | What separates the accounts | Sign in, once per folder |
+| --- | --- | --- |
+| Claude Code | `CLAUDE_CONFIG_DIR=<folder>`, the way Anthropic documents several accounts | `/login` in the pane |
+| Codex | `CODEX_HOME=<folder>` | `codex login` in a shell with `CODEX_HOME` set |
+| pi | `PI_CODING_AGENT_DIR=<folder>`, which moves settings, sessions and login | `/login` in the pane |
+| omp | `--profile <name>`, or `OMP_PROFILE=<name>` | `/login` in the pane, or `omp login` |
+
+To sign in, start the row once and run the sign-in in its pane. Each folder asks one time. After
+that, the row starts signed in. The sign-in is the agent's own flow, and some need a browser on that
+machine.
+
+A running session keeps its account. To use the other account, start a new session from the other
+row.
+
+Three more things need to know the folder, because the bridge reads its own environment and not a pane's:
+
+- **Chat history.** Collie finds a session's log under the default folder. For another folder, add
+  its logs to the bridge's `.env`, with absolute paths, then restart that Collie instance. For
+  Claude Code the setting is `COLLIE_TRANSCRIPT_ROOT=/home/you/.claude/projects,/home/you/.claude-work/projects`.
+  Codex takes `COLLIE_CODEX_ROOT` (`/home/you/.codex-work/sessions`). pi and omp take `COLLIE_PI_ROOT`
+  with the `sessions` folder of each home. Each setting replaces the default list, so name the
+  default folder too.
+- **Claude Code hooks.** Run `CLAUDE_CONFIG_DIR=/home/you/.claude-work collie hooks install claude`
+  once per folder ([Terminals](multiplexers.md#collie-writes-hooks-into-claudes-own-settings)).
+- **The 5-hour and 7-day windows** of a Claude Code pane read that pane's own login, once the hooks
+  in its folder report the folder. Collie only reads the file, and it sends the login nowhere but
+  Anthropic ([Usage windows](#usage-windows)).
 
 ### Reaching a durable agent (experimental)
 
@@ -741,7 +906,7 @@ weight = "400 700"           # optional
 ```
 
 Custom fonts append to the built-in list rather than replacing it
-([ADR 0033](../.adr/0033-the-app-face-is-a-device-preference.md)), unlike the behavior in
+([ADR 0148](../.adr/0148-a-theme-names-words-never-drawings-and-the-device-choice-wins.md)), unlike the behavior in
 `commands.toml` and the other configuration files. Because fonts do not trigger actions, there is
 nothing to shadow.
 
@@ -999,7 +1164,7 @@ GitHub token. What the report holds, and how to read it before you send it, is i
 
 ## Multi-session
 
-By default, one Collie instance serves every Herdr session it finds.
+By default, one Collie instance serves every Herdr session it finds. The phone calls each one a space.
 
 `COLLIE_MULTI_SESSION=on` (the default) discovers and serves every named Herdr session under your
 config root, switchable from the header. Setting `COLLIE_MULTI_SESSION=off` serves only the primary
@@ -1018,7 +1183,7 @@ The phone calls a terminal grouping a space. Herdr calls the same thing a sessio
 names one by the folder its socket lives in, so `<config root>/sessions/project-yt/` shows as
 `project-yt`. In Collie's own words a session is one agent conversation, which is why the file is
 called `spaces.toml`. A label replaces the registry name in the space
-switcher, on its trigger, on the space tag of a row in **All sessions**, and on a durable agent's
+switcher, on its trigger, on the space tag of a row in **All spaces**, and on a durable agent's
 row. The switcher keeps the registry name under the label.
 
 ```toml
@@ -1062,7 +1227,7 @@ logged. A folder that is not on disk at launch time falls back to home.
 
 ## Usage windows
 
-The dots beside the model show your 5-hour and 7-day limits for Claude and Codex, with no setup.
+The figures beside the model show the limits the agent reports for Claude and Codex, usually the 5-hour and 7-day ones, with no setup. A plan that reports one limit shows one. A weekly limit for one model shows as `7d` and the model name (`7d Opus 30%`), and a row with more than three limits shows the first three and a count (`+1`). They read as a percentage of what is used (`7d 83%`) unless you choose dots in Settings, Appearance, Usage row.
 
 ```bash
 # turn every source off
@@ -1100,7 +1265,7 @@ Each source reads a different thing.
 
 `collie doctor` shows every source in its `account-windows` row: on or off, the file it reads and the host it asks. [Terminals](multiplexers.md#collie-writes-hooks-into-claudes-own-settings) has the statusLine road.
 
-The context dot needs no setting. For pi, OMP, Codex and OpenCode, Collie reads the tokens of the last turn from the session log. It reads the model's window from Codex's log, or from the harness's own model list on disk (pi's `models-store.json`, OMP's `models.db`, OpenCode's `~/.cache/opencode/models.json`). A model that list does not name gets no context dot; the model name still shows. The tag also shows the session's cost in dollars after the dots when the harness reports one: Claude Code through the wrapped status line, pi, OMP and OpenCode from their logs. Codex has none, so its tag shows no cost.
+The context figure needs no setting. For pi, OMP, Codex and OpenCode, Collie reads the tokens of the last turn from the session log. It reads the model's window from Codex's log, or from the harness's own model list on disk (pi's `models-store.json`, OMP's `models.db`, OpenCode's `~/.cache/opencode/models.json`). A model that list does not name shows the token count (`ctx 222k`) and no percentage, and the Dots view draws nothing for it; the model name still shows. The tag also shows the session's cost in dollars after the figures when the harness reports one: Claude Code through the wrapped status line, pi, OMP and OpenCode from their logs. Codex has none, so its tag shows no cost.
 
 ## Dark mode / light mode
 
@@ -1197,14 +1362,46 @@ The terminal mirror continues polling in Zen mode, and interactive buffer elemen
 functional. Prompt buttons, "Load older", and "Show entire history" controls stay available because
 they are part of the content stream rather than chrome.
 
+## Enter sends
+
+> **Note.** Enter stays a new line until you turn **Enter sends** on. Nothing changes by itself.
+
+To make Enter send the message, open **Settings → Appearance → Enter sends** and turn it on. The
+choice is stored per device and never leaves it.
+
+With the switch on, a physical keyboard's Enter sends the message and **Shift+Enter** adds a new
+line. The on-screen keyboard's Enter always adds a new line, so a tap on a phone never sends by
+mistake. Use the Send button there. **Ctrl+Enter** and **Cmd+Enter** send with the switch on or
+off, and they always did.
+
+The reply box of a durable agent follows the same switch. The full-screen editor, which opens from
+**Expand** for long text, keeps Ctrl+Enter and Cmd+Enter only, so Enter there is always a new line.
+
+Collie reads each Enter press to tell the two keyboards apart. A press counts as a physical
+keyboard's only when it names the Enter or numpad Enter key, no input method is composing text, the
+key is not held down, and the on-screen keyboard is not up. Any doubt leaves the new line.
+
+The first time Collie sees an Enter press from a real keyboard and you have not chosen, that Enter
+still adds its new line, and one line above the reply box says "Using a keyboard? Enter can send."
+**Turn on** switches it on. The close button switches it off. Either way the line does not come back
+on this device, and **Enter sends** in Settings still changes the choice.
+
 ## Large screens
 
-> **Note.** On a tablet or an open Fold the pane screen shows several panes side by side. A phone held upright and flat is not changed.
+> **Note.** On a tablet or an open Fold the pane screen shows several panes side by side, and from 900 pixels wide the dashboard shows its Spaces in columns. A phone held upright and flat is not changed.
 
 The layout turns on for the pane screen when the screen is at least 600 CSS pixels wide and at least
 480 pixels tall. A phone held sideways is under 480 pixels tall, so it keeps the phone layout.
 To switch it off, open **Settings → Appearance → Large-screen layout** and pick **Off**. **Auto**,
 the default, turns it on where the screen is big enough. The choice is stored per device.
+
+The dashboard follows the same switch, from 900 pixels wide. The Spaces stand side by side in
+columns 384 pixels wide, as many as fit (two at 900 pixels, three at 1280, four at 1920, six at most),
+and the tab bar at the foot is as wide as the columns. A band at the top repeats every session that
+needs you or finished unseen, as a card with its question. A session in the band also keeps its row
+in its Space, so nothing moves out of place. The band closes when nothing waits, and the
+**needs you** switch hides it, because the columns then show only those sessions. Narrower than 900
+pixels, and with **Off**, the dashboard is the one narrow list.
 
 The layout has three parts.
 
@@ -1345,15 +1542,24 @@ session has no Chat or History. Set `kiro_root` when Kiro keeps its sessions som
 dsh-tui needs no Herdr integration for Chat. It reports its state to Herdr itself, but Herdr does
 not pass its session on, so Collie asks the kernel which session lock (`session.lock`, held with
 `flock`) the pane's foreground dsh process holds, and reads that session's log under
-`$DSH_HOME/sessions`, or `~/.dsh/sessions`, compressed or plain. This works on Linux only, where
-`/proc/locks` lists every lock and who holds it; elsewhere a dsh-tui pane keeps its terminal view.
-Set `dsh_root` when dsh keeps its sessions somewhere else.
+`$DSH_HOME/sessions`, or `~/.dsh/sessions`, compressed or plain. This works on Linux, where
+`/proc/locks` lists every lock and who holds it, and on macOS, where Collie asks `lsof` which files
+the process holds open, and those of the processes in its group. On Windows, or on a Mac without
+`lsof`, a dsh-tui pane keeps its terminal view. Set `dsh_root` when dsh keeps its sessions somewhere
+else.
+
+Grok needs no Herdr integration for Chat either. Collie reads the list of live sessions Grok keeps
+(`active_sessions.json`, in `$GROK_HOME` or `~/.grok`) and takes the one its process holds. When the
+list does not name the process, Collie asks `lsof` which `chat_history.jsonl` the process holds open.
+That works on Linux and macOS, not on Windows. When two Grok panes sit in one folder, a pane that
+the list does not name yet keeps its terminal view rather than show the other pane's chat.
 
 Antigravity CLI (`agy`, which Herdr may also call `antigravity`) needs no Herdr integration for Chat
-either. Collie asks `lsof` which `presence/<uuid>.lock` file the pane's foreground agy process holds,
-and reads that conversation from `conversations/<uuid>.db` under `~/.gemini/antigravity-cli`,
+either. Collie asks which `presence/<uuid>.lock` file the pane's foreground agy process holds, and
+reads that conversation from `conversations/<uuid>.db` under `~/.gemini/antigravity-cli`,
 read-only, or from its `transcript.jsonl` when the database is empty. It never guesses the newest
-conversation in a folder. This needs `lsof` on the machine, so it works on Linux and macOS, not on
+conversation in a folder. On Linux, Collie reads `/proc/locks` without needing `lsof` or extra privileges;
+on macOS, it asks `lsof` which files the process holds open. This works on Linux and macOS, not on
 Windows; without it an agy pane keeps its terminal view. Set `agy_root`, or `COLLIE_AGY_ROOT`, when
 Antigravity keeps its home somewhere else.
 

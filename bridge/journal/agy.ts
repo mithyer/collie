@@ -3,11 +3,10 @@
 // Reads per-conversation SQLite trajectories (`<root>/conversations/<uuid>.db`, CortexStep protobuf
 // payloads) first, and falls back to plaintext `<root>/brain/<uuid>/.system_generated/logs/transcript.jsonl`
 // when no populated `.db` exists (excluding `.pb` fixed-key decryption). Session discovery binds to
-// the running process's held `<root>/presence/<uuid>.lock` via `lsof`, never guessing from the newest
-// conversation in a shared folder.
-import { execFile } from "node:child_process";
+// the running process's held `<root>/presence/<uuid>.lock` (via Linux `/proc/locks` or `lsof` on macOS),
+// never guessing from the newest conversation in a shared folder.
+import { readdir, stat } from "node:fs/promises";
 import { join } from "node:path";
-import { promisify } from "node:util";
 
 import type { JsonValue } from "../json.ts";
 import { decodeCursor, encodeCursor, NO_CURSOR, type Cursor, type ReadSince } from "./cursor.ts";
@@ -29,6 +28,8 @@ import {
   type Reduction,
   type RowReducer,
 } from "./reduce.ts";
+import { pidOpenFiles as defaultOpenFiles, pathsOf, type OpenFiles } from "./open-files.ts";
+import { heldCandidates, LINUX_PROC, type ProcReader } from "./proc-locks.ts";
 import { readSqlite } from "./sqlite-read.ts";
 import { clamp, MAX_RESULT_CHARS, MAX_TEXT_CHARS, stripAnsi, summarizeToolInput } from "./text.ts";
 import { classifyToolCall } from "./tool-call.ts";
@@ -43,7 +44,6 @@ import type {
 
 const SESSION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const MAX_STEP_BYTES = 4 * 1024 * 1024;
-const exec = promisify(execFile);
 
 // Historical and current CortexStep tool step_types that share `meta.4` (`call.1=id, call.2=name, call.3=args`).
 const TOOL_STEP_TYPES = new Set([5, 7, 8, 9, 17, 21, 33, 132]);
@@ -164,15 +164,21 @@ function stepEntry(idx: number, type: number, payload: Uint8Array): TranscriptEn
       /* Keep a malformed input as the native string. */
     }
     const summary = summarizeToolInput(args);
+    const classified = classifyToolCall(name, args, summary);
     const tool: Extract<TranscriptPart, { kind: "tool" }> = {
       kind: "tool",
       name,
       summary,
-      call: classifyToolCall(name, args, summary),
+      call: classified,
     };
     const id = string(call, 1);
     if (id) tool.id = id;
     const output = string(proto(bytes(proto(bytes(step, 140)), 2)), 1);
+    if (classified.kind === "execute") {
+      const match = /^Command exited with code (-?\d+)\b/m.exec(output);
+      const exitCode = match ? Number(match[1]) : Number.NaN;
+      if (Number.isSafeInteger(exitCode)) classified.exitCode = exitCode;
+    }
     const error = string(proto(bytes(step, 31)), 2);
     if (error) tool.result = { ...clamp(error, MAX_RESULT_CHARS), isError: true };
     else if (output) tool.result = clamp(output, MAX_RESULT_CHARS);
@@ -211,6 +217,117 @@ const JSONL_NOTE_TYPES = new Set([
   "ERROR_MESSAGE",
   "CODE_ACTION",
 ]);
+
+const JSONL_STRING_KEYS = new Set([
+  "file_path",
+  "notebook_path",
+  "path",
+  "filePath",
+  "Path",
+  "TargetFile",
+  "AbsolutePath",
+  "DirectoryPath",
+  "SearchPath",
+  "command",
+  "cmd",
+  "script",
+  "CommandLine",
+  "description",
+  "label",
+  "toolSummary",
+  "pattern",
+  "query",
+  "q",
+  "claim",
+  "Query",
+  "glob",
+  "include",
+  "url",
+  "task",
+  "Role",
+  "subagent_type",
+  "agent",
+  "agent_type",
+  "TypeName",
+  "model",
+  "Model",
+  "prompt",
+  "Prompt",
+  "question",
+  "header",
+]);
+
+function decodeTruncatedJsonString(raw: string): string {
+  let out = "";
+  for (let i = 1; i < raw.length; i++) {
+    const ch = raw[i]!;
+    if (ch !== "\\") {
+      out += ch;
+      continue;
+    }
+    const next = raw[++i];
+    if (next === undefined) break;
+    if (next === '"' || next === "\\" || next === "/") out += next;
+    else if (next === "n") out += "\n";
+    else if (next === "r") out += "\r";
+    else if (next === "t") out += "\t";
+    else if (next === "b") out += "\b";
+    else if (next === "f") out += "\f";
+    else if (next === "u") {
+      const hex = raw.slice(i + 1, i + 5);
+      if (/^[0-9a-fA-F]{4}$/.test(hex)) {
+        out += String.fromCharCode(Number.parseInt(hex, 16));
+        i += 4;
+      } else {
+        out += "\\u";
+      }
+    } else {
+      out += next;
+    }
+  }
+  return out;
+}
+
+// In compact `transcript.jsonl`, AGY serializes each value in `tool_calls[].args` as a JSON string
+// (`"\"/a.ts\""`, `"1"`, or a truncated `"\"hello\n<truncated 40 bytes>"`). Unwrap those values so
+// `summarizeToolInput` and `classifyToolCall` see native strings, numbers and arrays, while leaving
+// already-decoded `transcript_full.jsonl` objects untouched.
+function unwrapJsonlArgs(args: JsonValue | undefined): JsonValue | undefined {
+  if (args === null || args === undefined || typeof args !== "object" || Array.isArray(args)) return args;
+  const entries = Object.entries(args);
+  if (entries.length === 0) return args;
+  const out: Record<string, JsonValue | undefined> = {};
+  let sawQuotedOrContainer = false;
+  for (const [k, v] of entries) {
+    if (typeof v !== "string") return args;
+    if (v.startsWith('"') || v.startsWith("[") || v.startsWith("{")) {
+      try {
+        // SAFETY: JSON.parse returns a valid JsonValue by construction.
+        out[k] = JSON.parse(v) as JsonValue;
+        sawQuotedOrContainer = true;
+        continue;
+      } catch {
+        if (v.startsWith('"') && /<truncated \d+ bytes>$/.test(v)) {
+          out[k] = decodeTruncatedJsonString(v);
+          sawQuotedOrContainer = true;
+          continue;
+        }
+        return args;
+      }
+    }
+    if (!JSONL_STRING_KEYS.has(k) && /^(?:-?\d+(?:\.\d+)?|true|false|null)$/.test(v)) {
+      try {
+        // SAFETY: JSON.parse returns a valid JsonValue by construction.
+        out[k] = JSON.parse(v) as JsonValue;
+        continue;
+      } catch {
+        return args;
+      }
+    }
+    return args;
+  }
+  return sawQuotedOrContainer ? out : args;
+}
 
 export function createAgyReducer(): RowReducer {
   const unknown = createUnknownCounter({ rows: KNOWN_STEP_ROWS, roles: [], parts: [] });
@@ -256,6 +373,11 @@ export function createAgyReducer(): RowReducer {
               : undefined;
       if (role === undefined) return NO_CHANGE;
       const parts: TranscriptPart[] = [];
+      if (role === "assistant" && typeof row.thinking === "string" && row.thinking.trim() !== "") {
+        const clipped = clamp(stripAnsi(row.thinking), MAX_TEXT_CHARS);
+        if (Array.isArray(row.truncated_fields) && row.truncated_fields.includes("thinking")) clipped.truncated = true;
+        parts.push({ kind: "thinking", ...clipped });
+      }
       if (typeof row.content === "string" && row.content.trim() !== "") {
         const content = role === "user" ? userRequest(row.content) : row.content;
         const clipped = clamp(stripAnsi(content), MAX_TEXT_CHARS);
@@ -267,8 +389,9 @@ export function createAgyReducer(): RowReducer {
           if (tool === null || typeof tool !== "object" || Array.isArray(tool) || typeof tool.name !== "string") {
             continue;
           }
-          const summary = summarizeToolInput(tool.args);
-          parts.push({ kind: "tool", name: tool.name, summary, call: classifyToolCall(tool.name, tool.args, summary) });
+          const args = unwrapJsonlArgs(tool.args);
+          const summary = summarizeToolInput(args);
+          parts.push({ kind: "tool", name: tool.name, summary, call: classifyToolCall(tool.name, args, summary) });
         }
       }
       if (parts.length === 0) return NO_CHANGE;
@@ -436,50 +559,76 @@ export class AgyTranscriptSource implements TranscriptSource {
   }
 }
 
-type OpenFiles = (pid: number) => Promise<string>;
-const openFiles: OpenFiles = async (pid) =>
-  (
-    await exec("lsof", ["-nP", "-a", "-p", String(pid), "-Fn"], {
-      timeout: 1000,
-      maxBuffer: 1024 * 1024,
-      windowsHide: true,
-    })
-  ).stdout;
+export type AgyFiles = OpenFiles | ((pid: number) => Promise<string | readonly string[]>);
 
 /** Bind to the process-held presence lock, never the newest database in a shared workspace. */
-export function agyJournal(roots: string | readonly string[], files: OpenFiles = openFiles): JournalAdapter {
+export function agyJournal(
+  roots: string | readonly string[],
+  files: AgyFiles = defaultOpenFiles,
+  proc: ProcReader = LINUX_PROC,
+): JournalAdapter {
   const source = new AgyTranscriptSource(roots);
-  const cache = new Map<number, { at: number; paths: string[] }>();
 
   async function discover(_cwd: string, hints?: DiscoverHints): Promise<AgentSessionRef | null> {
-    for (const proc of hints?.processes ?? []) {
-      const name = proc.argv[0]?.split(/[/\\]/).pop()?.replace(/\.exe$/i, "");
+    for (const procHint of hints?.processes ?? []) {
+      const name = procHint.argv[0]?.split(/[/\\]/).pop()?.replace(/\.exe$/i, "");
       if (name !== "agy" && name !== "antigravity") continue;
-      const index = proc.argv.indexOf("--conversation");
+      const index = procHint.argv.indexOf("--conversation");
       const arg =
-        proc.argv.find((value) => value.startsWith("--conversation="))?.slice(15) ??
-        (index >= 0 ? proc.argv[index + 1] : undefined);
-      if (!proc.pid && arg && SESSION_ID.test(arg)) {
+        procHint.argv.find((value) => value.startsWith("--conversation="))?.slice(15) ??
+        (index >= 0 ? procHint.argv[index + 1] : undefined);
+      if (!procHint.pid && arg && SESSION_ID.test(arg)) {
         const ref = { kind: "id" as const, value: arg };
         if (await source.resolve(ref)) return ref;
       }
-      if (!proc.pid || !Number.isSafeInteger(proc.pid) || proc.pid <= 0) continue;
+      if (!procHint.pid || !Number.isSafeInteger(procHint.pid) || procHint.pid <= 0) continue;
+
+      // On Linux, read /proc/locks first: no lsof needed, and works under systemd services
+      // running with PrivateTmp=yes (where mount namespace isolation denies cross-namespace readlink on /proc/<pid>/fd).
       try {
-        let held = cache.get(proc.pid);
-        if (!held || Date.now() - held.at > 1000) {
-          held = {
-            at: Date.now(),
-            paths: (await files(proc.pid))
-              .split("\n")
-              .filter((line) => line.startsWith("n"))
-              .map((line) => line.slice(1)),
-          };
-          if (cache.size >= 64) cache.clear();
-          cache.set(proc.pid, held);
+        const locked = await proc.flocks(procHint.pid);
+        if (locked !== null && locked.size > 0) {
+          // Every root's presence locks, so the btrfs rule in heldCandidates sees all of them.
+          // A root listed twice is scanned once, or its one lock would count as two.
+          const lockRoots = [...new Set(source.roots)];
+          const candidates: { path: string; dev: bigint; ino: bigint; id: string; presenceDir: string }[] = [];
+          for (const root of lockRoots) {
+            const presenceDir = join(root, "presence");
+            const entries = await readdir(presenceDir).catch(() => null);
+            if (entries === null) continue;
+            for (const entry of entries) {
+              if (!entry.endsWith(".lock")) continue;
+              const id = entry.slice(0, -5);
+              if (!SESSION_ID.test(id)) continue;
+              const lockPath = join(presenceDir, entry);
+              const st = await stat(lockPath, { bigint: true }).catch(() => null);
+              if (st === null || !st.isFile()) continue;
+              candidates.push({ path: lockPath, dev: st.dev, ino: st.ino, id, presenceDir });
+            }
+          }
+          const held = await heldCandidates(locked, candidates, proc);
+          for (const root of lockRoots) {
+            const presenceDir = join(root, "presence");
+            const ids: string[] = [];
+            for (const c of held) {
+              if (c.presenceDir === presenceDir && (await containedRealpath(c.path, presenceDir))) ids.push(c.id);
+            }
+            if (ids.length !== 1) continue;
+            const ref = { kind: "id" as const, value: ids[0]! };
+            if (await source.resolve(ref)) return ref;
+          }
         }
+      } catch {
+        /* /proc/locks unreadable or failed; fall back to openFiles */
+      }
+
+      // Fallback: ask openFiles (lsof on macOS, or wherever /proc/locks found nothing).
+      try {
+        const raw = await files(procHint.pid);
+        const paths = typeof raw === "string" ? pathsOf(raw) : raw;
         for (const root of source.roots) {
           const ids: string[] = [];
-          for (const path of held.paths) {
+          for (const path of paths) {
             const id = path.split(/[/\\]/).pop()?.replace(/\.lock$/, "") ?? "";
             if (!path.endsWith(".lock") || !SESSION_ID.test(id)) continue;
             if (await containedRealpath(path, join(root, "presence"))) ids.push(id);

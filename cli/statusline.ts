@@ -6,11 +6,16 @@ import type { JsonObject } from "../bridge/json.ts";
 import {
   asCost,
   asPercent,
+  asTokenCount,
+  asWindowSize,
   customClaudeConfigDir,
+  orderedLimits,
   USAGE_SCHEMA_VERSION,
+  WINDOW_5H,
+  WINDOW_7D,
+  WINDOW_BY_STATUSLINE,
   type UsageLimit,
   type UsageRecord,
-  type UsageWindow,
 } from "../bridge/usage.ts";
 import { BEACON_HARNESS, edgeStateDirs, readEnvMarkers, type EdgeTargetDeps } from "./beacon.ts";
 import { EXIT } from "./io.ts";
@@ -19,16 +24,19 @@ import { mergeStatusLine, readUsage, writeUsage } from "./usage-store.ts";
 // `collie beacon statusline` — the operator's own Claude Code statusLine, with Collie listening in.
 //
 // Claude Code runs the statusLine command on every assistant message with a JSON document on stdin:
-// the context window's use, and for a Pro or Max account the 5-hour and 7-day rate limit windows. It
-// is the one place the agent tells a local program the two subscription windows, so it is where the
-// phone's 5-hour and 7-day dots come from (.adr/0115). Collie never asks the vendor and never reads a
-// credential. The context dot does not need this verb: the beacon hooks read it from the session
-// transcript (`cli/context-reading.ts`). Since 2026-10-24 the wrap is OPT-IN, `hooks install claude
-// --statusline`, because rewriting an operator's statusLine is the part of the design that bites.
+// the context window's use, and for a Pro or Max account the rate limit windows it reports. It is the
+// one place the agent tells a local program those subscription windows, so it is one source of the
+// phone's usage dots (.adr/0115; the other is the account windows of ADR 0118). This verb never asks
+// the vendor and never reads a credential. It is also the one place Claude Code states the context window's size
+// (`context_window_size`), so a Claude session's context dot needs this verb: the beacon hooks read the
+// tokens from the session transcript (`cli/context-reading.ts`) but divide only by the size stated here.
+// The wrap was opt-in from 2026-10-24 (`--statusline`); since 2026-11-13 `hooks install claude` wraps a
+// plain statusLine by default and `--no-statusline` keeps or restores the operator's own command,
+// because without the wrap nothing states the window and the phone can show only a token count.
 //
 // ── THE OPERATOR'S STATUSLINE IS NEVER REPLACED ───────────────────────────────────────────────────
 //
-// `collie hooks install claude --statusline` rewrites `statusLine.command` to this verb with the operator's command
+// `collie hooks install claude` rewrites `statusLine.command` to this verb with the operator's command
 // carried along, base64url-encoded, in the same string: `<collie> beacon statusline <b64> # collie-
 // statusline v1`. Nothing else in `statusLine` moves (`padding`, `refreshInterval`), and `uninstall`
 // decodes the string and puts the operator's command back exactly. Carrying it in the string, rather
@@ -36,12 +44,14 @@ import { mergeStatusLine, readUsage, writeUsage } from "./usage-store.ts";
 //
 // A settings file with NO statusLine gets none. A statusLine is not free: with one configured, Claude
 // Code stops drawing most of its footer hints (`esc to interrupt` among them), which the phone's
-// screen readers use. So the windows come only to an operator who already chose a statusLine AND asked
-// for the wrap; a pane without one draws the model tag and the context dot.
+// screen readers use. So the context share and the windows from this road come only to an operator who
+// already chose a statusLine; a pane without one shows the context as a token count (and the 5-hour and
+// 7-day windows from the account road, .adr/0118).
 //
-// An install WITHOUT the flag leaves a plain statusLine alone, and re-points one that is already
-// wrapped (an operator who had the wrap keeps it, and a moved binary heals). Only a wrapped statusLine
-// whose command names another binary counts as behind: that one prints nothing until it is re-pointed.
+// An install re-points a statusLine that is already wrapped (a moved binary heals), and with
+// `--no-statusline` gives it its own command back. Only a wrapped statusLine whose command names
+// another binary counts as behind: that one prints nothing until it is re-pointed. A plain one is not
+// behind; `doctor` names it in its `statusline-claude` row.
 //
 // ── THE ORDER, AND WHAT CAN FAIL ──────────────────────────────────────────────────────────────────
 //
@@ -161,7 +171,7 @@ function withCommand(document: JsonObject, command: string): JsonObject {
 /**
  * The document with the operator's statusLine wrapped, or unchanged. A wrapper written by another
  * binary path or marker version is rewritten around the same original, which is how it heals. A plain
- * statusLine is wrapped only with `wrapPlain` (`hooks install claude --statusline`); without it the
+ * statusLine is wrapped only with `wrapPlain` (`hooks install claude`, not `--no-statusline`); without it the
  * plain command stays exactly as the operator wrote it.
  */
 export function wrapStatusLine(document: JsonObject, binary: string, wrapPlain: boolean): JsonObject {
@@ -193,11 +203,38 @@ export function statusLineBehind(document: JsonObject, binary: string): boolean 
 
 // ── The payload ──────────────────────────────────────────────────────────────
 
-/** The two windows Claude Code reports, by its key, and the label the phone draws for each. */
-const WINDOW_KEYS: readonly (readonly [string, UsageWindow])[] = [
-  ["five_hour", "5h"],
-  ["seven_day", "7d"],
-];
+/**
+ * The keys of `rate_limits` whose window has a key of Collie's own: Claude Code's `five_hour` and
+ * `seven_day` are `5h` and `7d` (the keys an older phone words), and its gateway `spend_limit` is `spend`.
+ * Any other key that holds a `used_percentage` keeps the vendor's own key, so a window Claude Code adds
+ * later is drawn as it is named and never dropped (2026-11-15).
+ */
+const WINDOW_KEYS: ReadonlyMap<string, string> = new Map([
+  ["five_hour", WINDOW_5H],
+  ["seven_day", WINDOW_7D],
+  ["spend_limit", "spend"],
+]);
+
+/** A vendor key kept as a window key: a short name made of letters, digits, `_`, `.` and `-`. Anything else is not a window. */
+const VENDOR_WINDOW_KEY = /^[A-Za-z0-9_.-]{1,32}$/;
+
+/**
+ * The context's token count the document states: `current_usage`'s input, cache creation and cache read
+ * tokens, the sum `used_percentage` is taken from. Undefined when `current_usage` is null, before the
+ * first answer and after `/compact` until the next one. `total_input_tokens` is not read: 2.1.323 sends
+ * it as 0 then, which would draw an empty context that is not.
+ */
+function statedTokens(contextWindow: JsonObject | undefined): number | undefined {
+  const current = asJsonObject(contextWindow?.current_usage);
+  if (current === undefined) return undefined;
+  let sum = 0;
+  for (const key of ["input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"]) {
+    const part = asJsonNumber(current[key]);
+    if (part === undefined || !Number.isFinite(part) || part < 0) return undefined;
+    sum += part;
+  }
+  return asTokenCount(sum);
+}
 
 /**
  * The numbers in a statusLine document, as the record the bridge reads, plus the session they belong
@@ -211,22 +248,33 @@ export function usageFromStatusLine(
   const session = asJsonString(payload.session_id);
   if (session === undefined || !SESSION_ID.test(session)) return null;
   const record: UsageRecord = { schemaVersion: USAGE_SCHEMA_VERSION, harness: BEACON_HARNESS, at: now };
-  const context = asPercent(asJsonObject(payload.context_window)?.used_percentage);
+  const contextWindow = asJsonObject(payload.context_window);
+  const context = asPercent(contextWindow?.used_percentage);
   if (context !== undefined) record.context = context;
+  const tokens = statedTokens(contextWindow);
+  if (tokens !== undefined) record.contextTokens = tokens;
+  // The size of the window Claude Code itself counts against: exact for every model, 1M and 400k included.
+  const size = asWindowSize(contextWindow?.context_window_size);
+  if (size !== undefined) {
+    record.window = size;
+    record.windowBy = WINDOW_BY_STATUSLINE;
+  }
   const cost = asCost(asJsonObject(payload.cost)?.total_cost_usd);
   if (cost !== undefined) record.cost = cost;
-  const limitsRoot = asJsonObject(payload.rate_limits);
+  const limitsRoot = asJsonObject(payload.rate_limits) ?? {};
   const limits: UsageLimit[] = [];
-  for (const [key, window] of WINDOW_KEYS) {
-    const row = asJsonObject(limitsRoot?.[key]);
+  for (const [key, value] of Object.entries(limitsRoot)) {
+    const window = WINDOW_KEYS.get(key) ?? (VENDOR_WINDOW_KEY.test(key) ? key : undefined);
+    const row = asJsonObject(value);
     const used = asPercent(row?.used_percentage);
-    if (used === undefined) continue;
+    if (window === undefined || used === undefined) continue;
     // Claude Code says epoch SECONDS; the record is epoch milliseconds, as every time in the bridge is.
     const seconds = asJsonNumber(row?.resets_at);
     limits.push(seconds !== undefined && Number.isFinite(seconds) && seconds > 0 ? { window, used, resetsAt: seconds * 1000 } : { window, used });
   }
-  if (limits.length > 0) record.limits = limits;
-  if (record.context === undefined && record.limits === undefined && record.cost === undefined) return null;
+  const ordered = orderedLimits(limits);
+  if (ordered.length > 0) record.limits = ordered;
+  if (record.context === undefined && record.contextTokens === undefined && record.limits === undefined && record.cost === undefined) return null;
   if (configDir !== undefined) record.configDir = configDir;
   return { session, record };
 }

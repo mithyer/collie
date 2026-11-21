@@ -8,6 +8,7 @@ import { DEAD_DEBOUNCE_MS, isLive, resetLiveness } from "./liveness";
 import { resetBasePathForTests } from "./base-path";
 import { burstPaneId, resetPollIntent, sendCount } from "./poll-intent";
 import { setDeviceToken } from "./pairing";
+import { asJsonObject, asJsonString, type JsonValue } from "./json";
 import { resetServerClockForTests, serverSkewMs } from "./server-clock";
 import {
   apiErrorFields,
@@ -16,6 +17,7 @@ import {
   checkRun,
   clearRecentRuns,
   createTab,
+  createWorkspace,
   fetchChat,
   fetchConfig,
   fetchFileImage,
@@ -30,12 +32,14 @@ import {
   POLL_TIMEOUT_MS,
   readFailureKind,
   imageSrc,
+  launch,
   refreshNow,
   removeRecentRun,
   sendKeys,
   startLaunch,
   fetchWalkyWho,
   pinItem,
+  postArrived,
   postWalky,
   sendReply,
   textBeforeLastSend,
@@ -171,6 +175,28 @@ describe("api client", () => {
       ok: false,
       error: "prompt changed",
       code: "prompt_changed",
+    });
+  });
+
+  // The person's "It arrived" (M102 spec 01): a write by pane, so the crew link can carry it.
+  describe("postArrived", () => {
+    it("posts the request id to the pane's arrived route under the scope, and is true on a 200", async () => {
+      const seen: { path: string; search: string; body: JsonValue | undefined }[] = [];
+      server.use(
+        http.post(/\/api\/pane\/[^/]+\/arrived$/, async ({ request }) => {
+          const url = new URL(request.url);
+          // SAFETY: `Response.json()` output IS a JsonValue by construction.
+          seen.push({ path: url.pathname, search: url.search, body: (await request.json()) as JsonValue });
+          return HttpResponse.json({ word: "arrived" });
+        }),
+      );
+      await expect(postArrived("w1:p1", "req-000001", { host: "laptop" })).resolves.toBe(true);
+      expect(seen).toEqual([{ path: "/api/pane/w1%3Ap1/arrived", search: "?host=laptop", body: { requestId: "req-000001" } }]);
+    });
+
+    it("throws on a refusal: a send that did not end unknown, a second mark", async () => {
+      server.use(http.post(/\/api\/pane\/[^/]+\/arrived$/, () => new HttpResponse("this send is already marked", { status: 409 })));
+      await expect(postArrived("w1:p1", "req-000002")).rejects.toThrow();
     });
   });
 
@@ -1201,7 +1227,7 @@ describe("one-off runs and their history (ADR 0095)", () => {
   afterEach(() => vi.restoreAllMocks());
 
   function capture() {
-    const calls: Array<{ url: string; method: string | undefined; body: unknown }> = [];
+    const calls: Array<{ url: string; method: string | undefined; body: JsonValue | undefined }> = [];
     vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
       calls.push({ url: String(input), method: init?.method, body: init?.body == null ? undefined : JSON.parse(String(init.body)) });
       return new Response(JSON.stringify({ ok: true, removed: 1 }), { status: 200, headers: { "content-type": "application/json" } });
@@ -1227,6 +1253,32 @@ describe("one-off runs and their history (ADR 0095)", () => {
       { url: "/api/launch?host=badger", method: "POST", body: { starter: "notes-new", requestId: "id-3" } },
       { url: "/api/launch", method: "POST", body: { command: "htop", requestId: "id-4", cwd: "~/src/app" } },
     ]);
+  });
+
+  it("a quick launch, a tab create and a space create each carry a request id, a fresh one per call (M100 spec 04)", async () => {
+    const calls = capture();
+    await launch("claude", "w1:p1", { host: "badger" });
+    await launch("claude");
+    await createTab("w1", { cwd: "~/src/app" }, { host: "badger" });
+    await createWorkspace({ label: "x" });
+    const bodies = calls.map((call) => asJsonObject(call.body) ?? {});
+    const ids = bodies.map((body) => asJsonString(body.requestId));
+    for (const id of ids) expect(id).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u);
+    expect(new Set(ids).size).toBe(4);
+    expect(bodies.map(({ requestId: _id, ...rest }) => rest)).toEqual([
+      { command: "claude", paneId: "w1:p1" },
+      { command: "claude" },
+      { workspaceId: "w1", cwd: "~/src/app" },
+      { label: "x" },
+    ]);
+  });
+
+  it("a request id the caller names is the one sent", async () => {
+    const calls = capture();
+    await launch("claude", undefined, undefined, "id-9");
+    await createTab("w1", { requestId: "id-10" });
+    await createWorkspace({ requestId: "id-11" });
+    expect(calls.map((call) => asJsonString(asJsonObject(call.body)?.requestId))).toEqual(["id-9", "id-10", "id-11"]);
   });
 
   it("checkRun posts the line to that machine's check and returns its answer, a read that sends nothing else", async () => {
@@ -1347,7 +1399,7 @@ describe("the walky talky routes (M62)", () => {
   });
 
   it("hands back the skipped shell panes and the refusal counts when the bridge sends them", async () => {
-    const skipped = [{ address: "bluefin/w1:p2", memberId: "bluefin", machine: "bluefin", label: "zsh" }];
+    const skipped = [{ address: "lodge/w1:p2", memberId: "lodge", machine: "lodge", label: "zsh" }];
     const refusals = { counts: { "rate limit": 3 }, since: 1_700_000_000_000 };
     server.use(http.get("/api/walky/who", () => HttpResponse.json({ targets: [], skipped, refusals })));
     await expect(fetchWalkyWho()).resolves.toEqual({ targets: [], skipped, refusals });

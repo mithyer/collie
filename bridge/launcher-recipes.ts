@@ -104,6 +104,14 @@ const RECIPE_TABLE = {
     { id: "never", label: "Never ask", args: "--approval-mode never", group: "mode", noPrompts: true },
     { id: "no-questions", label: "No question prompts", args: "--disable-request-user-input", noPrompts: true },
   ],
+  // MiniMax Code: continue, programmatic tool calling, and the mode flags. Provisional until the
+  // harness canary's `--help` sweep, like every new table row.
+  mcode: [
+    { id: "continue", label: "Continue last", args: "--continue" },
+    { id: "ptc", label: "Programmatic Tool Calling", args: "--ptc" },
+    { id: "lightweight", label: "Mode: lightweight", args: "--mode lightweight", group: "mode" },
+    { id: "standard", label: "Mode: standard", args: "--mode standard", group: "mode" },
+  ],
 } satisfies Record<string, readonly RecipeOption[]>;
 
 /** The options each harness offers. A harness with no entry offers none: its recipe is its binary. */
@@ -150,7 +158,11 @@ export function buildRecipe(harness: string, picked: readonly string[]): BuiltRe
 
 // ── The no-prompts scan ─────────────────────────────────────────────────────────────────────────
 
-/** Flags that skip permission prompts wherever they sit in a line. Each verified first-hand. */
+/**
+ * Flags that skip permission prompts wherever they sit in a line. Each verified first-hand. Codex
+ * `--full-auto` is not scanned: Codex 0.162.0 refuses the flag. A CLI that renames a flag drops the
+ * recipe rows built from it on their next read.
+ */
 const NO_PROMPT_FLAGS: ReadonlySet<string> = new Set([
   // Claude Code
   "--dangerously-skip-permissions",
@@ -181,7 +193,9 @@ const NO_PROMPT_PAIRS: readonly (readonly [string, string])[] = [
  * case the tick exists for.
  */
 export function scanNoPrompts(line: string): boolean {
-  const words = line.trim().split(/\s+/).map(unquote);
+  // Leading `NAME=value` assignments are not the command word (an account's `CODEX_HOME='…' codex`, M101),
+  // as `runProgram` reads them. A quoted value may hold spaces, so the assignments go before the split.
+  const words = line.trim().replace(LEADING_ASSIGNMENTS, "").split(/\s+/).map(unquote);
   // The command word's last path part, on either separator, without a Windows launcher suffix.
   const first = (words[0]?.split(/[\\/]/).at(-1) ?? "").replace(/\.(?:exe|cmd|ps1)$/i, "");
   for (let i = 0; i < words.length; i++) {
@@ -197,6 +211,9 @@ export function scanNoPrompts(line: string): boolean {
   }
   return false;
 }
+
+/** One or more `NAME=value` words at the start of a line, a value bare or in one pair of quotes. */
+const LEADING_ASSIGNMENTS = /^(?:[A-Za-z_][A-Za-z0-9_]*=(?:'[^']*'|"[^"]*"|\S*)\s+)+/u;
 
 /** A word with one layer of matching quotes taken off, so `'--yolo'` still reads as the flag. */
 function unquote(word: string): string {

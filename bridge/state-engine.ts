@@ -1,5 +1,7 @@
 import type { AgentSessionRef, ForegroundProcess } from "./journal/types.ts";
 import type { MuxAdapter, MuxAttention, MuxPane } from "./mux/types.ts";
+import { SCREEN_NAME_READERS } from "./harness-name-sources.ts";
+import { normalizeTerminalTitle, normalizeTitle, type SessionTitles } from "./session-title.ts";
 import {
   type AgentStatus,
   type AgentView,
@@ -275,9 +277,17 @@ function toView(pane: MuxPane, kind: "agent" | "shell"): AgentView {
   // Optional fields are ASSIGNED, never conditionally spread: absent stays absent, and each
   // condition below stays readable as the one rule it encodes.
   if (pane.paneLabel) view.paneLabel = pane.paneLabel;
+  // Why a blocked pane needs you when it is not a question (AgentView.blockedBy). Only with `blocked`.
+  if (pane.status === "blocked" && pane.blockedBy !== undefined) view.blockedBy = pane.blockedBy;
+  // Only a fact that differs from the default rides (see AgentView.workspaceNamed).
+  if (pane.spaceNamed !== undefined && pane.spaceNamed !== (pane.spaceLabel !== pane.spaceId)) view.workspaceNamed = pane.spaceNamed;
   // Denormalised alongside workspaceLabel so no client has to join tabs[].
   if (pane.tabLabel) view.tabLabel = pane.tabLabel;
-  if (pane.terminalTitle) view.terminalTitle = pane.terminalTitle;
+  // Every multiplexer's title goes through the one normalizer (session-title.ts), so a spinner glyph,
+  // a control byte or an endless title reads the same way on tmux, zellij, tern and the durable adapter
+  // as it already did on Herdr. The stale check below still reads the raw title.
+  const title = normalizeTerminalTitle(pane.terminalTitle);
+  if (title !== undefined) view.terminalTitle = title;
   // The program's own line under the title and its small mark, from an adapter with no screen. Absent
   // stays absent, so every other pane is byte-identical.
   if (pane.subtitle) view.subtitle = pane.subtitle;
@@ -320,18 +330,25 @@ export interface EngineSnapshot {
 export const ATTENTION_WINDOW_MS = 10_000;
 
 /**
- * The user-given name of the Muse session running in a pane, read out of Muse's own journal
- * (bridge/journal/muse.ts `museSessionNameReader`) — Muse paints no session name for the grid
- * scrape below to find. The contract mirrors {@link extractClaudeSessionName}'s: the name;
- * `null` when the pane's own session is known exactly and has no user-given name; `undefined`
- * when nothing can be said either way, so the sticky cache keeps the last-known name. Injected
- * rather than imported: the reader is filesystem state rooted in operator config, and this
+ * A harness's session name read out of its own journal when the pane reports no session ref, bound by
+ * the pane's foreground argv instead: Muse's user-given name (bridge/journal/muse.ts
+ * `museSessionNameReader`), which Muse paints nowhere for a screen read to find. The contract mirrors
+ * {@link extractClaudeSessionName}'s: the name; `null` when the pane's own session is known exactly and
+ * has no user-given name; `undefined` when nothing can be said either way, so the sticky cache keeps
+ * the last-known name. Injected rather than imported, and keyed by the harness word as data
+ * (harness-name-sources.ts): the reader is filesystem state rooted in operator config, and this
  * engine's world is the mux port.
  */
-export type MuseSessionNameProbe = (
+export type ArgvNameProbe = (
   ref: AgentSessionRef | undefined,
   processes: readonly ForegroundProcess[] | undefined,
 ) => Promise<string | null | undefined>;
+
+/**
+ * The cleaned names a harness's journal gives the session a pane names (bridge/session-titles.ts), read
+ * from memory. Injected: the tracker reads the journal, and this engine's world is the mux port.
+ */
+export type SessionTitleLookup = (pane: AgentView) => SessionTitles | undefined;
 
 type TransitionListener = (agent: AgentView, from: AgentStatus, to: AgentStatus) => void;
 type RemoveListener = (paneId: string) => void;
@@ -402,21 +419,25 @@ export class StateEngine {
   // the bridge came up, and holding the engine hot for each of them would spend a fast spell on every
   // restart.
   private sawHerd = false;
-  // The Muse journal name reader, when the bridge wired one (see {@link MuseSessionNameProbe}).
-  // Absent — every test, and a bridge with transcripts off — muse panes are never probed and
-  // carry no sessionName, exactly as before the reader existed.
-  private readonly museNameProbe: MuseSessionNameProbe | undefined;
+  // The argv-bound journal name readers the bridge wired, by harness word (see {@link ArgvNameProbe}).
+  // Absent (every test, and a bridge with transcripts off): those panes are never probed and carry no
+  // sessionName from here, exactly as before the reader existed.
+  private readonly argvNames: Readonly<Record<string, ArgvNameProbe>>;
+  // The journal's names for each pane's session (see {@link SessionTitleLookup}). Absent: no pane
+  // carries an agentTitle, and the screen read is the only person-set name, as before the tracker.
+  private readonly titles: SessionTitleLookup | undefined;
   // The screen's ask, when the bridge reads screens (see liftScreenAsks). Absent: the mux's status
   // stands as reported.
   private screenAsk: ScreenAsk | undefined;
   constructor(
     private readonly mux: MuxAdapter,
     private readonly pollMs: number,
-    opts: { museSessionName?: MuseSessionNameProbe } = {},
+    opts: { argvNames?: Readonly<Record<string, ArgvNameProbe>>; titles?: SessionTitleLookup } = {},
   ) {
     this.cadenceMs = pollMs;
     this.baseCadenceMs = pollMs;
-    this.museNameProbe = opts.museSessionName;
+    this.argvNames = opts.argvNames ?? {};
+    this.titles = opts.titles;
   }
 
   /**
@@ -425,7 +446,9 @@ export class StateEngine {
    * waits, because pi has no blocked state for an extension's question. Lifted before the
    * transitions are taken, so the "Needs you" mark and the push follow the screen. The read is the
    * previous poll's (the Surface reads after each poll), so the mark trails the screen by one poll
-   * either way. Only ever raises to `blocked`; a status the mux reports is never lowered.
+   * either way. Only ever raises to `blocked`; a status the mux reports is never lowered. A pane
+   * `blocked` by an error (`blockedBy: "error"`) whose screen shows an ask loses that mark and is a
+   * question.
    */
   liftScreenAsks(fn: ScreenAsk): void {
     this.screenAsk = fn;
@@ -734,10 +757,17 @@ export class StateEngine {
       }
       await this.enrichSessionNames(agents, revisions);
 
-      // The screen's ask wins for `blocked` (see liftScreenAsks).
+      // The screen's ask wins for `blocked` (see liftScreenAsks). It also wins over an error: a pane whose
+      // program reported `error` while a dialog shows on its screen is a question, with every guard a
+      // question has, so the error's mark goes (AgentView.blockedBy).
       const screenAsk = this.screenAsk;
       if (screenAsk !== undefined) {
-        for (const a of agents) if (a.status !== "blocked" && screenAsk(a.paneId)) a.status = "blocked";
+        for (const a of agents) {
+          if (a.status === "blocked" && a.blockedBy === undefined) continue;
+          if (!screenAsk(a.paneId)) continue;
+          a.status = "blocked";
+          delete a.blockedBy;
+        }
       }
 
       // Detect transitions against the previous poll. First sighting of a pane never fires a
@@ -815,90 +845,99 @@ export class StateEngine {
   }
 
   /**
-   * Read each pane's own session name and attach it to the view, exactly parallel to
-   * `paneLabel`. Claude's lives only in the pane's rendered text — Herdr's pane metadata
-   * doesn't carry it — so it is scraped off the visible grid (see
-   * {@link extractClaudeSessionName}); Muse paints none anywhere, so its name comes from the
-   * journal probe ({@link MuseSessionNameProbe}) when the bridge wired one. This is the one
-   * place all panes can pick a name up (the web app only holds text for the open pane). Reads
-   * run in parallel and are individually best-effort: a read that fails or times out, a screen
-   * with no input box in view, or a probe that cannot bind the pane exactly keeps the
-   * last-known name (sticky cache) and never fails the poll; a proven-unnamed answer drops it,
-   * and so does a Muse pane whose binding changed under its name (see museBindings).
-   * A multiplexer that cannot hand over a rendered grid declines the read, which reads here as
-   * "keep whatever's cached" — exactly like a read that failed.
+   * Attach each pane's session names to its view, exactly parallel to `paneLabel`.
+   *
+   * THE JOURNAL FIRST. The title tracker (bridge/session-titles.ts) reads each harness's own records
+   * by session id and hands back two cleaned names: the one the person set in the harness, which
+   * becomes `sessionName`, and the agent's own title, which becomes `agentTitle`. It runs on this
+   * engine's poll and is read here from memory, so a fresh name trails the journal by one poll.
+   *
+   * THEN TWO FALLBACKS, each for a harness that declares one as data (harness-name-sources.ts), and
+   * only while the journal named no person-set name for the pane. A screen read: Claude paints its
+   * `/rename` name into its input box (see {@link extractClaudeSessionName}), which matters where the
+   * pane reports no session id. An argv-bound journal read: Muse names no session ref
+   * ({@link ArgvNameProbe}). Reads run in parallel and are individually best-effort: a read that fails
+   * or times out, a screen with no input box in view, or a probe that cannot bind the pane exactly keeps
+   * the last-known name (sticky cache) and never fails the poll; a proven-unnamed answer drops it, and so
+   * does an argv-bound pane whose binding changed under its name (see museBindings). A multiplexer that
+   * cannot hand over a rendered grid declines the read, which reads here as "keep whatever's cached".
    */
   private async enrichSessionNames(
     agents: AgentView[],
     revisions: Map<string, number>,
   ): Promise<void> {
-    const claude = agents.filter((a) => a.agent === "claude");
-    const probe = this.museNameProbe;
-    const muse = probe === undefined ? [] : agents.filter((a) => a.agent === "muse");
-    if (claude.length === 0 && muse.length === 0) return;
+    const journal = new Map(agents.map((a) => [a.paneId, this.titles?.(a)]));
+    const fallback = agents.filter((a) => journal.get(a.paneId)?.person === undefined);
+    const screened = fallback.filter((a) => SCREEN_NAME_READERS.has(a.agent));
+    const argvBound = fallback.filter((a) => this.argvNames[a.agent] !== undefined);
+    const unchanged = (a: AgentView): boolean => {
+      const rev = revisions.get(a.paneId);
+      return rev !== undefined && this.enrichedAt.get(a.paneId) === rev;
+    };
+    const markRead = (a: AgentView): void => {
+      const rev = revisions.get(a.paneId);
+      if (rev !== undefined) this.enrichedAt.set(a.paneId, rev);
+    };
     await Promise.all([
-      ...claude.map(async (a) => {
-        const rev = revisions.get(a.paneId);
-        if (rev !== undefined) {
-          const prev = this.enrichedAt.get(a.paneId);
-          if (prev !== undefined && prev === rev) return;
-        }
+      ...screened.map(async (a) => {
+        const read = SCREEN_NAME_READERS.get(a.agent);
+        if (read === undefined || unchanged(a)) return;
         try {
           // `viewport` — never `recent`; see SESSION_NAME_READ_LINES for what a `recent` read does
           // to the operator's screen. The viewport is also strictly safer to parse: `recent` hands
           // back transcript scrollback, where Claude echoes past user messages as `❯ …` lines that
           // the prompt anchor would have to discriminate against. `preserve` because colour is the
           // only thing that tells a `/rename` name from a mode badge Claude draws in the same rule.
-          const read = await this.mux.readGrid(a.paneId, {
+          const grid = await this.mux.readGrid(a.paneId, {
             scope: "viewport",
             lines: SESSION_NAME_READ_LINES,
             styling: "preserve",
           });
-          if (!read.ok) return;
-          const name = extractClaudeSessionName(read.value.text);
+          if (!grid.ok) return;
+          const name = read(grid.value.text);
           // An input box in view with no name forgets the old one: a name renamed away, or a badge
           // once mistaken for a name, must not outlive the screen that showed it.
-          if (name) this.sessionNames.set(a.paneId, name);
+          const clean = normalizeTitle(name);
+          if (clean !== undefined) this.sessionNames.set(a.paneId, clean);
           else if (name === null) this.sessionNames.delete(a.paneId);
-          if (rev !== undefined) this.enrichedAt.set(a.paneId, rev);
+          markRead(a);
         } catch {
           // Keep whatever's cached (if anything) — a transient read failure must not blank the name.
         }
       }),
-      ...muse.map(async (a) => {
-        if (probe === undefined) return;
-        const rev = revisions.get(a.paneId);
-        if (rev !== undefined) {
-          const prev = this.enrichedAt.get(a.paneId);
-          if (prev !== undefined && prev === rev) return;
-        }
+      ...argvBound.map(async (a) => {
+        const probe = this.argvNames[a.agent];
+        if (probe === undefined || unchanged(a)) return;
         try {
           // A pane that already reports its session needs no argv to bind it, so the foreground
           // read is spent only where it can buy the binding (server.ts `discoveryHints`).
           const processes = a.agentSession === undefined ? await this.foregroundOf(a.paneId) : undefined;
           const binding = museBindingOf(a.agentSession, processes);
           const name = await probe(a.agentSession, processes);
-          // The same sticky contract as Claude's scrape: a name sets, a proven-unnamed exact
+          // The same sticky contract as the screen read: a name sets, a proven-unnamed exact
           // session (`null`) forgets, say-nothing (`undefined`) keeps the last-known name. One
           // addition: say-nothing on a pane whose readable binding is not the one the name was
           // read by forgets too, because the name belongs to a session that has left the pane.
-          if (name) {
-            this.sessionNames.set(a.paneId, name);
+          const clean = normalizeTitle(name);
+          if (clean !== undefined) {
+            this.sessionNames.set(a.paneId, clean);
             if (binding === null) this.museBindings.delete(a.paneId);
             else this.museBindings.set(a.paneId, binding);
           } else if (name === null || this.museBindingLost(a.paneId, binding)) {
             this.sessionNames.delete(a.paneId);
             this.museBindings.delete(a.paneId);
           }
-          if (rev !== undefined) this.enrichedAt.set(a.paneId, rev);
+          markRead(a);
         } catch {
           // Keep whatever's cached (if anything) — a transient probe failure must not blank the name.
         }
       }),
     ]);
     for (const a of agents) {
-      const name = this.sessionNames.get(a.paneId);
+      const titles = journal.get(a.paneId);
+      const name = titles?.person ?? this.sessionNames.get(a.paneId);
       if (name) a.sessionName = name;
+      if (titles?.agent) a.agentTitle = titles.agent;
     }
   }
 

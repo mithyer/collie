@@ -15,7 +15,7 @@ import { TelemetrySettingsCard } from "./telemetry-settings-card";
 // next message and the write with a request id. Driven through a memory router and MSW.
 
 const PING: TelemetryPing = {
-  v: 1,
+  v: 3,
   id: "0123456789abcdef0123456789abcdef",
   day: "2026-11-05",
   version: "1.27.0",
@@ -50,7 +50,7 @@ describe("Telemetry card (M86 spec 02)", () => {
     renderCard(view());
     expect(await screen.findByText("Telemetry")).toBeInTheDocument();
     expect(
-      screen.getByText("Anonymous: one ping a day with the install count and the trouble signals, under a random ID. Nothing else."),
+      screen.getByText("Anonymous: one ping a day with the install count, which agents and multiplexers ran and whether the optional data link was on, and the trouble signals, under a random ID."),
     ).toBeInTheDocument();
   });
 
@@ -198,7 +198,7 @@ describe("Telemetry card (M86 spec 02)", () => {
 
   describe("this machine only (M86 hardening)", () => {
     const member = (id: string, name: string, isLead = false): ServerSummary => ({ id, name, isLead, reachable: true, protocol: "ok", lastSeenAt: 0 });
-    const crew = [member("bluefin", "bluefin", true), member("minibuch", "minibuch"), member("hc-box", "bluefin-hc")];
+    const crew = [member("lodge", "lodge", true), member("workshop", "workshop"), member("hc-box", "lodge-hc")];
 
     it("says the switch changes this machine only, with no crew", async () => {
       renderCard(view());
@@ -213,7 +213,7 @@ describe("Telemetry card (M86 spec 02)", () => {
 
     it("a lead with members lists their names and says to set it on each machine", async () => {
       renderCard(view(), "", crew);
-      expect(await screen.findByText("Not covered by this switch: minibuch, bluefin-hc. Set it on each machine.")).toBeInTheDocument();
+      expect(await screen.findByText("Not covered by this switch: workshop, lodge-hc. Set it on each machine.")).toBeInTheDocument();
       expect(screen.getByText("This switch changes this machine only.")).toBeInTheDocument();
     });
 
@@ -225,7 +225,7 @@ describe("Telemetry card (M86 spec 02)", () => {
 
     it("the member note does not depend on the reading: it is there when the read fails", async () => {
       renderCard("fail", "", crew);
-      expect(await screen.findByText("Not covered by this switch: minibuch, bluefin-hc. Set it on each machine.")).toBeInTheDocument();
+      expect(await screen.findByText("Not covered by this switch: workshop, lodge-hc. Set it on each machine.")).toBeInTheDocument();
     });
   });
 

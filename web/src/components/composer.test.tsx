@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { createRef, useEffect, useMemo, useState } from "react";
 import type { ComponentProps } from "react";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
@@ -7,6 +7,7 @@ import { createMemoryRouter, RouterProvider } from "react-router";
 
 import * as api from "@/lib/api";
 import { setLocale, whenLocaleReady } from "@/lib/i18n";
+import { __resetEnterSendsStore, enterSendsChoice, setEnterSends } from "@/lib/enter-sends-store";
 import { clearStatus, useStatus } from "@/lib/status";
 import { isReloadHeld, subscribeReloadHeld, __resetReloadGuard } from "@/lib/reload-guard";
 import { loadDraft, loadDraftEntry, saveDraft } from "@/lib/drafts";
@@ -14,7 +15,11 @@ import { __resetOperatorCommands } from "@/lib/operator-config";
 import { server } from "@/test/setup";
 import { fixtureServers, recordedSends, sendAnswer, sendHandler, type SentRequest } from "@/test/handlers";
 import { CrewProvider } from "./crew-provider";
-import { Composer } from "./composer";
+import { Composer, type ComposerHandle } from "./composer";
+import { CardDock } from "./card-dock";
+import type { CannotTellFacts } from "./cannot-tell-card";
+import { parseAnsi } from "@/lib/ansi";
+import { splitLines } from "@/lib/blocks";
 import { addRow, chordKey, DEFAULT_BOARD, setCell } from "@/lib/key-board";
 import { resetKeyBoard, setKeyBoard } from "@/lib/key-board-store";
 import { type PaneJob, type PaneSubagent, type PinRow, type ServerSummary, type TranscriptEntry } from "@/lib/types";
@@ -22,8 +27,9 @@ import { __resetBeltIntents, queueBeltIntent, takeBeltIntent } from "@/lib/belt-
 import { paneScopeKey } from "@/lib/scope";
 import { SubagentSheetCtx, type SubagentSheetHandle, type SubagentTarget } from "./chat-cards";
 import type { Surface } from "@/lib/surface/surface";
-import { asJsonObject } from "@/lib/json";
+import { asJsonObject, asJsonString, parseJsonObject, type JsonObject } from "@/lib/json";
 import { markLive } from "@/lib/liveness";
+import { __forgetSendAgainMemory } from "@/lib/send-again";
 import { beginCatchUp, endCatchUp, setLocked } from "@/lib/idle";
 import { offersFor, SEND_REASONS, type SendReason } from "@/lib/surface/send";
 import { WAY_OUT_STATES, type WayOutState } from "@/lib/way-out";
@@ -169,6 +175,9 @@ beforeAll(() => {
 });
 beforeEach(() => {
   clearStatus();
+  __resetEnterSendsStore();
+  // An unknown send arms "Send it again?" for the same text on the same pane; no test inherits another's.
+  __forgetSendAgainMemory();
   imageEditHarness.mode = "auto";
   imageEditHarness.lastConfirm = null;
   imageEditHarness.mounts = 0;
@@ -508,7 +517,7 @@ describe("Composer: the Surface table (M56 spec 06)", () => {
     const user = await typeAndSend("carry on please");
 
     await waitFor(() => expect(container.querySelector('[data-slot="composer-refusal"]')).not.toBeNull());
-    expect(container.querySelector('[data-slot="composer-refusal"]')).toHaveTextContent(/cannot read this screen.*cannot read was open over the box/i);
+    expect(container.querySelector('[data-slot="composer-refusal"]')).toHaveTextContent(/cannot read was open over the box.*cannot read this screen/i);
     // The phone's sentence says it once: the bridge's same English is not repeated under it.
     expect(container.querySelector('[data-slot="composer-refusal-detail"]')).toBeNull();
     expect(screen.getByRole("textbox")).toHaveValue("carry on please");
@@ -516,7 +525,7 @@ describe("Composer: the Surface table (M56 spec 06)", () => {
     await user.click(screen.getByRole("button", { name: "Answer the dialog" }));
     expect(onAnswerDialog).toHaveBeenCalledTimes(1);
 
-    await user.click(screen.getByRole("button", { name: "Type here" }));
+    await user.click(screen.getByRole("button", { name: "Send anyway" }));
     await waitFor(() => expect(screen.getByRole("textbox")).toHaveValue(""));
     expect(recordedSends().map(({ text, mode, rowsHash }) => ({ text, mode, rowsHash }))).toEqual([
       { text: "carry on please", mode: "send", rowsHash: undefined },
@@ -528,7 +537,7 @@ describe("Composer: the Surface table (M56 spec 06)", () => {
     server.use(...sendHandler((request) => sendAnswer(request.id, "refused", "not_free", { offers: ["keys"], surface: RUNNING, detail: "The input box is not free." })));
     const { container } = renderWithContainer({ surface: RUNNING });
     await typeAndSend("next step please");
-    await waitFor(() => expect(container.querySelector('[data-slot="composer-refusal"]')).toHaveTextContent(/not free.*agent was working/i));
+    await waitFor(() => expect(container.querySelector('[data-slot="composer-refusal"]')).toHaveTextContent(/agent was working.*not free/i));
     expect(screen.getByRole("textbox")).toHaveValue("next step please");
     // No card to go to: the notice carries no control.
     expect(screen.queryByRole("button", { name: "Answer the dialog" })).toBeNull();
@@ -546,7 +555,7 @@ describe("Composer: the Surface table (M56 spec 06)", () => {
     const user = await typeAndSend("ls -la");
     await waitFor(() => expect(container.querySelector('[data-slot="composer-refusal"]')).toHaveTextContent(/could not find the input box/i));
     expect(screen.queryByRole("button", { name: "Answer the dialog" })).toBeNull();
-    await user.click(screen.getByRole("button", { name: "Type here" }));
+    await user.click(screen.getByRole("button", { name: "Send anyway" }));
     await waitFor(() => expect(recordedSends()).toHaveLength(2));
     expect(recordedSends()[1]!.rowsHash).toBe("77aa00");
   });
@@ -571,9 +580,14 @@ describe("Composer: the Surface table (M56 spec 06)", () => {
     expect(screen.getByRole("button", { name: "Send" })).toHaveAttribute("aria-disabled", "true");
   });
 
-  it("composer unreachable with no note says the box cannot be reached", () => {
+  it("a box the read could not reach says so and stays typeable: the bridge reads again, and offers Send anyway (M102 spec 03, I4)", () => {
     renderComposerWithStatus({ surface: UNREACHABLE });
-    expect(screen.getByPlaceholderText("Can't reach the input box")).toBeDisabled();
+    expect(screen.getByPlaceholderText("Can't reach the input box")).toBeEnabled();
+  });
+
+  it("a box a fact blocks (its note: a machine the lead cannot reach, sending off) stays locked and names why", () => {
+    renderComposerWithStatus({ surface: UNREACHABLE, unreachableNote: "workshop is not answering" });
+    expect(screen.getByPlaceholderText("workshop is not answering")).toBeDisabled();
   });
 
   it("the facts outrank every row: a gone pane and a read-only device lock the field, even over an ask", () => {
@@ -683,7 +697,7 @@ describe("Composer: a read dialog is refused at the thumb", () => {
     await user.click(screen.getByRole("button", { name: "Send" }));
 
     await waitFor(() => expect(container.querySelector('[data-slot="composer-refusal"]')).toHaveTextContent(/cannot read this screen/i));
-    expect(screen.getByRole("button", { name: "Type here" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Send anyway" })).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "Answer the dialog" }));
     expect(onAnswerDialog).toHaveBeenCalledTimes(1);
     // Only the first tap went out, and it typed nothing: the bridge refused before any key.
@@ -717,7 +731,7 @@ describe("Composer: a read dialog is refused at the thumb", () => {
     await user.click(screen.getByRole("button", { name: "Hide this notice" }));
     await waitFor(() => expect(container.querySelector('[data-slot="composer-refusal"]')).toBeNull());
     // The offers stay: the ✕ hid only the notice.
-    expect(screen.getByRole("button", { name: "Type here" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Send anyway" })).toBeInTheDocument();
 
     // The same words over the same screen stay hidden; a send that reads another screen shows again.
     await user.click(screen.getByRole("button", { name: "Send" }));
@@ -741,7 +755,7 @@ describe("Composer: a read dialog is refused at the thumb", () => {
 
     await user.click(screen.getByRole("button", { name: "Hide this notice" }));
     await waitFor(() => expect(container.querySelector('[data-slot="composer-refusal"]')).toBeNull());
-    expect(screen.queryByRole("button", { name: "Type here" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Send anyway" })).toBeNull();
 
     await user.click(screen.getByRole("button", { name: "Send" }));
     await waitFor(() => expect(recordedSends()).toHaveLength(2));
@@ -755,10 +769,10 @@ describe("Composer: a read dialog is refused at the thumb", () => {
     const { container } = renderWithContainer({ surface: unreadable });
     await user.type(screen.getByRole("textbox"), "carry on please");
     await user.click(screen.getByRole("button", { name: "Send" }));
-    await waitFor(() => expect(screen.getByRole("button", { name: "Type here" })).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByRole("button", { name: "Send anyway" })).toBeInTheDocument());
 
     await user.click(screen.getByRole("button", { name: "Dismiss the send offers" }));
-    await waitFor(() => expect(screen.queryByRole("button", { name: "Type here" })).toBeNull());
+    await waitFor(() => expect(screen.queryByRole("button", { name: "Send anyway" })).toBeNull());
     await waitFor(() => expect(container.querySelector('[data-slot="composer-refusal"]')).toBeNull());
   });
 
@@ -778,13 +792,167 @@ describe("Composer: a read dialog is refused at the thumb", () => {
   });
 });
 
+// A sign-in field (`/login`'s code or key field, the Surface's `field: "secret"`): the composer saves no
+// draft of what is typed there, no stored send intent, no "You sent" text, and names the send `secret`.
+describe("Composer: sign-in field", () => {
+  const SIGN_IN: Surface = { revision: 3, turn: "idle", modal: "none", composer: "empty", field: "secret" };
+  const CODE = "FAKEcode1234abcd#FAKEstate5678";
+
+  function storedAnywhere(text: string): boolean {
+    const all = [localStorage, sessionStorage].flatMap((store) => Object.keys(store).map((key) => store.getItem(key) ?? ""));
+    return all.some((value) => value.includes(text));
+  }
+
+  it("names the field, saves no draft of the code, and sends it marked secret", async () => {
+    const user = userEvent.setup();
+    let typed = "";
+    server.use(...replyHandler((text) => (typed = text)));
+    renderComposer({ surface: SIGN_IN });
+    const box = screen.getByRole("textbox", { name: "Sign-in code" });
+
+    await user.type(box, CODE);
+    expect(loadDraft(undefined, "w1:p1")).toBeNull();
+    expect(storedAnywhere(CODE)).toBe(false);
+
+    await user.click(screen.getByRole("button", { name: "Send the code" }));
+    await waitFor(() => expect(typed).toBe(CODE));
+    expect(recordedSends()[0]?.secret).toBe(true);
+    expect(storedAnywhere(CODE)).toBe(false);
+    expect(screen.queryByText(CODE)).toBeNull();
+  });
+
+  it("keeps no send intent of the code when the bridge does not answer", async () => {
+    const user = userEvent.setup();
+    server.use(http.post("*/api/send", () => HttpResponse.error()));
+    renderComposer({ surface: SIGN_IN });
+    const box = screen.getByRole("textbox", { name: "Sign-in code" });
+
+    await user.type(box, CODE);
+    await user.click(screen.getByRole("button", { name: "Send the code" }));
+    await screen.findByText("No answer from the bridge. Look at the agent's screen before you send the code again.");
+    expect(screen.queryByText(/it does not send twice/u)).toBeNull();
+    expect(storedAnywhere(CODE)).toBe(false);
+  });
+
+  it("a plain send with no answer keeps today's notice", async () => {
+    const user = userEvent.setup();
+    server.use(http.post("*/api/send", () => HttpResponse.error()));
+    renderComposer({ surface: FREE });
+    await user.type(screen.getByRole("textbox"), "an ordinary reply");
+    await user.click(screen.getByRole("button", { name: "Send" }));
+    await screen.findByText(/Tap Send again: it does not send twice\./u);
+    expect(screen.queryByText(/Look at the agent's screen/u)).toBeNull();
+  });
+
+  // M102 spec 09: the phone's picture may be a moment old (`reason: "stale"`, composer unknown). The
+  // field stays named on such a read, and the secret rules hold there too.
+  it("on a stale read of the field: the framed sign-in field, no autocorrect, no draft, and a send marked secret", async () => {
+    const user = userEvent.setup();
+    let typed = "";
+    server.use(...replyHandler((text) => (typed = text)));
+    const STALE: Surface = { revision: 3, turn: "unknown", modal: "unknown", composer: "unknown", reason: "stale", field: "secret" };
+    renderComposer({ surface: STALE });
+    const box = screen.getByRole("textbox", { name: "Sign-in code" });
+    expect(box).toHaveAttribute("autocorrect", "off");
+
+    await user.type(box, CODE);
+    expect(loadDraft(undefined, "w1:p1")).toBeNull();
+    expect(storedAnywhere(CODE)).toBe(false);
+
+    await user.click(screen.getByRole("button", { name: "Send the code" }));
+    await waitFor(() => expect(typed).toBe(CODE));
+    expect(recordedSends()[0]?.secret).toBe(true);
+    expect(storedAnywhere(CODE)).toBe(false);
+  });
+
+  it("a plain box still keeps its draft", async () => {
+    const user = userEvent.setup();
+    renderComposer({ surface: FREE });
+    await user.type(screen.getByRole("textbox"), "an ordinary reply");
+    expect(loadDraft(undefined, "w1:p1")).toBe("an ordinary reply");
+  });
+
+  // M102 spec 06, the picked option "Framed field".
+  it("secret field: a framed field names what it waits for, shows a code by default, and Show masks it", async () => {
+    const user = userEvent.setup();
+    const { container } = renderWithContainer({ surface: SIGN_IN });
+    const frame = container.querySelector<HTMLElement>('[data-slot="secret-field"]');
+    expect(frame).not.toBeNull();
+    expect(within(frame!).getByText("Sign-in code")).toBeInTheDocument();
+    const box = screen.getByRole("textbox", { name: "Sign-in code" });
+    expect(box).toHaveAttribute("placeholder", "Not saved. Sent once.");
+    // No Attach, no long-press Send menu: the frame has Paste, Send and Close only.
+    expect(container.querySelector('[data-slot="composer-box"]')).toBeNull();
+    await user.type(box, "ABC");
+    expect(box.className).not.toMatch(/text-security/u);
+    await user.click(screen.getByRole("button", { name: "Hide the code" }));
+    expect(box.className).toMatch(/text-security:disc/u);
+    expect(screen.getByRole("button", { name: "Show the code" })).toHaveAttribute("aria-pressed", "false");
+  });
+
+  it("secret field: close sends nothing, the normal draft comes back, and the notice opens the field again", async () => {
+    const user = userEvent.setup();
+    saveDraft(undefined, "w1:p1", "my normal draft");
+    renderComposer({ surface: SIGN_IN });
+    await user.type(screen.getByRole("textbox", { name: "Sign-in code" }), "HALF");
+    await user.click(screen.getByRole("button", { name: "Close the code field" }));
+    expect(recordedSends()).toHaveLength(0);
+    expect(screen.getByRole("textbox")).toHaveValue("my normal draft");
+    expect(screen.getByText("The code field is closed. Nothing was sent.")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Open the code field" }));
+    // The half-typed code was not kept: the field opens empty.
+    expect(screen.getByRole("textbox", { name: "Sign-in code" })).toHaveValue("");
+    expect(storedAnywhere("HALF")).toBe(false);
+  });
+
+  it("secret field: a send empties the field and the normal draft stays apart", async () => {
+    const user = userEvent.setup();
+    let typed = "";
+    server.use(...replyHandler((text) => (typed = text)));
+    saveDraft(undefined, "w1:p1", "my normal draft");
+    renderComposer({ surface: SIGN_IN });
+    const box = screen.getByRole("textbox", { name: "Sign-in code" });
+    await user.type(box, CODE);
+    await user.keyboard("{Enter}");
+    await waitFor(() => expect(typed).toBe(CODE));
+    expect(box).toHaveValue("");
+    expect(loadDraft(undefined, "w1:p1")).toBe("my normal draft");
+  });
+
+  // No block without an exit: a field nothing can leave from says why, in the composer's own words.
+  it("secret field: a box out of reach says why in the field, and the code field's own line gives way", () => {
+    const OUT_OF_REACH: Surface = { revision: 3, turn: "unknown", modal: "unknown", composer: "unreachable", field: "secret" };
+    renderComposer({ surface: OUT_OF_REACH, unreachableNote: "Sending text is off on this pane." });
+    const box = screen.getByRole("textbox", { name: "Sign-in code" });
+    expect(box).toBeDisabled();
+    expect(box).toHaveAttribute("placeholder", "Sending text is off on this pane.");
+    cleanup();
+    renderComposer({ surface: SIGN_IN, readOnly: true });
+    expect(screen.getByRole("textbox", { name: "Sign-in code" })).toHaveAttribute("placeholder", "Read-only, not authorised");
+  });
+
+  it("secret field: Paste trims the clipboard's code, and focuses the field where the clipboard cannot be read", async () => {
+    const user = userEvent.setup();
+    const readText = vi.fn(() => Promise.resolve("  PASTED-CODE-1234\n"));
+    Object.defineProperty(navigator, "clipboard", { value: { readText }, configurable: true });
+    renderComposer({ surface: SIGN_IN });
+    await user.click(screen.getByRole("button", { name: "Paste" }));
+    await waitFor(() => expect(screen.getByRole("textbox", { name: "Sign-in code" })).toHaveValue("PASTED-CODE-1234"));
+    cleanup();
+    Object.defineProperty(navigator, "clipboard", { value: undefined, configurable: true });
+    renderComposer({ surface: SIGN_IN });
+    await user.click(screen.getByRole("button", { name: "Paste" }));
+    expect(screen.getByRole("textbox", { name: "Sign-in code" })).toHaveFocus();
+  });
+});
+
 // A shell's password prompt never echoes what is typed (#103), so the bridge cannot see a text land
 // there. When the bridge refuses a tap over such a screen (the stub below answers `unconfirmed`), the
 // composer reads the screen it already shows for the prompt, display only, and says so. A bare shell
 // with no profile gets such a refusal only at a password prompt (the bridge runs the same detector);
 // anywhere else the bridge types its text and presses Enter blind.
 describe("Composer: password prompt", () => {
-  const SUDO = "$ sudo systemctl restart collie\n[sudo] password for altan:";
+  const SUDO = "$ sudo systemctl restart collie\n[sudo] password for dev:";
   const SHELL: Surface = { revision: 9, turn: "unknown", modal: "unknown", composer: "unknown", reason: "no-match" };
 
   function refuseUnconfirmed() {
@@ -800,10 +968,10 @@ describe("Composer: password prompt", () => {
     await user.type(box, "hunter2hunter2");
     await user.click(screen.getByRole("button", { name: "Send" }));
 
-    await waitFor(() => expect(screen.getByText("[sudo] password for altan:")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText("[sudo] password for dev:")).toBeInTheDocument());
     expect(screen.getByRole("button", { name: /use type/i })).toBeInTheDocument();
     // The two-tap Send is untouched: a false positive costs a dismissal, not an action.
-    expect(screen.getByRole("button", { name: "Type here" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Send anyway" })).toBeInTheDocument();
     expect(recordedSends()).toHaveLength(1);
   });
 
@@ -820,7 +988,7 @@ describe("Composer: password prompt", () => {
     await user.type(box, "hunter2hunter2");
     await user.click(screen.getByRole("button", { name: "Send" }));
 
-    await waitFor(() => expect(screen.getByText("[sudo] password for altan:")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText("[sudo] password for dev:")).toBeInTheDocument());
     expect(screen.getByRole("button", { name: /use type/i })).toBeInTheDocument();
     expect(loadDraft(undefined, "w1:p1")).toBeNull();
     expect(recordedSends()).toHaveLength(1);
@@ -1490,21 +1658,22 @@ describe("Composer — the footer's strips animate in, never jump in", () => {
     await expectArrivedThroughCollapse(await screen.findByText(/typing into terminal/i));
   });
 
-  it("wraps the pending-send preview, which stays in the footer as a VERIFICATION surface", async () => {
-    // It is not moved to the top pills, and the reason is in composer.tsx at the strip: the "sent"
+  it("floats the pending-send preview as a toast, which stays a VERIFICATION surface", async () => {
+    // It is not a row of the footer any more (nothing moves when it comes), and not a pill: the "sent"
     // EVENT is already a pill (`composer.status.sent`, asserted here too), while this half holds the
     // words that were sent on screen until the mirror echoes them back, so the operator can check
-    // what landed rather than tapping Send twice. That outlives a pill's 2.5s and would be truncated
-    // by one.
+    // what landed rather than tapping Send twice. It shows only once the send is `SEND_SLOW_MS` old
+    // (composer-send-toast.test.tsx), so this waits for it.
     const user = userEvent.setup();
     renderComposerWithStatus();
     const box = screen.getByPlaceholderText(/type a reply/i);
     await user.type(box, "ship it");
     await user.click(screen.getByRole("button", { name: "Send" }));
 
-    const preview = await screen.findByText(/ship it/i, { selector: "span" });
-    await expectArrivedThroughCollapse(preview);
-    // The event half really is in the pills, so the footer is carrying only the verification half.
+    const preview = await screen.findByText(/ship it/i, { selector: "span" }, { timeout: 4000 });
+    expect(preview.closest('[data-slot="send-toast"]')).not.toBeNull();
+    expect(rowOf(preview)).toBeNull();
+    // The event half really is in the pills.
     expect(screen.getByTestId("status")).toHaveTextContent(/sent/i);
   }, 15000);
 });
@@ -2030,6 +2199,24 @@ describe("Composer — terminal-draft preview", () => {
     expect(recordedSends().map((r) => r.mode)).toEqual(["send", "replace"]);
   });
 
+  // Field case 2026-11-13: the bridge typed the text and did not press Enter. The box now shows the
+  // person's own message; the preview must not offer it back as somebody's draft to Take over.
+  it("after typed_not_submitted the text the bridge left in the box is no terminal draft: no preview, no Take over", async () => {
+    const user = userEvent.setup();
+    server.use(...sendHandler((request) => sendAnswer(request.id, "typed_not_submitted", "changed", { offers: ["submit", "discard", "keys"] })));
+    renderDraftHarness();
+    await user.type(screen.getByPlaceholderText(/type a reply/i), "decision 1 is good");
+    await user.click(screen.getByRole("button", { name: "Send" }));
+    await screen.findByRole("button", { name: "Submit" });
+    strandDraft("decision 1 is good");
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(screen.queryByText(/draft in terminal/i)).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /take over/i })).not.toBeInTheDocument();
+    // Another text in the box is a real draft again: the preview shows it.
+    strandDraft("someone else typed this");
+    expect(await screen.findByText(/draft in terminal/i)).toBeInTheDocument();
+  });
+
   it("read-only device: shows the preview and allows Take over (local copy), writing nothing to the terminal", async () => {
     const user = userEvent.setup();
     const keyCalls: string[] = [];
@@ -2261,7 +2448,9 @@ describe("Composer — no draft preview while its own send is in flight", () => 
 
 // Issue 691: on an iPhone with the keyboard up, the first tap on Send only dropped the keyboard. The
 // press moved focus off the field, and a busy (disabled) Send let the tap fall through to the box.
-describe("Composer — one tap on Send keeps the keyboard up (issue 691)", () => {
+// Since 2026-11-18 the send itself ends the keyboard: one tap on Send sends (the press does not move the
+// focus), and once the send is dispatched the box blurs when a SOFT keyboard is up.
+describe("Composer — one tap on Send sends, then the soft keyboard closes (issue 691)", () => {
   function holdSend() {
     let release!: () => void;
     const gate = new Promise<void>((resolve) => {
@@ -2279,6 +2468,141 @@ describe("Composer — one tap on Send keeps the keyboard up (issue 691)", () =>
     );
     return { release, posts };
   }
+
+  /** A soft keyboard for `useKeyboardOpen`, which reads `visualViewport` (jsdom has none). */
+  function withSoftKeyboard() {
+    const listeners = new Set<() => void>();
+    const vv = {
+      width: 400,
+      height: 800,
+      addEventListener: (_: string, fn: () => void) => void listeners.add(fn),
+      removeEventListener: (_: string, fn: () => void) => void listeners.delete(fn),
+    };
+    Object.defineProperty(window, "visualViewport", { value: vv, configurable: true });
+    return {
+      open: () => {
+        vv.height = 400;
+        act(() => listeners.forEach((fn) => fn()));
+      },
+    };
+  }
+  afterEach(() => {
+    Reflect.deleteProperty(window, "visualViewport");
+  });
+
+  it("blurs the box after a Send tap while a soft keyboard is up, and the first tap sends", async () => {
+    const user = userEvent.setup();
+    const keyboard = withSoftKeyboard();
+    const { release, posts } = holdSend();
+    renderComposer();
+    const box = screen.getByPlaceholderText(/type a reply/i);
+    await user.type(box, "hello");
+    keyboard.open();
+    expect(box).toHaveFocus();
+    await user.click(screen.getByRole("button", { name: "Send" }));
+    // One tap sent it, and the box let go before the bridge answered.
+    await waitFor(() => expect(posts).toEqual(["hello"]));
+    expect(box).not.toHaveFocus();
+    expect(box).toHaveValue("");
+    release();
+    await waitFor(() => expect(screen.getByRole("button", { name: "Send" })).toBeInTheDocument());
+    expect(box).not.toHaveFocus();
+  });
+
+  it("keeps the focus with no soft keyboard (a hardware keyboard, a wide layout)", async () => {
+    const user = userEvent.setup();
+    const { release, posts } = holdSend();
+    renderComposer();
+    const box = screen.getByPlaceholderText(/type a reply/i);
+    await user.type(box, "hello");
+    await user.click(screen.getByRole("button", { name: "Send" }));
+    await waitFor(() => expect(posts).toEqual(["hello"]));
+    expect(box).toHaveFocus();
+    release();
+    await waitFor(() => expect(box).toHaveValue(""));
+    expect(box).toHaveFocus();
+  });
+
+  it("keeps the focus when the send is refused before it goes (the Really send? arm)", async () => {
+    const user = userEvent.setup();
+    const keyboard = withSoftKeyboard();
+    const { posts } = holdSend();
+    renderComposer();
+    const box = screen.getByPlaceholderText(/type a reply/i);
+    await user.type(box, "rm -rf /");
+    keyboard.open();
+    await user.click(screen.getByRole("button", { name: "Send" }));
+    await screen.findByRole("button", { name: "Really send?" });
+    expect(posts).toEqual([]);
+    expect(box).toHaveFocus();
+    expect(box).toHaveValue("rm -rf /");
+  });
+
+  it("brings the focus back when the send fails and its words are put back", async () => {
+    const user = userEvent.setup();
+    const keyboard = withSoftKeyboard();
+    server.use(http.post("*/api/send", () => HttpResponse.error()));
+    renderComposer();
+    const box = screen.getByPlaceholderText(/type a reply/i);
+    await user.type(box, "hello");
+    keyboard.open();
+    await user.click(screen.getByRole("button", { name: "Send" }));
+    await screen.findByText(/Tap Send again: it does not send twice\./u);
+    expect(box).toHaveValue("hello");
+    expect(box).toHaveFocus();
+  });
+
+  it("does not touch the focus of another field: the code field keeps its keyboard", async () => {
+    const user = userEvent.setup();
+    const keyboard = withSoftKeyboard();
+    holdSend();
+    renderComposer();
+    const box = screen.getByPlaceholderText(/type a reply/i);
+    await user.type(box, "hello");
+    keyboard.open();
+    const other = document.createElement("input");
+    document.body.appendChild(other);
+    try {
+      other.focus();
+      await user.click(screen.getByRole("button", { name: "Send" }));
+      await waitFor(() => expect(box).toHaveValue(""));
+      expect(other).toHaveFocus();
+    } finally {
+      other.remove();
+    }
+  });
+
+  it("keeps the focus in Type into terminal mode, on an agent pane and on a shell", async () => {
+    for (const pane of [{ agent: "claude", isShell: false }, { agent: undefined, isShell: true }] as const) {
+      const user = userEvent.setup();
+      const keyboard = withSoftKeyboard();
+      server.use(http.post(/\/api\/pane\/[^/]+\/keys$/, () => HttpResponse.json({ ok: true })));
+      renderComposer(pane);
+      await user.click(screen.getByRole("button", { name: "Type into terminal" }));
+      const box = screen.getByRole("textbox");
+      box.focus();
+      await user.type(box, "ls");
+      keyboard.open();
+      expect(box).toHaveFocus();
+      await user.keyboard("{Enter}");
+      expect(box).toHaveFocus();
+      cleanup();
+    }
+  });
+
+  it("a shell pane's box send is a send like any other: the soft keyboard closes", async () => {
+    const user = userEvent.setup();
+    const keyboard = withSoftKeyboard();
+    const { release, posts } = holdSend();
+    renderComposer({ agent: undefined, isShell: true });
+    const box = screen.getByPlaceholderText(/shell command/i);
+    await user.type(box, "ls");
+    keyboard.open();
+    await user.click(screen.getByRole("button", { name: "Send" }));
+    await waitFor(() => expect(posts).toEqual(["ls"]));
+    expect(box).not.toHaveFocus();
+    release();
+  });
 
   it("refuses the focus move of a mouse down on Send", async () => {
     const user = userEvent.setup();
@@ -3351,7 +3675,8 @@ describe("Composer — the composer is one box", () => {
     await user.type(field(), "looks good");
     // `fireEvent` returns false when the handler called preventDefault, so this reads the two
     // decisions directly: the plain key is handed to the textarea, the modified one is taken.
-    expect(fireEvent.keyDown(field(), { key: "Enter" })).toBe(true);
+    // A hardware-looking Enter, with nothing stored on this device (ADR 0157): still the browser's new line.
+    expect(fireEvent.keyDown(field(), { key: "Enter", code: "Enter", keyCode: 13 })).toBe(true);
     expect(props.onSent).not.toHaveBeenCalled();
     expect(field()).toHaveValue("looks good");
 
@@ -3630,7 +3955,7 @@ describe("Composer — an attachment is a chip (ADR 0060)", () => {
     expect(typed).toEqual(["[Image #7] is a label"]);
   });
 
-  // 2026-10-14, minibuch: a draft carried a stale `[Image #1]` with no chip behind it (text copied
+  // 2026-10-14, workshop: a draft carried a stale `[Image #1]` with no chip behind it (text copied
   // from a pane that was closed), the next photo was numbered #1 again, and Send swapped BOTH copies
   // for its path. Two trailing paths became two images in Claude's box, and the send stalled.
   it("numbers a new chip past every marker already in the text, so a stale one is never its twin", async () => {
@@ -4079,7 +4404,7 @@ describe("Composer — the belt's clear control (M40 spec 04, #291)", () => {
   });
 
   describe("when the X is inert, and when it is not", () => {
-    it("is inert while a send is in flight: aria-disabled, and a tap clears nothing", async () => {
+    it("has nothing to clear while a send is in flight: the box let go at the tap and the X slot is held unseen (M104)", async () => {
       const user = userEvent.setup();
       let release: () => void = () => {};
       const held = new Promise<void>((resolve) => {
@@ -4096,11 +4421,12 @@ describe("Composer — the belt's clear control (M40 spec 04, #291)", () => {
       fireEvent.change(field(), { target: { value: "looks good" } });
       await user.click(screen.getByRole("button", { name: "Send" }));
 
-      const x = xButton()!;
-      await waitFor(() => expect(x).toHaveAttribute("aria-disabled", "true"));
-      await user.click(x);
-      expect(field()).toHaveValue("looks good");
+      // The box is empty from the tap on, so no X is offered and no Undo can bring the sent text back twice.
+      await waitFor(() => expect(field()).toHaveValue(""));
+      expect(xButton()).not.toBeInTheDocument();
       expect(undoButton()).not.toBeInTheDocument();
+      // The X's slot keeps its width, unseen and out of reach, so nothing on the belt slides.
+      expect(document.querySelector("[data-belt-clear-slot='held']")).not.toBeNull();
 
       release();
       await waitFor(() => expect(props.onSent).toHaveBeenCalled());
@@ -4934,7 +5260,7 @@ describe("outcome at the thumb", () => {
   it("refused turn_running: the agent is working, said as that, with the draft kept", async () => {
     await send(() => sendAnswer("x", "refused", "turn_running", { offers: ["keys"], surface: SURFACES.running }), { surface: SURFACES.running });
     await waitFor(() => expect(refusalText()).not.toBe(""));
-    expect(refusalText()).toBe("The agent is working. Send again when it is done.");
+    expect(refusalText()).toBe("The agent is working and does not take a message now. Stop the turn, or send again when it ends.");
     expect(screen.getByRole("textbox")).toHaveValue("hello there");
   });
 
@@ -4988,9 +5314,31 @@ describe("outcome at the thumb", () => {
     expect(screen.getByRole("button", { name: "Submit" })).toBeInTheDocument();
   });
 
+  // Field case 2026-11-13 ("the input froze"): after typed_not_submitted the person tapped Send again. Nothing
+  // on the phone locks: the field takes keys, Send is live, and a second Send is a new send request.
+  it("typed_not_submitted changed in a running turn: the field and Send stay live, and Send again is a new send of the same text", async () => {
+    let n = 0;
+    const user = await send(
+      () => (++n === 1 ? sendAnswer("x", "typed_not_submitted", "changed", { offers: ["submit", "discard", "keys"], surface: wayOutCase("draft").surface }) : sendAnswer("y", "sent")),
+      { surface: SURFACES.running },
+      "decision 1 is good",
+    );
+    await screen.findByRole("button", { name: "Submit" });
+    const field = screen.getByRole("textbox");
+    expect(field).toHaveValue("decision 1 is good");
+    expect(field).not.toBeDisabled();
+    const sendButton = screen.getByRole("button", { name: "Send" });
+    expect(sendButton).not.toHaveAttribute("aria-disabled", "true");
+    await user.click(sendButton);
+    await waitFor(() => expect(recordedSends()).toHaveLength(2));
+    expect(recordedSends()[1]).toMatchObject({ mode: "send", text: "decision 1 is good" });
+    expect(recordedSends()[1]!.id).not.toBe(recordedSends()[0]!.id);
+    await waitFor(() => expect(screen.getByRole("textbox")).toHaveValue(""));
+  });
+
   it("refused probe_failed: names the Surface and points to the Keys dock and the Screen", async () => {
     await send(() => sendAnswer("x", "refused", "probe_failed", { surface: SURFACES.noMatch, offers: ["keys"] }));
-    await waitFor(() => expect(refusalText()).toMatch(/typing did not land.*could not find the input box/i));
+    await waitFor(() => expect(refusalText()).toMatch(/could not find the input box.*test key did not land/i));
     expect(screen.getByRole("button", { name: "Open Keys" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Screen" })).toBeInTheDocument();
     expect(header()).toBe("");
@@ -4999,7 +5347,7 @@ describe("outcome at the thumb", () => {
   it("refused not_free: names the dialog that was open and points to its card and the Keys dock", async () => {
     const onAnswerDialog = vi.fn();
     const user = await send(() => sendAnswer("x", "refused", "not_free", { surface: SURFACES.ask }), { onAnswerDialog, dialogCard: true });
-    await waitFor(() => expect(refusalText()).toMatch(/not free.*a menu was open/i));
+    await waitFor(() => expect(refusalText()).toMatch(/a menu was open.*not free/i));
     await user.click(screen.getByRole("button", { name: "Answer the dialog" }));
     expect(onAnswerDialog).toHaveBeenCalledTimes(1);
     await user.click(screen.getByRole("button", { name: "Open Keys" }));
@@ -5007,13 +5355,17 @@ describe("outcome at the thumb", () => {
     expect(header()).toBe("");
   });
 
-  it("unknown: says to read the screen, then send again, keeps the draft, and the next tap is accepted as a new request", async () => {
+  it("unknown: says to read the screen, then send again, keeps the draft, and the next tap asks once before it sends a new request", async () => {
     const user = await send(() => sendAnswer("x", "unknown", "no_evidence", { offers: ["keys"] }));
     await waitFor(() => expect(refusalText()).toMatch(/read the screen, then send again/i));
     expect(screen.getByRole("button", { name: "Screen" })).toBeInTheDocument();
     expect(screen.getByRole("textbox")).toHaveValue("hello there");
     expect(header()).toBe("");
+    // The same text on the same pane, moments after an unknown result: the Send slot asks (M100 spec 06).
     await user.click(screen.getByRole("button", { name: "Send" }));
+    const again = await screen.findByRole("button", { name: "Send it again?" });
+    await new Promise((resolve) => setTimeout(resolve, 750)); // the question takes a moment before it counts (SEND_AGAIN_CONFIRM_DELAY_MS)
+    await user.click(again);
     await waitFor(() => expect(recordedSends()).toHaveLength(2));
     expect(recordedSends()[1]!.id).not.toBe(recordedSends()[0]!.id);
   });
@@ -5218,7 +5570,7 @@ describe("the cap (M56 spec 09)", () => {
     server.use(...capBridge(false));
     renderWithContainer({ surface: UNREADABLE });
     const user = await typeAndSend("carry on please");
-    await user.click(await screen.findByRole("button", { name: "Type here" }));
+    await user.click(await screen.findByRole("button", { name: "Send anyway" }));
     await waitFor(() => expect(screen.getByRole("textbox")).toHaveValue(""));
     expect(recordedSends().map(({ rowsHash, capAck }) => ({ rowsHash, capAck }))).toEqual([{ rowsHash: undefined, capAck: undefined }, { rowsHash: "0f00ba", capAck: undefined }]);
   });
@@ -5227,15 +5579,15 @@ describe("the cap (M56 spec 09)", () => {
     server.use(...capBridge(true));
     const { container } = renderWithContainer({ surface: UNREADABLE });
     const user = await typeAndSend("carry on please");
-    await user.click(await screen.findByRole("button", { name: "Type here" }));
+    await user.click(await screen.findByRole("button", { name: "Send anyway" }));
 
     await waitFor(() => expect(container.querySelector('[data-slot="composer-refusal"]')).toHaveTextContent(/on agent 2\.1\.301 5 times today/i));
     // The phone's own words stand in the notice, not the bridge's English.
     expect(container.querySelector('[data-slot="composer-refusal"]')).not.toHaveTextContent(/bridge's own english/i);
     expect(screen.getByRole("textbox")).toHaveValue("carry on please");
-    expect(screen.queryByRole("button", { name: "Type here" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Send anyway" })).toBeNull();
 
-    await user.click(screen.getByRole("button", { name: "Confirm and type" }));
+    await user.click(screen.getByRole("button", { name: "Confirm and send anyway" }));
     await waitFor(() => expect(screen.getByRole("textbox")).toHaveValue(""));
     expect(recordedSends().map(({ rowsHash, capAck }) => ({ rowsHash, capAck }))).toEqual([
       { rowsHash: undefined, capAck: undefined },
@@ -5254,7 +5606,7 @@ describe("the cap (M56 spec 09)", () => {
     );
     const { container } = renderWithContainer({ surface: UNREADABLE });
     const user = await typeAndSend("carry on please");
-    await user.click(await screen.findByRole("button", { name: "Type here" }));
+    await user.click(await screen.findByRole("button", { name: "Send anyway" }));
     await waitFor(() => expect(container.querySelector('[data-slot="composer-refusal"]')).toHaveTextContent("on agent 5 times today"));
     expect(container.querySelector('[data-slot="composer-refusal"]')?.textContent).not.toMatch(/agent -|\s{2}/u);
   });
@@ -5263,8 +5615,8 @@ describe("the cap (M56 spec 09)", () => {
     server.use(...capBridge(true));
     renderWithContainer({ surface: UNREADABLE });
     const user = await typeAndSend("carry on please");
-    await user.click(await screen.findByRole("button", { name: "Type here" }));
-    await screen.findByRole("button", { name: "Confirm and type" });
+    await user.click(await screen.findByRole("button", { name: "Send anyway" }));
+    await screen.findByRole("button", { name: "Confirm and send anyway" });
     // The field, the Send button and the Keys board are all still there, enabled, with the draft kept.
     expect(screen.getByRole("textbox")).toBeEnabled();
     expect(screen.getByRole("button", { name: "Send" })).toBeEnabled();
@@ -5276,8 +5628,8 @@ describe("the cap (M56 spec 09)", () => {
     server.use(...capBridge(true));
     renderWithContainer({ surface: UNREADABLE });
     const user = await typeAndSend("carry on please");
-    await user.click(await screen.findByRole("button", { name: "Type here" }));
-    await screen.findByRole("button", { name: "Confirm and type" });
+    await user.click(await screen.findByRole("button", { name: "Send anyway" }));
+    await screen.findByRole("button", { name: "Confirm and send anyway" });
     await user.click(screen.getByRole("button", { name: "Dismiss the send offers" }));
     await user.click(screen.getByRole("button", { name: "Send" }));
     await waitFor(() => expect(recordedSends()).toHaveLength(3));
@@ -5832,26 +6184,113 @@ describe("Composer command suggestions (#458)", () => {
 
 
 describe("Composer — known launch startup send-lock", () => {
-  it("keeps a local draft editable and blocks button, keyboard and Quick without a request", async () => {
+  it("turns the box off for the start, in the look of a locked one, and has no notice row", async () => {
+    const props = renderComposer({ starting: true });
+    // The placeholder says why, inside the box: the reply words are gone, and no row of its own holds "Starting…".
+    const box = screen.getByPlaceholderText("Starting…");
+    expect(box).not.toBeDisabled();
+    expect(box).toHaveAttribute("readonly");
+    expect(box).toHaveAttribute("aria-disabled", "true");
+    expect(box).toHaveClass("opacity-50", "cursor-not-allowed");
+    expect(screen.queryByText("Starting…")).toBeNull();
+    expect(box.closest("[class*='bg-muted/40']")).not.toBeNull();
+    expect(screen.queryByRole("status")).toBeNull();
+    expect(screen.getByRole("button", { name: /^Send$/ })).toHaveAttribute("aria-disabled", "true");
+    expect(screen.getByRole("button", { name: "Attach file" })).toBeDisabled();
+    expect(props.onSent).not.toHaveBeenCalled();
+    // The terminal's own doors stay: Type mode and Keys are not held.
+    expect(screen.getByRole("button", { name: "Type into terminal" })).not.toBeDisabled();
+    await userEvent.setup().click(screen.getByRole("button", { name: "Keys" }));
+    expect(screen.getByRole("button", { name: "Esc" })).not.toBeDisabled();
+  });
+
+  it("keeps a draft typed before the start, sends nothing during it, and gives the box back editable", async () => {
     const user = userEvent.setup();
     const typed = vi.fn();
     server.use(...replyHandler(typed));
-    const props = renderComposer({ starting: true });
+    let start = (_on: boolean) => {};
+    function View() {
+      const [starting, setStarting] = useState(false);
+      start = setStarting;
+      return <Composer paneId="start:p1" agent="kiro" isShell={false} gone={false} readOnly={false} surface={FREE} starting={starting}
+        text="pane output" terminalDraft={null} rawTerminalDraft={null}
+        prefs={{ wrap: true, fontSize: 11, draftFontSize: 14, chatFontSize: 14, fontFamily: "system", rawTerminal: false, tapToFocus: true, expandClippedReply: true, stretchText: false }}
+        display={{ open: false, onToggle: vi.fn() }} onSent={vi.fn()} />;
+    }
+    const router = createMemoryRouter([{ path: "/", element: <View /> }]);
+    render(<RouterProvider router={router} />);
     const box = screen.getByPlaceholderText(/type a reply/i);
     expect(box).not.toBeDisabled();
     await user.type(box, "keep this draft");
-    expect(screen.getByText("Starting…")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /^Send$/ })).toHaveAttribute("aria-disabled", "true");
+    box.focus();
+    act(() => start(true));
+    // Held: not disabled (a disabled field drops focus and the keyboard with it), read only and aria-disabled.
+    expect(box).not.toBeDisabled();
+    expect(box).toHaveAttribute("readonly");
+    expect(box).toHaveAttribute("aria-disabled", "true");
+    expect(box).toHaveFocus();
+    expect(box).toHaveAttribute("placeholder", "Starting…");
+    expect(box).toHaveValue("keep this draft");
+    // Keys, Enter, Ctrl+Enter, paste, cut, drop, composition and a change event that got through change nothing and send nothing.
+    await user.keyboard("more{Enter}");
+    fireEvent.keyDown(box, { key: "Enter" });
     fireEvent.keyDown(box, { key: "Enter", ctrlKey: true });
-    await user.click(screen.getByRole("button", { name: "Quick" }));
-    await user.click(screen.getByRole("button", { name: "continue" }));
+    fireEvent.keyDown(box, { key: "Enter", metaKey: true });
+    await user.paste("pasted words");
+    fireEvent.paste(box, { clipboardData: { items: [], getData: () => "fire pasted" } });
+    expect(fireEvent.cut(box)).toBe(false);
+    expect(fireEvent.drop(box)).toBe(false);
+    fireEvent.compositionStart(box);
+    fireEvent.change(box, { target: { value: "keep this draft, composed" } });
+    fireEvent.compositionEnd(box, { data: "composed" });
+    expect(box).toHaveValue("keep this draft");
+    expect(box).toHaveFocus();
+    await user.click(screen.getByRole("button", { name: /^Send$/ }));
+    expect(typed).not.toHaveBeenCalled();
+    expect(loadDraft(undefined, "start:p1")).toBe("keep this draft");
+    act(() => start(false));
+    expect(box).not.toBeDisabled();
+    expect(box).not.toHaveAttribute("readonly");
+    expect(box).not.toHaveAttribute("aria-disabled");
+    expect(box).toHaveFocus();
+    expect(box).toHaveValue("keep this draft");
+    await user.type(box, "!");
+    expect(box).toHaveValue("keep this draft!");
+  });
+
+  it("every error ends the hold: a stale or lost read frees the box for the offline rules, a gone pane locks it", async () => {
+    const user = userEvent.setup();
+    const typed = vi.fn();
+    server.use(...replyHandler(typed));
+    // A failed read or a reconnect: the copy is stale. The box is not held, takes a draft, and sends nothing.
+    const props = renderComposer({ starting: true, stale: true });
+    const box = screen.getByRole("textbox");
+    expect(box).not.toHaveAttribute("readonly");
+    expect(box).not.toHaveAttribute("aria-disabled");
+    await user.type(box, "typed while the read is down");
+    expect(box).toHaveValue("typed while the read is down");
+    fireEvent.keyDown(box, { key: "Enter", ctrlKey: true });
     expect(typed).not.toHaveBeenCalled();
     expect(props.onSent).not.toHaveBeenCalled();
-    expect(box).toHaveValue("keep this draft");
-    expect(loadDraft(undefined, props.paneId)).toBe("keep this draft");
-    expect(screen.getByRole("button", { name: "Type into terminal" })).not.toBeDisabled();
-    await user.click(screen.getByRole("button", { name: "Keys" }));
-    expect(screen.getByRole("button", { name: "Esc" })).not.toBeDisabled();
+    cleanup();
+    // The pane closed under the hold: the lock takes over with its own words, not the hold's.
+    renderComposer({ starting: true, gone: true });
+    const gone = screen.getByRole("textbox");
+    expect(gone).toBeDisabled();
+    expect(gone).not.toHaveAttribute("placeholder", "Starting…");
+    expect(typed).not.toHaveBeenCalled();
+  });
+
+  it("does not turn a box off for Type mode, where keys still go", async () => {
+    const user = userEvent.setup();
+    renderComposer({ starting: true });
+    await user.click(screen.getByRole("button", { name: "Type into terminal" }));
+    expect(screen.getByPlaceholderText(/type|terminal/i)).not.toBeDisabled();
+  });
+
+  it("does not turn the box off when no launch is starting", () => {
+    renderComposer({ starting: false });
+    expect(screen.getByPlaceholderText(/type a reply/i)).not.toBeDisabled();
   });
 
   it("startup never unlocks a genuine read-only or unreachable composer", () => {
@@ -5880,12 +6319,1042 @@ describe("Composer — known launch startup send-lock", () => {
     const box = screen.getByRole("textbox");
     await user.type(box, "offered draft");
     await user.click(screen.getByRole("button", { name: /^Send$/ }));
-    await screen.findByRole("button", { name: "Type here" });
+    await screen.findByRole("button", { name: "Send anyway" });
     act(lock);
-    const commit = screen.getByRole("button", { name: "Type here" });
+    const commit = screen.getByRole("button", { name: "Send anyway" });
     expect(commit).toBeDisabled();
     await user.click(commit);
     expect(typed).toHaveBeenCalledOnce();
     expect(box).toHaveValue("offered draft");
+  });
+});
+
+// M102 spec 02: the step each stop card names is a button first in the notice, then the card or the
+// Screen, then Open Keys. Send again after another running send waits, off, with its reason under it,
+// until a later read shows the box free; it never sends by itself.
+describe("the next step on a stop card (M102 spec 02)", () => {
+  /** A composer whose Surface the test moves on, as a poll would. */
+  function renderWithSurface(first: Surface, over: Partial<ComponentProps<typeof Composer>> = {}) {
+    let move: (next: Surface) => void = () => undefined;
+    function Harness() {
+      const [surface, setSurface] = useState<Surface>(first);
+      move = setSurface;
+      return (
+        <CrewProvider servers={undefined}>
+          <StatusSentinel />
+          <Composer
+            paneId="w1:p1"
+            agent="claude"
+            isShell={false}
+            gone={false}
+            readOnly={false}
+            surface={surface}
+            text="pane output"
+            terminalDraft={null}
+            rawTerminalDraft={null}
+            prefs={{ wrap: true, fontSize: 11, draftFontSize: 14, chatFontSize: 14, fontFamily: "system", rawTerminal: false, tapToFocus: true, expandClippedReply: true, stretchText: false }}
+            display={{ open: false, onToggle: vi.fn() }}
+            onSent={vi.fn()}
+            {...over}
+          />
+        </CrewProvider>
+      );
+    }
+    markLive("w1:p1", Date.now());
+    render(<RouterProvider router={createMemoryRouter([{ path: "/", element: <Harness /> }])} />);
+    return { move: (next: Surface) => act(() => move(next)) };
+  }
+
+  const free = (revision: number): Surface => ({ ...FREE, revision });
+
+  it("next step: Send again waits for the other send, says why, turns on when the box is free again, and never sends by itself", async () => {
+    let calls = 0;
+    server.use(
+      ...sendHandler((request) => {
+        calls += 1;
+        return calls === 1 ? sendAnswer(request.id, "refused", "busy", { offers: ["keys"], surface: free(3), detail: "Another send on this pane is still running." }) : sendAnswer(request.id, "sent");
+      }),
+    );
+    const user = userEvent.setup();
+    const { move } = renderWithSurface(free(3));
+    await user.type(screen.getByRole("textbox"), "after the other one");
+    await user.click(screen.getByRole("button", { name: "Send" }));
+    const again = await screen.findByRole("button", { name: "Send again" });
+    expect(again).toBeDisabled();
+    expect(screen.getByText("Send again turns on when the other send ends.")).toBeInTheDocument();
+    // The other send still holds the box: a new read with text in it keeps the button off.
+    move({ ...FREE, revision: 4, composer: "draft" });
+    expect(screen.getByRole("button", { name: "Send again" })).toBeDisabled();
+    // The box is free again: the button turns on, the live line says so, and nothing went out by itself.
+    move(free(5));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Send again" })).toBeEnabled());
+    expect(screen.getByText("The other send ended. You can send again.")).toBeInTheDocument();
+    expect(recordedSends()).toHaveLength(1);
+    await user.click(screen.getByRole("button", { name: "Send again" }));
+    await waitFor(() => expect(recordedSends()).toHaveLength(2));
+    expect(recordedSends()[1]).toMatchObject({ text: "after the other one", mode: "send" });
+    expect(recordedSends()[1]!.id).not.toBe(recordedSends()[0]!.id);
+  });
+
+  it("next step: a turn the agent does not take a message in offers Stop the turn first, then Open Keys", async () => {
+    const running = wayOutCase("running").surface;
+    let stops = 0;
+    server.use(
+      ...sendHandler((request) => sendAnswer(request.id, "refused", "turn_running", { offers: ["keys"], surface: running })),
+      http.post(/\/api\/pane\/[^/]+\/abort$/, () => {
+        stops += 1;
+        return HttpResponse.json({ requestId: "stop-0001", outcome: "stopped" });
+      }),
+    );
+    const user = userEvent.setup();
+    renderWithSurface(running, { stopOffered: true });
+    await user.type(screen.getByRole("textbox"), "one more thing");
+    await user.click(screen.getByRole("button", { name: "Send" }));
+    await screen.findByText(/Stop the turn, or send again/u);
+    // The notice's own buttons, in order: the step first, Open Keys last (the belt has its own Stop).
+    const notice = document.querySelector('[data-slot="composer-refusal"]')!.closest<HTMLElement>('[data-slot="notice"]')!;
+    const words = within(notice).getAllByRole("button").map((b) => b.textContent);
+    expect(words.indexOf("Stop the turn")).toBe(0);
+    expect(words.indexOf("Stop the turn")).toBeLessThan(words.indexOf("Open Keys"));
+    await user.click(within(notice).getByRole("button", { name: "Stop the turn" }));
+    await waitFor(() => expect(stops).toBe(1));
+  });
+
+  it("next step: a draft Collie cannot read whole offers Empty the box, which is the Clear route", async () => {
+    const posted: string[] = [];
+    server.use(
+      ...sendHandler((request) => sendAnswer(request.id, "refused", "draft_present", { offers: ["keys"], surface: { ...FREE, composer: "draft" }, detail: "The draft is longer than Collie empties in one request." })),
+      http.post(/\/api\/pane\/[^/]+\/clear$/, ({ request }) => {
+        posted.push(request.url);
+        return HttpResponse.json({ requestId: "clear-0001", outcome: "cleared" });
+      }),
+    );
+    const user = userEvent.setup();
+    renderWithSurface({ ...FREE, composer: "draft" });
+    await user.type(screen.getByRole("textbox"), "my long message");
+    await user.click(screen.getByRole("button", { name: "Send" }));
+    await waitFor(() => expect(document.querySelector('[data-slot="composer-refusal"]')?.textContent).toMatch(/cannot read whole.*The button "Empty the box" deletes that draft/u));
+    await user.click(screen.getByRole("button", { name: "Empty the box" }));
+    await waitFor(() => expect(posted).toHaveLength(1));
+    // The person's draft in the phone's field stays: only the agent's box was emptied.
+    expect(screen.getByRole("textbox")).toHaveValue("my long message");
+  });
+});
+
+describe("the unread card (M102 spec 03)", () => {
+  const UNREAD: Surface = { revision: 7, turn: "idle", modal: "unreadable", composer: "empty" };
+
+  /** A composer whose unread identity the test moves on, as a new screen would. */
+  function renderUnread(first: string | null, over: Partial<ComponentProps<typeof Composer>> = {}) {
+    let move: (next: string | null) => void = () => undefined;
+    const handle = createRef<ComposerHandle>();
+    function Harness() {
+      const [identity, setIdentity] = useState<string | null>(first);
+      move = setIdentity;
+      return (
+        <CrewProvider servers={undefined}>
+          <StatusSentinel />
+          <Composer
+            ref={handle}
+            paneId="w1:p1"
+            agent="claude"
+            isShell={false}
+            gone={false}
+            readOnly={false}
+            surface={UNREAD}
+            text="pane output"
+            terminalDraft={null}
+            rawTerminalDraft={null}
+            prefs={{ wrap: true, fontSize: 11, draftFontSize: 14, chatFontSize: 14, fontFamily: "system", rawTerminal: false, tapToFocus: true, expandClippedReply: true, stretchText: false }}
+            display={{ open: false, onToggle: vi.fn() }}
+            onSent={vi.fn()}
+            unreadState={identity}
+            {...over}
+          />
+        </CrewProvider>
+      );
+    }
+    markLive("w1:p1", Date.now());
+    render(<RouterProvider router={createMemoryRouter([{ path: "/", element: <Harness /> }])} />);
+    return { handle, move: (next: string | null) => act(() => move(next)) };
+  }
+
+  it("unread card: the Keys drawer opens once for a new screen, and a drawer the person closed stays closed", async () => {
+    const user = userEvent.setup();
+    const { move } = renderUnread("screen-a");
+    const keys = screen.getByRole("button", { name: "Keys" });
+    await waitFor(() => expect(keys).toHaveAttribute("aria-expanded", "true"));
+    await user.click(keys);
+    expect(keys).toHaveAttribute("aria-expanded", "false");
+    // The same screen read again does not open it a second time.
+    move("screen-a");
+    expect(keys).toHaveAttribute("aria-expanded", "false");
+    // A new screen Collie cannot read opens it again.
+    move("screen-b");
+    await waitFor(() => expect(keys).toHaveAttribute("aria-expanded", "true"));    // The pad's 123 chip stays as the person left it: a digit is never Collie's offer.
+    expect(screen.getByRole("button", { name: "123" })).toHaveAttribute("aria-pressed", "false");
+  });
+
+  it("unread card: a new screen never takes over a drawer the person has open", async () => {
+    const user = userEvent.setup();
+    const { move } = renderUnread(null);
+    await user.click(screen.getByRole("button", { name: "Quick" }));
+    expect(screen.getByRole("button", { name: "Quick" })).toHaveAttribute("aria-expanded", "true");
+    move("screen-a");
+    expect(screen.getByRole("button", { name: "Quick" })).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByRole("button", { name: "Keys" })).toHaveAttribute("aria-expanded", "false");
+  });
+
+  it("unread card: Send past this screen reads the screen once, then the next send carries its rows hash with override", async () => {
+    server.use(...sendHandler((request) => (request.mode === "prepare" ? sendAnswer(request.id, null, undefined, { rowsHash: "0b0e1f" }) : sendAnswer(request.id, "sent"))));
+    const user = userEvent.setup();
+    const { handle } = renderUnread(null);
+    act(() => handle.current?.typeAnyway());
+    await waitFor(() => expect(recordedSends()).toHaveLength(1));
+    expect(recordedSends()[0]).toMatchObject({ text: "", mode: "prepare" });
+    // Nothing was typed by the read: the field waits for the person's words.
+    await waitFor(() => expect(screen.getByRole("textbox")).toHaveAttribute("placeholder", expect.stringMatching(/./u)));
+    await user.type(screen.getByRole("textbox"), "yes, go on");
+    await user.click(screen.getByRole("button", { name: "Send" }));
+    await waitFor(() => expect(recordedSends()).toHaveLength(2));
+    expect(recordedSends()[1]).toMatchObject({ text: "yes, go on", rowsHash: "0b0e1f", override: true });
+  });
+
+  it("unread card: an override that met a menu says so, opens the Keys pad, and stays armed on the screen now", async () => {
+    let n = 0;
+    server.use(
+      ...sendHandler((request) => {
+        n += 1;
+        if (request.mode === "prepare") return sendAnswer(request.id, null, undefined, { rowsHash: "0aaa01" });
+        if (n === 2) return sendAnswer(request.id, "refused", "menu_open", { offers: ["keys"], rowsHash: "0bbb02", surface: UNREAD });
+        return sendAnswer(request.id, "sent");
+      }),
+    );
+    const user = userEvent.setup();
+    const { handle } = renderUnread(null);
+    act(() => handle.current?.typeAnyway());
+    await waitFor(() => expect(recordedSends()).toHaveLength(1));
+    await user.type(screen.getByRole("textbox"), "carry on");
+    await user.click(screen.getByRole("button", { name: "Send" }));
+    await waitFor(() => expect(document.querySelector('[data-slot="composer-refusal"]')?.textContent).toMatch(/A menu or a question is on the screen, so nothing was typed/u));
+    expect(screen.getByRole("button", { name: "Keys" })).toHaveAttribute("aria-expanded", "true");
+    // The next tap binds to the rows the refusal carried, still with the person's word.
+    await user.click(screen.getByRole("button", { name: "Send" }));
+    await waitFor(() => expect(recordedSends()).toHaveLength(3));
+    expect(recordedSends()[2]).toMatchObject({ text: "carry on", rowsHash: "0bbb02", override: true });
+  });
+
+  it("unread card: an override typed with no Enter offers no Submit; the person presses Enter on the pad", async () => {
+    server.use(
+      ...sendHandler((request) =>
+        request.mode === "prepare"
+          ? sendAnswer(request.id, null, undefined, { rowsHash: "0ccc03" })
+          : sendAnswer(request.id, "typed_not_submitted", "override", { offers: ["keys"], surface: UNREAD }),
+      ),
+    );
+    const user = userEvent.setup();
+    const { handle } = renderUnread(null);
+    act(() => handle.current?.typeAnyway());
+    await waitFor(() => expect(recordedSends()).toHaveLength(1));
+    await user.type(screen.getByRole("textbox"), "yes please");
+    await user.click(screen.getByRole("button", { name: "Send" }));
+    await waitFor(() => expect(document.querySelector('[data-slot="composer-refusal"]')?.textContent).toMatch(/Collie pressed no Enter\. Check the screen, then press Enter on the Keys pad/u));
+    expect(screen.queryByRole("button", { name: "Submit" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Keys" })).toHaveAttribute("aria-expanded", "true");
+    expect(recordedSends()).toHaveLength(2);
+  });
+
+  it("unread card: an override typed after words already in the agent's box says so (draftSeen)", async () => {
+    server.use(
+      ...sendHandler((request) =>
+        request.mode === "prepare"
+          ? sendAnswer(request.id, null, undefined, { rowsHash: "0ccc05" })
+          : sendAnswer(request.id, "typed_not_submitted", "override", { offers: ["keys"], surface: UNREAD, draftSeen: true }),
+      ),
+    );
+    const user = userEvent.setup();
+    const { handle } = renderUnread(null);
+    act(() => handle.current?.typeAnyway());
+    await waitFor(() => expect(recordedSends()).toHaveLength(1));
+    await user.type(screen.getByRole("textbox"), "yes please");
+    await user.click(screen.getByRole("button", { name: "Send" }));
+    await waitFor(() => expect(document.querySelector('[data-slot="composer-refusal"]')?.textContent).toMatch(/after words that were already there\. Collie pressed no Enter/u));
+  });
+
+  it("unread card: an override whose text was already in the box says nothing was typed again, and opens the pad", async () => {
+    server.use(
+      ...sendHandler((request) =>
+        request.mode === "prepare"
+          ? sendAnswer(request.id, null, undefined, { rowsHash: "0ccc08" })
+          : sendAnswer(request.id, "typed_not_submitted", "override", { offers: ["keys"], surface: UNREAD, textAlreadyTyped: true }),
+      ),
+    );
+    const user = userEvent.setup();
+    const { handle } = renderUnread(null);
+    act(() => handle.current?.typeAnyway());
+    await waitFor(() => expect(recordedSends()).toHaveLength(1));
+    await user.type(screen.getByRole("textbox"), "yes please");
+    await user.click(screen.getByRole("button", { name: "Send" }));
+    await waitFor(() => expect(document.querySelector('[data-slot="composer-refusal"]')?.textContent).toBe("This text was already in the agent's box, so nothing was typed again. Press Enter on the Keys pad."));
+    expect(screen.getByRole("button", { name: "Keys" })).toHaveAttribute("aria-expanded", "true");
+  });
+
+  // The phone's own read can differ from the bridge's fresh one, so no word before the tap promises that
+  // Enter goes or that it does not: one wording on every screen, and the receipt says what happened
+  // (the M102 review, pass 2, item 1).
+  async function expectNeutralWords(shown: Surface): Promise<void> {
+    server.use(
+      ...sendHandler((request) =>
+        request.mode === "prepare"
+          ? sendAnswer(request.id, null, undefined, { rowsHash: "0aaa10" })
+          : sendAnswer(request.id, "refused", "unconfirmed", { offers: ["commit", "keys"], rowsHash: "0aaa09", surface: shown }),
+      ),
+    );
+    const user = userEvent.setup();
+    const { handle } = renderUnread(null, { surface: shown });
+    await user.type(screen.getByRole("textbox"), "carry on");
+    await user.click(screen.getByRole("button", { name: "Send" }));
+    await waitFor(() => expect(document.querySelector('[data-slot="composer-refusal"]')?.textContent).toMatch(/Collie cannot read this screen\. Check the pane, then tap Send anyway\.$/u));
+    expect(screen.getByRole("button", { name: "Send anyway" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /^(Type here|Send here)$/u })).toBeNull();
+    expect(document.body.textContent).not.toMatch(/presses Enter|no Enter/u);
+    act(() => handle.current?.typeAnyway());
+    await waitFor(() => expect(screen.getByRole("textbox")).toHaveAttribute("placeholder", "Your message goes past this screen\u2026"));
+  }
+
+  it("before the tap no word promises Enter either way, where the manual Send is open", async () => {
+    await expectNeutralWords({ revision: 3, turn: "idle", modal: "unknown", composer: "empty" });
+  });
+
+  it("before the tap no word promises Enter either way, where the manual Send is shut", async () => {
+    await expectNeutralWords({ revision: 3, turn: "unknown", modal: "unknown", composer: "unknown", reason: "stale" });
+  });
+
+  // WIRE-12, M102 review 2 item 5: a manual commit whose screen changed only in numbers or a spinner is placed with
+  // no key and answered typed_not_submitted/override. The phone says to press Enter on the Keys pad and opens it.
+  it("a manual commit the bridge placed with no key says press Enter on the Keys pad, and opens the pad", async () => {
+    const manual: Surface = { revision: 3, turn: "idle", modal: "unknown", composer: "empty" };
+    server.use(
+      ...sendHandler((request) =>
+        request.override === true
+          ? sendAnswer(request.id, "typed_not_submitted", "override", { offers: ["keys"], surface: manual })
+          : sendAnswer(request.id, "refused", "unconfirmed", { offers: ["commit", "keys"], rowsHash: "0aaa11", surface: manual }),
+      ),
+    );
+    const user = userEvent.setup();
+    renderUnread(null, { surface: manual });
+    await user.type(screen.getByRole("textbox"), "carry on");
+    await user.click(screen.getByRole("button", { name: "Send" }));
+    const commit = await screen.findByRole("button", { name: "Send anyway" });
+    // The Keys pad is shut until the receipt says the text waits for Enter.
+    expect(screen.getByRole("button", { name: "Keys" })).toHaveAttribute("aria-expanded", "false");
+    await user.click(commit);
+    await waitFor(() => expect(recordedSends()).toHaveLength(2));
+    expect(recordedSends()[1]).toMatchObject({ text: "carry on", rowsHash: "0aaa11", override: true });
+    await waitFor(() => expect(document.querySelector('[data-slot="composer-refusal"]')?.textContent).toMatch(/Collie pressed no Enter\. Check the screen, then press Enter on the Keys pad\./u));
+    expect(screen.queryByRole("button", { name: "Submit" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Keys" })).toHaveAttribute("aria-expanded", "true");
+  });
+
+  it("unread card: an override the screen moved under says so and stays armed on the screen now", async () => {
+    server.use(
+      ...sendHandler((request) =>
+        request.mode === "prepare"
+          ? sendAnswer(request.id, null, undefined, { rowsHash: "0eee06" })
+          : request.rowsHash === "0eee06"
+            ? sendAnswer(request.id, "refused", "stale_surface", { offers: ["keys"], rowsHash: "0fff07", surface: UNREAD })
+            : sendAnswer(request.id, "sent"),
+      ),
+    );
+    const user = userEvent.setup();
+    const { handle } = renderUnread(null);
+    act(() => handle.current?.typeAnyway());
+    await waitFor(() => expect(recordedSends()).toHaveLength(1));
+    await user.type(screen.getByRole("textbox"), "go on");
+    await user.click(screen.getByRole("button", { name: "Send" }));
+    await waitFor(() => expect(document.querySelector('[data-slot="composer-refusal"]')?.textContent).toBe("The screen changed before your text went in, so nothing was typed. Look at the screen now, then tap Send, then Send anyway."));
+    await user.click(screen.getByRole("button", { name: "Send" }));
+    await waitFor(() => expect(recordedSends()).toHaveLength(3));
+    expect(recordedSends()[2]).toMatchObject({ text: "go on", rowsHash: "0fff07", override: true });
+  });
+
+  it("unread card: a not_free refusal with the rows hash offers Send anyway, which sends the override on those rows (I4)", async () => {
+    const stale: Surface = { revision: 3, turn: "unknown", modal: "unknown", composer: "unknown", reason: "stale" };
+    server.use(
+      ...sendHandler((request) =>
+        request.rowsHash === undefined ? sendAnswer(request.id, "refused", "not_free", { offers: ["keys"], rowsHash: "0ddd04", surface: stale }) : sendAnswer(request.id, "sent"),
+      ),
+    );
+    const user = userEvent.setup();
+    renderUnread(null, { surface: stale });
+    await user.type(screen.getByRole("textbox"), "carry on please");
+    await user.click(screen.getByRole("button", { name: "Send" }));
+    await user.click(await screen.findByRole("button", { name: "Send anyway" }));
+    await waitFor(() => expect(recordedSends()).toHaveLength(2));
+    expect(recordedSends()[1]).toMatchObject({ text: "carry on please", rowsHash: "0ddd04", override: true });
+  });
+
+  it("unread card: a not_free refusal on a sign-in field offers no Send anyway", async () => {
+    const secret: Surface = { revision: 3, turn: "unknown", modal: "unknown", composer: "unknown", field: "secret" };
+    server.use(...sendHandler((request) => sendAnswer(request.id, "refused", "not_free", { offers: ["keys"], rowsHash: "0eee05", surface: secret })));
+    const user = userEvent.setup();
+    renderUnread(null, { surface: { ...secret, composer: "empty", turn: "idle", modal: "none" } });
+    await user.type(screen.getByRole("textbox", { name: "Sign-in code" }), "123456");
+    await user.click(screen.getByRole("button", { name: "Send the code" }));
+    await waitFor(() => expect(recordedSends()).toHaveLength(1));
+    await waitFor(() => expect(document.querySelector('[data-slot="composer-refusal"]')).not.toBeNull());
+    expect(screen.queryByRole("button", { name: "Send anyway" })).toBeNull();
+  });
+
+  it("unread card: a refusal whose step is the screen asks the pane to show the card", async () => {
+    server.use(...sendHandler((request) => sendAnswer(request.id, "refused", "not_free", { offers: ["keys"], surface: { ...UNREAD, modal: "unknown", composer: "unknown" } })));
+    const onScreenUnread = vi.fn();
+    const user = userEvent.setup();
+    renderUnread(null, { surface: FREE, onScreenUnread });
+    await user.type(screen.getByRole("textbox"), "hello");
+    await user.click(screen.getByRole("button", { name: "Send" }));
+    await waitFor(() => expect(onScreenUnread).toHaveBeenCalledTimes(1));
+  });
+});
+
+describe("the cannot tell card (M102 spec 04)", () => {
+  const SENTENCE = "Collie cannot tell if this arrived. Look at the screen.";
+  const WAITING = "Collie is waiting for the agent's own word that it arrived. Send again turns on when the wait ends.";
+  const FAILED = "Collie could not record that. Try again, or clear the draft yourself.";
+  const SETTLED = "Collie already knows how this send ended, so there is nothing to record. Look at the screen.";
+  const UNKNOWN_HERE = "This machine cannot record that. Look at the screen to see whether it arrived.";
+  const SCREEN = splitLines(parseAnsi("  I found three notes in the sample list.\n\n  Working on it. One moment."));
+  const SIGN_IN: Surface = { revision: 3, turn: "idle", modal: "none", composer: "empty", field: "secret" };
+  const UNKNOWN = (id: string, parts: Parameters<typeof sendAnswer>[3] = {}) => sendAnswer(id, "unknown", "no_evidence", { offers: ["keys"], ...parts });
+
+  /**
+   * A composer wired as the pane view wires it: the composer reports the send it cannot tell about, the dock draws the
+   * card, and the card's two answers go back through the composer's handle.
+   */
+  function renderCannotTell(over: Partial<ComponentProps<typeof Composer>> = {}) {
+    const handle = createRef<ComposerHandle>();
+    let setReadOnly: (next: boolean) => void = () => undefined;
+    let landEntry: (entry: TranscriptEntry) => void = () => undefined;
+    function Harness() {
+      const [entries, setEntries] = useState<readonly TranscriptEntry[]>([]);
+      landEntry = (entry) => setEntries((prev) => [...prev, entry]);
+      const [facts, setFacts] = useState<CannotTellFacts | null>(null);
+      const [ring, setRing] = useState(0);
+      const [readOnly, setReadOnlyState] = useState(false);
+      setReadOnly = setReadOnlyState;
+      return (
+        <CrewProvider servers={undefined}>
+          <StatusSentinel />
+          <CardDock
+            blocks={[]}
+            cannotTell={
+              facts === null
+                ? null
+                : {
+                    facts,
+                    lines: SCREEN,
+                    wrap: true,
+                    ring,
+                    onArrived: () => handle.current?.markArrived() ?? Promise.resolve("failed"),
+                    onClose: () => handle.current?.closeCannotTell(),
+                    onAgain: () => handle.current?.answerAgain(),
+                  }
+            }
+          />
+          <Composer
+            ref={handle}
+            paneId="w1:p1"
+            agent="claude"
+            isShell={false}
+            gone={false}
+            readOnly={readOnly}
+            surface={FREE}
+            text="pane output"
+            terminalDraft={null}
+            rawTerminalDraft={null}
+            prefs={{ wrap: true, fontSize: 11, draftFontSize: 14, chatFontSize: 14, fontFamily: "system", rawTerminal: false, tapToFocus: true, expandClippedReply: true, stretchText: false }}
+            display={{ open: false, onToggle: vi.fn() }}
+            onSent={vi.fn()}
+            onCannotTell={setFacts}
+            onCannotTellRing={() => setRing((n) => n + 1)}
+            chatEntries={entries}
+            {...over}
+          />
+        </CrewProvider>
+      );
+    }
+    markLive("w1:p1", Date.now());
+    render(<RouterProvider router={createMemoryRouter([{ path: "/", element: <Harness /> }])} />);
+    return { handle, setReadOnly: (next: boolean) => act(() => setReadOnly(next)), land: (entry: TranscriptEntry) => act(() => landEntry(entry)) };
+  }
+
+  /** The bridge's side: the first send ends unknown, later ones go; the arrived route records each id it is asked about. */
+  function bridge(options: { arrived?: () => Response; awaiting?: () => number } = {}) {
+    const arrivals: string[] = [];
+    let n = 0;
+    server.use(
+      ...sendHandler((request) => {
+        n += 1;
+        return n === 1 ? UNKNOWN(request.id, options.awaiting === undefined ? {} : { awaitingEventUntil: options.awaiting() }) : sendAnswer(request.id, "sent");
+      }),
+      http.post(/\/api\/pane\/[^/]+\/arrived$/, async ({ request }) => {
+        arrivals.push(asJsonString(parseJsonObject(await request.text())?.requestId) ?? "");
+        return options.arrived?.() ?? HttpResponse.json({ word: "arrived" });
+      }),
+    );
+    return arrivals;
+  }
+
+  /** Type a draft, send it, and wait for the card the unknown answer opens. */
+  async function sendUnknown(user: ReturnType<typeof userEvent.setup>, draft = "run the sample check") {
+    await user.type(screen.getByRole("textbox"), draft);
+    await user.click(screen.getByRole("button", { name: "Send" }));
+    await screen.findByRole("group", { name: /Collie (cannot tell|is waiting)/u });
+  }
+
+  const card = () => document.querySelector('[data-slot="cannot-tell-card"]');
+  const noticeShown = () => document.querySelector('[data-slot="composer-refusal"]') !== null;
+  const sendButton = async () => {
+    const button = screen.getByRole("button", { name: "Send" });
+    await waitFor(() => expect(button).toBeEnabled());
+    return button;
+  };
+
+  it("cannot tell: the card shows on an unknown answer with the screen, and the box's own notice does not", async () => {
+    bridge();
+    const user = userEvent.setup();
+    renderCannotTell();
+    await sendUnknown(user);
+    expect(screen.getByRole("group", { name: SENTENCE })).toBeInTheDocument();
+    expect(screen.getByText(/Working on it\. One moment\./u)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "It arrived" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Send again" })).toBeInTheDocument();
+    expect(noticeShown()).toBe(false);
+    // The draft stays: an unknown receipt keeps it.
+    expect(screen.getByRole("textbox")).toHaveValue("run the sample check");
+  });
+
+  it("cannot tell: a send the bridge stopped mid-way says the text may be in the box, and a screen reader hears it (M102 spec 16)", async () => {
+    server.use(...sendHandler((request) => sendAnswer(request.id, "unknown", "interrupted", { offers: ["keys"] })));
+    const user = userEvent.setup();
+    renderCannotTell();
+    await user.type(screen.getByRole("textbox"), "run the sample check");
+    await user.click(screen.getByRole("button", { name: "Send" }));
+    const words = "Collie stopped while it typed this. Your text may be in the box without Enter. Look at the screen.";
+    expect(await screen.findByRole("group", { name: words })).toBeInTheDocument();
+    expect(card()?.querySelector('[role="status"]')?.textContent).toBe(words);
+    expect(noticeShown()).toBe(false);
+  });
+
+  it("cannot tell: the card's sentence is a live region, so the notice it stands in for is still heard", async () => {
+    bridge();
+    const user = userEvent.setup();
+    renderCannotTell();
+    await sendUnknown(user);
+    const live = card()?.querySelector('[role="status"]');
+    expect(live?.textContent).toBe("Collie cannot tell if this arrived. Look at the screen.");
+  });
+
+  it("cannot tell: a host with no card keeps today's notice and its second-tap question", async () => {
+    bridge();
+    const user = userEvent.setup();
+    renderCannotTell({ onCannotTell: undefined, onCannotTellRing: undefined });
+    await user.type(screen.getByRole("textbox"), "run the sample check");
+    await user.click(screen.getByRole("button", { name: "Send" }));
+    await waitFor(() => expect(noticeShown()).toBe(true));
+    expect(card()).toBeNull();
+  });
+
+  it("cannot tell: It arrived posts once with the request id, clears through the belt's clear, and Undo clear brings the draft back", async () => {
+    const arrivals = bridge();
+    const user = userEvent.setup();
+    renderCannotTell();
+    await sendUnknown(user);
+    const sentId = recordedSends()[0]!.id;
+    await user.click(screen.getByRole("button", { name: "It arrived" }));
+    await waitFor(() => expect(card()).toBeNull());
+    expect(arrivals).toEqual([sentId]);
+    expect(screen.getByRole("textbox")).toHaveValue("");
+    // The one clear path: its Undo slot shows, and the mistaken tap is one tap back.
+    await user.click(await screen.findByRole("button", { name: "Undo clear" }));
+    expect(screen.getByRole("textbox")).toHaveValue("run the sample check");
+    // Nothing was sent again, and the card stays gone.
+    expect(recordedSends()).toHaveLength(1);
+    expect(arrivals).toHaveLength(1);
+    expect(card()).toBeNull();
+  });
+
+  it("cannot tell: words typed since the send are the next message, so It arrived ends the card and keeps them", async () => {
+    bridge();
+    const user = userEvent.setup();
+    renderCannotTell();
+    await sendUnknown(user);
+    await user.type(screen.getByRole("textbox"), " and more");
+    await user.click(screen.getByRole("button", { name: "It arrived" }));
+    await waitFor(() => expect(card()).toBeNull());
+    expect(screen.getByRole("textbox")).toHaveValue("run the sample check and more");
+    expect(screen.queryByRole("button", { name: "Undo clear" })).toBeNull();
+  });
+
+  it("cannot tell: a mark that fails on the way keeps the card and the draft, says so in the card's line, and takes another tap", async () => {
+    let refuse = true;
+    const arrivals = bridge({ arrived: () => (refuse ? new HttpResponse("bridge down", { status: 500 }) : HttpResponse.json({ word: "arrived" })) });
+    const user = userEvent.setup();
+    renderCannotTell();
+    await sendUnknown(user);
+    await user.click(screen.getByRole("button", { name: "It arrived" }));
+    expect(await screen.findByText(FAILED)).toBeInTheDocument();
+    expect(card()).not.toBeNull();
+    expect(screen.getByRole("textbox")).toHaveValue("run the sample check");
+    expect(screen.queryByRole("button", { name: "Undo clear" })).toBeNull();
+    refuse = false;
+    await user.click(screen.getByRole("button", { name: "It arrived" }));
+    await waitFor(() => expect(card()).toBeNull());
+    expect(arrivals).toHaveLength(2);
+  });
+
+  it("cannot tell: a receipt that did not end unknown (409) is final: the card says so, offers Close, and never Try again (the M102 review, K)", async () => {
+    const arrivals = bridge({ arrived: () => new HttpResponse("this send did not end unknown", { status: 409 }) });
+    const user = userEvent.setup();
+    renderCannotTell();
+    await sendUnknown(user);
+    await user.click(screen.getByRole("button", { name: "It arrived" }));
+    expect(await screen.findByText(SETTLED)).toBeInTheDocument();
+    expect(screen.queryByText(FAILED)).toBeNull();
+    expect(screen.queryByRole("button", { name: "It arrived" })).toBeNull();
+    await user.click(screen.getByRole("button", { name: "Close" }));
+    await waitFor(() => expect(card()).toBeNull());
+    // Close ends the question only: the draft stays, and nothing more was sent or marked.
+    expect(screen.getByRole("textbox")).toHaveValue("run the sample check");
+    expect(arrivals).toHaveLength(1);
+    expect(recordedSends()).toHaveLength(1);
+  });
+
+  it("cannot tell: an older member that does not know the mark (404) is final: the card says so and offers Close (the M102 review, K)", async () => {
+    const arrivals = bridge({ arrived: () => new HttpResponse("not found", { status: 404 }) });
+    const user = userEvent.setup();
+    renderCannotTell();
+    await sendUnknown(user);
+    await user.click(screen.getByRole("button", { name: "It arrived" }));
+    expect(await screen.findByText(UNKNOWN_HERE)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "It arrived" })).toBeNull();
+    await user.click(screen.getByRole("button", { name: "Close" }));
+    await waitFor(() => expect(card()).toBeNull());
+    expect(arrivals).toHaveLength(1);
+  });
+
+  it("cannot tell: Send on the unchanged draft sends nothing, rings the card for 1600 ms, and brings it into view", async () => {
+    bridge();
+    const scrolled = vi.fn();
+    Element.prototype.scrollIntoView = scrolled;
+    try {
+      const user = userEvent.setup();
+      renderCannotTell();
+      await sendUnknown(user);
+      expect(card()).not.toHaveAttribute("data-highlight");
+      await user.click(await sendButton());
+      await waitFor(() => expect(card()).toHaveAttribute("data-highlight"));
+      expect(card()?.className).toContain("ring-primary");
+      expect(scrolled).toHaveBeenCalledTimes(1);
+      // Nothing was sent, and no "Send it again?" question took the Send slot.
+      expect(recordedSends()).toHaveLength(1);
+      expect(screen.queryByRole("button", { name: "Send it again?" })).toBeNull();
+      // The ring is for about 1.6 seconds.
+      await waitFor(() => expect(card()).not.toHaveAttribute("data-highlight"), { timeout: 3000 });
+      expect(recordedSends()).toHaveLength(1);
+    } finally {
+      // SAFETY: the test planted the stub on the prototype; jsdom has no scrollIntoView of its own, so removing it restores that.
+      Reflect.deleteProperty(Element.prototype, "scrollIntoView");
+    }
+  });
+
+  it("cannot tell: a changed draft sends as usual and ends the card", async () => {
+    bridge();
+    const user = userEvent.setup();
+    renderCannotTell();
+    await sendUnknown(user);
+    await user.type(screen.getByRole("textbox"), " with a second line");
+    await user.click(await sendButton());
+    await waitFor(() => expect(recordedSends()).toHaveLength(2));
+    expect(recordedSends()[1]).toMatchObject({ text: "run the sample check with a second line" });
+    await waitFor(() => expect(card()).toBeNull());
+  });
+
+  it("cannot tell: Send again is a new id through /api/send, with no Send it again? step", async () => {
+    bridge();
+    const user = userEvent.setup();
+    renderCannotTell();
+    await sendUnknown(user);
+    await user.click(screen.getByRole("button", { name: "Send again" }));
+    await waitFor(() => expect(recordedSends()).toHaveLength(2));
+    expect(recordedSends()[1]).toMatchObject({ text: "run the sample check", mode: "send" });
+    expect(recordedSends()[1]!.id).not.toBe(recordedSends()[0]!.id);
+    expect(screen.queryByRole("button", { name: "Send it again?" })).toBeNull();
+    await waitFor(() => expect(card()).toBeNull());
+  });
+
+  it("cannot tell: a secret send keeps no text, and Enter it again opens the sign-in field empty", async () => {
+    const arrivals = bridge();
+    const user = userEvent.setup();
+    renderCannotTell({ surface: SIGN_IN });
+    await user.type(screen.getByRole("textbox", { name: "Sign-in code" }), "FAKEcode1234");
+    await user.click(screen.getByRole("button", { name: "Send the code" }));
+    await screen.findByRole("group", { name: SENTENCE });
+    expect(recordedSends()[0]?.secret).toBe(true);
+    // Two buttons: the word, and Enter it again. No Send again, because no text is kept to send.
+    expect(screen.getByRole("button", { name: "It arrived" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Send again" })).toBeNull();
+    expect(noticeShown()).toBe(false);
+    expect(loadDraftEntry(undefined, "w1:p1")).toBeNull();
+    await user.click(screen.getByRole("button", { name: "Enter it again" }));
+    const field = await screen.findByRole("textbox", { name: "Sign-in code" });
+    expect(field).toHaveValue("");
+    await waitFor(() => expect(field).toHaveFocus());
+    expect(card()).toBeNull();
+    // Nothing was sent again and nothing was restored anywhere.
+    expect(recordedSends()).toHaveLength(1);
+    expect(arrivals).toHaveLength(0);
+    expect(loadDraftEntry(undefined, "w1:p1")).toBeNull();
+    expect(document.body.textContent).not.toContain("FAKEcode1234");
+  });
+
+  it("cannot tell: It arrived on a sign-in code marks the word and ends the card, with no draft to clear", async () => {
+    const arrivals = bridge();
+    const user = userEvent.setup();
+    renderCannotTell({ surface: SIGN_IN });
+    await user.type(screen.getByRole("textbox", { name: "Sign-in code" }), "FAKEcode1234");
+    await user.click(screen.getByRole("button", { name: "Send the code" }));
+    await screen.findByRole("group", { name: SENTENCE });
+    await user.click(screen.getByRole("button", { name: "It arrived" }));
+    await waitFor(() => expect(card()).toBeNull());
+    expect(arrivals).toEqual([recordedSends()[0]!.id]);
+    expect(screen.queryByRole("button", { name: "Undo clear" })).toBeNull();
+  });
+
+  it("cannot tell: a read-only device sees the card without its buttons", async () => {
+    bridge();
+    const user = userEvent.setup();
+    const { setReadOnly } = renderCannotTell();
+    await sendUnknown(user);
+    setReadOnly(true);
+    expect(screen.getByRole("group", { name: SENTENCE })).toBeInTheDocument();
+    expect(screen.getByText(/Working on it\. One moment\./u)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "It arrived" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Send again" })).toBeNull();
+  });
+
+  it("cannot tell: while the agent's own word may still come, Send again is off, says why on a tap, turns on by itself, and sends nothing by itself", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const until = Date.now() + 5_000;
+      bridge({ awaiting: () => until });
+      const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
+      renderCannotTell();
+      await sendUnknown(user);
+      expect(screen.getByRole("group", { name: WAITING })).toBeInTheDocument();
+      const again = screen.getByRole("button", { name: "Send again" });
+      expect(again).toHaveAttribute("aria-disabled", "true");
+      // "It arrived" stays live while Send again waits.
+      expect(screen.getByRole("button", { name: "It arrived" })).not.toHaveAttribute("aria-disabled", "true");
+      // A tap says the same sentence in the card's own line, and sends nothing.
+      await user.click(again);
+      expect(await screen.findAllByText(WAITING)).toHaveLength(2);
+      expect(recordedSends()).toHaveLength(1);
+      // The time passes: the sentence and the button change on their own, and still nothing is sent.
+      await act(async () => {
+        vi.advanceTimersByTime(5_100);
+      });
+      await waitFor(() => expect(screen.getByRole("group", { name: SENTENCE })).toBeInTheDocument());
+      expect(screen.getByRole("button", { name: "Send again" })).toHaveAttribute("aria-disabled", "false");
+      // The card's line, which said the same words, closes with them (it leaves through the Collapse's exit).
+      await waitFor(() => expect(screen.queryByText(WAITING)).toBeNull());
+      expect(recordedSends()).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("cannot tell: a sign-in code waits too, so Enter it again is off while the agent's word may come", async () => {
+    const until = Date.now() + 60_000;
+    bridge({ awaiting: () => until });
+    const user = userEvent.setup();
+    renderCannotTell({ surface: SIGN_IN });
+    await user.type(screen.getByRole("textbox", { name: "Sign-in code" }), "FAKEcode1234");
+    await user.click(screen.getByRole("button", { name: "Send the code" }));
+    await screen.findByRole("group", { name: WAITING });
+    expect(screen.getByRole("button", { name: "Enter it again" })).toHaveAttribute("aria-disabled", "true");
+    await user.click(screen.getByRole("button", { name: "Enter it again" }));
+    // The tap says the wait in the card's line, and the card stays: nothing was entered again.
+    expect(await screen.findAllByText(WAITING)).toHaveLength(2);
+    expect(card()).not.toBeNull();
+    expect(recordedSends()).toHaveLength(1);
+  });
+
+  it("cannot tell: the card goes when the journal shows the text landed, with no tap", async () => {
+    bridge();
+    const user = userEvent.setup();
+    const { land } = renderCannotTell();
+    await sendUnknown(user);
+    expect(card()).not.toBeNull();
+    land(userTurn("run the sample check", "u-landed"));
+    await waitFor(() => expect(card()).toBeNull());
+    // The journal settled it: the kept draft went with it, and nothing was marked or sent again.
+    expect(screen.getByRole("textbox")).toHaveValue("");
+    expect(recordedSends()).toHaveLength(1);
+  });
+});
+
+// M102 spec 02: Send it now on a row held for two minutes. The person looked at the screen and tapped: the
+// composer reads the screen for a rows hash, cancels the held row, then sends its text once with override.
+describe("Send it now on a row held for two minutes (M102 spec 02)", () => {
+  const WORDS = "Run the full test suite, then fix whatever fails.";
+  const LONG_ROW = { requestId: "held0001", mode: "send", text: WORDS, heldAt: 1_700_000_000_000, expiresAt: 1_700_000_000_000 + 30 * 60_000, state: "held", heldLong: true, cause: "turn_running" } as const;
+  const SEND_NOW = "Send the queued message now, past the hold";
+  const RUNNING: Surface = { revision: 1, turn: "running", modal: "none", composer: "empty" };
+
+  /** The DELETEs the fake bridge took, each with how many sends it had already seen. */
+  function fakeCancel(status: number, body: JsonObject) {
+    const calls: { id: string; sendsSeen: number }[] = [];
+    server.use(
+      http.delete("/api/send/:id", ({ params }) => {
+        calls.push({ id: String(params.id), sendsSeen: recordedSends().length });
+        return HttpResponse.json(body, { status });
+      }),
+    );
+    return calls;
+  }
+
+  function renderHeld() {
+    return renderComposerWithStatus({ surface: RUNNING, held: [LONG_ROW] });
+  }
+
+  it("reads the screen, cancels the held row, then sends its text once with override and the rows hash", async () => {
+    server.use(...sendHandler((request) => (request.mode === "prepare" ? sendAnswer(request.id, null, undefined, { rowsHash: "0c0ffe" }) : sendAnswer(request.id, "sent"))));
+    const cancels = fakeCancel(200, { result: "cancelled" });
+    const user = userEvent.setup();
+    renderHeld();
+    await user.click(screen.getByRole("button", { name: SEND_NOW }));
+    await waitFor(() => expect(recordedSends()).toHaveLength(2));
+    expect(recordedSends()[0]).toMatchObject({ text: "", mode: "prepare" });
+    expect(recordedSends()[1]).toMatchObject({ text: WORDS, rowsHash: "0c0ffe", override: true });
+    // The cancel came after the read and before the send.
+    expect(cancels).toEqual([{ id: "held0001", sendsSeen: 1 }]);
+  });
+
+  it("a read that brings back no rows hash cancels nothing, sends nothing and says so", async () => {
+    server.use(...sendHandler((request) => sendAnswer(request.id, null)));
+    const cancels = fakeCancel(200, { result: "cancelled" });
+    const user = userEvent.setup();
+    renderHeld();
+    await user.click(screen.getByRole("button", { name: SEND_NOW }));
+    await waitFor(() => expect(document.querySelector('[data-slot="composer-refusal"]')).toHaveTextContent("Collie could not read the screen again. Send, then tap Send anyway."));
+    expect(cancels).toEqual([]);
+    expect(recordedSends()).toHaveLength(1);
+    // The row stays held, with its button.
+    expect(screen.getByRole("button", { name: SEND_NOW })).toBeInTheDocument();
+  });
+
+  it("a cancel that finds the row already out sends nothing and says it went out", async () => {
+    server.use(...sendHandler((request) => (request.mode === "prepare" ? sendAnswer(request.id, null, undefined, { rowsHash: "0c0ffe" }) : sendAnswer(request.id, "sent"))));
+    fakeCancel(409, { result: "refused", reason: "busy", receipt: { requestId: "held0001", outcome: "sent", keys: [] } });
+    const user = userEvent.setup();
+    renderHeld();
+    await user.click(screen.getByRole("button", { name: SEND_NOW }));
+    await waitFor(() => expect(screen.getByTestId("status")).toHaveTextContent("It already went out."));
+    expect(recordedSends()).toHaveLength(1);
+    expect(screen.getByRole("textbox")).toHaveValue("");
+  });
+
+  it("a send the bridge refuses gives the words back to the empty box", async () => {
+    server.use(...sendHandler((request) => (request.mode === "prepare" ? sendAnswer(request.id, null, undefined, { rowsHash: "0c0ffe" }) : sendAnswer(request.id, "refused", "not_free"))));
+    fakeCancel(200, { result: "cancelled" });
+    const user = userEvent.setup();
+    renderHeld();
+    await user.click(screen.getByRole("button", { name: SEND_NOW }));
+    await waitFor(() => expect(recordedSends()).toHaveLength(2));
+    await waitFor(() => expect(screen.getByRole("textbox")).toHaveValue(WORDS));
+  });
+});
+
+
+// ADR 0057 said a bare Enter is a new line and the Send button, or Ctrl/Cmd+Enter, sends. ADR 0157 keeps that for
+// every device until the person turns "Enter sends" on, and then a bare Enter sends only when the press shows it came
+// from a physical keyboard. A guess never changes what Enter does: the first real-looking press only OFFERS the switch.
+describe("Composer — Enter sends (ADR 0157)", () => {
+  const field = () => screen.getByPlaceholderText(/type a reply/i);
+  const HARDWARE = { key: "Enter", code: "Enter", keyCode: 13 } as const;
+  const offer = () => screen.queryByText("Using a keyboard? Enter can send.");
+
+  /** A soft keyboard for `useKeyboardOpen`, which reads `visualViewport` (jsdom has none). */
+  function withSoftKeyboard() {
+    const listeners = new Set<() => void>();
+    const vv = {
+      width: 400,
+      height: 800,
+      addEventListener: (_: string, fn: () => void) => void listeners.add(fn),
+      removeEventListener: (_: string, fn: () => void) => void listeners.delete(fn),
+    };
+    Object.defineProperty(window, "visualViewport", { value: vv, configurable: true });
+    return {
+      open: () => {
+        vv.height = 400;
+        act(() => listeners.forEach((fn) => fn()));
+      },
+    };
+  }
+  afterEach(() => {
+    Reflect.deleteProperty(window, "visualViewport");
+  });
+
+  it("with nothing stored, never sends on a bare Enter, and offers the switch once after a real-looking press", async () => {
+    const user = userEvent.setup();
+    const props = renderComposer();
+    await user.type(field(), "looks good");
+    expect(offer()).toBeNull();
+    // The browser keeps the new line (the handler did not call preventDefault) and nothing is sent.
+    expect(fireEvent.keyDown(field(), HARDWARE)).toBe(true);
+    expect(props.onSent).not.toHaveBeenCalled();
+    expect(await screen.findByText("Using a keyboard? Enter can send.")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Turn on" })).toBeInTheDocument();
+    expect(enterSendsChoice()).toBeNull();
+    // A second press still never sends.
+    expect(fireEvent.keyDown(field(), HARDWARE)).toBe(true);
+    expect(props.onSent).not.toHaveBeenCalled();
+  });
+
+  it("Turn on stores the choice, the offer leaves, and the next Enter sends once", async () => {
+    const user = userEvent.setup();
+    const props = renderComposer();
+    await user.type(field(), "ship it");
+    fireEvent.keyDown(field(), HARDWARE);
+    await user.click(await screen.findByRole("button", { name: "Turn on" }));
+    expect(enterSendsChoice()).toBe("on");
+    expect(localStorage.getItem("collie:enter-sends:v1")).toBe("on");
+    expectLeaving(offer());
+    expect(props.onSent).not.toHaveBeenCalled();
+
+    expect(fireEvent.keyDown(field(), HARDWARE)).toBe(false);
+    await waitFor(() => expect(field()).toHaveValue(""));
+    expect(props.onSent).toHaveBeenCalledTimes(1);
+  });
+
+  it("the dismiss control stores off, and neither the offer nor a send comes back", async () => {
+    const user = userEvent.setup();
+    const props = renderComposer();
+    await user.type(field(), "later");
+    fireEvent.keyDown(field(), HARDWARE);
+    await user.click(await screen.findByRole("button", { name: "Dismiss the Enter offer" }));
+    expect(enterSendsChoice()).toBe("off");
+    expectLeaving(offer());
+
+    await waitFor(() => expect(offer()).toBeNull());
+    expect(fireEvent.keyDown(field(), HARDWARE)).toBe(true);
+    expect(offer()).toBeNull();
+    expect(props.onSent).not.toHaveBeenCalled();
+  });
+
+  it("shows no offer when a choice is stored, on or off", async () => {
+    const user = userEvent.setup();
+    setEnterSends(false);
+    renderComposer();
+    await user.type(field(), "x");
+    fireEvent.keyDown(field(), HARDWARE);
+    expect(offer()).toBeNull();
+  });
+
+  it("shows no offer with the soft keyboard up, and sends nothing there with the switch on", async () => {
+    const user = userEvent.setup();
+    const keyboard = withSoftKeyboard();
+    const props = renderComposer();
+    await user.type(field(), "typed on the phone");
+    keyboard.open();
+    expect(fireEvent.keyDown(field(), HARDWARE)).toBe(true);
+    expect(offer()).toBeNull();
+    setEnterSends(true);
+    expect(fireEvent.keyDown(field(), HARDWARE)).toBe(true);
+    expect(props.onSent).not.toHaveBeenCalled();
+    expect(field()).toHaveValue("typed on the phone");
+  });
+
+  it("shows no offer for a press with an empty code (an on-screen keyboard)", async () => {
+    const user = userEvent.setup();
+    renderComposer();
+    await user.type(field(), "x");
+    fireEvent.keyDown(field(), { key: "Enter", code: "", keyCode: 13 });
+    expect(offer()).toBeNull();
+  });
+
+  describe("with the switch on", () => {
+    beforeEach(() => setEnterSends(true));
+
+    it("sends on a hardware-looking Enter, and on the numpad's", async () => {
+      const user = userEvent.setup();
+      const props = renderComposer();
+      await user.type(field(), "one");
+      expect(fireEvent.keyDown(field(), HARDWARE)).toBe(false);
+      await waitFor(() => expect(props.onSent).toHaveBeenCalledTimes(1));
+      await user.type(field(), "two");
+      expect(fireEvent.keyDown(field(), { ...HARDWARE, code: "NumpadEnter" })).toBe(false);
+      await waitFor(() => expect(props.onSent).toHaveBeenCalledTimes(2));
+    });
+
+    it("leaves Shift+Enter and Alt+Enter to the textarea", async () => {
+      const user = userEvent.setup();
+      const props = renderComposer();
+      await user.type(field(), "keep");
+      expect(fireEvent.keyDown(field(), { ...HARDWARE, shiftKey: true })).toBe(true);
+      expect(fireEvent.keyDown(field(), { ...HARDWARE, altKey: true })).toBe(true);
+      expect(props.onSent).not.toHaveBeenCalled();
+      expect(field()).toHaveValue("keep");
+    });
+
+    it("leaves an Enter with an empty code to the textarea", async () => {
+      const user = userEvent.setup();
+      const props = renderComposer();
+      await user.type(field(), "keep");
+      expect(fireEvent.keyDown(field(), { key: "Enter", code: "", keyCode: 13 })).toBe(true);
+      expect(props.onSent).not.toHaveBeenCalled();
+    });
+
+    it("never sends on the Enter that confirms an input method composition", async () => {
+      const user = userEvent.setup();
+      const props = renderComposer();
+      await user.type(field(), "かな");
+      expect(fireEvent.keyDown(field(), { ...HARDWARE, isComposing: true })).toBe(true);
+      expect(fireEvent.keyDown(field(), { ...HARDWARE, keyCode: 229 })).toBe(true);
+      expect(props.onSent).not.toHaveBeenCalled();
+    });
+
+    it("sends once for a held Enter: the repeats add no new line and send nothing", async () => {
+      const user = userEvent.setup();
+      const props = renderComposer();
+      await user.type(field(), "once");
+      expect(fireEvent.keyDown(field(), HARDWARE)).toBe(false);
+      // The repeats of the same press are stopped, so the emptied box gets no new lines.
+      expect(fireEvent.keyDown(field(), { ...HARDWARE, repeat: true })).toBe(false);
+      expect(fireEvent.keyDown(field(), { ...HARDWARE, repeat: true })).toBe(false);
+      await waitFor(() => expect(field()).toHaveValue(""));
+      expect(props.onSent).toHaveBeenCalledTimes(1);
+    });
+
+    it("on an empty box does what Ctrl+Enter does there: nothing is sent", async () => {
+      const props = renderComposer();
+      expect(fireEvent.keyDown(field(), HARDWARE)).toBe(false);
+      expect(fireEvent.keyDown(field(), { key: "Enter", ctrlKey: true })).toBe(false);
+      expect(props.onSent).not.toHaveBeenCalled();
+    });
+  });
+
+  it.each([
+    ["nothing stored", null],
+    ["off", false],
+    ["on", true],
+  ] as const)("Ctrl+Enter still sends with the choice %s", async (_name, choice) => {
+    const user = userEvent.setup();
+    if (choice !== null) setEnterSends(choice);
+    const props = renderComposer();
+    await user.type(field(), "go");
+    expect(fireEvent.keyDown(field(), { key: "Enter", ctrlKey: true })).toBe(false);
+    await waitFor(() => expect(props.onSent).toHaveBeenCalledTimes(1));
   });
 });

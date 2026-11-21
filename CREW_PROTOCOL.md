@@ -21,8 +21,8 @@ cited so a reviewer can check the extension is faithful.
 
 **1.8.0 renames every name a machine reads on this link. Nothing else changes.** No route was added
 or dropped, no body shape moved, no timeout moved, and no rule below was rewritten. 1.7.0 renamed
-the word a person reads and kept the machine names ([ADR 0038](./.adr/0038-the-group-is-a-crew-the-wire-keeps-pack.md));
-this version finishes the rename ([ADR 0039](./.adr/0039-the-machine-says-crew-too.md)).
+the word a person reads and kept the machine names ([ADR 0144](./.adr/0144-one-lead-one-door-and-the-operator-moves-the-crown.md), which replaced ADR 0038);
+this version finishes the rename ([ADR 0144](./.adr/0144-one-lead-one-door-and-the-operator-moves-the-crown.md), which replaced ADR 0039).
 
 | What | Version 1 | Version 2 |
 |---|---|---|
@@ -50,7 +50,7 @@ version, so there is no negotiation and nothing in between two machines.
 **1.8.0 is the oldest build that speaks version 2.** That is where the number first shipped, and it is
 a named constant on the operator's side too: `PROTOCOL_FLOOR_VERSION` in `cli/update-check.ts`, tied to
 `CREW_PROTOCOL_VERSION` by a test so the two move together
-([ADR 0045](./.adr/0045-a-build-below-the-protocol-floor-is-a-red-preflight.md)).
+([ADR 0143](./.adr/0143-how-an-install-updates-and-what-a-release-offers-it.md)).
 
 **A member below the floor lands on §7's exact-match window, and it is told twice.** On the link, its
 answers carry no crew protocol header, so the headerless ladder calls it `unreachable` for the first
@@ -89,8 +89,9 @@ version 2 and only version 2.
 | **warrant** | The short, lead-signed object that names the deputy: crew id, generation, deputy member id, deputy certificate fingerprint, issue and refresh times (§18). A *standing permission*, never a command. |
 
 These are the shipped words. Earlier drafts said *alpha* for *lead* and *bridge* for *collie*; both
-are dead. The vocabulary decision and the rename rules for operator-visible surfaces are
-[ADR 0012](./.adr/0012-every-machine-runs-a-collie-and-the-pack-has-a-lead.md).
+are dead. The vocabulary decision is
+[ADR 0144](./.adr/0144-one-lead-one-door-and-the-operator-moves-the-crown.md); the rename rules for operator-visible surfaces are in
+[`CONTRIBUTING.md`](./CONTRIBUTING.md).
 
 ## 2. Shape of the thing
 
@@ -120,15 +121,17 @@ graph TD
 The lead is the only dialler: a peer never calls the lead except at `join`, `leave` and `promote`
 (§8.6), and publishes nothing for the phone to reach ([ADR 0013](./.adr/0013-a-peer-listens-without-becoming-a-front-door.md)).
 The dotted edges are `collie crew add` / `collie crew update`, which push a git bundle over the
-operator's own ssh ([ADR 0016](./.adr/0016-updates-ride-the-operators-ssh.md)); the crew link carries
-runtime data and never software.
+operator's own ssh ([ADR 0144](./.adr/0144-one-lead-one-door-and-the-operator-moves-the-crown.md)); the crew link carries
+runtime data and never Collie itself. Since 2026-11-10 (ADR 0144, rule 3) the code of a trick
+may cross it **only as inert data**: held, never installed and never run, until a person taps on the
+surface of the machine that will run it. A remote command on a member stays refused.
 
 Three rules generate most of this document:
 
 1. **The lead consumes a peer's *Collie* HTTP API.** The lead **never dials a peer's Herdr socket**,
    and no Herdr method name ever crosses a crew link. This is the mux-driver seam — a peer fronting
    something other than Herdr is invisible to this protocol. Argument:
-   [ADR 0011](./.adr/0011-the-pack-protocol-is-the-mux-driver-seam.md).
+   [ADR 0144](./.adr/0144-one-lead-one-door-and-the-operator-moves-the-crown.md).
 2. **A peer publishes nothing.** No `tailscale serve`, never `tailscale funnel`, no PWA, no browser
    gates. A peer's crew listener is not a front door.
 3. **Solo pays zero tax.** With zero peers enrolled, every observable byte is what it is today (§11).
@@ -150,6 +153,29 @@ structural rather than aesthetic:
   log and leaves the peer's own operator with nothing.
 - **It welds Collie to Herdr.** The wire format would become Herdr method names, and the seam in rule
   1 would not exist.
+- **The socket is a bigger gun than the API.** Collie's HTTP API is a narrow, gated, audited
+  projection of the Herdr socket. The lead can do to a peer exactly what a phone plugged into that
+  peer could do, and no more. A forwarded socket would remove that bound.
+
+### The seven leaks a non-Herdr member must watch for
+
+No member other than Herdr exercises rule 1 yet, so the seam is a promise, not a verified property.
+These are the places a future non-Herdr member can leak Herdr's shape across the link:
+
+1. **Session semantics.** A member's session names are opaque labels from the lead's side, not
+   Herdr's primary-versus-named sessions or its `session.snapshot` shapes.
+2. **Pane identity.** A member's pane id is not assumed re-derivable, session-scoped, numeric or
+   stable across a member restart the way Herdr's happen to be.
+3. **Status vocabulary.** The wire carries Collie's own `AgentStatus` type, never Herdr's status values.
+4. **Journal assumed present.** `/history` may not exist on a member. A harness with no adapter has no
+   journal, and across the link an absent journal is a capability answer, not an error.
+5. **Keys assumed universal.** The `+`-joined `send_keys` grammar (`ctrl+c`, `shift+tab`) is Herdr's.
+   A member may accept a different set, or none.
+6. **`reachable` mis-read.** `SessionSummary.reachable` is this collie's link to its own multiplexer.
+   It does not mean "the member is up", which is a lead-side fact.
+7. **Paths assumed portable.** Upload paths, working directories and transcript locations mean
+   something only on the machine that produced them. The lead never resolves a path derived from a
+   member's filesystem.
 
 ---
 
@@ -263,6 +289,7 @@ the same handlers. There is no second handler set, no second semantic, and no He
 | `POST` | `/crew/v1/pane/:id/pins` | `POST …/pins` | forwarded, additive-optional (§7.1), added 2026-11-06 (M90). `{ itemId }`, the id of a Chat block: the member finds the block in the pane's journal and keeps its own copy, answers `201 { pin }` (`200` with the pin it has when the block was already pinned: one pin per item id, never a duplicate or a refusal), or `404` `pin.item_not_found`, `409` `pin.not_pinnable` (an image, a compaction marker), `409` `pin.not_settled` (the block belongs to a turn the program is still writing: pin it when it settles), `409` `pin.cap` (100 pins a session), `409` `pin.no_session`. A WRITE on the write budget: refused before it is attempted when the member is not taking writes (§10.3) and by the member's own device gate (§12). The lead records `pins` and the member `pin.add`, with no text in either line. A peer that predates it answers 404, which the phone reads as a pin that did not land |
 | `DELETE` | `/crew/v1/pane/:id/pins?pin=<id>` | `DELETE …/pins?pin=<id>` | forwarded, additive-optional (§7.1), added 2026-11-06 (M90). Drops one pin from that member's file and answers `204`, also when the pin was already gone. A WRITE, gated and refused as the POST is; the member records `pin.remove`, the lead `pins`. A peer that predates it answers 404 |
 | `DELETE` | `/crew/v1/pane/:id/held?request=<id>` | `DELETE …/held?request=<id>` | forwarded, additive-optional (§7.1), added 2026-11-07 (issue 740). The Cancel or Dismiss on a queued row of a pane on that member, whose hold queue keeps the row: the same answer as the member's own `DELETE /api/send/<id>?pane=<id>`. A held request ends `cancelled` and an ended row is dismissed, both `200` `{ result }`; a request going out now is `409` `{ result: "refused", reason, receipt? }`; a row the pane does not hold is `404`. A WRITE, gated and refused as the pins `DELETE` is; the member records `send-cancel` and the lead records `send-cancel` for the forward, neither with text. Only a `DELETE` ends a row: any other method at `…/held` is answered `405` and audited on neither side. A peer that predates it answers 404, which the phone reads as a row already gone |
+| `POST` | `/crew/v1/pane/:id/arrived` | `POST …/arrived` | forwarded, additive-optional (§7.1), added 2026-11-16 (M102 spec 01). The person's "It arrived" on a send of a pane on that member whose receipt ended `unknown`, with the body `{ requestId }`: the member's store keeps the receipt and writes `word: "arrived"` beside its outcome, which stays `unknown`. `200` `{ word: "arrived" }`; an id the pane does not hold, or one of another pane, is `404`; a receipt that did not end `unknown`, or is already marked, is `409`. A WRITE, gated and refused as the pins `POST` is; the member records `send-arrived` and the lead records `send-arrived` for the forward, neither with text. A peer that predates it answers 404. The commit's `override: true` rides the `…/reply` body beside `rowsHash` (additive-optional): the member keeps it only on a request that names the phone's own request id, and a member that predates it ignores it |
 | `POST` | `/crew/v1/pane/:id/walky` | none: the lead's own call, beside `GET /api/pane/:id/walky` (`WALKY_PANE_ROUTE`) | forwarded, additive-optional (§7.1), added 2026-10-17 (M62). A walky talky message the LEAD routes to the member that owns the pane, `:id` the pane id or `all` for every agent pane there, with the lead's attestation in the body (§21). A WRITE on the write budget, refused before it is attempted when the member is not taking writes (§10.3). Never a phone's: the browser path answers only the GET on this path, and the member answers the POST only from its lead, through walky's own handler and never through the reply handler. It is not behind the member's device gate, because no phone stands behind it and the attestation is what admits it. Audited `walky.deliver` on both sides (§12). A peer that predates it answers 404, which the lead writes as `refused: older member` in the receipt |
 | `POST` | `/crew/v1/tab` | `POST /api/tab` (`:218`) | forwarded |
 | `POST` | `/crew/v1/tab/:id/rename\|close` | `TAB_ACTION_ROUTE` (`:102`, matched `:234`) | forwarded |
@@ -273,6 +300,8 @@ the same handlers. There is no second handler set, no second semantic, and no He
 | `POST` | `/crew/v1/workspace` | `POST /api/workspace` (`:225`) | forwarded |
 | `GET` | `/crew/v1/worktree/plan` | `GET /api/worktree/plan` | forwarded, additive-optional (§7.1), added 2026-11-02 (ADR 0126 point 6). What a branch from a folder would be, answered by **the member's own** git and its own remembered choices; `cwd`, `branch` and `parent` ride through untouched. A READ: attempted against a stale member, read budget, audited on neither side. A peer that predates it answers 404 |
 | `POST` | `/crew/v1/worktree` | `POST /api/worktree` | forwarded, additive-optional (§7.1), added 2026-11-02 (ADR 0126 point 6). A new branch in a new folder on **the member**, made with its git and opened as a space by its multiplexer, with the launch fields of `workspace`. The body, `requestId` included, rides through unchanged, and since ADR 0127 it may carry the lead's `row` exactly as `launch` does (same rule, same `X-Collie-Lead-Row: 1` header the lead adds when it set `row`, same `launch.row_not_from_lead` refusal without it), so a retry with the same id lands on the member's own receipt and is still one create. A WRITE on its own budget (85 s, `WORKTREE_WRITE_BUDGET_MS`), dialled once: a timeout is `write_outcome_unknown`. Refused before it is attempted when the member is not taking writes (§10.3) and by the member's own device gate (§12); audited `worktree.create` on both sides. A member that cannot open a space or has no git answers with its own refusal, which passes through unchanged. A peer that predates it answers 404 |
+| `GET` | `/crew/v1/worktree/folder` | `GET /api/worktree/folder` | forwarded, additive-optional (§7.1), added 2026-11-13 (ADR 0093 note). The member's own "Worktree folder" setting: the stored string, its real path or the rule it breaks, and the folder the default falls back to. One value per machine, so the lead never answers for a member. A READ: attempted against a stale member, read budget, audited on neither side. A peer that predates it answers 404 |
+| `POST` | `/crew/v1/worktree/folder/set` | `POST /api/worktree/folder/set` | forwarded, additive-optional (§7.1), added 2026-11-13 (ADR 0093 note). Saves or clears (`{ "dir": string \| null }`) the member's setting after the member runs the folder rule on it. A WRITE: audited on both sides as `worktree.folder` with the act and never the path. A peer that predates it answers 404 |
 | `POST` | `/crew/v1/launch` | `POST /api/launch` | forwarded — additive-optional (§7.1). Runs an allowlisted `launchers.toml` row **on the peer**, from that peer's own rows; a lead that predates it never calls it, and a peer that predates it answers 404 to a lead that does. Since ADR 0127 (M82) the body may also carry `row` (`command`, `label`, `cwd?`, `harness?`, `noPrompts`), additive-optional (§7.1): the lead sets it when the `command` is one of the lead's own merged rows, and the peer runs that row when its own list has no match (its own match wins and `row` is then ignored). A peer admits `row` only when BOTH hold: the call came over this link from its lead, AND it carries the request header `X-Collie-Lead-Row: 1` (§6, additive-optional, added 2026-11-03, M82 spec 07). The lead adds that header itself, after the forwarded-header allowlist and beside `X-Crew-Device`, and only on a forward where it set `row`; a phone's own header of that name is never forwarded. A body `row` without the header is refused, `launch.row_not_from_lead` (400), whoever calls: a phone-direct body, and the body a lead before 0127 forwards unchanged with the phone's own `row` in it. A peer that predates 0127 ignores `row` and answers `launch.not_allowlisted`, which the lead passes on. Since 1.19.0 (ADR 0091) the body may instead name `harness` (an id from that peer's own `harnesses` list) or `shell: true`, plus `cwd` and `requestId`, all optional and additive: the receipt lives on the peer that made the pane. Since 1.19.0 (ADR 0095) the body may instead name `run`, a one-off line the peer checks against its own `[phone] run` switch and character rule and types into a fresh shell; the answer may carry `noPrompts`, and a run that worked joins that peer's own `commands-recent.json`. A peer that predates them answers 400 to a body without `command`, which the phone never sends to it, because that peer's launchers answer carries no `harnesses` |
 | `GET` | `/crew/v1/launchers` | `GET /api/launchers` | forwarded — additive-optional (§7.1), same pairing as above. This is a READ crossing the link rather than a second copy of `config`'s `launchers` field, which is why that field was retired from `/api/config` in the same change. Since ADR 0127 (M82) the lead merges its own rows into the `items` it answers for a member (each marked `from: "lead"`; `launchers` stays the member's own rows, `adding` becomes the lead's), and evaluates each lead row where it would run (`not_found`, and `no_folder` for a pinned `cwd` the member lacks); the member's own row wins on the same `command`. Since 1.19.0 (ADR 0091) the answer may carry `harnesses: [{ id, label, found }]`, the agents that peer starts and whether each binary is on its login PATH; additive-optional, and its absence is how the phone tells an older peer apart. Since 1.19.0 (ADR 0094) it may also carry `adding` (that peer's `[phone]` switches, its `launchers.toml` path, its recipe table and the added rows it holds back), and each row may carry `source`, `id`, `kind`, `harness`, `noPrompts`, `addedBy`, `addedAt` and `addedAs`, all additive-optional. Since 1.19.0 (ADR 0095) it may also carry `recentRuns` (that peer's one-off command history) and `adding.run` (its `[phone] run` switch), additive-optional. Since ADR 0127 the lead may add `cwd=<path>`, once per pinned `cwd` of its own rows (at most 50, a folder under the lead's home written `~/...`), and the answer then carries `folders: { <path as asked>: boolean }`, whether each is a folder on that peer with `~` read as its home; answered to a crew caller only. Additive-optional: a lead that predates it sends no `cwd`, and a peer that predates it answers no `folders`, which the lead reads as no folder check. A forwarded query keeps a repeated key as every value, in order |
 | `POST` | `/crew/v1/launchers/added` | none: answered on the lead | Not forwarded since ADR 0127 (M82, 2026-11-03), whatever `?host=` says: the lead answers a phone's add from its own store, so the row lands in the lead's own `launchers-added.json` and joins the crew's rows. Before 0127 (since 1.19.0, ADR 0094) it was a forwarded WRITE on that member's own store. A member keeps the rows it already holds and lists them as its own. A member now answers 404 to a lead of an older build that still forwards it, |
@@ -288,8 +317,10 @@ the same handlers. There is no second handler set, no second semantic, and no He
 | `GET` | `/crew/v1/folders` | `GET /api/folders` | forwarded — additive-optional (§7.1), added 2026-09-27 (M40/02, #289). That member's own new-space folder list, `{ recent, favourites, home }` off its own `folders.json`: a folder exists on one machine, so the list is read where the folder is and the lead keeps no copy. A lead that predates it never calls it, and a peer that predates it answers 404 to a lead that does, which the phone reads as "no list" and never as an error |
 | `POST` | `/crew/v1/folders/star` | `POST /api/folders/star` | forwarded — additive-optional (§7.1), same pairing as above. A WRITE on that member's own `folders.json`, `{ folder, starred }`, refused before it is attempted when the member is not taking writes (§10.3) and by the member's own device gate (§12). Not audited on either side: it is a preference, like `notifications/prefs`, and touches no terminal |
 | `POST` | `/crew/v1/walky/off` | `POST /api/walky/off` | forwarded — additive-optional (§7.1), added 2026-11-06 (M89). The phone's walky talky switch for one session, `{ pane, off }`: the flag lives on the member that owns the pane, which alone enforces it (§21), so the set lands there, `by: "operator"`. A WRITE, refused before it is attempted when the member is not taking writes (§10.3) and by the member's own device gate (§12); an idempotent set, so it carries no request id. Audited on both sides as `walky.off`. A peer that predates it answers 404, which the phone shows as a failed switch |
-| `POST` | `/crew/v1/ask/:id` | `POST /api/ask/:id` (`ASK_ROUTE`) | forwarded, additive-optional (§7.1), added 2026-11-09 (M56 spec 12). A tap on the hook hold card of a member's pane: one Answer to an ask the member's own ask book minted, `{ pane, hash, optionId, origin: "person_tap", via? }`, the pane in the body. The member answers it through its own `/api/ask/:id`, with its own device gate (§12), its own hash check and its own receipt, and audits `ask`; the lead audits `ask` for the forward with the pane read from the body. A WRITE: refused before it is attempted when the member is not taking writes (§10.3), dialled once on the pane write budget, never retried. The member's answer reaches the phone unchanged. A forward whose outcome the lead cannot know (sent, no reply) is answered by the lead in the ask route's own shape, a `200` `{ receipt: { askId, outcome: "unknown", reason: "no_evidence" } }`, never `write_outcome_unknown`. A lead that predates it answers the phone `400` without a call, and a peer that predates it answers 404, which the phone shows as a refusal |
+| `POST` | `/crew/v1/ask/:id` | `POST /api/ask/:id` (`ASK_ROUTE`) | forwarded, additive-optional (§7.1), added 2026-11-09 (M56 spec 12). A tap on the hook hold card of a member's pane: one Answer to an ask the member's own ask book minted, `{ pane, hash, optionId, origin: "person_tap", via? }`, the pane in the body. The member answers it through its own `/api/ask/:id`, with its own device gate (§12), its own hash check and its own receipt, and audits `ask`; the lead audits `ask` for the forward with the pane read from the body. A WRITE: refused before it is attempted when the member is not taking writes (§10.3), dialled once on the pane write budget, never retried. The member's answer reaches the phone unchanged. A forward whose outcome the lead cannot know (sent, no reply) is answered by the lead in the ask route's own shape, a `200` `{ receipt: { askId, outcome: "unknown", reason: "no_evidence" } }`, never `write_outcome_unknown`. A lead that predates it answers the phone `400` without a call, and a peer that predates it answers 404, which the phone shows as a refusal. *(Amended 2026-11-17, M102 spec 14: the same route also carries a tap on a **screen** card of a member's terminal pane, an Answer to a keys ask the member's ask book minted, when that member marks the pane `askRoute: true` in its snapshot (additive-optional, absent-means-closed). The route, the gate, the budget and the member's checks are unchanged: the member answers it exactly as its own phone's tap, through its ask book's id, hash and screen check, its key gate and its own `ask` audit line. No route is added. A member that predates the mark sends none, and the phone keeps the guarded `…/keys` route for its cards and says that the machine runs an older Collie.)* |
 | `GET` | `/crew/v1/folders/browse` | `GET /api/folders/browse` | proxied byte-for-byte — additive-optional (§7.1), added 2026-10-19 (#467). The New page's folder browser: the sub-folders of one folder under **the member's own home**, by name, with a `git` bit, off its own disk (`bridge/folder-browse.ts`, ADR 0083's bound with home as the root); `?path=` rides through untouched and the member resolves it by its own New page rule. A READ for forwarding (attempted against a stale member, read budget, audited on neither side, never masked: names only), answered only for a device the member's **own** device policy authorises, as the Files read is (§12, `crewGate`'s write branch). A refusal is the Files view's `404 { "error": "unknown-path" }`; a peer that predates it answers a plain 404, which the phone reads as "update this member" |
+| `GET` | `/crew/v1/accounts` | `GET /api/accounts` | proxied byte-for-byte, additive-optional (§7.1), added 2026-11-16 (M101 spec 06). The member's own accounts list, `{ harnesses, accounts, found }`, for the account pick in New: accounts are per machine. A row may carry `panes` (additive-optional, added 2026-11-17, M101): the ids of that machine's own panes that run in the row's folder, at most 64, absent when none; the phone reads it only from its own machine, because the Change login row is not offered over the link. For a **GET only**: the lead forwards no other method on this path (`route_not_federated`) and the member dispatches none (404). A READ (attempted against a stale member, read budget, audited on neither side, never masked); the lead keeps nothing of the answer, which holds a sign-in email. A peer that predates it answers a plain 404 and a Windows member its own `404 accounts.unavailable`; the phone reads both as "no accounts here" and hides the pick. A start with an account rides `launch` with its `account` id unchanged, and the member resolves the id against its own list (`accounts.unknown` otherwise); a `launch` with `signIn: true` over the link is refused by the member, `400 bad body` |
+| `POST` | `/crew/v1/accounts`, `/crew/v1/accounts/remove` | none: answered by the machine the phone talks to | Not forwarded (M101 spec 06): a member's accounts are added and removed on that machine only. The lead answers `?host=` with `501 route_not_federated`, and a member's surface answers 404 |
 | `GET` | `/crew/v1/blobs/:hash` | `GET /api/blobs/:hash` | proxied byte-for-byte — additive-optional (§7.1). The image an agent's own journal named, off the disk that holds it; a lead that predates it never calls it, and a peer that predates it answers 404 to a lead that does |
 | `GET` | `/crew/v1/config` | `GET /api/config` (`:288`) | consumed by the lead, not proxied |
 | `GET` | `/crew/v1/hello` | — (new) | consumed by the lead: liveness + version + member id |
@@ -307,6 +338,18 @@ narrows the cached body per request (`bridge/crew/merge.ts`), because the phone'
 dial the lead's cache cannot already answer (§10.1). **Widening is a second dimension of ONE machine
 and never travels as a host:** a crew request may still not name a `host=`, because a peer has no
 peers (§4).
+
+A widened answer still carries ONE `workspaces` and ONE `tabs` list, the primary session's, so the
+cached body cannot answer a request about a member's other session with that session's spaces and
+tabs *(added 2026-11-18, issue 785)*. When a phone's `?host=<member>&session=<name>` names a session
+the member published that is reachable and not its primary, the lead notes it, and its next sweeps
+also dial that member's `GET /crew/v1/snapshot?session=<name>` beside the widened one, on the same
+per-call budget, and keep only that answer's two lists for the merge. Nothing new is on the wire:
+`?session=` is the parameter every member already reads. The dial carries none of §20's follow headers
+and no §21 ack, and its outcome never reaches the member's health. It runs only while a phone keeps
+asking (15 s after the last request) and its lists serve for at most 60 s; a failed dial keeps the last
+good lists within that age, else the merge serves the primary's lists as before. A member with one
+session costs no second dial. Lead-local, so `CREW_PROTOCOL_VERSION` does not move.
 
 **`hello`'s response body** is the one place both versions cross a link — the wire contract and the
 answering build:
@@ -441,7 +484,8 @@ generation is admissible for the same reason, and it names no secret: an integer
 
 **Deliberately not on the crew surface**, because they are properties of the collie the phone talks to
 rather than of a herd: `POST /api/subscribe` (`:303`), `POST /api/notifications/snooze` (`:318`),
-`GET|POST /api/notifications/prefs` (`:340`), `POST /api/update/check` (`:367`). Push subscriptions
+`GET|POST /api/notifications/prefs` (`:340`), `POST /api/notifications/clear`,
+`POST /api/update/check` (`:367`). Push subscriptions
 live on the lead; notification policy is one crew-wide setting the lead owns; update checking is
 per-machine and is the operator's business on each. A peer's own `/api/*` surface still has them for
 its own operator, when that peer is being used directly.
@@ -449,7 +493,7 @@ its own operator, when that peer is being used directly.
 **Which bridge sends a push for a peer's pane: the lead.** A peer in a crew mutes its own herd push
 path (`herdPushGate`, `bridge/crew/notify.ts`), and the lead derives every alert for a peer's panes
 from the snapshots it sweeps (`PeerNotifier`), then sends it to the subscriptions it holds. So the
-ask push guard ([ADR 0100](./.adr/0100-an-ask-travels-as-data-and-is-answered-by-id.md)) runs where
+ask push guard ([ADR 0146](./.adr/0146-a-durable-agent-is-a-session-with-no-screen-that-acts-by-id.md)) runs where
 the push is sent: on the lead, over each swept body, keyed on `(member id, toolCallId)`, with its
 memory in the lead's state dir. A peer runs no guard for its own asks while it is in a crew. The
 guard's hourly breaker counts per member, and its one summary push names the member id. A solo
@@ -476,7 +520,13 @@ than to anything it fronts. They exist because three operator verbs are otherwis
 | `POST` | `/crew/v1/lead` | the member being promoted | "The member calling you is the lead now" (§14). The old lead demotes itself and answers with its roster (the only way the new lead can pin members it has never spoken to); a peer re-pins and keeps its id and the crew secret. A member may only claim leadership **for itself** — and a claim is **not self-authorising**: the lead demotes only against a live operator approval (§14). |
 | `POST` | `/crew/v1/leave` | any member | The caller removes **itself** from this collie's roster (§8.4). The member id is the admitted one, never a body field, and a second call is still `200` — the operator's question has the same answer either way. |
 | `POST` | `/crew/v1/walky` | any member | Added 2026-10-17 (§21). The caller hands its lead one walky talky message, signed by the caller's key, to deliver to the lead's panes and route on to the members it names. Answered only by a collie that leads (a peer answers 404), and only to a §8.6-signed caller: the message must name that member as its sender and its signer. Changes no roster. |
+| `POST` | `/crew/v1/walky/who` | any member | Added in 1.29.0 (§21, M98). The caller asks its lead for the crew's agent panes, so a member's `collie walky who` lists what the lead's `send here` reaches. Body `{}`, signed per §8.6 like `walky`. Answered only by a collie that leads (a peer answers 404, so does a lead before 1.29.0), and only to a signed member of its roster. A read: it changes no roster and advances no floor. |
+| `POST` | `/crew/v1/hill/media` | any member | Added in 1.29.0 (§22). The caller hands its lead one image of a Decision it is about to post: `{ sha256, b64 }`, at most 2 MB of PNG, JPEG or WebP. Signed per §8.6. Answered only by a collie that leads, and only to a signed member of its roster. The lead holds the image by member and hash for 15 minutes. Changes no roster and advances no floor. |
+| `POST` | `/crew/v1/hill/post` | any member | Added in 1.29.0 (§22). The caller posts one Decision for one of its own sessions on its lead's Hill. Signed per §8.6; the poster's machine is the signer, never a body field. Answered only by a collie that leads. Changes no roster and advances no floor: the post's request id is its replay key. |
+| `POST` | `/crew/v1/hill/op` | any member | Added in 1.29.0 (§22). The caller asks its lead for one Decision's status, withdraws one, or lists its own, for one of its own sessions. Signed per §8.6. Answered only by a collie that leads. Changes no roster and advances no floor. |
+| `POST` | `/crew/v1/tricks/propose` | any member | Added in 1.29.0 (§24). The caller hands its lead a trick's files for the person to switch on, from one of its own sessions or its terminal. Signed per §8.6; the proposer's machine is the signer, never a body field. Answered only by a collie that leads. The lead keeps the files as inert data and installs nothing before the person's tap. Changes no roster and advances no floor. |
 | `POST` | `/crew/v1/walky/outcomes` | the lead | Added 2026-10-18 (§21). The lead hands a member the receipts it learned for messages that member sent to another machine, so the sender sees how they ended. Answered only by a collie that has a lead, and only to its own lead: any other caller is the uniform 401. The member writes a receipt only for a message its own log holds and that it sent itself. Changes no roster. |
+| `POST` | `/crew/v1/tricks/inputs` | the lead | Added in 1.29.0 (§23). The lead asks a member for the files a trick's `inputs` globs match in that member's agent sessions' folders, read through the member's Files view. Answered only by a collie that has a lead, and only to its own lead: any other caller is the uniform 401. Refused `403` with `code: "trick_reads_off"` while the member's trick reads are off. A read: changes no roster and writes nothing on the member. |
 | `POST` | `/crew/v1/pairing` | the lead | Syncs the lead's paired-device registry — **hashes only** — to the **deputy and to nobody else** (§18.14). Refused unless the caller is *this collie's own lead* AND this collie holds a verified warrant naming **itself**. A label that collides with one of this machine's own paired devices refuses the sync with `code: "pairing_label_collision"`, naming the labels; it is never silently renamed. |
 | `POST` | `/crew/v1/launchers-copy` | the lead | Added 2026-11-03 (§18.14, ADR 0127 point 5). Sends the lead's merged launcher rows to the **deputy and to nobody else**, as a read-only copy the deputy serves only once it leads. The same two role checks as `pairing`: the caller is *this collie's own lead*, and this collie holds a verified warrant naming **itself**. A deputy that `404`s it is a build before the route; the lead stops sending to it until the next connect. Changes no roster. |
 | `POST` | `/crew/v1/takeover` | the deputy | The witness question, then the re-pin (§18.16). **Two-phase**, with `phase` additive-optional and **absent meaning `probe`** — the reading that changes nothing. It is the one route a caller admitted **as the deputy** may use, and like `warrant` it has two kinds of recipient: arriving at a collie that still believes it leads, a `probe` answers `lead_is_alive` (it *is* the lead, and it *is* answering) and a `commit` is a deposition (§18.12). |
@@ -486,7 +536,8 @@ Everything except `enroll` sits behind the same two factors as the rest of the p
 carries a role check on top: *admitted* and *allowed to do this* are different questions.
 
 **Which routes may be authenticated by a §8.6 signature** is a closed set — `leave`, `lead`, `hello`,
-since 2026-08-20 `warrant` and `takeover`, and since 2026-10-17 `walky` (§21). It is exactly the routes that travel **peer → lead**, the one
+since 2026-08-20 `warrant` and `takeover`, since 2026-10-17 `walky` (§21), since 1.29.0 `walky/who` (§21), and
+since 1.29.0 `hill/media`, `hill/post` and `hill/op` (§22) and `tricks/propose` (§24). It is exactly the routes that travel **peer → lead**, the one
 direction where the transport cannot pin (§8.1), and `warrant` joined it for the delivery that
 matters most: a new lead telling the old one that the crown has moved (§18.12). The proxy surface is
 not on the list and must not be — those calls run lead → peer over a pinned handshake, and admitting a
@@ -523,6 +574,9 @@ Every request on a crew link, and every response:
 | `X-Crew-Lead-Release: <x.y.z>` | request | **Optional**, added 2026-09-04 (§20). On `GET /crew/v1/snapshot` only: the bare version the LEAD is itself running, sent only while that version is a strict release and the lead's own health gate has settled it. Absent means the lead is on a dev or prerelease build, or is mid-run — and absent means the receiving member does nothing. It is a statement about the sender and carries no ref, no URL and no command. *(Amended 2026-10-18, ADR 0110: an Edge build `x.y.z-edge.N` is stated too; see §20, "Two release lines".)* |
 | `X-Crew-Lead-Line: <line>[;<step>]` | request | **Optional**, added 2026-10-18 (§20, ADR 0110). On `GET /crew/v1/snapshot` only, and only beside `X-Crew-Lead-Release`: the lead's release line, `stable` or `edge`, and, when the release it states is where its last run landed, that run's step, `rollback` or `switch`. Absent means `stable` with no step. It carries no ref, no URL and no command. |
 | `X-Crew-Update-Turn: <member-name>;<run-id>` | request | **Optional**, added 2026-09-04 (§20). On `GET /crew/v1/snapshot` only: who may take that release now, and the id of the `UpdateRun` the operator confirmed on the lead. Sent to **at most one member at a time**. A member ignores a turn that does not name itself. Absent means it is not this member's turn. |
+| `X-Collie-Reason: <code>` | response | **Optional**, added 2026-11-17 (M102 spec 14). On a refusal of the send, ask, hook or crew paths: one code of the list in `bridge/refusal.ts` (`no_pane`, `bad_body`, `link_timeout`, ...), the same code the answering bridge wrote in its own audit line. No text. A member's code reaches the phone through the lead, which passes it on only when it is a code of that list and drops any other value. A member that predates it sends none, and the lead then records the forward as before. |
+| `X-Collie-By: lead\|member\|bridge\|hook` | response | **Optional**, added 2026-11-17 (M102 spec 14), beside `X-Collie-Reason` only: who refused. The lead never copies a member's value: it sets `member` itself on a member's refusal it passes on, and `lead` on its own. |
+| `X-Collie-Member-Version: <version>` | response | **Optional**, added 2026-11-17 (M102 spec 14). Set by the lead, never by a member: the version that member last reported (`PeerState.version`), on a refused or failed write to it and on the lead's own refusals for that member's version (`host_incompatible`, the older member's text refusal, whose bodies also carry `memberVersion`). Absent when the member reported none. Informational only; nothing branches on it. |
 | `X-Crew-Received-At` | response | Omitted deliberately. **A peer's clock is never trusted for freshness** — the lead stamps its own receipt time (§10). |
 
 The crew surface carries **no `Origin` and no `Host` expectation**: `checkAccess()`
@@ -609,7 +663,7 @@ updated machines, so build skew is the steady state (§7), and this section is t
   preflight (`collie update --check`, which walks the members over the operator's ssh) reds the
   `version` check when a member's build is below the protocol floor, the oldest build that speaks
   this document's `CREW_PROTOCOL_VERSION` (`PROTOCOL_FLOOR_VERSION` in `cli/update-check.ts`,
-  [ADR 0045](./.adr/0045-a-build-below-the-protocol-floor-is-a-red-preflight.md)). That is a
+  [ADR 0143](./.adr/0143-how-an-install-updates-and-what-a-release-offers-it.md)). That is a
   judgement about whether a crew update can finish, made before anything is started, and it changes
   no route, no response and no code path on the link. On the wire the rule above still stands whole:
   a build-version difference refuses nothing.
@@ -971,6 +1025,14 @@ Run **on the peer**, once.
    > A member that joins again with the same fingerprint keeps its id and is never refused. An older
    > lead keeps the suffix behaviour.
 
+   > **Note, added in 1.29.0. The words an address keeps are no machine's name.** `local` (this machine,
+   > on every bridge), `all` and `here` are words of the walky address grammar, so a member id that is
+   > one of them would name another target: on the lead, `local/<pane>` is the lead's own pane. A label
+   > that becomes one of them is refused with the same `422` and `"takenBy": "reserved"`; no path mints
+   > such an id; a member that joins again under one gets a fresh id; and a member already enrolled under
+   > one is refused at admission with the uniform `401` (the store is not rewritten) and named once in the
+   > bridge's log at boot, with `collie crew remove <id>` as the way out.
+
 **`<lead-address>` is whatever the operator can reach.** Any network: tailnet, LAN, WireGuard,
 someone else's overlay, an SSH tunnel. Collie owns authentication; **the operator owns reachability**.
 There is no discovery, no enumeration, and no overlay-network integration — ever.
@@ -1138,7 +1200,7 @@ Stated plainly, because a crew link is remote shell access to a second machine.
       **former lead's** panes, journal and uploads — the reach this section otherwise reserves to a
       compromised *lead*, had from a single compromised *peer*.
 
-  **What closes it (§14, [ADR 0014](./.adr/0014-promote-is-a-confirm-on-the-lead.md)): promotion is a
+  **What closes it (§14, [ADR 0144](./.adr/0144-one-lead-one-door-and-the-operator-moves-the-crown.md)): promotion is a
   confirm on the receiver, not a command from the claimant.** The demotion needs the old lead's
   operator. `newLead()` on a leading collie demotes only if a **live handover approval** — minted on
   that machine by `collie crew approve-promote <member>`, ten minutes, single-use — names the
@@ -1191,12 +1253,14 @@ travel it are the most consequential in the protocol: `leave` removes a member f
 speak for any other. The second factor is therefore re-established over material both sides already
 pinned — no new key, no new trust, the same guarantee the handshake gives the other way.
 
-**`POST /crew/v1/leave`, `POST /crew/v1/lead`, `POST /crew/v1/warrant` and `POST /crew/v1/walky` MUST carry a signature.**
+**`POST /crew/v1/leave`, `POST /crew/v1/lead`, `POST /crew/v1/warrant`, `POST /crew/v1/walky`, `POST /crew/v1/walky/who`
+and the three `POST /crew/v1/hill/*` routes (§22, added in 1.29.0) MUST carry a signature.**
 `GET /crew/v1/hello` MAY, and does when a verb sends it, so `collie crew status` and `collie
 reconnect` can probe a lead at all. (`warrant` joined the set on 2026-08-20: §18.12's deposition
 travels peer → lead, into a listener that pins nothing inbound. `walky` joined it on 2026-10-17: a
 member's walky talky message travels the same direction, and the signature is what names the member
-that sent it, §21.) Nothing else may: the proxy surface
+that sent it, §21. `walky/who` and the three Hill routes joined it in 1.29.0 for the same reason: each
+travels member → lead, and the lead takes the member from the signature alone, §22.) Nothing else may: the proxy surface
 (§5) runs lead → peer over a pinned handshake, and hashing a body to verify a signature there would
 pull a streamed upload (§13) into memory on the security path. `/crew/v1/enroll` cannot — at that
 instant nobody has pinned the caller (§8.2).
@@ -1232,6 +1296,36 @@ instant nobody has pinned the caller (§8.2).
 - **A failure at any step is the uniform 401** of §8.1 — indistinguishable from a wrong secret, an
   unpinned certificate, or an unknown member. The signature is checked **before** the timestamp, so a
   caller who cannot sign learns nothing about this collie's clock or about what it has already seen.
+- **The body has a cap per route, read before the body is** *(added in 1.29.0)*. The body is read
+  whole before the signature is checked, because its digest is signed. So each signable route has
+  one most-bytes value (`SIGNED_BODY_CAPS` in `bridge/crew/router.ts`): `leave`, `hello` and
+  `walky/who` 64 KiB; `lead`, `warrant` and `takeover` 1 MiB; `walky` 256 KiB; `hill/media` 3 MiB;
+  `hill/post` 64 KiB; `hill/op` 4 KiB; `tricks/propose` 8 MiB. A declared `Content-Length` over the cap is refused before one
+  byte is read. A body with no declared length is read only up to the cap. Either way the answer is
+  `413` with `{ error, code: "body_too_large" }` and the protocol header, audited as `crew.refused`
+  with the factor `body-too-large`. It names no member, because nothing was admitted yet. Each cap is
+  many times what the route sends today: the largest walky talky message, 4,000 characters of body
+  with its space line and every label at its maximum, is under 40 KiB as JSON, and a roster carries
+  about 1.5 KB per member. A request without the signature header is never read here, as before.
+- **What needs no body is checked before the body is read** *(added in 1.29.0)*. The crew secret
+  (`Authorization`) is compared first: admission refuses every request without it whatever its
+  signature says, so a signed request with a wrong or absent secret is the uniform 401 (audited with
+  the factor `secret`) and not one byte of its body is read. A `X-Crew-Timestamp` that is not a
+  timestamp is the uniform 401 there too. The skew window is still checked after the signature, as
+  above. Telling "read" from "not read" apart only says whether a guessed secret is right, and the
+  secret is 256 random bits.
+- **At most 4 large signed bodies are read at once, and at most 4 uploads beside them** *(added in
+  1.29.0)*: the routes whose cap is over 256 KiB are counted, `hill/media` in its own count
+  (`SIGNED_MEDIA_READS_MAX`) and `lead`, `warrant` and `takeover` in another (`SIGNED_READS_MAX`, both
+  in `bridge/crew/router.ts`). `tricks/propose` has a third count of its own, 2 at once
+  (`SIGNED_PROPOSE_READS_MAX`), and its body must arrive within 60 seconds (`PROPOSE_READ_MS`); a body
+  that does not is `400` with `code: "body_unread"`, and its slot is free again. A member's uploads, stalled or not, therefore never turn away the crew's
+  own lead, warrant or takeover calls, and at most 16 MiB sits unverified in memory. One more in a full
+  count is answered `503` with `Retry-After: 1` and `{ error, code: "signed_reads_busy" }`, its body
+  unread, audited as `crew.refused` with the factor `signed-reads-busy`. The routes with a smaller cap
+  are not counted. A member reads the 503 as a dial that did not land. A body whose stream breaks off
+  gives its slot back and is answered `400` with `{ error, code: "body_unread" }`, audited with the
+  factor `body-unread`.
 
 **The warrant is a SECOND signed object under the same key** (§18, added 2026-08-20). It reuses these
 primitives unchanged — base64 ECDSA-P256-SHA256, made with the signer's own key and verified against
@@ -1412,14 +1506,14 @@ prevents (`web/src/lib/api.ts:201-203`).
   wire shape gains `host: string`, so the phone can address what it renders. Absent on a solo
   snapshot (§11).
 - **A pane may carry `asks`** (additive-optional, §7.1, added 2026-10-12,
-  [ADR 0100](./.adr/0100-an-ask-travels-as-data-and-is-answered-by-id.md)): every open ask of a pane
+  [ADR 0146](./.adr/0146-a-durable-agent-is-a-session-with-no-screen-that-acts-by-id.md)): every open ask of a pane
   whose adapter raises them as data, up to the durable agent's 50 per pane. The lead adds no rule for it:
   the merge keeps a pane whole and only stamps `host`, so a member's asks reach the phone as the
   member listed them, and a lead that predates the field passes it through the same way. The lead's
   push guard keys a peer's asks on `(member id, toolCallId)`, so a re-raised question is shown and
   not pushed again; it caps pushes, never the list (§5, "Which bridge sends a push").
 - **A pane may carry `turnId`** (additive-optional, §7.1, added 2026-10-12,
-  [ADR 0101](./.adr/0101-a-control-on-a-screenless-pane-names-the-turn-it-saw.md)): the newest turn
+  [ADR 0146](./.adr/0146-a-durable-agent-is-a-session-with-no-screen-that-acts-by-id.md)): the newest turn
   of a pane whose adapter takes guarded controls, which the phone sends back with a send or an abort.
   The merge passes it through like `asks`, and a lead that predates it does the same.
 - **A pane may carry `actions`** (additive-optional, §7.1, added 2026-10-13, M53 spec 07): the belt
@@ -1432,11 +1526,31 @@ prevents (`web/src/lib/api.ts:201-203`).
 - **A pane may carry `walkyOff: true`** (additive-optional, §7.1, added 2026-11-06): the session
   turned its walky talky off. Only `true` means off; absent reads as on, which is what every older
   member sends. It only shows: the member that owns the pane refuses (§21, "Pane instances").
+- **A pane may carry `workspaceNamed`** (additive-optional, §7.1, added 2026-11-10, M98): whether the
+  pane's `workspaceLabel` is a name of the space's own, a boolean, sent only when it differs from the
+  default `workspaceLabel !== workspaceId`. Absent means the default, which is what every older member
+  sends. The lead keeps it only as a boolean and drops anything else. Walky talky reads it to key a
+  space: a named space joins the space of the same name on another member, an unnamed one stays on its
+  machine (§21).
 - **A pane may carry `pins`** (additive-optional, §7.1, added 2026-11-06, M90): how many pins the
   pane's session holds on the member that owns it, a whole number above zero. Absent means none,
   which is what every older member sends and what a session with no pins sends. The lead keeps the
   field only in that form and drops anything else. It only shows: the list and the unpin are the
   member's `pane/:id/pins` route.
+- **A pane may carry `account`** (additive-optional, §7.1, added 2026-11-15, M101): the added account
+  the pane's agent runs under on the member that owns it, `{ id, label }`, the member's own id and
+  label. Absent means the Default account or no account known, which is what every older member
+  sends. The lead passes it through untouched, as the `cache` bullet says of a field merge does not
+  read. It only shows: the member's accounts are its own, read and changed with `?host=` on
+  `/api/accounts`. `CREW_PROTOCOL_VERSION` stays `2`, no new route on the link, no new verb and no new
+  header.
+- **A pane may carry `blockedBy`** (additive-optional, §7.1, added 2026-11-19, PR 787): `"error"` on a
+  pane whose `status` is `blocked` because its program reported that its turn stopped on a failure
+  (herdr-core's `state=error`). The status stays `blocked`, so a lead or phone that predates the field
+  still shows the pane as needing you. A collie that reads it treats the pane as needing a look, not
+  an answer: no ask is open, Load older reads, and its push goes once the pane is seen. The lead keeps
+  it only as `"error"` and only on a `blocked` pane, and drops anything else; a pane without it is a
+  plain `blocked`, which is what every older member sends. `CREW_PROTOCOL_VERSION` stays `2`.
 - **A session may carry `label`** (additive-optional, §7.1, added 2026-10-19): the display label
   the member's own operator wrote in its `spaces.toml`. It is display-only: `name` stays the
   session's identity on the link and in every address. The lead keeps it only as a string and runs
@@ -1447,8 +1561,8 @@ prevents (`web/src/lib/api.ts:201-203`).
 **The merged `agents` and `shellPanes` run in place order, never by status.** The lead's panes come
 first, then each peer's in member-id order. Inside one machine the order is workspace number, then
 the tab's index in the merged `tabs` list, then `tabPosition`, then the pane id. A status change
-therefore never moves a row. *(added 2026-09-23,
-[ADR 0063](./.adr/0063-a-pane-keeps-its-place-when-its-state-changes.md); the merge used to sort by
+therefore never moves a row. *(added 2026-09-23; the rule today is
+[ADR 0147](./.adr/0147-a-pane-list-keeps-its-place-and-the-footer-holds-views.md); the merge used to sort by
 status first.)*
 
 Merging is the *only* place the lead re-serialises. Its ETag over the merged body is **the lead's
@@ -1494,6 +1608,21 @@ never crosses a crew link.
   (`web/src/lib/api.ts`), so the deadline that fires first is still the lead's and the phone still
   gets §10.3's legible answer rather than a dead socket. Lead-local, never on the wire, so it is not
   a version-negotiated value (§7.1).
+
+  **A launch, a tab and a space create dial longer: `CREATE_WRITE_BUDGET_MS`, 18 s** *(added
+  2026-11-13, M100 spec 04)*. The member does more on these than one call: the multiplexer's own
+  create (5 s), a look in its snapshot when that call timed out (4 s), and for a launch its wait for
+  the new shell to draw (5 s) before it types. The 5 s write budget made the lead give up inside the
+  member's own wait, read `write_outcome_unknown` over a pane the member then made, and the next tap
+  made a second agent. The budget is the member's own bound (`LAUNCH_BUDGET_MS`,
+  `bridge/create-confirm.ts`), still inside the phone's 20 s. The member holds one deadline of its
+  own on the whole run (`MEMBER_DEADLINE_MS`, 15 s, below the lead's 18 s): past it the member answers
+  `write_outcome_unknown` at once and the run goes on, settling its receipt as the pane or as unknown,
+  so a repeat with the same id replays, joins or answers unknown. The three routes now take an optional
+  `requestId` in the body, like `launch` since 1.19.0 (additive-optional, §7.1; the member keeps a
+  receipt per id and answers a repeat with the first pane), and an unknown outcome on the member
+  itself is the same 504 `write_outcome_unknown` the lead gives. Lead-local budget, so no version
+  negotiation.
 
 ### 10.2 Four distinct states, never conflated *(a fourth added 2026-08-20)*
 
@@ -1704,7 +1833,7 @@ federation code exists to break it.
 
 | Surface | Solo behaviour | Decided at |
 |---|---|---|
-| Routes served to a browser | unchanged; **zero** routes added, zero status codes changed. Amended on purpose 2026-10-05 (ADR 0084): `GET /api/machines`, `GET /api/machines/:id/history` and `POST /api/machines/:id/alerts` answer on a solo collie for its one machine, id `local`; they name no crew state and are pinned in `bridge/solo-baseline.test.ts` | `bridge/server.ts:165-390` |
+| Routes served to a browser | unchanged; **zero** routes added, zero status codes changed. Amended on purpose 2026-10-05 (ADR 0084): `GET /api/machines`, `GET /api/machines/:id/history` and `POST /api/machines/:id/alerts` answer on a solo collie for its one machine, id `local`; they name no crew state and are pinned in `bridge/solo-baseline.test.ts`. Amended on purpose 2026-11-18: `POST /api/diag/composer` answers on a solo collie, read-gated, never forwarded, and names no crew state | `bridge/server.ts:165-390` |
 | `/crew/v1/*` | **not routed at all** — no crew prefix is registered with zero peers | §5 |
 | Snapshot bytes | unchanged — `servers` is **omitted**, and no `host` field is added to sessions or panes | `bridge/types.ts:164-186` |
 | Snapshot ETag | **unchanged.** Follows from the row above: no added field, no shifted hash | `bridge/http-cache.ts:16-19` |
@@ -1714,7 +1843,7 @@ federation code exists to break it.
 | Push payload | unchanged — no `host` field, mirroring how `session` is stamped only for non-primary | `bridge/push.ts:124-131` |
 | Poll cadence | unchanged — **no second timer, no peer sweep**, same idle relaxation. Amended on purpose 2026-10-05: the one interval runs at the fast cadence for `HOT_POLLS` polls after an input or a new agent pane with no session (`ARCHITECTURE.md` §5), solo or not, and names no crew state | `bridge/event-poker.ts`, `bridge/config.ts:212-213` |
 | Audit line bytes | unchanged — `host` is omitted, not null, exactly as `session`/`device` are today | `bridge/audit.ts:55-61` |
-| Files written | **exactly today's set**: `uploads/`, `audit.log`, `push-subscriptions.json`, `snooze.json`, `notify-prefs.json`, `activity.json`, `update-state.json`. **No key, no certificate, no trust store, no roster.** Amended on purpose 2026-09-27 (M40/02, #289): `folders.json` joins the set as a file written **only after the first space created with a folder or the first star** — an instance that never does either writes nothing new, and it names no crew state. Amended on purpose 2026-10-05 (ADR 0084): `machine-history.json` is written from the tick at most once every five minutes once a minute is recorded, and `machine-alerts.json` only after the operator sets the first rule. Amended on purpose 2026-10-17 (ADR 0107): `sent.jsonl` is written only after the first shell line or one-off run the skip rules keep, and never with `COLLIE_SENT=off`. Amended on purpose 2026-11-09 (push rule 4): `push-clear-budget.json` is written only after the first silent clear reaches a push subscription, so an instance nobody subscribed to push from never has it | `bridge/server.ts:1075`, `bridge/audit.ts:65`, `bridge/push.ts:86`, `bridge/snooze.ts:19`, `bridge/notify-prefs.ts:45`, `bridge/activity.ts:100`, `bridge/update.ts:147`, `bridge/folders.ts`, `bridge/machine-history.ts`, `bridge/machine-alerts.ts`, `bridge/sent.ts` |
+| Files written | **exactly today's set**: `uploads/`, `audit.log`, `push-subscriptions.json`, `snooze.json`, `notify-prefs.json`, `activity.json`, `update-state.json`. **No key, no certificate, no trust store, no roster.** Amended on purpose 2026-09-27 (M40/02, #289): `folders.json` joins the set as a file written **only after the first space created with a folder or the first star** — an instance that never does either writes nothing new, and it names no crew state. Amended on purpose 2026-10-05 (ADR 0084): `machine-history.json` is written from the tick at most once every five minutes once a minute is recorded, and `machine-alerts.json` only after the operator sets the first rule. Amended on purpose 2026-10-17 (ADR 0107): `sent.jsonl` is written only after the first shell line or one-off run the skip rules keep, and never with `COLLIE_SENT=off`. Amended on purpose 2026-11-09 (push rule 4): `push-clear-budget.json` is written only after the first silent clear reaches a push subscription, so an instance nobody subscribed to push from never has it. Amended on purpose 2026-11-18: `diag-composer.jsonl` is written only after a paired phone reports a reply box below its screen (`POST /api/diag/composer`, numbers and enums only, at most 500 lines), so a bridge no phone reports to never has it, and it names no crew state | `bridge/server.ts:1075`, `bridge/audit.ts:65`, `bridge/push.ts:86`, `bridge/snooze.ts:19`, `bridge/notify-prefs.ts:45`, `bridge/activity.ts:100`, `bridge/update.ts:147`, `bridge/folders.ts`, `bridge/machine-history.ts`, `bridge/machine-alerts.ts`, `bridge/sent.ts` |
 | Ports opened | exactly one, loopback, as today. The standby door's second listener (§18.15) is bound only when `COLLIE_STANDBY_PORT` is set **and** a trust store exists, which a solo instance has neither of | `bridge/config.ts:210-211`, `bridge/crew/standby.ts` |
 
 **Why `servers` is optional-and-absent rather than always-present.** An always-present field — even a
@@ -1834,7 +1963,7 @@ The path is **phone → lead → owning peer's disk**.
 Transparent failover is a non-goal.**
 
 **Promotion is a confirm on the receiver, not a command from the claimant** (amended 2026-08-11,
-closes F2 — [ADR 0014](./.adr/0014-promote-is-a-confirm-on-the-lead.md)). A signature proves *which
+closes F2 — [ADR 0144](./.adr/0144-one-lead-one-door-and-the-operator-moves-the-crown.md)). A signature proves *which
 member is speaking* (§8.6); it cannot prove *that an operator willed it*. So the crown moves in **two
 steps on two machines**, and each step is refused without the one before it:
 
@@ -1847,6 +1976,13 @@ Touching both machines is the design, not friction: consent run on the lead is w
 operator controls the machine that is about to lose its terminals, its roster and its front door.
 
 ### 14.1 The approval — `collie crew approve-promote <member-id>` (on the lead)
+
+Consent lives on the machine being taken from, because a design where the claimant supplies it (a
+flag, a second signature, a token it was handed earlier) proves control of the machine that stands to
+gain, which the attacker already has. Warn-only was refused: a wildcard bind warning reports the
+operator's own decision back to them, but an unconsented demotion would report an attacker's decision
+after it had committed, once the front door had moved and the roster was handed over
+([ADR 0144](./.adr/0144-one-lead-one-door-and-the-operator-moves-the-crown.md)).
 
 Mints a **pending handover approval** and **restarts the lead** so the running process holds
 it. The approval is persisted in the trust store beside the crew's other state:
@@ -2221,7 +2357,7 @@ record is the reservation and the run that closed it, side by side:
 - **An upload-read route** (§5), if a use case ever needs the lead to serve a peer-stored image.
 - **A non-Herdr peer — EXERCISED on 2026-09-08 for both tmux AND zellij, no longer a reservation.**
   The seam (§2,
-  [ADR 0011](./.adr/0011-the-pack-protocol-is-the-mux-driver-seam.md)) was walked for the first time
+  [ADR 0144](./.adr/0144-one-lead-one-door-and-the-operator-moves-the-crown.md)) was walked for the first time
   in the VM lab: a **tmux** peer, enrolled under a **herdr** lead, with a real ssh reach, its own
   config root and its own trust store. Every feature in this document's peer table was driven on
   that peer through the lead: the merge carried its own tmux ids (`%0`, `$0`, `@0`), a pane read
@@ -2287,7 +2423,7 @@ record is the reservation and the run that closed it, side by side:
 ## 17. Open items this document does not close
 
 - The **final product vocabulary** for operator-visible surfaces (env keys, action ids, CLI verbs).
-  Settled by [ADR 0012](./.adr/0012-every-machine-runs-a-collie-and-the-pack-has-a-lead.md);
+  Settled by [ADR 0144](./.adr/0144-one-lead-one-door-and-the-operator-moves-the-crown.md);
   `collie` / `lead` / `peer` / `crew` are the words *this* document
   uses and they must stay greppable.
 - ~~**The general policy for a version-skewed crew.**~~ **Closed 2026-08-12 by §7.1** ("Version skew
@@ -2420,6 +2556,11 @@ A peer's listener is built with **exactly one TLS anchor** — its lead's certif
 `server.reload({ tls })` does **not** swap a pinned `ca` (§8.1). Therefore a warrant that arrives over
 the crew link lands **on disk**, and is **inert at the transport until that member restarts**. No
 route, signature or warrant can climb that wall.
+
+The restart that completes phase 2 therefore rides the operator's own SSH (§18.13), and the crew link
+never carries an instruction to restart. A restart message on the wire would be a remote code path
+behind the same two factors that guard a pane read, and it would turn the link into a control plane
+only to skip an SSH leg Collie already has ([ADR 0144](./.adr/0144-one-lead-one-door-and-the-operator-moves-the-crown.md)).
 
 | Phase | What happens | When it takes effect |
 |---|---|---|
@@ -3293,6 +3434,17 @@ preflight, its own detached updater, its own health gate and its own rollback.
 untouched: code distribution to a member is credentialed by the operator's own SSH and by nothing
 else. What crosses here is two facts, and the second of them is a mutex token.
 
+Why the link never carries code: the crew secret is a symmetric bearer credential, and a stolen one
+must cost an outage, not a supply chain. §8.5 already grants a compromised lead every member's
+terminals, but that reach is live and ends when the lead is cleaned. An installed build persists
+across the cleanup, on machines nobody thinks to check, and an update route would run with no human
+in the loop. The operator's own SSH is a key that has to be held and used, so it stays the only
+credential for code. For the same reason the bridge never holds an SSH key or an agent so that the
+phone could drive `crew update` directly: that would be a standing shell credential for every member,
+readable by a long-lived network-facing service and still valid after the incident that exposed it.
+Outbound HTTPS to GitHub for a pinned public tag has no credential, one destination and one artifact
+kind.
+
 There is **no new route, no new verb, and no inbound update surface on a member.** A member's
 `/crew/v1/*` surface stays exactly what §5 lists. `X-Crew-Protocol` stays `1`.
 
@@ -3509,11 +3661,28 @@ is two hops, A to the lead and the lead to B.
 | `POST` | `/crew/v1/walky` | a member, to its lead | the signed message | `{ receipts }` |
 | `POST` | `/crew/v1/pane/:id/walky` | the lead, to a member | `{ message, attest, sender? }` | `{ receipts }` |
 | `POST` | `/crew/v1/walky/outcomes` | the lead, to a member | `{ receipts }` | `{ written }` |
+| `POST` | `/crew/v1/walky/who` | a member, to its lead | `{}` | `{ targets }` |
 | `GET` | `/crew/v1/pane/:id/walky?limit=` | the lead, to a member, for a phone | none | `{ messages }` |
 
 - `/crew/v1/walky` is a **membership-table route** (§5): it carries no pane data and is addressed to the
   collie. It joins the signed set (§8.6), because it travels peer → lead, where the transport cannot
   pin. Only a collie that leads answers it; a peer answers 404.
+- `/crew/v1/walky/who` (added in 1.29.0, M98) is a **membership-table route** like `/crew/v1/walky`: it
+  joins the signed set (§8.6) and only a collie that leads answers it. A member sends the empty object
+  `{}`; the lead answers `{ targets }`, the rows its own `collie walky who` prints: its own agent panes
+  and every member's from its last sweep, each with `address`, `memberId`, `machine`, `harness`,
+  `label`, `state`, `space` (the space of the message section below) and `walky: "off"` when the
+  session turned it off. Since 1.29.0 a row may also carry `name` (the name a person gave the session,
+  at most 120 characters), `nameBy` (`collie`, `harness` or `tab`: where that name was set) and `title`
+  (the title the agent gave its session, left out while the lead's `COLLIE_REDACT` is on), each
+  additive-optional (§7.1) and absent when there is none. A reader drops a field of the wrong shape and
+  keeps the row. The lead takes a member's `name` and `title` from the `sessionName`, `paneLabel`,
+  `soleTabName` and `agentTitle` of that member's panes in its sweep; a member before 1.29.0 sends no
+  `agentTitle`, and its rows carry no `title`. It is a read for display. The member keeps its own panes as they are now and
+  takes only the other machines' rows from the answer; a row that is not a pane address or has no well
+  formed space is dropped. Every send is still decided by the bridge that owns the target pane. A
+  member that gets no usable answer (a lead before 1.29.0 answers 404, a refused or unknown dial, no
+  answer in 8 seconds) lists its own panes with the note it always printed.
 - `/crew/v1/pane/:id/walky` is a **forwarded write** (§5's table, `FORWARDABLE` in
   `bridge/crew/forward.ts`). `:id` is the pane id when the message names one pane, and `all` when it
   names `<member>/all` or `all`. For a scope it is the pane id of one pane the lead's expansion
@@ -3560,6 +3729,26 @@ Two signed objects, each behind its own fixed domain tag, LF between fields, `-`
 collie-walky-v1\n<id>\n<kind>\n<from.memberId>\n<from.address>\n<from.harness>\n<to>\n<replyTo>\n<at>\n<sha256(body) hex>
 ```
 
+Optional lines follow the ten fields, each only when it is set and always in this order, so a message
+without them keeps the string above and every older bridge still verifies it:
+
+```
+wake
+space "<from.space.key as a JSON string>"
+outside
+subject "<subject as a JSON string>"
+```
+
+- `wake` (added 2026-11-04, M85): the message has `wake: true`.
+- `space` (added 2026-11-10, M98): the message's `from.space` is an object. The key is written with
+  `JSON.stringify`, so the NUL of an unnamed key reads `\u0000` and the line stays one line whatever
+  the space is called. `named` and `label` are not signed: `named` is the key's form, checked where the
+  message is read, and the label is display data like `from.label`.
+- `outside` (added 2026-11-10, M98): the message has `outside: true`, the sender's word that it may
+  leave its space.
+- `subject` (added 2026-11-13, M98 spec 07): the message has a `subject`. A subject holds only ASCII
+  letters, digits, the space and `. , - _ / # + ' ? % @ =`, so its JSON form is the subject in quotes.
+
 The lead's attestation, signed by the lead's key, beside a message it routes to one member:
 
 ```
@@ -3580,8 +3769,8 @@ the value the trust store pins (`fingerprintOfCert`, `bridge/crew/identity.ts`).
 A walky message's `to` may also be a scope as the sender typed it (added 2026-10-30, M75): `<repo>`,
 `<repo>#<branch>` or `here`. It stays the signed `to` on every hop, so a recipient reads the group the
 message was addressed to, not its own pane address. A member that delivers a scope reads the label of
-the pane the route names at that moment, and delivers only while the label sits in the scope (for
-`here`, in the repo of the sender's `from.label`), so a pane outside the scope cannot ride it. The
+the pane the route names at that moment, and delivers only while the pane sits in the scope (for
+`here`, in the sender's signed space; from 1.29.0, M98), so a pane outside the scope cannot ride it. The
 attestation binds the crew and the receiver (§16's rule for a broadened pin), so a member cannot
 present an attested message at a sibling or in another crew. The voucher binds the crew and names the
 member and its certificate; it names no message, so the attestation is still what binds one message
@@ -3602,9 +3791,112 @@ Both receiving sides run ONE shape check on the message as it arrived, before th
   characters. Neither is signed; both reach a header line.
 - **The body** is one a second clean leaves unchanged, at most 4,000 characters, and **the address**
   names its member (`local/…` is a solo word).
+- **`from.space`** (added 2026-11-10, M98) is null or absent for an operator, a 400 otherwise. For an
+  agent, an unnamed key must start with the signer's member id and a NUL: a member cannot claim
+  another machine's unnamed space, and a claim that does not match the signer is the uniform 401. A
+  named key is taken as claimed, because the name is the operator's to give.
 
 A malformed field is a 400 that says why, because the caller passed both factors. A sender or a pane
 that does not match the signer is the uniform 401.
+
+### The subject of a message *(added 2026-11-13, M98 spec 07)*
+
+A walky message may carry the sender's subject, additive-optional (§7.1):
+
+- **`subject`**: a string, or absent. It is the sender's words for what the message is about, already
+  cleaned (`readSubject` in `bridge/walky/types.ts`, the allow-list in `web/src/lib/walky-subject.ts`):
+  only ASCII letters, digits, the space and `. , - _ / # + ' ? % @ =`, one space between words, no
+  blank at either end, at most 6 words and 48 characters. Any other
+  value fails the message. The sender's bridge refuses a longer one with the receipt reason
+  `subject over 6 words or 48 characters: shorten it`, and never cuts it.
+
+It is signed (the `subject` line above), so a hop cannot add, change or drop it. A bridge below 1.29.0
+drops the field when it reads a message, and cannot verify a canonical string that holds the line. So
+it rides the space's skew rule below: a lead routes a member below 1.29.0 a copy without the `subject`
+line, as it drops the space and `outside` lines, attested over that copy. A member that knows its lead
+is below 1.29.0 never refuses for the subject: its bridge, the signer, signs a message that may leave
+the machine without the subject, and the sender's answer carries `subjectLeftOut: true`. The space
+rule's own refusal is unchanged. 1.29.0-edge.1
+counts as below 1.29.0: a prerelease sorts before its release.
+
+The header a receiving bridge types carries `about "<subject>"` after the sender and the word
+`outside`, before any ` reply to <id>`. A reader that predates it takes it as part of the sender's
+text and still finds the id, the kind and the reply suffix.
+
+### The typed line names its sender in words *(changed 2026-11-14, fix/walky-line-fields)*
+
+The receiving bridge types the sender as `<address> on <harness> in "<label>"` (` on <harness>` only
+when the pane has a known harness), and an operator as `"<label>"`. A bridge before this change typed
+`<address> (<harness>, <label>)` and `(<label>)`; fish runs a parenthesis as a command substitution,
+so a label typed at a fish prompt ran there. The address, the harness and the label keep only ASCII
+letters, digits and `. , _ / # + @ = : % -` (the label also the space), and every other character
+becomes `_` (`lineField`, `web/src/lib/walky-subject.ts`). Nothing on the wire changes: the fields keep
+their bytes and their signature, and only the typed line is cleaned. Both readers (`readHeaderPart`)
+take the new form and the old one, so a line from an older bridge, or in history, reads as before. A
+reader of 1.29.0-edge.1 finds the id, the kind and the reply suffix in the new form, and takes the word
+`outside` as sender text, because it looks for it after a parenthesis.
+
+### The space of a message *(added 2026-11-10, M98)*
+
+A walky message names the space it comes from, under the sender's signature, and may carry the
+sender's word that it may leave that space. Both fields are additive-optional (§7.1):
+
+- **`from.space`**: `{ key, named, label }` for an agent, the space of the sending pane
+  (`bridge/walky/space.ts`), or `null` for an operator. `key` is the space's raw name from the
+  multiplexer, NFC and trimmed, when the space is named; an unnamed space's key is
+  `<member id>\u0000<space id>`, so it is a space on that one machine and never joins one elsewhere.
+  `named` must match the key's form: a named key holds no NUL, an unnamed one holds exactly one, after a
+  member id. Both strings are at most 1,024 characters. A field that is there and not one fails the
+  message: a malformed body, a 400. Absent on a message from a bridge below 1.29.0.
+- **`outside`**: `true`, or absent. Any other value reads as absent.
+
+Both are signed (the optional lines above). A bridge below 1.29.0 drops both fields when it reads a
+message, and cannot verify a canonical string that holds either line.
+
+The skew rule (`SPACE_FIRST_VERSION`, 1.29.0, in `bridge/walky/crew.ts`, and `olderThanSpace`, which
+reads a version like `olderThanWalky`):
+
+1. **A member below 1.29.0 cannot enforce the border.** Its lead checks the border for it before the
+   hop, from that member's pane list (each `PaneWire` carries its space), and routes it a copy without
+   the space line and the `outside` line, attested over that copy.
+2. **A message signed by a bridge below 1.29.0 carries no space.** A receiver lets it pass as before
+   and its receipt notes the pass as `legacy`. A crew levels within a day.
+3. **A message signed by a bridge at or above 1.29.0, of kind agent, with no space**, is refused as a
+   bad request.
+
+### The border of a message *(added 2026-11-10, M98)*
+
+A message of kind agent reaches only panes of the sender's space, unless the sender said otherwise.
+The bridge that owns the target pane decides, in `place()` (`bridge/walky/deliver.ts`) and again when
+it types a held message. Nothing on the wire carries the verdict: it is each receiving bridge's own
+check, the lead's included, on the signed fields above (`bridge/walky/border.ts`). In order:
+
+1. **An operator's message passes.** The kind is the bridge's proof (§21's `kind`), not the sender's
+   word. A phone's message is not bound by a space.
+2. **A message with no `from.space` is not checked** when its signer is below 1.29.0 (the skew rule
+   above). From a signer at or above 1.29.0 it is a bad request.
+3. **The same space passes**: the sender's `space.key` equals the target pane's, exactly. A named key
+   joins across machines. An unnamed key holds its member id and so never equals a key elsewhere. This
+   check comes before the flag: a message with `outside: true` to a pane of the sender's own space
+   passes as `in`, and its header carries no `outside` word.
+4. **`outside: true` passes.** An agent's `all` and `<member>/all` are refused without it. With the flag
+   they reach every pane, and each pane of the sender's own space still passes as `in`; only the others
+   pass as `outside`.
+5. **A reply passes** when it answers a message the TARGET pane sent and that went to the sender. Both
+   facts come from the receiving bridge's own log, never from the message, so a pane cannot reply
+   across the border to an id it only knows.
+6. **Anything else is refused** with the receipt reason `outside your space`.
+
+A bridge that passes a message by the outside flag (rule 4, not rule 3) types its header with the word
+`outside` after the sender and before any `reply to`. A reader that predates the word takes it as part of
+the sender's text. The receipt records how the message passed (`via`: `operator`, `in`, `reply`,
+`outside` or `legacy`), an additive-optional field (§7.1).
+
+A lead runs the check for a member below 1.29.0, which cannot, before the hop and for a leg that names
+one pane. A leg to a whole machine needs none: an agent's `all` reached it only with the outside flag.
+A member that knows its lead is below 1.29.0 refuses a message with the space or `outside` line before
+it dials, with the reason `lead older than 1.29.0: update the lead`. A member that does not know its
+lead's release dials, and the lead's 401 reads as `signature`, as before.
 
 ### What the lead checks, in order
 
@@ -3620,14 +3912,15 @@ that does not match the signer is the uniform 401.
    machine included (see "Workspace scopes", added 2026-10-30).
 
 The lead counts the caps again, as every delivering bridge does (`bridge/walky/rate.ts`): 30 tokens
-per sender in 10 minutes, keyed by `kind`, `from.memberId` and `from.address` and never the label; 6
+per sender in 10 minutes, keyed by `kind`, `from.memberId` and `from.address` and never the label; 12
 messages in 10 minutes between the same two addresses, either direction (`pair limit`); and one outer
 bucket per dialling member, 60 tokens in 10 minutes, all its panes together. An operator's broadcast
 takes one token per pane and per member leg. A refusal is a receipt (`refused`, `rate limit` or
 `pair limit`) in a 200, never a 429.
 
 Every delivering bridge also refuses, before anything is logged: an agent's `all` or `<member>/all`
-(`only the operator may broadcast`), a message to its sender's own pane (`that is your own pane`), and
+without the outside flag (`outside your space`, from 1.29.0; before, `only the operator may broadcast`),
+a message to its sender's own pane (`that is your own pane`), and
 a reply chain deeper than 4 in its own log (`thread depth`; a link the log does not hold ends the walk
 and counts 0). The sender's own bridge refuses a reply to a message that did not reach the sender's
 pane (`unknown reply`) and sends a reply to the stored sender of what it answers. A pane id that two
@@ -3818,8 +4111,11 @@ An answer to the member's own `POST /crew/v1/walky` that arrives after a pushed 
 over it: neither its `accepted` nor, since 2026-10-18, the `unknown` of a dial that timed out.
 
 `collie walky who` on the lead lists every member's agent panes, from the bodies its sweep already
-holds, so it dials nobody. A member has no roster, so `who` there lists its own panes and the line
-"other machines: run `collie walky who` on the lead (<lead>), or use the phone".
+holds, so it dials nobody. A member has no roster, so since 1.29.0 it asks its lead with
+`POST /crew/v1/walky/who` and lists its own panes with every other machine's rows from the answer, in
+one list with the lead's, so `who` and `send here` agree. When the lead gives no usable answer (a lead
+before 1.29.0, a refused dial, 8 seconds), `who` lists its own panes and the line "other machines: run
+`collie walky who` on the lead (<lead>), or use the phone", as before.
 
 ### Pane instances (added 2026-10-18)
 
@@ -3917,3 +4213,567 @@ before.
 
 A solo install mints no key, signs nothing, registers none of these routes and never sends a message
 off the machine (§11). `CREW_PROTOCOL_VERSION` stays `2`.
+
+## 22. Decisions from any machine of a crew *(added in 1.29.0)*
+
+The Hill holds Decisions: a question an agent asks, which the operator answers with one tap on the
+phone (`docs/walky-talky.md`). Since 1.29.0 an agent on any member posts one, and it shows on the
+lead's Hill like one from the lead's own sessions. There is **one Hill**: only the lead holds
+Decisions, mints their ids (`dc_` and 12 characters) and pushes to the phone. A member's bridge holds
+none. Before 1.29.0 a member refused every post with `not_on_lead`.
+
+### The routes
+
+| Method | Path | Sent by | Body | Answer | Body cap |
+|---|---|---|---|---|---|
+| `POST` | `/crew/v1/hill/media` | a member, to its lead | `{ sha256, b64 }` | `{ ok, sha256, mime, width, height }` | 3 MiB |
+| `POST` | `/crew/v1/hill/post` | a member, to its lead | `{ from, fields, images }` | `{ ok, decision }` | 64 KiB |
+| `POST` | `/crew/v1/hill/op` | a member, to its lead | `{ op, id?, as }` | `{ ok, decision }` or `{ ok, decisions }` | 4 KiB |
+
+- All three are **membership-table routes** (§5): they carry no pane data and are addressed to the
+  collie. They join the signed set (§8.6), because they travel member → lead. They do not advance
+  the replay floor: they change no roster. Only a collie that leads answers them; a peer answers 404.
+  A lead before 1.29.0 answers the **uniform 401**, not 404: the paths are outside its signable set,
+  so its admission ignores the signature, and a member rides no pinned handshake into its lead.
+- **The member is the signer.** The lead takes the member from the §8.6 signature, never from the
+  body. `from.address` in a post and `as` in an op must be a pane address of that member's own machine
+  (`<member>/<pane>`, with or without `#<token>`). Any other address, `local/...`, a scope or `all` is
+  the uniform 401, audited like any refusal. The labels in `from` (`harness`, `label`, `host`) are
+  display data. The lead shows its own name for the member where it has one.
+- **A post names sessions of its own machine only.** The answer is typed where `replyTo` points, as
+  the operator, and the session it names may read the Decision with `collie hill status`. So
+  `replyTo`, and `about` (which only labels the card), must each be a pane address of the signing
+  member, as `from.address` must; `about` may also be `here`. Any other value is refused
+  `bad_target` ("... is not a session on this machine"), before the lead looks at which sessions are
+  live, so the refusal says nothing about the sessions of other machines. It is a content refusal,
+  not the 401: these are the agent's words, where `from` and `as` are the member bridge's own claim.
+  `supersedes` names a Decision of the same session only, on the lead as on one machine.
+- `hill/media` carries one image: `sha256` is the lowercase hex SHA-256 of the bytes, `b64` the bytes
+  in standard base64. The lead decodes it strictly, checks the hash, and sniffs the first bytes: PNG,
+  JPEG or WebP only, at most 2 MB, the same rules as an image on the lead's own machine. With the Hill
+  or WalkyTalky off on the lead, it refuses the image first (`hill_off`, `walky_off`) and neither
+  decodes nor holds it, since no post could follow. It holds the
+  image in memory by member and hash, for 15 minutes from the last upload, at most 16 MiB per member.
+  The same hash again refreshes the time and costs nothing. A lead restart drops them all.
+- `hill/post` carries the post's fields as `collie hill post` sends them, without the socket's frame,
+  and the images by hash: `images: [{ sha256, caption? }]`, at most 4. A field `images` with paths is
+  refused 400: a path names a file on the member, never on the lead. The lead reads the fields with
+  the same reader and the same rules as a post on its own machine (the clean pass, the view parser,
+  every cap). An image it does not hold is refused `bad_image`, and the member sends it again.
+- `hill/op` is `status`, `withdraw` or `list`, for the session `as` names. `id` is required for the
+  first two. Since the crew state (1.29.0) it also takes `state`, with no `id` and no `as`: the lead
+  answers `{ ok, crewState: { state, at, by, told } }`. Every member, and its agents through
+  `collie hill state --json`, so learns who set it (a phone's label, or `terminal`) and how many sessions
+  the last tell reached. A lead before it answers `400`, which the member reads as `lead_too_old`.
+- **Content refusals are `200` with `{ ok: false, code, error }`**, the codes of the socket
+  (`docs/commands.md`): `bad_title`, `too_many_open`, `hill_off`, `bad_image` and the others. `400`
+  is a body the lead cannot read. `401` is the uniform 401.
+
+### Caps and the phone
+
+- One member's agents hold at most **40 open Decisions** on the lead, across all its sessions, beside
+  the 20 per session and 200 in total. A post past it is refused `too_many_open`.
+- No Decision stays open past **30 days** (`HILL_MAX_EXPIRY_DAYS`), a member's or the lead's own: a
+  later `expiresAt` is held to 30 days from the post, never refused. `collie hill post --expires`
+  refuses a longer duration before it asks.
+- A `now` Decision rings the phone at most **4 times an hour from one member**, and at most **6 times
+  an hour from all members together**, beside 3 an hour per session and 10 in total
+  (`HILL_PUSH_RATE`, `bridge/hill/push.ts`). The crew share is below the total, so the lead's own
+  sessions and tricks always keep 4 of the hour, however many members post. Past a limit, the
+  Decision posts and shows, and only its push is skipped. The lead's own sessions count only toward
+  the per-session and total limits.
+
+### Idempotency
+
+The post's `requestId` (a UUID, `--request-id`) is its replay key, per session, as on one machine. The
+same request id with the same content answers the decision already stored; with other content it is
+refused `request_id_reused`. The image hashes are part of the content. A replay of `hill/media` is
+the same image. So a member may send a post again after any failure, and the lead keeps one decision.
+
+### The member's side
+
+The member's walky socket takes the agent's `collie hill` call as before. It checks its own switches
+first (the Hill off, WalkyTalky off) and reads each image from its own disk under every local rule.
+Then it uploads each image, then posts. Status, withdraw and list are one call each. The member dials
+with its crew client, signed, with at most 20 seconds per image and 8 seconds per call, and one budget
+of 45 seconds for the whole forward, images and post together (`HILL_FORWARD_BUDGET_MS`, beside the
+other numbers in `bridge/hill/crew.ts`). The post's 8 seconds are always kept free: an image that cannot
+have its time stops the forward before the post, so nothing is posted, and the answer is the refused
+dial's. `collie hill post` waits 60 seconds for its socket (`HILL_POST_ASK_MS`), longer than the whole
+forward, so the CLI does not give up on a post that is still on its way and the agent does not post a
+second card under a new request id.
+
+### Skew
+
+The floor is `TRICKS_CREW_FIRST_VERSION`, `1.29.0` (`bridge/hill/crew.ts`), read the way §21 reads its
+floors (`olderThanFloor`). A member that knows its lead's release is below it refuses before it dials,
+with `not_on_lead` and the words "the lead (<lead>) runs a Collie older than 1.29.0". A lead whose
+release it does not know is dialled; its 401 (or a 404) reads the same way. Only a lead whose release
+is known and at or above the floor (`atTricksCrewFloor`) has its 401 read as a refused signature. A member below 1.29.0 never calls
+these routes and keeps answering `not_on_lead`.
+
+### When the lead does not answer
+
+- A refused dial: `lead_unreachable`, "the lead (<lead>) is not answering; nothing was posted. Post
+  again with --request-id <id>: it posts once". `collie hill post` exits 5.
+- A dial whose outcome is unknown (the post may have reached the lead): `lead_unreachable`, "the lead
+  (<lead>) did not confirm the post. Post again with --request-id <id>: it posts once".
+- A 401 from a lead known to run 1.29.0 or later: "the lead refused this machine's signature". From
+  any other lead a 401 reads as the older lead above.
+- `collie hill post` prints one line on a refusal, `hill: <reason> (<code>)`. When a retry can pass
+  (exit 5, and exit 3 that is not `hill_off`) a second line follows: `hill: send it again with
+  --request-id <id>`. When its socket took the post and did not answer in time, it says the post "is
+  not confirmed and may still reach the Hill", exits 5, and asks no other bridge on the machine.
+- Status and list: "the lead (<lead>) is not answering; try again". A withdraw whose outcome is
+  unknown says to check with `collie hill status <id>`.
+
+### The answer goes back
+
+An answer travels the way every answer does: the lead types it into the session as a walky talky
+message (§21), routed to the member's pane over the lead's own forward. The member checks the instance
+token again when it types.
+
+A session on a member the lead cannot reach now is one the lead's sweep marks `unreachable` (the
+`state` `collie walky who` prints), or a member not swept since the lead started. An answer to it is
+**refused before anything closes or is written**: the receipt is `rejected`, `state: "open"`, with
+the reason "<machine> is not answering. Your answer was not sent." and the additive-optional field
+`machine`. The card stays open, and the same tap may go once the machine is back. Nothing is queued
+(§10.3). The sweep never closes a Decision for a session whose machine is not answering.
+
+A **dismiss always closes**, even then: a card no tap could close would stay on the phone until it
+expires. The Decision closes `dismissed`, nothing is typed, the answer's `delivery` is `none`, and the
+`ok` receipt carries `machine` too, so the phone says "Dismissed. <machine> is not answering, so the
+session was not told." The poster reads the dismiss with `collie hill status` when its machine is back.
+
+### Compatibility
+
+Additive inside protocol version 2 (§7.1). A lead before 1.29.0 answers the uniform 401 on the three
+routes, read as above. A member before 1.29.0 never sends them. A phone before 1.29.0 ignores `machine` on a receipt
+and shows the reason as any refusal. A solo install registers none of these routes (§11).
+`CREW_PROTOCOL_VERSION` stays `2`.
+
+## 23. A trick on the lead reads files from every machine *(added in 1.29.0)*
+
+A trick is a small program the operator approves on one machine; its bridge runs it and draws what it
+prints on the phone (`web/src/lib/tricks/README.md`). Since 1.29.0 a trick on a crew's lead sees every
+member's sessions in its facts (§9 merges them), and a trick written for trick contract 2 may list
+`inputs`: globs of files to read from each agent session's folder. Before each run the lead fetches
+the matching files from each machine and copies them into the trick's folder. The trick reads them as
+data. It never reaches a member any other way: no socket, no token, no command.
+
+### The route
+
+| Method | Path | Sent by | Body | Answer | Body cap |
+|---|---|---|---|---|---|
+| `POST` | `/crew/v1/tricks/inputs` | the lead, to a member | `{ trick, run, globs, panes, have }` | `{ panes: [{ pane, state, files }] }` | 256 KiB asked, 8 MiB of files answered |
+
+- **Lead → member, like the walky outcomes push (§21).** It rides the proxy surface: the pinned mutual
+  TLS handshake, the crew secret and the dial attestation `X-Crew-Dial` (§8.1), and no §8.6 signature.
+  It is not in the signable set. Only a collie whose trust store holds an enrolled lead answers, and
+  only when the admitted caller is that lead. A deputy's second anchor, another member and a stranger
+  get the uniform 401. A lead or a solo install answers 404.
+- **The member's gate.** `COLLIE_CREW_TRICK_READS` on the member: `on` allows, `off` refuses, and any
+  other word refuses (it fails closed). Unset follows the member's device gate: allowed while
+  `COLLIE_DEVICE_HEADER` is unset (like the Files view to a crew link today), refused while it is set.
+  The member reads the gate at start (`.env`, or `[crew] crew_trick_reads` in `config.toml`), so a
+  change needs a restart. With neither variable set, the reads are on.
+  Refused is `403` with `{ code: "trick_reads_off" }`, and the member reads nothing. The gate is read
+  before the body is parsed.
+- **The body.** `trick` is the trick's id (`isTrickId`), `run` a run id for the audit, `globs` the
+  trick's approved `inputs` (1 to 8, each read by the same `inputGlobProblem` on the member), `panes`
+  the member's pane ids the lead's facts list for that member (1 to 256, plain ids, no `/`), and `have`
+  the files the lead already holds: `[{ pane, files: [{ rel, sha256 }] }]`, only for a pane asked. Any
+  unknown key, any other shape, or a body over 256 KiB is `400` (or `413` past the cap), and nothing is
+  read.
+- **Who names what.** The trick's author names the globs, and the operator approves them with the
+  trick's code: they are part of its powers, so a change of them asks again. The lead names the panes,
+  from its own facts. The member decides which of them it serves: only a pane its own snapshot shows as
+  an **agent** pane, read under that pane's Files root (ADR 0083). A shell pane, a pane it does not
+  have, or one with no root answers `no-pane` or `no-folder` with no files. The member names each file
+  (`rel`), and the lead checks every name again (below). The member is never named by the body: the
+  lead files the answer under the member id of the link it dialled.
+- **The member's read** is the Files view's own: the same root, home bound, real-path containment, deny
+  list (`.git`, the state secrets, the bridge's own state and config folders) and no-follow open. A link
+  is never followed at any level. A glob's `*` never matches a leading dot, so a dot name is read only
+  by a glob step that starts with a dot. A `.env` file (`.env`, `.env.local`, `.envrc`, in any case) is never
+  read, whatever the glob says: the Files view shows one to a person who opens it, a trick reads
+  unattended. A file over 2 MB, or a text file over 256 KiB, is listed as `skipped: "too-large"`; a
+  file that is neither UTF-8 text without NUL nor a PNG, JPEG or WebP picture is `skipped: "type"`. A
+  file whose name holds a control character, a bidi mark or isolate, a zero-width space or word joiner,
+  a byte order mark or a tag character (the characters a Decision's view refuses, `unsafeText`) is
+  never read: it is `skipped: "name"`, and its `rel` carries each such character as `?`. A folder with
+  such a name is never entered. At most 32 files and 64 folder listings per pane. With `COLLIE_REDACT` on, a text file
+  leaves masked. A file whose SHA-256 the lead named in `have` travels as its hash only. The bytes of
+  one answer stop at 8 MiB; past it a file is `skipped: "cap"`.
+- **A file in the answer** is `{ rel, bytes, mtime, sha256, kind, b64 }`, or `{ rel, bytes, mtime,
+  skipped }` for one left out, or without `b64` for one the lead holds.
+
+### The lead's side
+
+- The lead calls a member only for a contract 2 trick with `inputs`, only for a member its facts list
+  sessions of, and only for that member's agent sessions. Its own sessions are read locally through the
+  same reader. A member whose release is below 1.29.0 (`TRICKS_CREW_FIRST_VERSION`) gets no call, and
+  its sessions say `older`; a member the last sweep did not reach gets no call either (`offline`).
+- One call per trick per member in 5 seconds at most. Inside that window the last answer stands, and
+  the files it brought stay. The call has 8 seconds and is never retried. A refused dial or a timeout
+  is `offline`; a `404` is `older` (a member built before the route); a `403 trick_reads_off` is
+  `refused`. The lead reads at most the answer's cap of the body and drops the rest.
+- **The lead trusts no word of the answer.** For each file it checks: `rel` is a relative path that
+  passes the same rule as a Files path, holds no character `unsafeText` refuses, matches one of the
+  trick's globs step by step, and names no `.env`, `.git`, `.` or `..`; `b64` decodes strictly; the bytes' SHA-256 is `sha256`; the size is
+  `bytes` and within the kind's cap; a picture sniffs as PNG, JPEG or WebP; a text file is UTF-8 with no
+  NUL. A hash-only file counts only when the lead holds that file with that hash. A pane not asked is
+  ignored. Anything else is skipped and counted.
+- **Delivery.** The lead writes the files under the trick's approved copy, `inputs/<member>/<pane>/<rel>`,
+  each folder name one step encoded from the id (injective, hashed when long). It builds the whole tree
+  in a stage folder beside the old one, writes each file new (`wx`, never through a link), checks that
+  the joined path stays inside, then swaps the tree in and deletes the old one. A file kept from the
+  last run is copied only after a real-path and hash check. Whatever the program left in `inputs/` goes.
+  One run holds at most 24 MiB of files, the lead's own first.
+- **The facts.** Each session of a contract 2 trick with `inputs` gets `inputs: { state, files,
+  skipped? }`: `state` is `ok`, `offline`, `older`, `refused` or `none`, and each file names its `rel`,
+  its `path` relative to the trick folder, `bytes`, `sha256`, `mtime` and `kind`. The files are
+  untrusted data for the program, never code.
+
+### Audit
+
+One line per call on each side, action `tricks.inputs`, with the trick id, the number of files and their
+bytes. Never a file name and never a glob.
+
+### Compatibility
+
+Additive inside protocol version 2 (§7.1). A member before 1.29.0 never gets the call, and one that does
+answers 404, read as `older`. A trick written for contract 1 lists no `inputs` and triggers no call. A
+solo install and a lead register no handler for the route (§11). `CREW_PROTOCOL_VERSION` stays `2`.
+
+## 24. A member hands its lead a trick *(added in 1.29.0)*
+
+`collie trick propose <folder>` hands a trick to the person. On a crew member the files go to the lead,
+which holds the one Hill, and the person answers the card there. This route is the first that carries
+trick code, under the rule of ADR 0016's addendum of 2026-11-10: the code crosses as inert data, and
+nothing installs or runs it before a person's tap on the lead.
+
+### The route
+
+| Method | Path | Sent by | Body | Answer | Body cap |
+|---|---|---|---|---|---|
+| `POST` | `/crew/v1/tricks/propose` | a member, to its lead | `{ requestId, files, from }` | `{ ok, kind, id, hash, decision, replaced }`, `kind` is `proposal` or `version` | 8 MiB |
+
+- **Member → lead, signed like §22.** It is a membership-table route (§5), in the signed set (§8.6),
+  and it advances no replay floor: the request id is its replay key. Only a collie that leads answers;
+  a peer answers 404. A lead before 1.29.0 answers the uniform 401, as
+  for §22. The body is read within 60 seconds, at most 2 at once, counted apart from the other large
+  bodies (§8.6).
+- **The member is the signer.** `from` is `{ address }` for a session or `null` when no agent pane was
+  placed (a terminal, or a caller whose session the member could not confirm). An
+  address must be a pane address of the signing member, as in §22; any other address is the uniform
+  401, before a file is read. Any key beside the three is `400`.
+- **The member sends no name.** The lead names the session on its card with its own word for that
+  address (its session list), or with none; it names the machine with the member id. A label from the
+  member is never read.
+- **`files`** is `[{ rel, b64, x? }]`: `rel` the path inside the trick folder with `/`, `b64` the bytes
+  in standard base64, `x: true` for a file that was executable. The lead reads them with the same
+  reader the member and the CLI use (`readProposal`, `bridge/tricks/propose-wire.ts`): at most 300 files
+  and 5 MB, 8 folders deep, 256 characters a path; no `.` or `..` step, no dot step, no
+  `node_modules` or `inputs` step, no absolute path, no backslash or colon, no control, bidi or
+  invisible character, NFC only; no two names, of files or folders, that are one once case and Unicode
+  compatibility forms are set aside; in `media/` and `captures/` only pictures (a `.png`, `.jpg`, `.jpeg`
+  or `.webp` name and PNG, JPEG or WebP first bytes, at most 2 MB each and 50 in all, never `x`; since
+  1.29.1, an older lead refuses any file there) and no `config.toml` at the top (the person writes the
+  settings on the machine); the reserved
+  names are compared with case and Unicode compatibility forms set aside; a `trick.toml` of at most
+  64 KiB that the strict reader accepts, with an id Collie does not keep for itself. The base64 length
+  is checked before a byte is decoded.
+- **Counted before it is parsed.** Once the signature is checked, the lead counts the body's JSON
+  structure in one pass before `JSON.parse` builds it: more than 4096 `{`, `[`, `,` or `:` outside
+  strings, or nesting deeper than 8, is `400` with "The proposal has more parts than a trick's files
+  need, so it was not read." A proposal of 300 files needs about 2400.
+- **Content refusals are `200` with `{ ok: false, code, error }`**: `bad_request`, `bad_files`,
+  `bad_manifest`, `reserved_id`, `hill_off`, `exists`, `open_elsewhere`, `answering`, `too_many_open`,
+  `too_many_bytes`, `card_too_large`, `too_large`, `cannot_show`, `rate`, `request_id_reused`, `no_tricks`, `failed`. `400` is a
+  body the lead cannot read, `401` the uniform 401. A member that does not know a code
+  reads it as `failed` and prints the lead's line.
+
+### The lead's side
+
+- **Inert.** A proposal for a new trick is kept under `<configDir>/tricks/.collie-proposed/<id>/<hash>/`,
+  files 0600 with no executable bit, in a dot folder no scanner reads. Collie posts one card on its
+  Hill, as Collie: the title names the trick by its id, the summary names the proposer from the lead's
+  own facts, there is no recommendation, and the options are "Switch it on" (asked twice) and "Not
+  now". No agent and no member can post, answer or withdraw that card. With `from: null` the card
+  says "Someone on <member> proposes it. Collie could not confirm which session."
+- **The card never cuts a fact.** Every right, every `inputs` glob and every warning shows in full: as
+  chips when each fits a chip and one bar holds them all, else as paragraphs. The author's words are
+  cut to 3 paragraphs and 400 characters and go before any code when they would cost code. When the
+  facts alone do not fit a Decision's view, nothing is stored or posted, and the answer is
+  `card_too_large`, "This trick asks for more than a card can show, so it was not proposed. Ask your
+  person to add it on the machine."
+- **A group of cards.** Code that does not fit one card whole shows on one Decision with a `group`
+  of 2 to 8 cards (`{ digest, decline, parts: [{ view, sha256 }] }`). Card 1 is the facts and never
+  code: who proposes, every right and warning in full, the file table with each file's size and the
+  cards it is on, then the author's words when they still fit. Cards 2 to 8 hold every line of every
+  file, `trick.toml` first, then the file `run` names, then by path in byte order; a file that goes on
+  says "continues on the next card" and "continued from the last card", and a line longer than a row
+  goes on in the rows after it, marked `↪`. Each card is under the one Decision view cap; the code cards
+  hold 6 KiB of code each, 42 KiB and 64 files in all. A `trick.ts` whose bytes are a helper Collie
+  ships is named on card 1 and shown on none. `sha256` is the SHA-256 of a card's view as JSON text;
+  `digest` is the SHA-256 of `collie-hill-group`, the ref's type, id and hash, and the cards' hashes in
+  order, joined by NUL. Only Collie's own post makes a group: `group` or `parts` in a post from an
+  agent, a trick, the walky socket or `hill/post` (§22) is `bad_body`, "a group of cards is Collie's
+  own; post one card with a view". A trick that fits one card keeps one card.
+- **Refused at the door.** Code larger than a group is `too_large`, "This trick is too large to show on
+  the phone, so it was not proposed. Ask your person to add it on the machine." A file that is not
+  UTF-8 text, or a line the card would mask (a key) or show with `?` (a control, bidi or invisible
+  character), is `cannot_show`: no card ever shows a proposal other than as it is. The CLI refuses both
+  before it sends, counting the whole trick; the lead counts again on what it shows.
+- **The answer to a group.** The phone's answer (`POST /api/hill/<id>/answer`, on the lead) carries
+  `group: { digest, opened }`: the digest the phone was given, and the cards it opened, each of 1 to 8
+  once. A yes (any option but the group's `decline`) with no `group` is refused with "This app does not
+  show a group of cards yet. Reload Collie on this phone, then open every card and answer again."; with
+  another digest, "These cards changed since this phone showed them. Open them again from card 1.";
+  without every card, "Open all N cards first." Each is a rejected receipt that keeps the card open
+  and keeps nothing, so the same request id may try again. "Not now" and a dismiss need neither field.
+  `opened` is the phone's own claim, a display check that the person paged through the cards, never a
+  proof that they read them. The answer travels on no crew route: a member's own page refuses a Hill
+  answer and points to the lead's (§22), so an old member build answers nothing here; an old phone
+  app on the lead gets the reload words above.
+- **The tap.** "Switch it on" reads the stored bytes again and installs them only when their hash is
+  the card's. The trick folder is written beside the tricks and renamed into place, never over a folder
+  of that name, then the code written is approved and switched on.
+- **A new version** is taken only for a trick a proposal made that is on. It is kept inert in the same
+  store, and its one card ("Use the new version of <id>?") shows it against the approved copy and names
+  the proposer. Before the yes nothing outside the store and the proposals state changes on the lead.
+  On the yes the trick must still be the one the card was made against; its code files are replaced in
+  place, one temp file and rename each, and exactly that code approved. Every file the code hash does
+  not read (`config.toml`, `media/`, `captures/`, `inputs/`, logs, dot files, `node_modules`) stays byte
+  for byte. A new file whose name the person's own files hold refuses the yes, and nothing is written.
+  A write a crash cut short is cleaned up when the lead starts. A trick from a repository, one added on the
+  lead, one that is off, or one with a change waiting refuses the proposal (`exists`). A trick on auto
+  takes it, and the card still asks.
+- **A lead without tricks** answers `200` with `{ ok: false, code: "no_tricks" }`, "Tricks are not set
+  up on the lead, so nothing was proposed.", never 404, so the member does not read it as older.
+- **Limits.** Per session (or per machine's terminal) 2 open and 6 an hour; per member 4 open and 12
+  an hour, its sessions and its terminal together; per lead 8 open and 32 MiB stored. One open proposal
+  per trick id: the same session's next one replaces it, and the new card says "It replaces an earlier
+  proposal from the same session."; one with `from: null` never replaces (`open_elsewhere`), as the lead
+  cannot tell who sent it. A request id answers as it did for 24 hours; with other files it is
+  `request_id_reused`. The card closes after 3 days, and the stored copy goes with it.
+- **Memory.** At most 2 bodies of 8 MiB are read at once on this route. Apart from that, each
+  machine's walky socket reads at most 2 proposal lines of 8 MiB at once.
+
+### The member's side
+
+The member checks the files with the same reader before it sends, keeps no copy and queues nothing. A
+lead that refuses the dial is "The lead is not answering, so nothing was proposed." A timeout after the
+send is "The lead (<lead>) did not confirm the proposal. Propose again with --request-id <rid>: it is
+proposed once." A 404 is an older lead, named as such.
+
+### Audit
+
+On the lead: `trick.proposal` for each proposal taken (`kind` `proposal` or `version`), `trick.proposal.on` and
+`trick.approve` by `proposal` when the person says yes. Never a file's bytes.
+
+### Compatibility
+
+Additive inside protocol version 2 (§7.1). A member before 1.29.0 has no verb that sends it. A lead
+before 1.29.0 answers the uniform 401, and the member says the lead is older and proposes nothing. `CREW_PROTOCOL_VERSION` stays `2`.
+
+## 25. The deputy carries the lead's tricks and open Decisions *(added in 1.29.0)*
+
+A deputy takes over when its lead is gone (§18). Before this section the tricks the lead ran were gone
+with it. Now the lead keeps an inert copy of each trick that is on, at its approved version, on its
+deputy, and the person's takeover tap on the deputy's own standby page starts them there. The rule of
+ADR 0016's addendum holds: the code crosses as inert data, and nothing installs or runs it before a
+person's tap on the machine that runs it.
+
+Beside the tricks, the lead keeps a copy of its Hill's open Decisions on the same deputy, by the same
+rules (see "The Hill copy" below). The tap brings them into the deputy's Hill, so a question the person
+has not answered yet is still there after the takeover.
+
+### The routes
+
+| Method | Path | Sent by | Body | Answer | Body cap |
+|---|---|---|---|---|---|
+| `POST` | `/crew/v1/tricks-copy` | the lead, to its deputy | `{ seq, tricks }` | `{ applied, need: { code, state } }` | 8 MiB |
+| `POST` | `/crew/v1/tricks-copy/code` | the lead, to its deputy | `{ id, hash, part, parts, chunks }` | `{ held }` | 3 MiB |
+| `POST` | `/crew/v1/tricks-copy/state` | the lead, to its deputy | `{ id, digest, files }` | `{ applied }` | 6 MiB |
+| `POST` | `/crew/v1/hill-copy` | the lead, to its deputy | `{ seq, on, decisions, closed, tricks }` | `{ applied, need: { media } }` | 8 MiB |
+| `POST` | `/crew/v1/hill-copy/media` | the lead, to its deputy | `{ decisionId, mediaId, b64 }` or `{ decisionId, mediaId, gone: true }` | `{ held }` | 3 MiB |
+
+- **Lead → deputy, the launchers copy's gate.** Unsigned, on the pinned link the lead dials (§8.1), like
+  `launchers-copy`. Two questions must both answer yes before a byte of the body is read: the caller
+  is this collie's own lead, and this collie holds a verified warrant naming itself (§18). Anything
+  else is the uniform 401: a member, a peer that is not the deputy, a lead, a build that keeps no copy.
+  The body is read within 60 seconds, at most 2 at once, and only to its route's cap; over the cap is
+  `413`, a body that is not JSON is `400`.
+- **`tricks`** is at most 32 tricks, sorted by id on the lead, each `{ id, hash, auto, at, by, powers,
+  config, origin, files, state }`: the approved code hash, the switch's `auto`, when and by whom the
+  version was approved, the powers hash or `null`, `config.toml` as base64 or `null` (at most 64 KiB),
+  the origin record's text or `null` (at most 8 KiB), the code files as `{ rel, size, x }`, and the
+  digest of the state the lead would send or `null`. Every path follows §24's reader rules and must be
+  a code file the code hash reads; no two names fold to one; at most 300 files and 5 MB. A bad trick
+  or a repeated id refuses the whole list (`400`).
+- **`seq` only rises.** The deputy refuses a list whose `seq` is not above the one it holds from the
+  same lead (`409`, `stale`), so a late push never rolls a trick back to an older version. The lead
+  sends its clock or one past the `seq` the deputy reports, whichever is larger.
+- **Code in parts.** A trick's code goes in parts of at most 2 MiB of raw bytes, from part 0 in order.
+  Each chunk `{ rel, at, b64 }` appends to a file the list names, at exactly the bytes held so far and
+  never past its size. A part out of order is `409` (`order`), a chunk that does not continue its file
+  `409` (`bad_part`), and part 0 starts again. The last part checks every file's size and hashes the
+  files with the real code hash; a mismatch is `422` (`mismatch`), and that version is refused for good.
+- **State** is the trick's state folder (`state/…`) and the pictures of its approved copy's `media/` and
+  `captures/`, at most 500 files and 4 MiB a trick, 16 MiB for all tricks. `inputs/` never goes. A
+  picture must be a PNG, JPEG or WebP by its first bytes. The deputy takes one trick's state at most
+  once a minute (`429`, `rate`). A state too large to keep is settled as kept with no bytes, so it is
+  not asked for again until it changes.
+
+### The Hill copy
+
+- **`decisions`** is at most 500 open Decisions, newest first, each the record the lead's Hill stores
+  without its notification slot (`pushTag`). The deputy reads each one again with the Hill's own
+  reader. A record that does not read, is not open, repeats an id, or names an id in `closed` is left
+  out; the rest of the list still applies.
+- **Collie's own cards.** Of the Decisions of Collie's own (`from.kind` `collie`), the deputy holds
+  only the notice that a carried trick did not start (`ref.type` `carried`) with its single answer, OK,
+  which only closes it. Any other Collie card is left out and counted (`dropped`): a new version card
+  or a proposal card acts on files that never cross, and a lead must not place a card that acts on its
+  deputy.
+- **`closed`** is at most 500 ids of the lead's closed and cleared Decisions, newest first. The deputy
+  keeps every closed id the same lead named, newest first, up to 500, and never holds a Decision with
+  one of those ids as open again. A replayed or late list cannot bring an answered Decision back.
+- **`on`** is the lead's Hill switch. **`tricks`** holds the trick map records (the key to Decision id
+  entries) of the tricks whose Decisions are open, so a carried trick Decision keeps its key.
+- **`seq` only rises,** as for the tricks: `409` (`stale`) for a list not above the one held.
+- **Pictures.** The lead and the deputy plan the pictures the same way: newest Decision first, each
+  picture of at most 2 MiB, all together at most 32 MiB. A picture past the plan stays on the lead. The
+  answer to a list names the pictures the deputy lacks (`need.media`, as `<decisionId>/<mediaId>`); the
+  lead sends each in one body. Both ids must match their id patterns before any path is built (`400`).
+  A picture the plan does not carry is `409` (`unknown`). The deputy keeps a picture only when its size
+  is the size its record says and its first bytes say the type its record says; else it is `422`
+  (`mismatch`) and settled as left on the lead, so it is not asked for again. `gone: true` from the
+  lead settles it the same way.
+
+### The report
+
+The deputy reports `tricksDigest` (the digest of the list it holds), `tricksSeq` and `tricksNeed` (how
+many code and state parts it still lacks) on `hello` and `snapshot`, in the seat of `launchersDigest`.
+A deputy that holds no copy reports none of the three. The Hill copy reports `hillDigest`, `hillSeq`
+and `hillNeed` (how many pictures of the plan it still lacks) in the same seat, by the same rule. The
+digest is over the list as it arrived, before a record was left out, so a left-out record does not
+make the lead send the list again. From 1.29.0 the Hill report also carries `hillCopyKnows`, the list
+fields past the first four that the deputy reads (`["crewState"]`), even before its first list. The lead
+sends and digests `crewState` only for a deputy that names it, so a deputy before 1.29.0, which digests
+the four old fields, still reads current and is not sent the whole list every round. The lead syncs off its sweep, never awaited,
+one sync at a time: a list when the digest differs, and the missing parts again at most once a minute
+while it is the same. A `404` marks an older deputy, said once in the lead's journal: "<deputy>: keeps
+no copy of the tricks (an older Collie), so it cannot resume them after a takeover; not sent again until
+it reconnects".
+
+### The deputy's side
+
+- **Inert.** The copy lives under `<stateDir>/standby-tricks/`: `index.json`, the code under
+  `code/<id>/<hash16>/`, the state under `state/<id>/`. Folders are 0700 and files 0600, and no file
+  carries an executable bit; whether one was executable rides in the index. No tricks loader reads this
+  folder, and no switch names it.
+- **Whose copy it is.** The copy stays only while this machine is the deputy of the lead that sent it,
+  in that crew. A demotion, another lead, another crew, or this machine leading removes it at once,
+  `config.toml` with it.
+- **The Hill copy** lives under `<stateDir>/standby-hill/`: `index.json` and
+  `media/<decisionId>/<mediaId>`, folders 0700 and files 0600. The deputy's own Hill never reads it,
+  before or after a restart. It is removed by the same rule as the tricks copy.
+- **The page.** The armed standby page names the tricks the tap starts, read off this machine's own
+  disk, never off the lead's word: each carried trick whose code is held, then each trick this machine
+  already has on. A name is cleaned of control and invisible characters, cut to 40 characters and drawn
+  in its own box; at most 8 are named, then "and N more". When the Hill copy holds open Decisions, read
+  off this machine's disk too, one more line says "1 open question on the Hill comes along." or "N
+  open questions on the Hill come along."
+- **What the page showed is what the tap takes.** The armed page carries a mark of the lists it read:
+  the tricks copy's digest and how much of it is missing, and the Hill copy's `seq`. The tap sends it
+  back (`x-collie-carried`). When the copies hold another list by then, the tap is refused (`409`,
+  `changed: true`), nothing is asked or written, and the page is drawn again with the line "The list
+  changed. Read it again." From the tap until its answer, both copies are held: a list or a part from
+  the lead is answered `409` (`held`), and the lead sends it again later. Each copy takes one write at
+  a time; the hold waits for the write that runs when the tap comes, and the mark is then read again,
+  so a list that landed between the door's check and the hold refuses the tap the same way. The page
+  reads the names and the mark from one snapshot: the mark before and after the names, and only an
+  unchanged pair goes out.
+- **The tap.** The takeover commit (§18), and `collie promote` (§14) typed on the deputy, are the
+  person's yes. Each holds both copies through its role change and writes one marker,
+  `<stateDir>/standby-adopt.json` (0600): the lead it took over from, `by` (`takeover`, or `handover`
+  for the promote) and the time. Nothing else writes it; no crew route can. The boot after it, as the
+  lead, removes the marker, adopts both copies before it builds its Hill and its tricks, then removes
+  the copies, so no process with an older list in memory can write over the merge. The marker goes
+  first: an adoption that throws half way is never run again at a later boot, so a trick the person
+  switched off since stays off. A copy from another lead than
+  the marker names is not adopted, and a boot that does not lead drops the marker. While the marker is
+  on disk, a role change removes neither copy. The deputy trusts what its lead says was approved; it
+  checks that the lead's word and the carried code agree. For each held trick it compares the powers
+  the list carries with the powers of the held code (`powersOfDir`): when they differ, the trick's
+  folder is written where there is none, with no approved copy and no switch, and its notice carries
+  `kind: "rights"` ("The trick <name> is off after the takeover"). For each other held trick
+  it hashes the code again, writes the trick folder only where this machine has none (a folder of that
+  name is never written over; the carried version then runs from its approved copy, and the folder is
+  the usual new version card), makes the approved copy with the normal path, and writes the switch
+  with `by: "takeover"`, `from: <the old lead>`, the time of the tap and the lead's `auto`. `auto`
+  comes along only when the trick folder here holds the carried version after the tap. A kept folder
+  with other code gets `auto: false`, so that code waits as a new version card for a person's yes; a
+  decline this machine already held for that code stays. The state folder is written only where this
+  machine has none. A trick whose check fails does not start.
+- **A trick that did not start is said on the Hill.** The adoption leaves the failures in `<stateDir>/tricks/carried-notices.json` (0600), and the
+  same boot, as the lead, posts one Decision of Collie's own for each, with `ref.type` `carried`: "The
+  trick <name> did not start after the takeover", "It ran on <old lead>. Collie did not start it on
+  this machine: <reason>. Switch it on again in Settings → Tricks when you want it here.", and one
+  option, OK, which closes it. Its request id is fixed per tap and trick, so a second boot posts it
+  once. A Hill that is off or full keeps the file for a later boot.
+- **The tap brings the open Decisions along,** after the tricks, in the same adoption at boot. Only a copy from the lead the tap takes over from is read. Each Decision keeps
+  its id, and goes into this machine's Hill in one write; an id this Hill already holds or cleared is
+  left as it is here. Nothing is pushed, told or posted: they are not new. Each picture is read again
+  off this machine's disk and its type read again from its bytes; a Decision whose picture is not here
+  keeps the rest and carries the line "A picture stayed on <old lead>." A trick's Decision whose trick
+  did not start here closes at the tap with the reason "Its trick did not start on this machine after
+  the takeover."
+
+  A trick Decision that stays is moved to this machine (its `memberId`, `trickHost` and host), and its
+  trick map record comes along where this machine has none, so the trick does not post it a second
+  time. The Hill switch is written from the copy only when this machine has never set its own. The
+  copy is removed after.
+- **The old lead takes no answer.** A deposed lead (§18.12), a lead whose trust store already names a
+  new lead (after `approve-promote`, before its restart), and any peer refuse an answer to any Decision
+  with the receipt `denied` and the reason "This machine is not the crew's lead any more. Answer on the
+  new lead." Nothing is typed and nothing closes there, so a carried Decision is not answered twice.
+  Posts there are refused as a peer's are.
+
+### What the lead says
+
+The running lead writes what it last saw of its deputy's copy into its runtime marker
+(`deputyTricks`: the deputy, `current`, `behind` or `older`, and how many tricks it runs). `collie crew
+status` on the lead prints one line from it, a warning for an older deputy. `collie crew
+approve-promote <member>` says whether the tricks come along: they do only with the deputy's promote.
+When the deputy holds the whole Hill copy, the fact carries `questions`, the count of open Decisions,
+and both lines add "and N open questions on the Hill" (or name only the questions when the lead runs
+no trick).
+
+### Audit
+
+On the deputy: `tricks.carried` at the adoption, with `by`, with the ids started, the ids that failed and the folders
+kept. Never a file's bytes. `hill.carried` at the adoption, with the counts of Decisions stored open,
+closed with their reason, and Collie cards the copy left out (`dropped`). Never a Decision's text.
+
+### Known limits
+
+- `seq` is a JavaScript number. A lead whose clock reads near `Number.MAX_SAFE_INTEGER` (far past any
+  real time in milliseconds) would send a `seq` that cannot rise by one; the copy then stays at the
+  last list it took. Nothing checks for it.
+- The group digest of a proposal's cards is an unkeyed sha256 that anyone can compute: it proves the
+  cards belong together, not who made them. `docs/security.md` lists the files it protects.
+- A carried Decision keeps the old lead's `from.address` and `replyTo`.
+- A takeover against a lead that is cut off but up is a split brain (§14), and both machines can run
+  the same tricks at the same time.
+- The armed `/standby` GET names the carried tricks and the count of open Decisions without a login.
+
+### Compatibility
+
+Additive inside protocol version 2 (§7.1). A lead before 1.29.0 sends nothing, and a deputy before
+1.29.0 answers `404`, which the lead reads as "keeps no copy"; the Hill copy reads the same, on its
+own. A deputy's absent report reads as "holds
+nothing". `CREW_PROTOCOL_VERSION` stays `2`.

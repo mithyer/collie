@@ -30,7 +30,7 @@ afterAll(async () => {
 
 const TS = 1_789_000_000_000;
 const local = { ref: "id:abc" };
-const peer = { host: "minibuch", session: "next", ref: "pane:%1" };
+const peer = { host: "workshop", session: "next", ref: "pane:%1" };
 
 describe("watchKeyOf / watchIdOf", () => {
   test("the key carries all three parts, and two panes never collide", () => {
@@ -91,9 +91,25 @@ describe("CacheWatchStore", () => {
     const reloaded = new CacheWatchStore({ stateDir }, () => TS);
     await reloaded.load();
     expect(reloaded.current()).toEqual([
-      { host: "minibuch", session: "next", ref: "pane:%1", label: "collie · next", lastSeenAt: TS },
+      { host: "workshop", session: "next", ref: "pane:%1", label: "collie · next", lastSeenAt: TS },
     ]);
     expect(reloaded.has(watchKeyOf(peer))).toBe(true);
+  });
+
+  test("with COLLIE_REDACT on, a label is masked on disk and in the list, also one written with the mask off", async () => {
+    // A key a pane's agent could put in its session title, joined at runtime so no scan flags the file.
+    const key = `sk-or-v1-your-key-here-${"0".repeat(40)}`;
+    const label = `collie · Rotate ${key}`;
+    const stateDir = await tempDir();
+    const plain = new CacheWatchStore({ stateDir }, () => TS);
+    await plain.set(local, label, true);
+    expect(plain.list(() => undefined)[0]!.label).toBe(label);
+    const masked = new CacheWatchStore({ stateDir, redact: true }, () => TS);
+    await masked.load();
+    expect(masked.list(() => undefined)[0]!.label).not.toContain(key);
+    expect(masked.list(() => undefined)[0]!.label.startsWith("collie · Rotate ")).toBe(true);
+    await masked.set(local, label, true);
+    expect(await Bun.file(join(stateDir, "cache-watch.json")).text()).not.toContain(key);
   });
 
   test("setting the same pane twice keeps one row, with the fresher label", async () => {
@@ -126,7 +142,7 @@ describe("CacheWatchStore", () => {
     const rows = store.list((entry) => (entry.ref === "id:abc" ? "w1:p1" : undefined));
     expect(rows).toEqual([
       { id: watchIdOf(watchKeyOf(local)), label: "here", paneId: "w1:p1" },
-      { id: watchIdOf(watchKeyOf(peer)), label: "there", host: "minibuch", session: "next" },
+      { id: watchIdOf(watchKeyOf(peer)), label: "there", host: "workshop", session: "next" },
     ]);
   });
 

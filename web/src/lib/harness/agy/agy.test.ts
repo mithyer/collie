@@ -63,6 +63,8 @@ const KNOWN_FOREIGN_CLAIMS = new Set([
   // The same shape on 2.1.303: a background agent's Bash permission with a tall command (2026-10-19).
   "claude--v2303-permission-bash-bg-agent-rm--w160.txt",
   "claude--v2303-permission-bash-bg-agent-rm--w80.txt",
+  // And on 2.1.322, the same dialog taller than the screen: its top is cut off (2026-11-12, constructed).
+  "claude--v2322-permission-bash-cut-top--w160.txt",
   // Codex 0.167.0's hook-trust prompt (2026-11-07): three numbered rows under a footer, and no Codex name
   // anywhere on the screen, so `isAlienBuffer` cannot tell it apart. The same reasoning as above.
   "codex--v0167-hooks-review--w120.txt",
@@ -74,16 +76,27 @@ const ownFixtures = allAgyFixtures.filter((f) => !NEUTRAL.has(f));
 const neutralFixtures = allAgyFixtures.filter((f) => NEUTRAL.has(f));
 const foreignFixtures = allFixtures.filter((f) => !f.startsWith("agy--") && !KNOWN_FOREIGN_CLAIMS.has(f));
 
+// Open unprinted-key finding (ADR 0151 rule 2, M102 spec 03): the trust prompt's rows print no digit
+// (`> Yes, I trust this folder`, footer `↑/↓ Navigate · enter Confirm`), yet each option sends its row's
+// digit (agy/prompt-select.ts). No entry of UNPRINTED_KEY_EXCEPTIONS names it; it goes red the day it is
+// printed, named or no longer sent.
+const UNPRINTED_KEY_FINDINGS = {
+  "agy--trust-prompt.txt":
+    "the trust prompt sends the digits 1 and 2 on rows that print no digit (agy/prompt-select.ts); not one of a to g",
+} satisfies Readonly<Record<string, string>>;
+
 describeAdapterConformance(agyAdapter, {
   ownFixtures,
   foreignFixtures,
   neutralFixtures,
+  unprintedKeyFindings: UNPRINTED_KEY_FINDINGS,
 });
 
 describeAdapterConformance(antigravityAdapter, {
   ownFixtures,
   foreignFixtures,
   neutralFixtures,
+  unprintedKeyFindings: UNPRINTED_KEY_FINDINGS,
 });
 
 describe("agy: the named foreign claims are still claimed (delete the entry when one is not)", () => {

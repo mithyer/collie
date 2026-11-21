@@ -2,7 +2,6 @@
 
 - **Status:** Accepted
 - **Date:** 2026-09-17
-- **Shipped in:** 1.10.1
 - **Amends:** [ADR 0004](./0004-the-statusline-run-is-bounded.md). The 8-row statusline bound stays,
   and so does its size. It now bounds only what the view strips as a statusline. It no longer
   decides whether the box exists, so it no longer guards the send.
@@ -292,3 +291,77 @@ Trail: `bridge/surface/protocol.ts` (`COMMAND_SETTLE_MS`, `commandSettles`, `set
 `commandSettle`) · `bridge/surface/protocol.test.ts` ("a list drawn after S1's first read") · fixtures
 `omp--v18-6-1-path-like-loop-list--w120.txt`, `omp--v18-12-6-path-like-no-list--w120.txt`,
 `omp--v18-12-6-slash-mo-fuzzy--w120.txt`, `omp--v18-6-1-path-popup--w120.txt`.
+
+## Addendum, 2026-11-13: chrome under the box, a send finishes its own text, mail takes its text back
+
+Field case, request e86fd78e, Claude Code 2.1.323 over Herdr, a running turn with background agents. The
+send ended `typed_not_submitted (changed)` and the text stayed in the box. The session resumed a background
+agent at 17:38:02.055Z, inside S1's window (about 17:38:02.0Z to 17:38:04.5Z), and the agents panel under
+the box gained a `◯` row. S1's box-only rule asks that the rows under the box keep their count, so every S1
+read failed it. The frame fixtures `bridge/surface/fixtures/claude--v2323-agents-panel-*` replay the receipt
+exactly, and the same send with the panel unchanged goes out. Two retries of the same text were then refused
+`draft_present`: the bridge's own text read as a foreign draft.
+
+1. **A profile may mark a named footer row as chrome** (`idle.volatile.below.footerRows[].chrome`). Such a
+   row is left out of the count of rows under the box, out of the command settle key, and out of the rows
+   hash a person confirms. Only on a read whose frame walk accepted it inside the named footer run (a blank
+   row over the first entry, only listed rows to the bottom, at most `footerMaxRows`), and never the
+   statusline's last row. A row that only looks like chrome anywhere else still counts. Claude Code marks its
+   agents panel (main, agent, more, manage hint), not its mode row. No harness name is in shared code, and a
+   profile with no mark behaves as before. Enter still needs an S1 read that shows the frame, the box holding
+   exactly the typed text, no stronger cue, no modal claim and no other screen. A ticking statusline that is
+   not declared stays strict, and so does a screen with no frame, where no row can be proven chrome.
+2. **A send of the same text finishes its own earlier text.** A send or command whose earlier send, command
+   or Replace on the same pane and generation ended `typed_not_submitted` inside 30 minutes, or
+   `unknown(crash)` before its submit key, takes Submit's path when the settled S0 shows the conversation's
+   box, no modal, no notice, no popup, not scrolled, and the box holding exactly the text (`boxHolds`,
+   `all`). It presses only the submit key, bound to S0's gate revision, and S2 judges it as any Submit. The
+   memory is the bridge's own; after a restart the request files stand in for it (the newest settled
+   record of the pane that is no refusal or hold, its salted text hash equal to this request's). A box that
+   may show its placeholder as a draft (an unstyled read) is left to the probe. A hold release, a
+   WalkyTalky message, a view's send and a steer never take this path. Text a person typed or edited in the
+   terminal was never remembered or no longer matches, so it is refused `draft_present` as before.
+3. **A WalkyTalky message stopped before Enter takes its own text out again.** Another agent's words must
+   not stay in the person's box. When a read shows the box holding exactly the message, unfolded, with no
+   modal and no cue, Backspace goes as many times as the box shows characters, and each later read must
+   show a shorter start of the message. Any other read stops it. A `modal_cue` end gets no key. An emptied
+   box ends the send `refused (changed)`, and the message waits in the inbox.
+
+Trail: `bridge/surface/protocol.ts` (`chromeRows`, `countBelow`, `settleKey`, `finishesOwnText`,
+`leftInStore`, `submitTyped`, `takeMailBack`, `LEFT_TYPED_MS`) · `web/src/lib/surface/profile.ts`
+(`FooterRow.chrome`) · `web/src/lib/surface/profiles/claude.json` (`footerRowsNote`) ·
+`web/src/components/composer.tsx` (a typed answer marks its text handled) · `bridge/surface/protocol.test.ts`.
+
+## Note 2026-11-13 (ADR 0140)
+
+This record is about the screen path. A plain send, a WalkyTalky message and the box's text of a
+session whose harness is linked go through a part inside the agent as data (ADR 0140), and the input
+box is not read for them. Every send that keeps the screen path follows this record as written.
+
+## Addendum 2026-11-15: a command meets the turn rule on a screen that moves while it reads idle
+
+Status is unchanged. On lane 8788 (Claude Code 2.1.325) a session at its usage limit held queued
+messages. The person answered the limit menu with option 1, and Claude printed the released messages
+one after another. For some seconds the rows above the box scrolled and grew with no spinner, so the
+turn read idle. A `/login` sent then was refused `probe_failed` ("The probe character changed more
+than the box"). A message on that screen already took the turn-aware compare (`aboveMovedInTurn`:
+the frame stays, the rows under the box keep their count, the cue inside the frame stays, no modal,
+and the rows above only scroll and grow). A command was held to the full compare, so any command sent
+in those seconds was refused.
+
+**At its probe, a command now takes the same turn-aware compare, under the turn rule a command S0 read
+in a turn meets (`turnRefusal`).** It goes in only where that rule lets it into a turn: the harness
+queues commands (`keys.commandWhileRunning: "queues"`) or runs that one at once
+(`keys.commandsRunInTurn`). From there it rides the turn path (`streamed`), and its S1 reads only the
+rows above, as for a command S0 read in a turn. A command the profile never lets wait (`keys.neverHeld`)
+and a command on a harness that does not queue commands still fail the compare, as before. The S1
+compare of a command S0 and the probe read as idle is unchanged: rows above that move only after the
+probe still keep the command's Enter back.
+
+The choice was this rule over a longer wait for the screen to settle. Waiting would add seconds to
+every command on a busy screen and still fail on a long queue. The turn rule already says what a
+command may do in a turn; this record only lets a turn the screen does not mark count as one for a
+command too. The rule is profile data, so no harness is named in shared code.
+
+Trail: `bridge/surface/protocol.ts` (`aboveMovedInTurn`, the header's turn paragraph) ·
+`bridge/surface/protocol.flush-after-menu.test.ts`.

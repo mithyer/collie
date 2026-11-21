@@ -3,11 +3,11 @@ import { Icon } from "@/components/icons/icon";
 
 import { ActionsRow, type GeneralAction } from "@/components/actions-row";
 import { HostChip } from "@/components/host-chip";
-import { ModelTag } from "@/components/model-tag";
+import { MODEL_TAG_ROOM, ModelTag, modelTagShows } from "@/components/model-tag";
 import { RawMirror } from "@/components/raw-mirror";
 import { SessionStream } from "@/components/session-stream";
 import { Button } from "@/components/ui/button";
-import { ChatMessageList, type ChatMessageListHandle } from "@/components/ui/chat/chat-message-list";
+import { ChatMessageList, TailRoomContext, type ChatMessageListHandle } from "@/components/ui/chat/chat-message-list";
 import { BranchLabel } from "@/components/ui/branch-label";
 import { PaneGlyph } from "@/components/ui/pane-glyph";
 import { UnseenMark } from "@/components/ui/unseen-mark";
@@ -25,6 +25,8 @@ import { t } from "@/lib/i18n";
 import { paneSessionLog, useMuxCapability } from "@/lib/mux-capability";
 import { useOperatorCommands } from "@/lib/operator-config";
 import { paneGitHead } from "@/lib/git-head";
+import { CrossfadeText } from "@/components/ui/crossfade-text";
+import { paneRowKey } from "@/lib/hosts";
 import { paneName } from "@/lib/pane-name";
 import { paneScopeKey, type Scope } from "@/lib/scope";
 import { isUnseen, shownStatus } from "@/lib/triage";
@@ -123,7 +125,8 @@ export function ColumnHeader({ pane, controls, onFocus }: { pane: AgentView; con
       {/* The name is the column's way in for a keyboard: Enter on it gives the column the focus. */}
       <button type="button" onClick={own(onFocus)} className="min-h-11 min-w-0 flex-1 pl-2 text-left focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring">
         <div className="flex min-w-0 items-center gap-1.5">
-          <span className="min-w-0 truncate text-sm font-medium text-muted-foreground">{paneName(pane)}</span>
+          <span className="min-w-0 truncate text-sm font-medium text-muted-foreground"><CrossfadeText text={paneName(pane)} identity={paneRowKey(pane)} />
+          </span>
           <UnseenMark on={isUnseen(pane)} reserve />
         </div>
         {/* No space name: the space header above the strip is the one bar that names it. What is the
@@ -208,6 +211,7 @@ export function PaneColumnBody({
   return (
     <>
       <div data-slot="column-body" className="relative min-h-0 min-w-0 flex-1 border-t border-rule">
+        <TailRoomContext.Provider value={modelTagShows({ model: pane.model, usage: pane.usage }) ? MODEL_TAG_ROOM : 0}>
         {chat ? (
           <SessionStream
             feed={feed}
@@ -222,7 +226,7 @@ export function PaneColumnBody({
             savedCopy={null}
           />
         ) : (
-          <ChatMessageList ref={listRef} clearBand={0} dep={screenText} className="h-full px-3 pb-3 pt-0">
+          <ChatMessageList ref={listRef} clearBand={0} dep={screenText} className="h-full px-3 pb-[max(0.75rem,var(--tail-room,0px))] pt-0">
             {lines.length > 0 ? (
               <RawMirror lines={lines} wrap={prefs.wrap} className="rounded-none px-0" />
             ) : (
@@ -230,6 +234,7 @@ export function PaneColumnBody({
             )}
           </ChatMessageList>
         )}
+        </TailRoomContext.Provider>
         <ModelTag model={pane.model} effort={pane.effort} usage={pane.usage} />
       </div>
       {belt && (

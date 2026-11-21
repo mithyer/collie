@@ -1,5 +1,5 @@
-import type { ComponentProps } from "react";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { useState, type ComponentProps } from "react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 import { createMemoryRouter, RouterProvider } from "react-router";
@@ -25,6 +25,9 @@ beforeEach(() => {
 });
 afterEach(() => cleanup());
 
+/** Turns the launch on or off for the composer `renderComposer` drew: a start begins after the person typed. */
+let setStarting: (on: boolean) => void = () => undefined;
+
 function renderComposer(overrides: Partial<ComponentProps<typeof Composer>> = {}) {
   const props: ComponentProps<typeof Composer> = {
     paneId: "w1:p1",
@@ -41,7 +44,12 @@ function renderComposer(overrides: Partial<ComponentProps<typeof Composer>> = {}
     onSent: vi.fn(),
     ...overrides,
   };
-  const router = createMemoryRouter([{ path: "/", element: <Composer {...props} /> }]);
+  function Harness() {
+    const [starting, setStartingState] = useState(props.starting ?? false);
+    setStarting = (on) => act(() => setStartingState(on));
+    return <Composer {...props} starting={starting} />;
+  }
+  const router = createMemoryRouter([{ path: "/", element: <Harness /> }]);
   render(<RouterProvider router={router} />);
   return props;
 }
@@ -53,6 +61,7 @@ interface Posted {
   mode: string;
   rowsHash?: string;
   when?: string;
+  override?: boolean;
 }
 
 /** One answer the fake bridge gives: a body, or a failure with this HTTP status. */
@@ -179,9 +188,12 @@ describe("Composer on the Send Protocol (M56 specs 05 and 06)", () => {
     renderComposer();
     await user.type(screen.getByPlaceholderText(/type a reply/i), "go ahead");
     await user.click(screen.getByRole("button", { name: "Send" }));
-    await user.click(await screen.findByRole("button", { name: "Type here" }));
+    await user.click(await screen.findByRole("button", { name: "Send anyway" }));
     await waitFor(() => expect(sends).toHaveLength(2));
     expect(sends[1]).toMatchObject({ text: "go ahead", mode: "send", rowsHash: "0abc12" });
+    // The commit is the person's tap through the stop, so it says override (M102 spec 01); the first tap and the other offers do not.
+    expect(sends[0]).not.toHaveProperty("override");
+    expect(sends[1]).toMatchObject({ override: true });
   });
 
   it("typed but not submitted offers Submit and Discard, and keeps the draft", async () => {
@@ -222,7 +234,7 @@ describe("Composer on the Send Protocol (M56 specs 05 and 06)", () => {
     renderComposer();
     await user.type(screen.getByPlaceholderText(/type a reply/i), "/compact");
     await user.click(screen.getByRole("button", { name: "Send" }));
-    await user.click(await screen.findByRole("button", { name: "Type here" }));
+    await user.click(await screen.findByRole("button", { name: "Send anyway" }));
     await waitFor(() => expect(sends).toHaveLength(2));
     expect(sends.map((s) => s.mode)).toEqual(["command", "command"]);
     expect(paneCalls).toEqual([]);
@@ -248,6 +260,9 @@ describe("a stale screen in the placeholder", () => {
     const field = screen.getByRole("textbox");
     expect(field).toHaveAttribute("placeholder", HINT);
     expect(field.className).toMatch(/placeholder:text-xs/);
+    // Centred in the field's line (#758), the same as the Steer hint below.
+    expect(field.className).toMatch(/placeholder:leading-\[inherit\]/);
+    expect(field.className).toMatch(/(^| )leading-\[1\.5em\]/);
     expect(screen.queryByText(HINT)).toBeNull();
   });
 
@@ -296,8 +311,20 @@ describe("Steer or queue on the Send button (M69)", () => {
   it("a launch still starting offers neither Send nor its steer menu, and keeps the draft", async () => {
     const user = userEvent.setup();
     const { sends } = bridge([]);
-    renderSteer({ starting: true, surface: running, canSteer: true });
-    await openMenu(user, "wait for startup");
+    renderSteer({ surface: running, canSteer: true });
+    // The draft is typed before the start. While the launch starts the box is off (Altan, 2026-11-17), so a draft
+    // can only be there already; it stays in the box and nothing offers a send.
+    await user.type(field(), "wait for startup");
+    field().focus();
+    setStarting(true);
+    // Held, not disabled: the box keeps its focus (and the soft keyboard), and takes no input.
+    expect(field()).not.toBeDisabled();
+    expect(field()).toHaveAttribute("readonly");
+    expect(field()).toHaveAttribute("aria-disabled", "true");
+    expect(field()).toHaveFocus();
+    await user.keyboard("more{Enter}");
+    expect(field()).toHaveAttribute("placeholder", "Starting…");
+    fireEvent.contextMenu(screen.getByRole("button", { name: "Send" }));
     expect(screen.getByRole("button", { name: "Send" })).toHaveAttribute("aria-disabled", "true");
     expect(screen.queryByRole("button", { name: STEER })).toBeNull();
     expect(screen.queryByRole("button", { name: "Send as message" })).toBeNull();
@@ -309,6 +336,12 @@ describe("Steer or queue on the Send button (M69)", () => {
     renderSteer({ surface: running, canSteer: true });
     expect(field()).toHaveAttribute("placeholder", HINT);
     expect(field().className).toMatch(/placeholder:text-xs/);
+    // THE HINT IS CENTRED IN THE FIELD'S LINE (#758): the smaller words take the field's own line box, as a
+    // length, instead of the 16px line `text-xs` brings, which stood them 3.5px above the box's centre. The
+    // field states its line-height as a length so the placeholder can inherit it; layout is in
+    // e2e/steer-placeholder.spec.ts.
+    expect(field().className).toMatch(/placeholder:leading-\[inherit\]/);
+    expect(field().className).toMatch(/(^| )leading-\[1\.5em\]/);
     // The hint is not text in the page: it is the placeholder or nothing.
     expect(screen.queryByText(HINT)).toBeNull();
   });
@@ -334,6 +367,8 @@ describe("Steer or queue on the Send button (M69)", () => {
     renderSteer({ canSteer: true });
     expect(screen.getByPlaceholderText(/type a reply/i)).toBeInTheDocument();
     expect(field().className).not.toMatch(/placeholder:text-xs/);
+    // The ordinary words keep the field's own line, untouched by the repair.
+    expect(field().className).not.toMatch(/leading-\[/);
     await openMenu(user, "hello");
     expect(await screen.findByRole("button", { name: "Send as message" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: STEER })).toBeNull();
@@ -344,6 +379,8 @@ describe("Steer or queue on the Send button (M69)", () => {
     renderSteer({ surface: running });
     expect(screen.getByPlaceholderText(/type a reply/i)).toBeInTheDocument();
     expect(field().className).not.toMatch(/placeholder:text-xs/);
+    // The ordinary words keep the field's own line, untouched by the repair.
+    expect(field().className).not.toMatch(/leading-\[/);
     await openMenu(user, "hello");
     expect(await screen.findByRole("button", { name: "Send as message" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: STEER })).toBeNull();
@@ -420,7 +457,7 @@ describe("Steer or queue on the Send button (M69)", () => {
     renderSteer({ surface: running, canSteer: true });
     await openMenu(user, "change course");
     await user.click(await screen.findByRole("button", { name: STEER }));
-    expect(await screen.findByText(/Steer is not available on this pane\. Nothing was sent\./)).toBeInTheDocument();
+    expect(await screen.findByText(/Steer is not available on this pane, so nothing was sent\./)).toBeInTheDocument();
     expect(loadDraft(undefined, "w1:p1")).toBe("change course");
   });
 

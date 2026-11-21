@@ -70,6 +70,19 @@ describe("accept", () => {
     });
   });
 
+  test("keeps no line of a send into a sign-in field, and forgets the line of one found there later", () => {
+    const store = new RequestStore(join(dir, "sends"), () => 5000);
+    const secret = store.accept(input({ text: "FAKEcode1234#FAKEstate", secret: true }));
+    expect(secret.record.line).toBeUndefined();
+    expect(readFileSync(join(dir, "sends", `${ID}.json`), "utf8")).not.toContain("FAKEcode");
+    const id = "req-0002-abcdef";
+    expect(store.accept(input({ id, text: "FAKEother5678" })).record.line).toBe("FAKEother5678");
+    store.forgetLine(id);
+    expect(store.get(id)?.line).toBeUndefined();
+    expect(readFileSync(join(dir, "sends", `${id}.json`), "utf8")).not.toContain("FAKEother");
+    expect(store.get(id)?.id).toBe(id);
+  });
+
   test("the line survives a restart, and a line that is not what it should be is dropped while the record stays", () => {
     const first = new RequestStore(join(dir, "sends"), () => 5000);
     first.accept(input({ text: "git status" }));
@@ -339,6 +352,82 @@ describe("a queued receipt whose text came back (ADR 0122)", () => {
     const read = store.get(ID)?.receipt;
     expect(read).toMatchObject({ outcome: "sent", queued: true });
     expect(read && "late" in read).toBe(false);
+  });
+});
+
+describe("the person's word on a stored receipt (M102 spec 01)", () => {
+  const unknownReceipt = (store: RequestStore, id: string, over: Partial<SendReceipt> = {}): void => {
+    const { record } = store.accept(input({ id }));
+    store.settle(id, { ...receiptFor(record, "unknown"), ...over });
+  };
+
+  test("a word survives a restart; a word this build did not write is dropped and the receipt stays", () => {
+    const store = new RequestStore(dir);
+    unknownReceipt(store, "req-word-keep-01", { word: "override" });
+    expect(new RequestStore(dir).get("req-word-keep-01")?.receipt).toMatchObject({ outcome: "unknown", word: "override" });
+    const path = join(dir, "req-word-keep-01.json");
+    const raw = JSON.parse(readFileSync(path, "utf8"));
+    writeFileSync(path, JSON.stringify({ ...raw, receipt: { ...raw.receipt, word: "trust-me" } }));
+    const read = store.get("req-word-keep-01")?.receipt;
+    expect(read).toMatchObject({ outcome: "unknown" });
+    expect(read && "word" in read).toBe(false);
+  });
+
+  test("a blind-road menuSign survives a restart; an unknown kind or a row that is no index drops it, and the receipt stays (M102 spec 12)", () => {
+    const store = new RequestStore(dir);
+    const { record } = store.accept(input({ id: "req-menu-sign-01" }));
+    store.settle("req-menu-sign-01", { ...receiptFor(record, "refused"), reason: "menu_open", menuSign: { kind: "yes-no", row: 2 } });
+    expect(new RequestStore(dir).get("req-menu-sign-01")?.receipt).toMatchObject({ outcome: "refused", reason: "menu_open", menuSign: { kind: "yes-no", row: 2 } });
+    const path = join(dir, "req-menu-sign-01.json");
+    const raw = JSON.parse(readFileSync(path, "utf8"));
+    for (const bad of [{ kind: "wizard", row: 2 }, { kind: "hint", row: -1 }, { kind: "hint", row: 1.5 }, "yes-no"]) {
+      writeFileSync(path, JSON.stringify({ ...raw, receipt: { ...raw.receipt, menuSign: bad } }));
+      const read = new RequestStore(dir).get("req-menu-sign-01")?.receipt;
+      expect(read).toMatchObject({ outcome: "refused", reason: "menu_open" });
+      expect(read && "menuSign" in read).toBe(false);
+    }
+  });
+
+  test("textAlreadyTyped survives a restart (M102 spec 12)", () => {
+    const store = new RequestStore(dir);
+    const { record } = store.accept(input({ id: "req-text-typed-01" }));
+    store.settle("req-text-typed-01", { ...receiptFor(record, "typed_not_submitted"), reason: "override", word: "override", textAlreadyTyped: true });
+    expect(new RequestStore(dir).get("req-text-typed-01")?.receipt).toMatchObject({ outcome: "typed_not_submitted", textAlreadyTyped: true });
+  });
+
+  test("markArrived writes arrived on a settled unknown receipt once, and keeps the outcome", () => {
+    const store = new RequestStore(dir);
+    unknownReceipt(store, "req-word-mark-01");
+    expect(store.markArrived("req-word-mark-01", "%1")).toBe("marked");
+    expect(store.markArrived("req-word-mark-01", "%1")).toBe("already");
+    expect(new RequestStore(dir).get("req-word-mark-01")?.receipt).toMatchObject({ outcome: "unknown", word: "arrived" });
+  });
+
+  test("markArrived replaces an override: the newer word is what the person said last", () => {
+    const store = new RequestStore(dir);
+    unknownReceipt(store, "req-word-over-01", { word: "override" });
+    expect(store.markArrived("req-word-over-01", "%1")).toBe("marked");
+    expect(store.get("req-word-over-01")?.receipt?.word).toBe("arrived");
+  });
+
+  test("markArrived refuses another pane's id and an id nobody sent as not_found, without telling them apart", () => {
+    const store = new RequestStore(dir);
+    unknownReceipt(store, "req-word-pane-01");
+    expect(store.markArrived("req-word-pane-01", "%2")).toBe("not_found");
+    expect(store.markArrived("req-word-nobody-1", "%1")).toBe("not_found");
+    expect(store.get("req-word-pane-01")?.receipt?.word).toBeUndefined();
+  });
+
+  test("markArrived refuses a sent receipt, an effective one and an unsettled one as not_unknown", () => {
+    const store = new RequestStore(dir);
+    const sent = store.accept(input({ id: "req-word-sent-01" })).record;
+    store.settle("req-word-sent-01", receiptFor(sent));
+    expect(store.markArrived("req-word-sent-01", "%1")).toBe("not_unknown");
+    const landed = store.accept(input({ id: "req-word-eff-001" })).record;
+    store.settle("req-word-eff-001", receiptFor(landed, "effective"));
+    expect(store.markArrived("req-word-eff-001", "%1")).toBe("not_unknown");
+    store.accept(input({ id: "req-word-open-01" }));
+    expect(store.markArrived("req-word-open-01", "%1")).toBe("not_unknown");
   });
 });
 

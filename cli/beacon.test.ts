@@ -7,8 +7,8 @@ import { HOST } from "../bridge/host.ts";
 import { managedSettingsPath } from "./hold-entry.ts";
 
 import { parseBeacon, parseEdge } from "../bridge/beacon/parse.ts";
-import { parseUsageRecord, usageFileName } from "../bridge/usage.ts";
-import { readTail, TAIL_BYTES, windowFromModel } from "./context-reading.ts";
+import { parseUsageRecord, usageFileName, type UsageRecord } from "../bridge/usage.ts";
+import { readTail, statedWindow, TAIL_BYTES } from "./context-reading.ts";
 import { beaconFileName, beaconKey, EDGE_FILE, EDGE_MAX_AGE_MS, EDGE_SPOOL_MAX } from "../bridge/beacon/paths.ts";
 import { hookTargetFileName } from "../bridge/beacon/hook-targets.ts";
 import { BEACON_SCHEMA_VERSION, type EdgeRecord } from "../bridge/beacon/types.ts";
@@ -190,13 +190,6 @@ describe("on macOS, the probe is ps lstart", () => {
     expect(d.files.read(file)).toBeNull();
   });
 
-  test("Windows has no probe: nothing is written and nothing is run", async () => {
-    const ps = fakePs();
-    const d = deps({ env: CORE, proc: null, pidProbe: { platform: "win32", run: ps.run } });
-    expect(await cmdBeaconEmit(d)).toBe(EXIT.OK);
-    expect(d.files.entries.size).toBe(0);
-    expect(ps.calls).toEqual([]);
-  });
 
   test("Linux never runs ps: a pid with no stat file has no start time", async () => {
     const ps = fakePs();
@@ -204,6 +197,64 @@ describe("on macOS, the probe is ps lstart", () => {
     expect(await cmdBeaconEmit(d)).toBe(EXIT.OK);
     expect(beacons(d.files).size).toBe(0);
     expect(ps.calls).toEqual([]);
+  });
+});
+
+// Windows has neither `/proc` nor `ps` (issue 798): the start time is kernel32's creation time, read in
+// process. The read is injected here, so the Windows branch runs on Linux.
+describe("on Windows, the probe is the native creation time (#798)", () => {
+  const CORE: Environment = { HC_TERMINAL_ID: "t1d5", HC_TERMINAL_SOCKET: "\\\\.\\pipe\\herdr-core-pat-default.sock" };
+  /** Microseconds since the Unix epoch, the unit `bridge/win32-process.ts` answers in. */
+  const CREATED = 1_794_847_739_081_296;
+
+  function fakeNative(answers: Record<number, number | null> = { [AGENT_PID]: CREATED }) {
+    const asked: number[] = [];
+    const native = (pid: number): number | null => {
+      asked.push(pid);
+      return answers[pid] ?? null;
+    };
+    return { asked, native };
+  }
+
+  test("a herdr-core Claude pane gets its edge and its beacon, carrying the creation time", async () => {
+    const win = fakeNative();
+    const runs: number[] = [];
+    // The fake disk holds a stat file for the agent (START_TIME), as a planted `C:\proc` would. Windows never reads it.
+    const d = deps({ env: CORE, pidProbe: { platform: "win32", native: win.native, run: (_c, pid) => (runs.push(pid), null) } });
+    expect(await cmdBeaconEmit(d)).toBe(EXIT.OK);
+    const [text, ...more] = [...beacons(d.files).values()];
+    expect(more).toEqual([]);
+    const record = parseBeacon(text ?? "");
+    expect(record?.session).toEqual({ kind: "id", value: SESSION });
+    expect(record?.pid).toBe(AGENT_PID);
+    expect(record?.pidStartTime).toBe(CREATED);
+    expect(record?.markers).toEqual([{ namespace: HERDR_CORE_NAMESPACE, scope: "\\\\.\\pipe\\herdr-core-pat-default.sock", pane: "t1d5" }]);
+    const edges = [...d.files.entries].filter(([path]) => path.startsWith(`${STATE}/edges/`) && EDGE_FILE.test(path.slice(`${STATE}/edges/`.length)));
+    expect(edges.map(([, entry]) => parseEdge(entry.text)?.pidStartTime)).toEqual([CREATED]);
+    expect(win.asked.every((pid) => pid === AGENT_PID)).toBe(true);
+    expect(runs).toEqual([]);
+  });
+
+  test("an agent the native read cannot see (gone, ended, denied) writes nothing, and exits 0", async () => {
+    const d = deps({ env: CORE, proc: null, pidProbe: { platform: "win32", native: fakeNative({ [AGENT_PID]: null }).native } });
+    expect(await cmdBeaconEmit(d)).toBe(EXIT.OK);
+    expect(d.files.entries.size).toBe(0);
+  });
+
+  test("a registered bridge is a live target while the native read returns its stored start, and dead once it differs", () => {
+    const REGISTRY = `${HOME}/.local/state/collie/hook-targets`;
+    const BRIDGE = 5001;
+    const d = deps({ env: CORE, proc: null, pidProbe: { platform: "win32", native: fakeNative({ [BRIDGE]: CREATED }).native } });
+    const file = `${REGISTRY}/${hookTargetFileName("/srv/a")}`;
+    const register = (start: number) =>
+      d.files.write(file, JSON.stringify({ schemaVersion: 1, stateDir: "/srv/a", pid: BRIDGE, pidStartTime: start, bootedAt: 1 }), 0o600);
+    d.files.mkdirp(REGISTRY, 0o700);
+    register(CREATED);
+    expect(liveHookTargets(d).map((t) => t.stateDir)).toEqual(["/srv/a"]);
+    // The same pid, started one microsecond later: another process, so the target is dead.
+    register(CREATED - 1);
+    expect(liveHookTargets(d)).toEqual([]);
+    expect(d.files.read(file)).toBeNull();
   });
 });
 
@@ -757,64 +808,96 @@ describe("the context reading (.adr/0115, amended 2026-10-24)", () => {
     return text === null ? null : parseUsageRecord(text);
   };
   const seed = (d: ReturnType<typeof deps>, over: JsonObject): void =>
-    d.files.write(USAGE, JSON.stringify({ schemaVersion: 1, harness: "claude", at: NOW - 5000, window: 1_000_000, ...over }));
+    d.files.write(USAGE, JSON.stringify({ schemaVersion: 1, harness: "claude", at: NOW - 5000, window: 1_000_000, windowBy: "statusline", ...over }));
   const USED = lines(userLine, assistant({ input_tokens: 10, cache_creation_input_tokens: 20_000, cache_read_input_tokens: 130_000, output_tokens: 900 }), tail);
 
-  describe("the window comes from SessionStart", () => {
-    test("the window of a model: the [1m] suffix is one million tokens, any other model two hundred thousand", async () => {
-      expect(windowFromModel("claude-opus-5-5[1m]")).toBe(1_000_000);
-      expect(windowFromModel("opus[1m]")).toBe(1_000_000);
-      expect(windowFromModel("claude-opus-5-5")).toBe(200_000);
-      expect(windowFromModel(undefined)).toBeUndefined();
-      expect(windowFromModel("")).toBeUndefined();
-      const big = await run("SessionStart", { source: "startup", model: "claude-opus-5-5[1m]" });
-      expect(record(big)).toMatchObject({ window: 1_000_000 });
-      expect(record(big)?.context).toBeUndefined();
-      const small = await run("SessionStart", { source: "startup", model: "claude-opus-5-5" });
-      expect(record(small)).toMatchObject({ window: 200_000 });
+  describe("the window is only the one the statusLine stated", () => {
+    test("statedWindow: the size a statusLine run wrote, and nothing else", () => {
+      const rec = (over: Partial<UsageRecord>): UsageRecord => ({ schemaVersion: 1, harness: "claude", at: 1, ...over });
+      expect(statedWindow(rec({ window: 1_000_000, windowBy: "statusline" }))).toBe(1_000_000);
+      expect(statedWindow(rec({ window: 400_000, windowBy: "fable" }))).toBeUndefined();
+      expect(statedWindow(rec({ window: 200_000 }))).toBeUndefined();
+      expect(statedWindow(rec({}))).toBeUndefined();
+      expect(statedWindow(null)).toBeUndefined();
     });
 
-    test("a start that names no model (claude -p) records no window, and the transcript then writes no context", async () => {
-      const d = await run("SessionStart", { source: "startup" });
-      expect(record(d)).toBeNull();
+    test("a start names no window, whatever its model: fable, opus[1m], an API id, a gateway model", async () => {
+      for (const model of ["fable", "claude-opus-5-5[1m]", "claude-opus-5-5", "claude-fable-5-2", "glm-5"]) {
+        expect(record(await run("SessionStart", { source: "startup", model }))).toBeNull();
+      }
+    });
+
+    test("the 2026-11-13 report: a 1M Fable session reads 22.2, as Claude Code's own 22, not 55.5", async () => {
+      // Field shapes as the live session wrote them: the statusLine stated `context_window_size: 1000000`,
+      // the transcript's newest line is the bare API id with these counts. Output tokens are not context.
+      const fable = assistant({ input_tokens: 2, cache_creation_input_tokens: 1_913, cache_read_input_tokens: 220_285, output_tokens: 277 }, "claude-fable-5-2");
+      const d = await run("Stop", {}, lines(userLine, fable, tail), (x) => seed(x, {}));
+      // 2 + 1_913 + 220_285 = 222_200 of 1_000_000.
+      expect(record(d)).toMatchObject({ window: 1_000_000, windowBy: "statusline", context: 22.2, contextTokens: 222_200 });
+    });
+
+    test("with no statusLine the transcript writes the count and no share; compact and clear remove the count", async () => {
+      expect(record(await run("SessionStart", { source: "startup", model: "fable" }))).toBeNull();
       const stop = await run("Stop", {}, USED);
-      expect(record(stop)).toBeNull();
+      expect(record(stop)?.contextTokens).toBe(150_010);
+      expect(record(stop)?.context).toBeUndefined();
+      for (const source of ["compact", "clear"]) {
+        const d = await run("SessionStart", { source }, null, (x) => x.files.write(USAGE, stop.files.read(USAGE) ?? ""));
+        expect(record(d)?.contextTokens).toBeUndefined();
+      }
+      // Nothing on file: nothing to forget, no file.
+      expect(record(await run("SessionStart", { source: "compact", model: "fable" }))).toBeNull();
+    });
+
+    test("an older build's table window is not divided by: no context, not a wrong one", async () => {
+      for (const over of [{ window: 400_000, windowBy: "fable", context: 55.5 }, { window: 200_000, windowBy: "opus", context: 100 }]) {
+        const d = await run("Stop", {}, USED, (x) => x.files.write(USAGE, JSON.stringify({ schemaVersion: 1, harness: "claude", at: NOW - 5000, ...over })));
+        expect(record(d)?.context).toBeUndefined();
+        expect(record(d)?.window).toBeUndefined();
+      }
+    });
+
+    test("a context the statusLine stated with no size (an older Claude Code) is left to the statusLine", async () => {
+      const d = await run("Stop", {}, USED, (x) => x.files.write(USAGE, JSON.stringify({ schemaVersion: 1, harness: "claude", at: NOW - 5000, context: 22 })));
+      expect(record(d)?.context).toBe(22);
+    });
+
+    test("the stated size stands for any model, one the transcript names or not", async () => {
+      const opus = lines(userLine, assistant({ input_tokens: 200_000 }, "claude-opus-5-5"), tail);
+      expect(record(await run("Stop", {}, opus, (x) => seed(x, { window: 400_000 })))).toMatchObject({ window: 400_000, windowBy: "statusline", context: 50 });
+      const unknown = lines(userLine, assistant({ input_tokens: 100_000 }, "glm-5"), tail);
+      expect(record(await run("Stop", {}, unknown, (x) => seed(x, { window: 128_000 })))?.context).toBe(78.1);
+      const none = lines(userLine, JSON.stringify({ type: "assistant", message: { usage: { input_tokens: 100_000 } } }), tail);
+      expect(record(await run("Stop", {}, none, (x) => seed(x, { window: 400_000 })))?.context).toBe(25);
     });
 
     test("a source it does not know writes nothing", async () => {
-      const d = await run("SessionStart", { source: "teleport", model: "claude-opus-5-5" });
-      expect(record(d)).toBeNull();
+      const d = await run("SessionStart", { source: "teleport", model: "claude-opus-5-5" }, null, (x) => seed(x, { context: 30 }));
+      expect(record(d)?.context).toBe(30);
     });
 
-    test("compact and clear drop the context and keep the limits and the window", async () => {
+    test("compact and clear drop the context and keep the limits and the stated window", async () => {
       const limits = [{ window: "5h" as const, used: 30, resetsAt: NOW + 3_600_000 }];
       for (const source of ["compact", "clear"]) {
         const d = await run("SessionStart", { source, model: "claude-opus-5-5[1m]" }, null, (x) => seed(x, { context: 71, limits }));
         const written = record(d);
         expect(written?.context).toBeUndefined();
-        expect(written?.window).toBe(1_000_000);
-        expect(written?.limits).toEqual(limits);
+        expect(written).toMatchObject({ window: 1_000_000, windowBy: "statusline", limits });
       }
     });
 
-    test("compact without a model keeps the window already on file", async () => {
-      const d = await run("SessionStart", { source: "compact" }, null, (x) => seed(x, { context: 71, window: 200_000 }));
-      expect(record(d)).toMatchObject({ window: 200_000 });
-      expect(record(d)?.context).toBeUndefined();
-    });
-
-    test("resume and fork with context_tokens write the context at once", async () => {
+    test("resume and fork with context_tokens write the context at once, against the stated window", async () => {
       for (const source of ["resume", "fork"]) {
-        const d = await run("SessionStart", { source, model: "claude-opus-5-5[1m]", context_tokens: 250_000 });
+        const d = await run("SessionStart", { source, model: "fable", context_tokens: 250_000 }, null, (x) => seed(x, {}));
         expect(record(d)).toMatchObject({ window: 1_000_000, context: 25 });
       }
-      const two = await run("SessionStart", { source: "resume", model: "claude-opus-5-5", context_tokens: 50_000 });
-      expect(record(two)?.context).toBe(25);
+      const small = await run("SessionStart", { source: "resume", context_tokens: 50_000 }, null, (x) => seed(x, { window: 200_000 }));
+      expect(record(small)?.context).toBe(25);
     });
 
-    test("resume with no model and no window on file has no context to write", async () => {
-      const d = await run("SessionStart", { source: "resume", context_tokens: 50_000 });
-      expect(record(d)).toBeNull();
+    test("resume with no stated window writes the count and no share", async () => {
+      const d = await run("SessionStart", { source: "resume", model: "opus[1m]", context_tokens: 50_000 });
+      expect(record(d)).toEqual({ schemaVersion: 1, harness: "claude", at: NOW, contextTokens: 50_000 });
     });
   });
 
@@ -828,8 +911,9 @@ describe("the context reading (.adr/0115, amended 2026-10-24)", () => {
       expect(record(small)?.context).toBe(75);
     });
 
-    test("no window on file, no context: honest beats guessed", async () => {
-      expect(record(await run("Stop", {}, USED))).toBeNull();
+    test("no window on file, no share: the token count alone, honest beats guessed", async () => {
+      const d = await run("Stop", {}, USED);
+      expect(record(d)).toEqual({ schemaVersion: 1, harness: "claude", at: NOW, contextTokens: 150_010 });
     });
 
     test("PostToolUse reads it too, and still writes its tool edge", async () => {
@@ -916,11 +1000,15 @@ describe("the context reading (.adr/0115, amended 2026-10-24)", () => {
 
     test("an unchanged whole percent writes nothing", async () => {
       // On file: 15.2. The transcript says 15.0. Both round to 15, so the file is not touched.
-      const d = await run("Stop", {}, USED, (x) => seed(x, { context: 15.2 }));
+      // The count on file draws as 150k, as the transcript's 150,010 does.
+      const d = await run("Stop", {}, USED, (x) => seed(x, { context: 15.2, contextTokens: 150_400 }));
       expect(JSON.parse(d.files.read(USAGE) ?? "{}").context).toBe(15.2);
       expect(JSON.parse(d.files.read(USAGE) ?? "{}").at).toBe(NOW - 5000);
-      const moved = await run("Stop", {}, USED, (x) => seed(x, { context: 17 }));
+      const moved = await run("Stop", {}, USED, (x) => seed(x, { context: 17, contextTokens: 150_400 }));
       expect(JSON.parse(moved.files.read(USAGE) ?? "{}").context).toBe(15);
+      // A count that draws another figure is a write, even with the share unchanged.
+      const grown = await run("Stop", {}, USED, (x) => seed(x, { context: 15.2, contextTokens: 149_000 }));
+      expect(JSON.parse(grown.files.read(USAGE) ?? "{}").contextTokens).toBe(150_010);
     });
 
     test("keeps an existing file's running limits and drops the expired ones, and the file's own time", async () => {
@@ -942,7 +1030,7 @@ describe("the context reading (.adr/0115, amended 2026-10-24)", () => {
       d.files.mkdirp("/home/pat/.local/state/collie/hook-targets", 0o700);
       d.files.write(`${HOME}/.local/state/collie/hook-targets/${hookTargetFileName(A.dir)}`, JSON.stringify({ schemaVersion: 1, stateDir: A.dir, pid: A.pid, pidStartTime: A.start, bootedAt: 1 }));
       d.files.write(`/proc/${String(A.pid)}/stat`, `${String(A.pid)} (bun) S 1 ${Array.from({ length: 17 }, (_v, i) => i).join(" ")} ${String(A.start)} 0 0`);
-      for (const dir of [A.dir, STATE]) d.files.write(`${dir}/usage/${usageFileName(SESSION)}`, JSON.stringify({ schemaVersion: 1, harness: "claude", at: 1, window: 1_000_000 }));
+      for (const dir of [A.dir, STATE]) d.files.write(`${dir}/usage/${usageFileName(SESSION)}`, JSON.stringify({ schemaVersion: 1, harness: "claude", at: 1, window: 1_000_000, windowBy: "statusline" }));
       await cmdBeaconEmit(d);
       for (const dir of [A.dir]) expect(parseUsageRecord(d.files.read(`${dir}/usage/${usageFileName(SESSION)}`) ?? "")?.context).toBe(15);
     });
@@ -1044,8 +1132,17 @@ describe("agentPidOf: the first non-shell ancestor (#689)", () => {
     expect(agentPidOf(100, table({ 100: { comm: "dash", ppid: 50 } }))).toBe(50);
   });
 
+  test("Windows: Git's bash launcher and the bash it starts are both climbed, to claude (#798)", () => {
+    const read = table({ 300: { comm: "bash", ppid: 200 }, 200: { comm: "bash", ppid: 100 }, 100: { comm: "claude", ppid: 40 } });
+    expect(agentPidOf(300, read)).toBe(100);
+  });
+
+  test("Windows: a parent the reader could not vouch for (ppid 0) ends the climb at the shell", () => {
+    expect(agentPidOf(300, table({ 300: { comm: "bash", ppid: 0 } }))).toBe(300);
+  });
+
   test("every shell name in the set is climbed, and a name that merely contains one is not", () => {
-    for (const comm of ["sh", "dash", "bash", "zsh", "ksh", "ash", "busybox"]) {
+    for (const comm of ["sh", "dash", "bash", "zsh", "ksh", "ash", "busybox", "cmd", "powershell", "pwsh"]) {
       expect(agentPidOf(100, table({ 100: { comm, ppid: 50 }, 50: { comm: "claude", ppid: 10 } }))).toBe(50);
     }
     expect(agentPidOf(100, table({ 100: { comm: "bash-wrapper", ppid: 50 } }))).toBe(100);

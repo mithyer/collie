@@ -287,6 +287,16 @@ describe("HerdrCoreMux over a fake core", () => {
     expect(panes.map((pane) => pane.paneId)).toEqual([created.value.paneId]);
   });
 
+  test("a space whose folder is a linked worktree opens like any other: the core keeps no worktree record (issue 732)", async () => {
+    const { fake, adapter } = build();
+    const asked = recordShells(fake);
+    const created = await adapter.createSpace({ cwd: "/home/dev/lab-wt", label: "wt", worktree: { repoRoot: "/home/dev/lab" } });
+    if (!created.ok) throw new Error(created.detail);
+    expect(asked).toHaveLength(1);
+    expect(asked[0]?.cwd).toBe("/home/dev/lab-wt");
+    expect(created.value.cwd).toBe("/home/dev/lab-wt");
+  });
+
   test("two new spaces get different ids, and a blank cwd sends no cwd to the core", async () => {
     const { fake, adapter } = build();
     const asked = recordShells(fake);
@@ -519,5 +529,35 @@ describe("the raw key gap (RAW_KEY_GAP_MS)", () => {
     ]);
     expect(waits).toEqual([KEY_HOLD_MS]);
     expect(clock.now()).toBe(KEY_HOLD_MS);
+  });
+});
+
+// M100 spec 03: a connection the core closed after the request (or the text) went out may follow a write
+// it acted on, so text and keys answer `unconfirmed`. A core that is not running stays `unreachable`.
+describe("a write whose connection the core closed before the answer", () => {
+  test("typeText and writeKeys answer unconfirmed, and say it may have arrived", async () => {
+    const fake = new FakeHcCore();
+    const mux = new HerdrCoreMux(fake, "/home/dev");
+    const pane = (await mux.snapshot()).panes[0]!;
+    fake.nextWrite = "closed";
+    const text = await mux.typeText(pane.paneId, "hello");
+    fake.nextKeys = "closed";
+    const keys = await mux.writeKeys(pane.paneId, ["Escape"]);
+    for (const ack of [text, keys]) {
+      expect(ack.ok ? "ok" : ack.reason).toBe("unconfirmed");
+      if (!ack.ok) expect(ack.detail).toContain("herdr-core closed the connection before it confirmed");
+      if (!ack.ok) expect(ack.detail).not.toContain("in time");
+    }
+    expect(fake.writes()).toEqual([]);
+  });
+
+  test("a core that is not running answers unreachable, with the dial's own words", async () => {
+    const fake = new FakeHcCore();
+    const mux = new HerdrCoreMux(fake, "/home/dev");
+    const pane = (await mux.snapshot()).panes[0]!;
+    fake.stopCore();
+    const ack = await mux.typeText(pane.paneId, "hello");
+    expect(ack.ok ? "ok" : ack.reason).toBe("unreachable");
+    if (!ack.ok) expect(ack.detail).toMatch(/^connect ENOENT \//u);
   });
 });

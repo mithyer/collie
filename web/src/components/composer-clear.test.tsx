@@ -86,7 +86,7 @@ describe("the Keys board's Clear button", () => {
     const posted = serveClear({ requestId: "echo-0001", outcome: "cleared" });
     mount("free");
     const clear = await openKeys(user);
-    expect(clear).toBeDisabled();
+    expect(clear).toHaveAttribute("aria-disabled", "true");
     await user.click(clear);
     expect(posted).toHaveLength(0);
   });
@@ -94,10 +94,10 @@ describe("the Keys board's Clear button", () => {
   it("is greyed while a dialog owns the keys, and while the link is down", async () => {
     const user = userEvent.setup();
     mount("ask");
-    expect(await openKeys(user)).toBeDisabled();
+    expect(await openKeys(user)).toHaveAttribute("aria-disabled", "true");
     cleanup();
     mount("offline");
-    expect(await openKeys(user)).toBeDisabled();
+    expect(await openKeys(user)).toHaveAttribute("aria-disabled", "true");
   });
 
   it("is enabled when the box holds a draft, shows its word and reaches 44px", async () => {
@@ -148,6 +148,15 @@ describe("the Keys board's Clear button", () => {
     mount("draft");
     await user.click(await openKeys(user));
     expect(await screen.findByText("The box did not clear. What is left was not touched.")).toBeInTheDocument();
+  });
+
+  it("says another Collie is typing into the pane, in Clear's own words, when the pane is busy (M102 spec 16)", async () => {
+    const user = userEvent.setup();
+    serveClear({ requestId: "echo-0003", outcome: "refused", reason: "pane_busy" });
+    mount("draft");
+    await user.click(await openKeys(user));
+    expect(await screen.findByText("Another Collie is typing into this pane, so nothing was cleared. Tap Clear again in a moment.")).toBeInTheDocument();
+    expect(screen.queryByText(/Send this one again/u)).toBeNull();
   });
 
   it("says an older machine cannot clear yet when its route answers a bare 404", async () => {

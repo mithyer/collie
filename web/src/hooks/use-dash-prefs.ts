@@ -1,11 +1,13 @@
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { asJsonBoolean, asJsonObject, asJsonString, type JsonObject, type JsonValue } from "@/lib/json";
 
 import type { ChangesLayout } from "@/lib/changes-tree";
 import { coerceDashView, isLegacyDashView, wasFocusView, type DashView } from "@/lib/dash-view";
 import { coercePaneOrder, type PaneOrder } from "@/lib/pane-order";
 import { coercePaneView, type PaneView } from "@/lib/pane-view";
+import { coerceUsageRow, DEFAULT_USAGE_ROW, type UsageRow } from "@/lib/usage-row";
 import { coerceZoomPill, type ZoomPill } from "@/lib/zoom-pill";
+import { setPageZoomAllowed } from "@/lib/page-zoom";
 import type { RecentDir } from "@/lib/triage";
 
 // Dashboard layout preferences, persisted in localStorage. Deliberately separate from
@@ -38,7 +40,11 @@ export interface DashPrefs {
    * a choice of one (see {@link coerceDashPrefs}).
    */
   isolatedSpaces: string[];
-  /** Workspaces hidden from the dashboard list (long-press a chip); their chips stay, dimmed. */
+  /**
+   * Workspaces this device hides from the dashboard list. No screen hides one now (the workspace
+   * chip strip and its long press are gone); a stored choice still applies, its row in the workspace
+   * filter's sheet says "hidden", and "Show hidden workspaces" there clears it.
+   */
   hiddenSpaces: string[];
   /**
    * Whether the Changes view also looks for repos INSIDE the pane's folder, not only the repo that
@@ -101,14 +107,16 @@ export interface DashPrefs {
    */
   showCompactions: boolean;
   /**
-   * The order a pane list runs in: `place` (machine, space, tab, position) or `activity` (whatever
-   * happened last, first). PLACE by default, which is the order ADR 0063 gave every surface.
+   * The order a pane list runs in: `place` (machine, space, tab, position), `activity` (whatever
+   * happened last, first) or `cache` (the soonest cache expiry first). PLACE by default, which is
+   * the order ADR 0147 gives every surface.
    *
-   * The operator's own request is the only thing that turns this on, and ADR 0071 holds the reason
-   * the list does not then re-sort itself on a poll: the reading is taken when the list opens and
-   * held while it is on screen. See lib/pane-order.ts, which owns both halves.
+   * The operator's own request is the only thing that turns this on, and ADR 0147 rule 4 holds the
+   * reason the list does not then re-sort itself on a poll: the reading is taken at a few named
+   * moments and held while it is on screen. See lib/pane-order.ts, which owns both halves.
    *
-   * Read by the pane switcher today (components/agent-sidebar.tsx).
+   * Read by the pane switcher (components/agent-sidebar.tsx), by the dashboard (routes/home.tsx), and
+   * written from both and from Settings > Appearance (components/pane-order-control.tsx).
    */
   paneOrder: PaneOrder;
   /**
@@ -125,6 +133,23 @@ export interface DashPrefs {
    * Screen view. A choice made here always wins over the theme (lib/zoom-pill.ts).
    */
   zoomPill: ZoomPill | null;
+  /**
+   * Whether a pinch zooms the whole page. ON by default, so a person who needs bigger text keeps the
+   * browser's own zoom. Off stops a stray pinch from zooming the app (lib/page-zoom.ts); the Screen
+   * view's own zoom (components/output-zoom.tsx) handles its pinch itself and works either way.
+   */
+  pageZoom: boolean;
+  /**
+   * How the usage row of a session draws its gauges: a whole `percent` (the default) or five `dots`
+   * (lib/usage-row.ts). Read by the model tag, wherever it is drawn (components/model-tag.tsx).
+   */
+  usageRow: UsageRow;
+  /**
+   * Whether tricks may draw small moving pictures over the app (the `float` place of a trick, lib/tricks/float.ts).
+   * ON by default (decided 2026-11-18): the pictures never cover a question and never block a tap. Off hides
+   * every one at once, on this device.
+   */
+  floatingThings: boolean;
 }
 
 const STORAGE_KEY = "collie:dash-prefs:v1";
@@ -159,6 +184,9 @@ const DEFAULTS: DashPrefs = {
   paneOrder: "place",
   paneView: "chat",
   zoomPill: null,
+  pageZoom: true,
+  usageRow: DEFAULT_USAGE_ROW,
+  floatingThings: true,
 };
 
 function coerceDepth(raw: JsonValue | undefined): number {
@@ -238,6 +266,9 @@ export function coerceDashPrefs(raw: JsonValue | undefined): DashPrefs {
     paneOrder: coercePaneOrder(p.paneOrder),
     paneView: coercePaneView(p.paneView),
     zoomPill: coerceZoomPill(p.zoomPill),
+    pageZoom: asJsonBoolean(p.pageZoom) ?? DEFAULTS.pageZoom,
+    usageRow: coerceUsageRow(p.usageRow),
+    floatingThings: asJsonBoolean(p.floatingThings) ?? DEFAULTS.floatingThings,
   };
 }
 
@@ -255,6 +286,16 @@ function loadPrefs(): DashPrefs {
   } catch {
     return { ...DEFAULTS };
   }
+}
+
+/** The stored Pinch to zoom choice, for the page's start (lib/page-zoom.ts keeps it from there). */
+export function loadPageZoomPref(): boolean {
+  return loadPrefs().pageZoom;
+}
+
+/** The stored Chat or Terminal choice, for the pane loader's read of a thread before the pane screen mounts. */
+export function loadPaneViewPref(): PaneView {
+  return loadPrefs().paneView;
 }
 
 function savePrefs(prefs: DashPrefs): void {
@@ -288,10 +329,30 @@ export interface UseDashPrefsReturn {
   setPaneOrder: (order: PaneOrder) => void;
   setPaneView: (view: PaneView) => void;
   setZoomPill: (choice: ZoomPill) => void;
+  setPageZoom: (on: boolean) => void;
+  setUsageRow: (choice: UsageRow) => void;
+  setFloatingThings: (on: boolean) => void;
 }
+
+/**
+ * THE OTHER READERS OF A CHANGED PREF. Every hook call keeps its own copy of the stored prefs, which is
+ * enough for a control and the page it sits on, but not for a reader that stays mounted while the
+ * choice is made elsewhere: the model tag of a strip column (wide layout) stays on screen while
+ * Settings is open beside it. A write tells every copy its patch, and each applies it in memory; the
+ * writer's own call stores it.
+ */
+type PrefsListener = (patch: Partial<DashPrefs>) => void;
+const listeners = new Set<PrefsListener>();
 
 export function useDashPrefs(): UseDashPrefsReturn {
   const [prefs, setPrefs] = useState<DashPrefs>(loadPrefs);
+  useEffect(() => {
+    const listener: PrefsListener = (patch) => setPrefs((p) => ({ ...p, ...patch }));
+    listeners.add(listener);
+    return () => {
+      listeners.delete(listener);
+    };
+  }, []);
 
   const update = useCallback((patch: Partial<DashPrefs>) => {
     setPrefs((p) => {
@@ -299,6 +360,7 @@ export function useDashPrefs(): UseDashPrefsReturn {
       savePrefs(next);
       return next;
     });
+    for (const listener of listeners) listener(patch);
   }, []);
 
   const setSpacesOpen = useCallback((spacesOpen: boolean) => update({ spacesOpen }), [update]);
@@ -319,7 +381,16 @@ export function useDashPrefs(): UseDashPrefsReturn {
   const setShowCompactions = useCallback((showCompactions: boolean) => update({ showCompactions }), [update]);
   const setPaneOrder = useCallback((paneOrder: PaneOrder) => update({ paneOrder }), [update]);
   const setPaneView = useCallback((paneView: PaneView) => update({ paneView }), [update]);
+  const setUsageRow = useCallback((usageRow: UsageRow) => update({ usageRow }), [update]);
+  const setFloatingThings = useCallback((floatingThings: boolean) => update({ floatingThings }), [update]);
   const setZoomPill = useCallback((zoomPill: ZoomPill) => update({ zoomPill }), [update]);
+  const setPageZoom = useCallback(
+    (pageZoom: boolean) => {
+      setPageZoomAllowed(pageZoom);
+      update({ pageZoom });
+    },
+    [update],
+  );
 
   const setBeltScale = useCallback(
     (scale: number) => update({ beltScale: coerceBeltScale(scale) }),
@@ -365,5 +436,8 @@ export function useDashPrefs(): UseDashPrefsReturn {
     setPaneOrder,
     setPaneView,
     setZoomPill,
+    setPageZoom,
+    setUsageRow,
+    setFloatingThings,
   };
 }

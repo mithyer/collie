@@ -59,6 +59,7 @@ import {
   muxGone,
   muxOk,
   muxRefused,
+  muxUnconfirmed,
   muxUnreachable,
   muxUnsupported,
   requestedCwd,
@@ -84,6 +85,8 @@ import {
   DEFAULT_TUIOS_TIMEOUT_MS,
   TuiosClient,
   TuiosError,
+  TuiosNoReply,
+  TuiosTimeout,
   TUIOS_PROTOCOL,
   TUIOS_REQUIRED_EVENT,
   type StreamResume,
@@ -180,6 +183,18 @@ function refusalFor<T>(err: T): MuxRefusalOutcome {
     return GONE_CODES.has(err.code) ? muxGone(err.message) : muxRefused(err.message);
   }
   return muxUnreachable(err instanceof Error ? err.message : String(err));
+}
+
+/**
+ * The refusal for a failure of a CREATE call. A call that did not answer in time, or whose connection
+ * closed after it carried the request, may still have made the window or the session, so it is
+ * `unconfirmed` and not `unreachable`: the route looks in the snapshot before it says anything
+ * (bridge/create-confirm.ts).
+ */
+function createRefusal<T>(err: T): MuxRefusalOutcome {
+  // {@link TuiosTimeout} and {@link TuiosNoReply}: read by every write, key and create.
+  if (err instanceof TuiosTimeout || err instanceof TuiosNoReply) return muxUnconfirmed(err.message);
+  return refusalFor(err);
 }
 
 /**
@@ -357,7 +372,19 @@ export class TuiosMux implements MuxAdapter {
   /** Literal text, written to the pane's PTY verbatim, submitting nothing. */
   async typeText(paneId: string, text: string): Promise<MuxAck> {
     if (text.length === 0) return muxAck();
-    return this.onPane(paneId, (session) => this.rpc.sendText(session, paneId, text));
+    const located = await this.locate(paneId);
+    if (!located.ok) return located;
+    const session = located.value.session.name;
+    // A write the daemon did not confirm, by a time-out or a closed connection that carried it, may still
+    // have reached the pane: `unconfirmed`, never `unreachable`, and the caller's next read decides.
+    try {
+      await this.rpc.sendText(session, paneId, text);
+      return muxAck();
+    } catch (err) {
+      if (err instanceof TuiosTimeout) return muxUnconfirmed(`tuios did not confirm the text written to ${paneId} in time (${err.message}). It may still arrive, so it was not written again.`);
+      if (err instanceof TuiosNoReply) return muxUnconfirmed(`tuios closed the connection before it confirmed the text written to ${paneId} (${err.message}). It may have arrived, so it was not written again.`);
+      return refusalFor(err);
+    }
   }
 
   /**
@@ -382,7 +409,18 @@ export class TuiosMux implements MuxAdapter {
       translated.push(result.key);
     }
     if (translated.length === 0) return muxAck();
-    return this.onPane(paneId, (session) => this.rpc.writeKeys(session, paneId, translated.join(" ")));
+    const located = await this.locate(paneId);
+    if (!located.ok) return located;
+    // Keys the daemon did not confirm, by a time-out or a closed connection, may still land:
+    // `unconfirmed`, never sent again (M100 spec 03).
+    try {
+      await this.rpc.writeKeys(located.value.session.name, paneId, translated.join(" "));
+      return muxAck();
+    } catch (err) {
+      if (err instanceof TuiosTimeout) return muxUnconfirmed(`tuios did not confirm the keys on ${paneId} in time (${err.message}). They may still arrive, so they were not sent again.`);
+      if (err instanceof TuiosNoReply) return muxUnconfirmed(`tuios closed the connection before it confirmed the keys on ${paneId} (${err.message}). They may have arrived, so they were not sent again.`);
+      return refusalFor(err);
+    }
   }
 
   /**
@@ -435,6 +473,7 @@ export class TuiosMux implements MuxAdapter {
     const found = await this.sessionById(request.spaceId);
     if (!found.ok) return found;
     const session = found.value;
+    let creating = false;
     try {
       const workspaces = await this.rpc.listWorkspaces(session.name);
       const empty = workspaces.filter((ws) => ws.windowCount === 0 && !ws.current);
@@ -443,6 +482,8 @@ export class TuiosMux implements MuxAdapter {
         return muxRefused(`Every workspace of session ${session.name} is in use. Close a tab first.`);
       }
       const asked = requestedCwd(request.cwd);
+      // From the first call that makes something, a time-out is `unconfirmed`.
+      creating = true;
       const created = await this.rpc.newWindow(session.name, free.workspace, asked);
       const label = request.label?.trim() ?? "";
       if (label.length > 0) await this.rpc.nameWorkspace(session.name, free.workspace, label);
@@ -454,7 +495,7 @@ export class TuiosMux implements MuxAdapter {
         cwd: asked ?? "",
       });
     } catch (err) {
-      return refusalFor(err);
+      return creating ? createRefusal(err) : refusalFor(err);
     }
   }
 
@@ -497,7 +538,7 @@ export class TuiosMux implements MuxAdapter {
         cwd: asked ?? "",
       });
     } catch (err) {
-      return refusalFor(err);
+      return createRefusal(err);
     }
   }
 

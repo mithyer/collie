@@ -27,11 +27,31 @@ function field(value: string | null): string {
 }
 
 /** The fields a signature covers. */
-export type SignedFields = Pick<WalkyMessage, "id" | "kind" | "from" | "to" | "replyTo" | "at" | "body" | "wake">;
+export type SignedFields = Pick<WalkyMessage, "id" | "kind" | "from" | "to" | "replyTo" | "at" | "body" | "wake" | "outside" | "subject">;
 
 /**
- * The canonical string of a message. `wake` (M85) adds one line, only when it is true, so every message
- * without it keeps the string it always had and an older bridge still verifies it.
+ * The space line (M98): `space ` and the key as a JSON string. JSON spells every control character as an
+ * escape (the NUL of an unnamed key is `\u0000`), so the line stays one line whatever the space's name.
+ * `named` is not a line of its own: it is the key's form (space.ts), checked where the message is read.
+ * The label is display data and is not signed, as `from.label` is not.
+ */
+export function spaceLine(key: string): string {
+  return `space ${JSON.stringify(key)}`;
+}
+
+/**
+ * The subject line (M98 spec 07): `subject ` and the subject as a JSON string. A clean subject holds only
+ * the allow-list of web/src/lib/walky-subject.ts, so the JSON form is the subject in quotes, on one line.
+ */
+export function subjectLine(subject: string): string {
+  return `subject ${JSON.stringify(subject)}`;
+}
+
+/**
+ * The canonical string of a message. Each optional line is there only when it is set, after the ten
+ * fields and in this order: `wake` (M85), the space line and `outside` (M98), the subject line (M98 spec
+ * 07). Every message without them keeps the string it always had, so an older bridge still verifies it.
+ * Each line has its own first word, so no optional line can pass for another.
  */
 export function canonicalMessage(message: SignedFields): string {
   const fields = [
@@ -46,7 +66,12 @@ export function canonicalMessage(message: SignedFields): string {
     String(message.at),
     sha256Hex(message.body),
   ];
-  return (message.wake === true ? [...fields, "wake"] : fields).join("\n");
+  if (message.wake === true) fields.push("wake");
+  const space = message.from.space;
+  if (space !== undefined && space !== null) fields.push(spaceLine(space.key));
+  if (message.outside === true) fields.push("outside");
+  if (message.subject !== undefined) fields.push(subjectLine(message.subject));
+  return fields.join("\n");
 }
 
 /** The message, signed by `signer` with the PKCS#8 key behind its pinned certificate. */

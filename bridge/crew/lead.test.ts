@@ -13,6 +13,8 @@ import {
   incompatibleBackoffMs,
   INCOMPATIBLE_BACKOFF_MS,
   MAX_CONTACT_RESETS,
+  SESSION_TOPOLOGY_DEMAND_MS,
+  SESSION_TOPOLOGY_MAX_AGE_MS,
   STALE_DIAL_LOG_REPEAT_MS,
   CrewLead,
   type PeerMemory,
@@ -240,13 +242,13 @@ describe("CrewLead — a peer's sessions never vanish (§10.2)", () => {
 
 describe("CrewLead, the host name on the merged servers rows (M77 spec 01)", () => {
   test("the lead's row states its own host, read on every merge; a member's row states the one it reported", async () => {
-    let own: string | null = "bluefin";
+    let own: string | null = "lodge";
     const h = lead([member({ memberId: "laptop" })], () => ok(body), { selfHost: () => own });
     await h.lead.sweep();
-    h.registry.recordStatus("laptop", { mux: "herdr-core", panes: 2, host: "minibuch" });
+    h.registry.recordStatus("laptop", { mux: "herdr-core", panes: 2, host: "workshop" });
     const rows = h.lead.merge(localBody(), NARROW_PLAN).servers!;
-    expect(rows.find((r) => r.id === "desk")!.host).toBe("bluefin");
-    expect(rows.find((r) => r.id === "laptop")!.host).toBe("minibuch");
+    expect(rows.find((r) => r.id === "desk")!.host).toBe("lodge");
+    expect(rows.find((r) => r.id === "laptop")!.host).toBe("workshop");
     own = null;
     expect("host" in h.lead.merge(localBody(), NARROW_PLAN).servers![0]!).toBe(false);
     // An answer that carries no host clears the banked one: a name true a sweep ago is not kept.
@@ -1092,6 +1094,67 @@ describe("CrewLead — the crew's launcher rows reach the deputy as a copy", () 
   });
 });
 
+// ── The tricks copy to the deputy (§25) ─────────────────────────────────────
+
+describe("CrewLead — the tricks copy reaches the deputy only (§25)", () => {
+  function carrying(opts: { deputy?: string | null; answer?: () => "done" | "idle" | "no_route" | "failed" }) {
+    const calls: string[] = [];
+    const lines: string[] = [];
+    const members = [member({ memberId: "laptop" }), member({ memberId: "nas" })];
+    const state = { reachable: true };
+    const l = new CrewLead({
+      log: (line) => void lines.push(line),
+      registry: new CrewRegistry({ sessions: { get: () => undefined }, self: "desk", members: () => members }),
+      snapshot: async () => (state.reachable ? ok(body) : down),
+      proxy: neverProxy,
+      self: { id: "desk", name: "the herd" },
+      maxUploadBytes: DEFAULT_MAX_UPLOAD_BYTES,
+      now: () => NOW,
+      carry: [
+        {
+          name: "copy of the tricks",
+          deputy: () => (opts.deputy === undefined ? "laptop" : opts.deputy),
+          sync: async (link) => {
+            calls.push(link.memberId);
+            return opts.answer?.() ?? "done";
+          },
+        },
+      ],
+    });
+    const sweep = async () => {
+      await l.sweep();
+      await Bun.sleep(5);
+    };
+    return { sweep, calls, lines, drop: () => void (state.reachable = false), restore: () => void (state.reachable = true) };
+  }
+
+  test("each sweep offers the deputy, and only the deputy, its sync", async () => {
+    const h = carrying({});
+    await h.sweep();
+    await h.sweep();
+    expect(h.calls).toEqual(["laptop", "laptop"]);
+  });
+
+  test("a crew with no deputy offers nobody", async () => {
+    const h = carrying({ deputy: null });
+    await h.sweep();
+    expect(h.calls).toEqual([]);
+  });
+
+  test("an OLD deputy is said once in the journal, and not asked again until it reconnects", async () => {
+    const h = carrying({ answer: () => "no_route" });
+    await h.sweep();
+    await h.sweep();
+    expect(h.calls).toHaveLength(1);
+    expect(h.lines.filter((l) => l.includes("keeps no copy of the tricks (an older Collie)"))).toHaveLength(1);
+    h.drop();
+    await h.sweep();
+    h.restore();
+    await h.sweep();
+    expect(h.calls).toHaveLength(2);
+  });
+});
+
 // ── §19 — the member's own update preflight, banked by the sweep ─────────────
 
 describe("CrewLead — each member's update preflight (§19)", () => {
@@ -1377,7 +1440,7 @@ describe("the schedule reads the live run, and the fold runs on every tick", () 
     // Now the run's open leg overrides the ladder, so the three dials land on three consecutive
     // sweeps rather than across twelve and a half minutes, and the run ends on the third.
     const turns = new UpdateTurns(() => {});
-    const h = lead([member({ memberId: "minibuch" })], () => skewed, { turns });
+    const h = lead([member({ memberId: "workshop" })], () => skewed, { turns });
     turns.begin("r-live", "1.4.1");
     for (let i = 0; i < TURN_MISSED_SWEEPS; i += 1) {
       await h.lead.sweep();
@@ -1451,7 +1514,7 @@ describe("the schedule reads the live run, and the fold runs on every tick", () 
 describe("a peer that speaks to us is due", () => {
   /** A lead whose one member has climbed to the top of the incompatible ladder. */
   async function backedOff() {
-    const h = lead([member({ memberId: "minibuch" })], () => skewed);
+    const h = lead([member({ memberId: "workshop" })], () => skewed);
     for (let i = 0; i < INCOMPATIBLE_BACKOFF_MS.length; i += 1) {
       if (i > 0) h.advance(incompatibleBackoffMs(i));
       await h.lead.sweep();
@@ -1473,20 +1536,20 @@ describe("a peer that speaks to us is due", () => {
   });
 
   test("the last good body survives a reset — a schedule change is never a knowledge change", async () => {
-    const h = lead([member({ memberId: "minibuch" })], (_l, call) => (call === 1 ? ok(body) : skewed));
+    const h = lead([member({ memberId: "workshop" })], (_l, call) => (call === 1 ? ok(body) : skewed));
     await h.lead.sweep(); // banks the body
     h.advance(incompatibleBackoffMs(1));
     await h.lead.sweep(); // incompatible, so the ladder starts
     const banked = h.lead.contributions()[0]?.body;
     expect(banked?.sessions).toEqual(body.sessions);
-    h.lead.noteAdmittedContact("minibuch");
+    h.lead.noteAdmittedContact("workshop");
     // §10.2: a peer's sessions never vanish. The reset moved the SCHEDULE and nothing else.
     expect(h.lead.contributions()[0]?.body).toEqual(banked);
   });
 
   test("contact marks the member due, and the NEXT sweep does the dial — the seam dials nothing", async () => {
     const h = await backedOff();
-    h.lead.noteAdmittedContact("minibuch");
+    h.lead.noteAdmittedContact("workshop");
     // Nothing was dialled by the call itself. One dialler, and it is the sweep.
     expect(h.calls.length).toBe(h.dials);
     await h.lead.sweep();
@@ -1502,16 +1565,16 @@ describe("a peer that speaks to us is due", () => {
 
   test("a second contact inside the floor is ignored", async () => {
     const h = await backedOff();
-    h.lead.noteAdmittedContact("minibuch");
+    h.lead.noteAdmittedContact("workshop");
     await h.lead.sweep(); // spends the reset: the answer is incompatible again, so the ladder returns
     const dials = h.calls.length;
     h.advance(CONTACT_RESET_FLOOR_MS - 1);
-    h.lead.noteAdmittedContact("minibuch");
+    h.lead.noteAdmittedContact("workshop");
     await h.lead.sweep();
     expect(h.calls.length).toBe(dials);
     // One millisecond past the floor, the same contact is honoured.
     h.advance(1);
-    h.lead.noteAdmittedContact("minibuch");
+    h.lead.noteAdmittedContact("workshop");
     await h.lead.sweep();
     expect(h.calls.length).toBe(dials + 1);
   });
@@ -1519,7 +1582,7 @@ describe("a peer that speaks to us is due", () => {
   test("a peer that can reach us and cannot serve us runs out of resets, and the ladder stands", async () => {
     const h = await backedOff();
     for (let i = 0; i < MAX_CONTACT_RESETS + 2; i += 1) {
-      h.lead.noteAdmittedContact("minibuch");
+      h.lead.noteAdmittedContact("workshop");
       await h.lead.sweep();
       h.advance(CONTACT_RESET_FLOOR_MS);
     }
@@ -1529,16 +1592,16 @@ describe("a peer that speaks to us is due", () => {
 
   test("one ok answer clears the counter, so a recovered peer starts from a full allowance", async () => {
     let healthy = false;
-    const h = lead([member({ memberId: "minibuch" })], () => (healthy ? ok(body) : skewed));
+    const h = lead([member({ memberId: "workshop" })], () => (healthy ? ok(body) : skewed));
     await h.lead.sweep();
     for (let i = 0; i < MAX_CONTACT_RESETS; i += 1) {
       h.advance(CONTACT_RESET_FLOOR_MS);
-      h.lead.noteAdmittedContact("minibuch");
+      h.lead.noteAdmittedContact("workshop");
       await h.lead.sweep();
     }
     const spent = h.calls.length;
     h.advance(CONTACT_RESET_FLOOR_MS);
-    h.lead.noteAdmittedContact("minibuch");
+    h.lead.noteAdmittedContact("workshop");
     await h.lead.sweep();
     expect(h.calls.length).toBe(spent); // exhausted
 
@@ -1551,14 +1614,14 @@ describe("a peer that speaks to us is due", () => {
     await h.lead.sweep(); // back on the ladder, from step one
     const after = h.calls.length;
     h.advance(CONTACT_RESET_FLOOR_MS);
-    h.lead.noteAdmittedContact("minibuch");
+    h.lead.noteAdmittedContact("workshop");
     await h.lead.sweep();
     expect(h.calls.length).toBe(after + 1);
   });
 
   test("a genuine version skew returns to the ladder on the very next verdict", async () => {
     const h = await backedOff();
-    h.lead.noteAdmittedContact("minibuch");
+    h.lead.noteAdmittedContact("workshop");
     await h.lead.sweep();
     const dials = h.calls.length;
     // The peer answered with the same foreign version, so the ladder is right about it again.
@@ -2024,5 +2087,224 @@ describe("CrewLead — every dial asks for every session, and the merge narrows 
     expect(h.lead.merge(localBody(), NARROW_PLAN).agents.map((p) => p.paneId)).toEqual(["w1:p1"]);
     const wide = h.lead.merge(localBody(), snapshotPlan("laptop", { session: undefined, widen: true }));
     expect(wide.agents.map((p) => p.paneId)).toEqual(["w1:p1"]);
+  });
+});
+
+// ── Issue 785: a member's non-primary session brings its own spaces and tabs ──
+// The sweep's widened body holds every session's panes but the PRIMARY session's spaces and tabs only,
+// so the lead fetches a watched non-primary session's own lists beside the member's dial.
+
+describe("CrewLead — a member's non-primary session shows its own spaces and tabs (issue 785)", () => {
+  const space = (workspaceId: string, label: string) => ({ workspaceId, number: 1, label, focused: false, agents: 1 });
+  const tab = (tabId: string, workspaceId: string, label: string) => ({ tabId, workspaceId, number: 1, label, focused: false });
+  const pane = (paneId: string, session: string, workspaceLabel: string) => ({
+    ...body.agents[0]!,
+    paneId,
+    workspaceId: "w1",
+    workspaceLabel,
+    tabId: "w1:t1",
+    session,
+  });
+
+  /** A member running `default` (primary) and `personal`. Space and tab ids collide, as in Herdr. */
+  const sessions = [
+    { name: "default", isPrimary: true, reachable: true, agents: 1, working: 0, blocked: 0 },
+    { name: "personal", isPrimary: false, reachable: true, agents: 1, working: 0, blocked: 0 },
+  ];
+  const widened = {
+    sessions,
+    agents: [pane("w1:p1", "default", "Work"), pane("w1:p1", "personal", "Personal")],
+    shellPanes: [],
+    workspaces: [space("w1", "Work")],
+    tabs: [tab("w1:t1", "w1", "work tab")],
+  };
+  const personal = {
+    sessions,
+    agents: [{ ...body.agents[0]!, workspaceLabel: "Personal" }],
+    shellPanes: [],
+    workspaces: [space("w1", "Personal")],
+    tabs: [tab("w1:t1", "w1", "personal tab")],
+  };
+  const personalPlan = snapshotPlan("laptop", { session: "personal", widen: false });
+
+  function leadOver(opts: {
+    sweepBody?: () => PeerSnapshotWire;
+    topology?: (view: SnapshotView) => PeerOutcome<unknown> | Promise<PeerOutcome<unknown>>;
+  } = {}) {
+    const views: SnapshotView[] = [];
+    const journal: string[] = [];
+    let clock = NOW;
+    const members = [member({ memberId: "laptop" })];
+    const l = new CrewLead({
+      log: (line) => journal.push(line),
+      registry: new CrewRegistry({ sessions: { get: () => undefined }, self: "desk", members: () => members }),
+      snapshot: async (_link, view) => {
+        views.push(view);
+        if (view.widen) return ok(opts.sweepBody?.() ?? widened, clock);
+        return opts.topology === undefined ? ok(personal, clock) : opts.topology(view);
+      },
+      proxy: neverProxy,
+      self: { id: "desk", name: "the herd" },
+      maxUploadBytes: DEFAULT_MAX_UPLOAD_BYTES,
+      now: () => clock,
+    });
+    return {
+      lead: l,
+      views,
+      journal,
+      advance: (ms: number) => {
+        clock += ms;
+      },
+    };
+  }
+
+  const memberSpaces = (merged: SnapshotResponse) =>
+    merged.workspaces.filter((w) => w.host === "laptop").map((w) => w.label);
+  const memberTabs = (merged: SnapshotResponse) => merged.tabs.filter((t) => t.host === "laptop").map((t) => t.label);
+
+  test("the primary session selected shows the primary's spaces and tabs, with no extra dial", async () => {
+    const h = leadOver();
+    await h.lead.sweep();
+    for (const plan of [NARROW_PLAN, snapshotPlan("laptop", { session: "default", widen: false })]) {
+      const merged = h.lead.merge(localBody(), plan);
+      expect(memberSpaces(merged)).toEqual(["Work"]);
+      expect(memberTabs(merged)).toEqual(["work tab"]);
+    }
+    await h.lead.sweep();
+    expect(h.views).toEqual([SWEEP_VIEW, SWEEP_VIEW]);
+  });
+
+  test("the non-primary session selected shows its own spaces and tabs from the next sweep on", async () => {
+    const h = leadOver();
+    await h.lead.sweep();
+    // The first poll after the switch is served the old way: the lead never dials inside a poll.
+    const first = h.lead.merge(localBody(), personalPlan);
+    expect(memberSpaces(first)).toEqual(["Work"]);
+    expect(first.agents.map((p) => p.workspaceLabel)).toEqual(["Personal"]);
+    await h.lead.sweep();
+    expect(h.views).toEqual([SWEEP_VIEW, SWEEP_VIEW, { session: "personal", widen: false }]);
+    const merged = h.lead.merge(localBody(), personalPlan);
+    expect(memberSpaces(merged)).toEqual(["Personal"]);
+    expect(memberTabs(merged)).toEqual(["personal tab"]);
+    expect(merged.agents.map((p) => [p.paneId, p.workspaceLabel, p.host])).toEqual([["w1:p1", "Personal", "laptop"]]);
+    // A request about the primary still gets the primary's lists, from the same cache.
+    expect(memberSpaces(h.lead.merge(localBody(), NARROW_PLAN))).toEqual(["Work"]);
+  });
+
+  test("the widened view of the non-primary session takes that session's lists too", async () => {
+    // The member's own `/api/snapshot` rule: the named session decides `workspaces` and `tabs`.
+    const h = leadOver();
+    await h.lead.sweep();
+    h.lead.merge(localBody(), snapshotPlan("laptop", { session: "personal", widen: true }));
+    await h.lead.sweep();
+    const merged = h.lead.merge(localBody(), snapshotPlan("laptop", { session: "personal", widen: true }));
+    expect(memberSpaces(merged)).toEqual(["Personal"]);
+    expect(merged.agents).toHaveLength(2);
+  });
+
+  test("a member with one session makes no extra dial, whatever the phone names", async () => {
+    const h = leadOver({ sweepBody: () => ({ ...widened, sessions: [sessions[0]!], agents: [widened.agents[0]!] }) });
+    await h.lead.sweep();
+    h.lead.merge(localBody(), snapshotPlan("laptop", { session: "default", widen: false }));
+    // A name the member never published is never dialled either: only its own registry makes a session.
+    h.lead.merge(localBody(), snapshotPlan("laptop", { session: "personal", widen: false }));
+    h.lead.merge(localBody(), snapshotPlan("laptop", { session: "../x", widen: false }));
+    await h.lead.sweep();
+    expect(h.views).toEqual([SWEEP_VIEW, SWEEP_VIEW]);
+  });
+
+  test("a failed fetch falls back to today's body, with one journal line per change", async () => {
+    const h = leadOver({ topology: () => down });
+    await h.lead.sweep();
+    h.lead.merge(localBody(), personalPlan);
+    await h.lead.sweep();
+    await h.lead.sweep();
+    const merged = h.lead.merge(localBody(), personalPlan);
+    // Never empty and never an error: the primary's lists, as before the fix, and the panes intact.
+    expect(memberSpaces(merged)).toEqual(["Work"]);
+    expect(merged.agents.map((p) => p.workspaceLabel)).toEqual(["Personal"]);
+    expect(h.lead.contributions()[0]!.state.health).toBe("reachable");
+    const lines = h.journal.filter((l) => l.includes('session "personal"'));
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain("timed out");
+  });
+
+  test("a failed re-fetch keeps the last good lists, and the journal says when it answers again", async () => {
+    let fail = false;
+    const h = leadOver({ topology: () => (fail ? down : ok(personal)) });
+    await h.lead.sweep();
+    h.lead.merge(localBody(), personalPlan);
+    await h.lead.sweep();
+    fail = true;
+    h.advance(1500);
+    h.lead.merge(localBody(), personalPlan);
+    await h.lead.sweep();
+    expect(memberSpaces(h.lead.merge(localBody(), personalPlan))).toEqual(["Personal"]);
+    fail = false;
+    await h.lead.sweep();
+    expect(h.journal.filter((l) => l.includes('session "personal"'))).toEqual([
+      expect.stringContaining("could not fetch"),
+      expect.stringContaining("answer again"),
+    ]);
+  });
+
+  test("the topology dial runs beside the member's own dial, so the sweep still ends within one budget", async () => {
+    // Both start together, each bounded by the client's per-call budget, so a slow one adds no round trip.
+    let release: () => void = () => {};
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const h = leadOver({
+      topology: async () => {
+        await gate;
+        return down;
+      },
+    });
+    await h.lead.sweep();
+    h.lead.merge(localBody(), personalPlan);
+    const sweeping = h.lead.sweep();
+    await Promise.resolve();
+    await Promise.resolve();
+    // Both dials of this member are already out before either answered.
+    expect(h.views).toEqual([SWEEP_VIEW, SWEEP_VIEW, { session: "personal", widen: false }]);
+    release();
+    await sweeping;
+    expect(memberSpaces(h.lead.merge(localBody(), personalPlan))).toEqual(["Work"]);
+  });
+
+  test("the cache honours its age, and the sweep stops dialling a session nobody looks at", async () => {
+    const h = leadOver();
+    await h.lead.sweep();
+    h.lead.merge(localBody(), personalPlan);
+    await h.lead.sweep();
+    expect(memberSpaces(h.lead.merge(localBody(), personalPlan))).toEqual(["Personal"]);
+    const dialsAfterLook = h.views.length;
+    // The phone left. Past the demand window the sweep dials the member's own view only.
+    h.advance(SESSION_TOPOLOGY_DEMAND_MS + 1);
+    await h.lead.sweep();
+    expect(h.views.slice(dialsAfterLook)).toEqual([SWEEP_VIEW]);
+    // A phone back within the age still gets the session's lists on its first poll.
+    expect(memberSpaces(h.lead.merge(localBody(), personalPlan))).toEqual(["Personal"]);
+    // Past the age it gets today's body again until the next sweep fetches the lists anew.
+    h.advance(SESSION_TOPOLOGY_MAX_AGE_MS + 1);
+    expect(memberSpaces(h.lead.merge(localBody(), personalPlan))).toEqual(["Work"]);
+    await h.lead.sweep();
+    expect(memberSpaces(h.lead.merge(localBody(), personalPlan))).toEqual(["Personal"]);
+  });
+
+  test("a session the member stops publishing is dropped, not dialled into a 404", async () => {
+    let answer: PeerSnapshotWire = widened;
+    const h = leadOver({ sweepBody: () => answer });
+    await h.lead.sweep();
+    h.lead.merge(localBody(), personalPlan);
+    await h.lead.sweep();
+    expect(h.views.filter((v) => !v.widen)).toHaveLength(1);
+    // `personal` closed on the member: its next answer lists `default` alone.
+    answer = { ...widened, sessions: [sessions[0]!], agents: [widened.agents[0]!] };
+    await h.lead.sweep();
+    expect(h.views.filter((v) => !v.widen)).toHaveLength(2);
+    await h.lead.sweep();
+    expect(h.views.filter((v) => !v.widen)).toHaveLength(2);
+    expect(memberSpaces(h.lead.merge(localBody(), personalPlan))).toEqual(["Work"]);
   });
 });

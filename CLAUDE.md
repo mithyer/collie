@@ -17,11 +17,13 @@ decisions [`.adr/`](./.adr/) · adding a harness
 [`.adr/`](./.adr/) holds the decisions whose reasoning would otherwise live only in a PR thread —
 specifically the ones that **close off an option someone will reasonably propose again**. If you're
 about to argue *why not* rather than *how*, check there first; if the answer isn't there and the
-decision is that shape, add one (numbering + format: [`.adr/README.md`](./.adr/README.md)).
+decision is that shape, add one (numbering, format and the topic map: [`.adr/README.md`](./.adr/README.md)).
 
 Rules elsewhere in this file stay short and normative and link to the ADR for the argument. Don't
-restate an ADR's reasoning here, and don't edit a superseded ADR into agreement with the present —
-mark it superseded and write the next one.
+restate an ADR's reasoning here, and never edit an ADR into agreement with the present: write the
+next one, and the superseded ADR becomes a stub (its file and number stay, its body stays in git
+history) that points at the live rule. `bun scripts/check-adr.ts` holds the record rules, and
+`bun run test` runs it.
 
 ## Versioning — MANDATORY
 
@@ -30,7 +32,9 @@ Collie is **SemVer**ed, and the version is **enforced**, so it never silently dr
 **The version lives in three files that must always agree, plus a matching CHANGELOG entry:**
 `herdr-plugin.toml` (canonical — Herdr reads it) · `package.json` · `web/package.json` ·
 newest *numbered* `## [x.y.z]` heading in `CHANGELOG.md`. `## [Unreleased]` is not numbered and is
-not part of that agreement.
+not part of that agreement. The Collie mod for Claude Code carries the same plain version in
+`inside/claude/.claude-plugin/plugin.json` (never an `-edge.N`): `scripts/check-version.sh` holds it,
+and the release commit bumps it with the three.
 
 **Two kinds of commit. A functional commit records; only the release commit bumps.** Never bump a
 version because you fixed something; the version moves once, when the release is cut.
@@ -48,6 +52,14 @@ answers where one exists (`Thanks @handle (#147).`), and with **no commit hash**
 exist yet, and the release commit adds it. The lead is what the GitHub Release page prints, so
 write it as the sentence an operator reads there. Do not touch the three version files.
 
+**Write every bullet for a person who has not read the code.** Crisp and short, but with context:
+the bold lead says the result a person sees, and the detail says in one or two sentences why it
+matters to them. A new concept gets one plain sentence of what it is and why a person would want it
+the first time it appears (what a trick is, before any bullet that uses the word), and later bullets
+build on it. Never a bare term the reader has not met, never a file, function, wire field, test or
+milestone name. (Altan, 2026-11-18, after the 1.29.0 section shipped at about 410 lines and opened
+with "a trick can let a session's own agent draw one screen", before it said what a trick is.)
+
 **A release needs something to ship.** Before you cut one, read `git log --oneline <last tag>..HEAD`.
 If the range holds only docs, tests and chores, do not release: the docs go out with the next real
 release or on the docs line (below), and the site's docs sync follows either. A docs-only release makes every self-updating lane
@@ -61,7 +73,12 @@ release. 1.14.2 was cut this way on 2026-09-28.
    - **PATCH** (`0.2.0 → 0.2.1`): nothing to learn. Bug fixes, internal refactors, and small
      additions that build on an existing verb or screen and change nothing about how you already
      use Collie: a QR printed beside the pairing code, an extra column in `devices list`, a new
-     flag with a safe default. The phone folds a patch-only delta into its weekly update digest
+     flag with a safe default. **A PATCH also carries additions to a feature that is still
+     experimental**: one that is off until switched on in Settings, Experiments, or that its docs
+     mark as an experiment, such as tricks and the Hill. A new place, part, manifest key or right
+     for such a feature is a patch, and `docs/tricks.md` already tells trick authors that tricks
+     may change in a patch release (Altan, 2026-11-18). A fix still must not break a trick that
+     works today without saying so in the changelog. The phone folds a patch-only delta into its weekly update digest
      (`DIGEST_PATCH_WINDOW_MS` in `bridge/update.ts`); the in-app band shows it at once.
 
      **An urgent patch keeps the daily cadence.** A patch the operator must take today, data loss, a
@@ -84,7 +101,8 @@ release. 1.14.2 was cut this way on 2026-09-28.
 
    - **MINOR** (`0.2.0 → 0.3.0`): something to learn, or worth hearing about today. A new verb,
      a new page, a new crew capability, a changed default, anything that earns its own section
-     in `docs/`. The phone nudges within a day.
+     in `docs/`. An experimental feature becomes a minor when it leaves Experiments, or when an
+     addition to it changes a surface that is not experimental. The phone nudges within a day.
    - **MAJOR** (`0.2.0 → 1.0.0`): the operator must change something. A config key renamed or
      removed, a contract broken, a workflow that used to work and now does not.
 
@@ -96,6 +114,20 @@ release. 1.14.2 was cut this way on 2026-09-28.
    line's short commit hash** in the link format
    `([abc1234](https://github.com/AltanS/collie/commit/abc1234))`. Clean up the section: merge
    or reorder lines as needed, and delete entries for changes reverted before release.
+
+   **Then rewrite the section for its reader, not for its history.** The Unreleased list is a log in
+   landing order; the release section is a summary. Write it for a person on the previous Stable
+   release: a fix or a reshape of something only an Edge build had folds into that feature's bullet,
+   because a Stable reader never saw the broken state. Merge related bullets into one per feature,
+   put a feature's intro bullet before its details, and lead each group with what matters most to
+   operators. A minor release lands at about 25 to 35 bullets, a patch at a handful. The style rule
+   above holds for every bullet.
+3b. **Show the operator a preview of the release notes, and wait for a yes.** Build the release page
+   body from the new section with `scripts/release-notes.ts` (the same code `release.yml` runs),
+   render it together with the section, serve it where the operator can open it on the phone, and
+   give the URL. The tag waits for the operator's explicit yes to the text. A green CI, a review or
+   a counsel verdict is not that yes. Text fixes go into the release commit, and the preview is
+   built again.
 4. **Re-create an empty `## [Unreleased]` heading above it.**
 5. **Bump `flake.lock` if it is to move at all** — in this commit and no other. The input is
    pinned by revision, so a bump is two edits: the `rev` in `flake.nix`, then `nix flake lock` to
@@ -125,7 +157,7 @@ release. 1.14.2 was cut this way on 2026-09-28.
    set: `bunx playwright test -c e2e/rig/playwright.config.ts` (*Browser tests*; the prerequisites are
    in `web/e2e/rig/README.md`). It starts a scratch bridge and Herdr with real Claude Code, pi and omp,
    and takes about 5 minutes. Then run the crew leg, `bunx playwright test -c e2e/rig/crew.config.ts`:
-   a lead and a member, about 4 minutes. All forty-one cases (thirty-four solo, seven on the crew leg)
+   a lead and a member, about 4 minutes. All forty-eight cases (thirty-nine solo, nine on the crew leg)
    must pass on the first tap. A failed case holds the tag, and so does a case that was not reached.
 
    **Every tag, a patch tag too, also runs the legs on herdr-core** (M79, replay, no model turn on
@@ -223,11 +255,11 @@ push until the release is out.
 
 **The GitHub Release page is built, not written.** `release.yml` runs
 `scripts/release-notes.ts` over `CHANGELOG.md` and hands the result to `gh release create`. The
-order on the page is the reader's, not the file's: **`## Update` first and unfolded**, because a
-phone arrives here from the in-app banner to copy one command and must not have to open anything
-to see it; then `## What changed`, the bold lead of every bullet in that version's section, one
+page opens with `## What changed`, the bold lead of every bullet in that version's section, one
 line each, under its group's name; then a link to the section itself for the commits and a compare
-link; then the by-hand verify recipe, the one block that sits in a `<details>`.
+link; then the by-hand verify recipe, the one block that sits in a `<details>`. It carries no update
+commands (Altan, 2026-11-18): `docs/upgrading.md` keeps them, and the in-app update band shows its
+own. An Edge build's page opens with one line that says it is an Edge build.
 
 The compare link's other end is a **real tag, asked of git** (`git describe --tags` on the tagged
 commit's parent), never derived from a CHANGELOG heading: betas 33 to 41 have headings and no tags,
@@ -312,7 +344,7 @@ page to be skimmed.
   a branch. One predicate (`git symbolic-ref -q HEAD`) picks the strategy, and the same predicate
   stops `update` re-linking a managed checkout — a re-link re-registers the plugin as local and Herdr
   then refuses `herdr plugin install`, the operator's only other way to refresh
-  ([ADR 0006](./.adr/0006-update-advances-the-checkout-herdr-installed.md)).
+  ([ADR 0143](./.adr/0143-how-an-install-updates-and-what-a-release-offers-it.md)).
 - **Frontend changes** (`web/`): rebuild with `bun run build` (root) or `cd web && bun run build`.
   The bridge serves `web/dist` **from disk at request time**, so on the deployment host
   a rebuild is **immediately live — no restart**.
@@ -403,7 +435,7 @@ component, not a spec. On 2026-10-17 the specs that did not pass that test moved
   `web/e2e/`: `smoke.spec.ts`, the layout and engine cases (`belt`, `changes`, `pane-glide`,
   `theme-first-paint`, `update-screen` and the rest), and `web/e2e/service-worker.spec.ts`, which
   builds two bundles under `web/e2e/.builds/` to prove an old shell picks up a new one. The
-  playground has no browser target any more: its card handles are tested in
+  design reference has no browser target any more: its card handles are tested in
   `web/src/playground/app.test.tsx`.
 - **Tier 2** runs by hand, from the workspace root: `make e2e`. It drives the dev lane's lead,
   instance `next` on port 8788, reads only, and never restarts or rebuilds anything. Its cases live
@@ -420,7 +452,7 @@ component, not a spec. On 2026-10-17 the specs that did not pass that test moved
   crew leg** (`-c e2e/rig/crew.config.ts`): the same phone against a lead and a member, for the walky
   talky cases that need a crew. It is **the gate before
   every release tag**, and **the proof for a change to a harness reader, the Surface, the Send
-  Protocol or the ask code**: run it on the branch, and all forty-one cases (thirty-four solo, seven
+  Protocol or the ask code**: run it on the branch, and all forty-eight cases (thirty-nine solo, nine
   on the crew leg) pass on the first tap. Every tag also runs the solo leg on herdr-core
   (`make browser-leg DIR=... MUX=herdr-core`) and the crew leg with its member on the core
   (`make browser-leg-crew DIR=... MUX=herdr,herdr-core`), and a change to a harness reader, the Surface,
@@ -435,7 +467,7 @@ case never invents its own payload.
 
 **The selector rule.** A case addresses a role and an accessible name, `getByRole` or `getByText`,
 never a CSS class. No case adds a `data-testid` anywhere in `web/src`. The one exception is the
-playground: every card carries an explicit `data-state` handle, set by a `state` prop on `Card`
+design reference: every card carries an explicit `data-state` handle, set by a `state` prop on `Card`
 (`web/src/playground/layout.tsx`), never derived from its label.
 
 **The locale rule.** A case that checks translated text pins the locale before the first
@@ -519,12 +551,33 @@ lint guard, the crew-wire guard or the `flake.lock` guard.
 - **Before adding any recurring visual pattern, check `web/src/components/ui/` for the
   primitive; if none exists, the primitive comes first, in its own commit.** A pattern built at
   a call site first is one that never gets promoted — the alert family cost six components that way.
-- **Check UI states in the playground** (`web/src/playground/`, `cd web && bun run playground`,
-  README → "The states playground") before changing a banner, the mark, the boot splash, the idle
-  lock, or the crew page — it renders every state at once. Never import playground code from app
-  code.
-  A card's label is a number and at most five words. Explanation goes in the report to Altan, not
-  on the page. `reach` and `note` are optional and hidden by default (the page's Notes switch).
+- **Check UI states in the design reference** (`web/design.html`, code in `web/src/playground/`,
+  `cd web && bun run design`, README → "The design reference") before changing a banner, the mark,
+  the boot splash, the idle lock, or the crew page. It renders every state at once, and its search
+  field finds an entry by title, id or keyword. Never import its code from app code. The old address
+  `playground.html` forwards to it; the folder keeps the name `playground/` because the website
+  imports `@/playground/harness` and `@/playground/fixtures` by name.
+- **The design reference holds only final states:** what the product ships, or what Altan approved.
+  One entry per state, no option rounds, no "today" beside a proposal, no measuring or explainer
+  pages. When a feature changes, its entry changes in the same branch; when it is gone, the entry
+  goes too.
+  - **Add an entry:** one row in `ENTRIES` (`web/src/playground/registry.tsx`) with an `id` (flat
+    kebab-case, its address `design.html#<id>`), a `title`, a `group` (the product area), and
+    `keywords`: the component names it
+    mounts and the words a person types to find it ("walky", "worktree", "permission"). Then a file
+    under `web/src/playground/sections/` exporting `DEF` (same id and title) and the section.
+    `registry.test.ts` fails on a missing id, a repeated id or no keywords.
+  - A card's label is a number and at most five words. Explanation goes in the report to Altan, not
+    on the page. `reach` and `note` are optional and hidden by default (the page's Notes switch).
+  - Links: `design.html#<id>` opens an entry, `#<id>/<card-handle>` scrolls to a card,
+    `?q=<words>` carries a search. Both survive a cold load.
+- **A pick round is a proposal, never a design reference entry.** When Altan picks between
+  options, the feature branch declares the round: a file `web/src/pick/rounds/<id>.tsx` (default
+  export a `PickRoundDef` from `web/src/pick/types.ts`: a title, numbered options of at most five
+  words, the cases) and one line in `web/src/pick/rounds.ts`; `rounds.test.ts` holds the contract.
+  The page that draws it (one case switch, phone frames, the Pick controls) is the maintainers'
+  design app, outside this repo. After the pick, the chosen state becomes a design reference entry
+  and the round's file and its line are deleted before the branch merges.
 - Data flows through **React Router** (`createBrowserRouter`, data mode): route **loaders**
   (`web/src/lib/loaders.ts`) fetch the snapshot + pane; **polling is `useRevalidator()` on an
   adaptive interval** (`web/src/hooks/use-polling.ts`); mutations are direct `lib/api.ts` calls
@@ -534,7 +587,7 @@ lint guard, the crew-wire guard or the `flake.lock` guard.
   `/pane/:paneId/history`, `/pane/:paneId/zoom` (the zoomed output, a child of the pane route,
   so the pane stays mounted under it), `/pane/:paneId/changes` and `/space/:spaceId/changes` (both matched as
   `changes/*`, so the commit view `…/changes/commit` and a folder or file of the tree `…/changes/files`
-  share the screen's route; the tree's root is `…/changes` itself, ADR 0083). The router
+  share the screen's route; the tree's root is `…/changes` itself, ADR 0150). The router
   instance is module-scoped so it keeps its location.
 - **Back goes up one level.** Navigate through `useNav()` (`web/src/hooks/use-nav.ts`): down is a
   push that records `from`, sideways is a replace, up steps back onto a legitimate parent or
@@ -584,7 +637,7 @@ lint guard, the crew-wire guard or the `flake.lock` guard.
   its `[[font]]` rows put extra UI typefaces UNDER the shipped three in the Settings picker, and the
   bridge serves the files read-only from `<config-dir>/fonts` at `GET /api/fonts/<basename>`. Same
   reader, same mtime liveness; the opposite posture, because a font cannot fire an action and so
-  shadows nothing ([ADR 0033](./.adr/0033-the-app-face-is-a-device-preference.md)). Don't dilute
+  shadows nothing ([ADR 0148](./.adr/0148-a-theme-names-words-never-drawings-and-the-device-choice-wins.md)). Don't dilute
   ADR 0018's replace-law to cover it.
 - **`launchers.toml` is the operator's fifth file, and the only one whose rows CREATE a pane** — its
   rows are the allowlist `POST /api/launch` matches exactly, so the client names a row and never
@@ -593,20 +646,20 @@ lint guard, the crew-wire guard or the `flake.lock` guard.
   supply a command line. The New page may also name an agent by id (`harness`), which the bridge
   maps to ONE binary word in `bridge/harness-launch.ts` and reports per machine on `/api/launchers`;
   a launch with a `requestId` replays from `launch-receipts.json` instead of opening a second pane
-  ([ADR 0091](./.adr/0091-launch-by-id-with-a-request-id.md)).
+  ([ADR 0145](./.adr/0145-a-start-names-what-to-run-and-a-retry-lands-on-its-receipt.md)).
   In a crew the lead's merged rows are the crew's: a launch of a lead row on a member carries the row
   over the crew link, accepted only when `caller.via === "crew"`, never from a phone-direct body, and
   a member's own row wins the same `command`; adds are answered on the lead and the deputy keeps a
-  read-only copy ([ADR 0127](./.adr/0127-the-leads-launcher-rows-are-the-crews-rows.md)).
+  read-only copy ([ADR 0145](./.adr/0145-a-start-names-what-to-run-and-a-retry-lands-on-its-receipt.md)).
   Rows a phone adds live in `<stateDir>/launchers-added.json` under the operator's `[phone]` switches,
   never in `launchers.toml`; they are merged into the allowlist at read time, the operator's row wins
   a duplicate line, a recipe row is rebuilt from `bridge/launcher-recipes.ts` and a free line is
   re-checked at every read. The bridge never writes `launchers.toml`, and a revoke takes the device's
-  rows with it ([ADR 0094](./.adr/0094-launchers-added-from-a-phone.md)).
+  rows with it ([ADR 0145](./.adr/0145-a-start-names-what-to-run-and-a-retry-lands-on-its-receipt.md)).
   The one exception to "never a command line" is a one-off `run`: a paired device, the operator's
   `[phone] run` switch and the same character rule, typed as a row is, never on a new branch, and
   recorded in `<stateDir>/commands-recent.json`, never as a row; its audit line keeps the command word
-  and the length, not the line ([ADR 0095](./.adr/0095-one-off-commands-and-their-history.md)).
+  and the length, not the line ([ADR 0145](./.adr/0145-a-start-names-what-to-run-and-a-retry-lands-on-its-receipt.md)).
 - **Every user-facing string goes through `t()`/`tn()` from `@/lib/i18n`**, and a component that
   calls them subscribes via `useLocale()` so it re-renders on a locale (or lazy-dictionary) change.
   `messages/en.ts` is the source of truth; all twelve dictionary files change together, enforced by
@@ -624,7 +677,7 @@ lint guard, the crew-wire guard or the `flake.lock` guard.
   `web/public/theme-init.js` and stored in `collie:design:v1` (`web/src/lib/design.ts`). CSS owns
   every stack; JavaScript only swaps a class name. What survives the reversal is the other half of
   the rule: **the chosen face never dresses agent-authored text** — `font-mono` and `font-content`
-  are untouched by it ([ADR 0033](./.adr/0033-the-app-face-is-a-device-preference.md)).
+  are untouched by it ([ADR 0148](./.adr/0148-a-theme-names-words-never-drawings-and-the-device-choice-wins.md)).
 - **The bundled Nerd Font subsets stay lazy and out of the precache** — `unicode-range` per face,
   version in the filename, cached first-use by `sw.ts`. Don't add them to `globPatterns`, don't
   widen a range, don't move subsetting into the build; the reasoning for each sits at the line that
@@ -708,7 +761,7 @@ lint guard, the crew-wire guard or the `flake.lock` guard.
   `input-box-frame.test.ts` pin both halves.
 - **The Herdr socket is never dialled across a machine boundary, and no Herdr vocabulary crosses a
   crew link** — the lead consumes a peer's Collie API, never its Herdr socket
-  ([ADR 0011](./.adr/0011-the-pack-protocol-is-the-mux-driver-seam.md)).
+  ([ADR 0144](./.adr/0144-one-lead-one-door-and-the-operator-moves-the-crown.md)).
 - **How soon Collie sees an out-of-band change is DECLARED (`topologyLatency`), never measured**, and
   `refresh()` is on the floor of the port so the phone can ask for a look now
   ([ADR 0031](./.adr/0031-freshness-is-a-declared-promise.md)). Every mutating route refreshes before
@@ -721,28 +774,28 @@ registered in `registry.ts`). Two other things touch the filesystem, and neither
 the rule below: `stt.json` in the state dir when the operator ran `collie stt setup`
 ([ADR 0029](./.adr/0029-speech-to-text-is-a-provider-seam-collie-owns.md)), and the operator's own
 font files under `<config-dir>/fonts`, served read-only through `bridge/operator-fonts.ts`
-([ADR 0033](./.adr/0033-the-app-face-is-a-device-preference.md)).
+([ADR 0148](./.adr/0148-a-theme-names-words-never-drawings-and-the-device-choice-wins.md)).
 
 **The law is that a CLIENT-SUPPLIED value becomes a path in four places only: the journal, the
 Changes view, the Files view, and a branch's folder** — in the journal it is a pane id, never a path.
 A branch's folder (`bridge/worktree-folder.ts`,
-[ADR 0093](./.adr/0093-a-branch-folder-is-named-by-its-parent.md)) is a PARENT the phone names and a
+[ADR 0145](./.adr/0145-a-start-names-what-to-run-and-a-retry-lands-on-its-receipt.md)) is a PARENT the phone names and a
 child the bridge names after the branch; `resolveParentTarget` refuses a `..` as sent, a link below
 home, a folder outside home, in a dotdir or in the repo, and a child that exists, and it runs at plan
-and again at create. Don't call Herdr's `worktree.create` with a `path` that did not just pass it. The Changes view
-(`bridge/changes.ts`, [ADR 0065](./.adr/0065-the-changes-view-reads-git-read-only.md)) is bounded by
+and again at create. The bridge runs `git worktree add` itself since ADR 0126 and no Herdr `worktree.create` runs, so never give git a `path` that did not just pass it. The Changes view
+(`bridge/changes.ts`, [ADR 0150](./.adr/0150-files-and-changes-read-under-a-root-the-bridge-picks.md)) is bounded by
 a listed-paths rule: a diff is served only for a repo the bridge's own discovery returned and a path
 git listed there, and an untracked read goes through `containedRealpath` too. Its git runs are
 hardened against repo-driven code execution (fsmonitor, external diff, textconv, filter drivers);
 don't drop a `-c` there without reading the module header. The Files view (`bridge/files-view.ts`,
-[ADR 0083](./.adr/0083-the-files-view-reads-the-changes-root.md)) is bounded by the Changes root: the
+[ADR 0150](./.adr/0150-files-and-changes-read-under-a-root-the-bridge-picks.md)) is bounded by the Changes root: the
 root comes off the snapshot, never the request, and its real path must pass the same bound; the
 client's path is relative, refused on its shape before any disk call, and its real path must sit
 inside the root's through `containedRealpath`; `.git` and the bridge's state and config folders are
 denied on top. The New page's folder browser (`bridge/folder-browse.ts`, #467) is the same place
 with home as the root: folder names only, the same shape check, containment, deny list, refusal and
 gate, and no new rule. It needs an authorised device (`device-read`), and its bytes go out as JSON, never as
-a document, with one exception: `files/image` ([ADR 0090](./.adr/0090-files-shows-images.md)) sends a
+a document, with one exception: `files/image` ([ADR 0150](./.adr/0150-files-and-changes-read-under-a-root-the-bridge-picks.md)) sends a
 picture's raw bytes, typed by `sniffImageType` from the bytes alone (PNG, JPEG, GIF, WebP, AVIF; no
 SVG), with `no-store` and a `default-src 'none'; sandbox` CSP, through the same `readFile` checks. `GET /api/fonts/<basename>` does not become a fourth such place: the request's name is **looked up** in the rows the operator's own
 `theme.toml` declared and that row's path is taken, so a name nobody declared is refused before any path exists. The containment
@@ -772,6 +825,15 @@ exemption is granted by POSITION — the peer check sits after the federated dis
 its own `COLLIE_STANDBY_HOST` and neither gate reaches it; don't route it through the front door's
 `fetch` to share them.
 
+**A harness part never calls a model and never reads a secret** (M99, [ADR 0140](./.adr/0140-a-part-inside-the-agent-dials-the-bridge.md)).
+The code `collie harness link <harness>` puts inside an agent (`inside/claude/`, later the pi, omp and opencode
+parts) dials the bridge's inside socket and does three things only: it submits the person's own words,
+answers what the person tapped, and reports turns. It names no model API (`$.model` in a Claude mod),
+spawns no process (`$.process`), writes no file, and reads no key, token, credential or `.env` (its
+environment reads are the pane marker variables, `HOME` and `XDG_STATE_HOME`). The guard
+(`inside/claude/guard.spec.ts`) fails the build on the model, the process and a file write; the
+secret rule is held in review. A part that needs any of those is a new ADR, not a patch.
+
 **The bridge makes four outbound calls of its own, and spawns no child for content unless
 `stt.json` names a speech provider.** The four calls are the update check, the Whistle
 model download: one file, fetched on a write device's tap or `collie stt whistle`, from a pinned
@@ -786,7 +848,7 @@ only), fetched on a write device's tap only, never forwarded, refused past 1 MB 
 passes it, and stored under `<stateDir>/themes` (M59 spec 06; the page itself keeps
 `connect-src 'self'`, ADR 0106). A `durable` peer configured with `COLLIE_DURABLE_URL` makes a fifth, to the program's URL the
 operator set, with the bearer token from `COLLIE_DURABLE_TOKEN`, and it is declined by setting
-nothing ([ADR 0103](./.adr/0103-the-wire-has-two-transports-a-private-socket-or-tls-with-a-token.md)). Speech-to-text (`bridge/stt/`, CLI
+nothing ([ADR 0146](./.adr/0146-a-durable-agent-is-a-session-with-no-screen-that-acts-by-id.md)). Speech-to-text (`bridge/stt/`, CLI
 `cli/stt.ts`) is a registered provider seam, absent until `stt.json` names a provider. Then it may
 hold a provider credential at 0600, open an operator-configured outbound path carrying microphone
 audio, on `codex` spawn a `codex app-server` child, and on `local-cli` spawn the operator's named
@@ -808,7 +870,7 @@ bearer credential the device holds, and is always on, reads included
 ([ADR 0086](./.adr/0086-reads-need-the-pairing-token.md)). Every `/api/*` route except `/api/health`
 and `/api/pair` needs a valid token, and an empty registry answers `403 device not paired`. The
 header gate still covers writes only, with one exception: the Files view asks for both as a
-`device-read` ([ADR 0083](./.adr/0083-the-files-view-reads-the-changes-root.md)). Neither applies to `/crew/v1/*`, which has its own two factors. The reasoning sits in
+`device-read` ([ADR 0150](./.adr/0150-files-and-changes-read-under-a-root-the-bridge-picks.md)). Neither applies to `/crew/v1/*`, which has its own two factors. The reasoning sits in
 `bridge/pairing.ts`'s header; don't collapse the two gates into one.
 
 **Collie manages exactly one front door: `tailscale serve`** — the CLI (`cli/serve.ts`) publishes it,
@@ -822,22 +884,24 @@ door** — [ADR 0001](./.adr/0001-one-managed-front-door.md).
 — two factors gate it (pinned mutual TLS + crew secret), and a peer publishes no front door
 ([ADR 0013](./.adr/0013-a-peer-listens-without-becoming-a-front-door.md)); the one exception is the
 **deputy's standby door** — bound, never published, armed by silence and spent by the operator's
-pairing credential ([ADR 0027](./.adr/0027-the-deputy-is-named-ahead-of-time.md) ·
-[ADR 0028](./.adr/0028-the-standby-door-is-a-second-listener.md)).
+pairing credential ([ADR 0144](./.adr/0144-one-lead-one-door-and-the-operator-moves-the-crown.md)).
 
 **Touching the crew wire surface forces a protocol decision** — a commit staging one of the
 wire-shape files in `bridge/crew/` must also stage `CREW_PROTOCOL.md` (additive-optional, §7.1) or
 bump `CREW_PROTOCOL_VERSION` (not expressible that way). `scripts/check-crew-wire.sh` is guard C of
 the pre-commit hook; a pure refactor takes the `SKIP_CREW_WIRE_CHECK=1` hatch
-([ADR 0025](./.adr/0025-the-wire-guard-forces-a-decision-never-a-bump.md)).
+(the header of the script holds the reasoning).
 
 **Code reaches a peer over the operator's own SSH, never over the crew link** — `crew add` installs
 it and `crew update` levels it, both pushing the lead's own commit as a `git bundle` from a checkout
 lead, while a lead with no commit sends Collie's own installer over the same ssh and the member
 installs the lead's release tag; the link
 carries runtime data and never becomes a distribution channel
-([ADR 0016](./.adr/0016-updates-ride-the-operators-ssh.md), addendum 2026-09-04: a peer may also
+([ADR 0144](./.adr/0144-one-lead-one-door-and-the-operator-moves-the-crown.md), and the update rules
+in [ADR 0143](./.adr/0143-how-an-install-updates-and-what-a-release-offers-it.md): a peer may also
 level ITSELF to the release its lead is running, fetching that public tag from GitHub over anonymous
-HTTPS on its own decision, which adds no code, route or verb to the link). How the operator
+HTTPS on its own decision, which adds no code, route or verb to the link; trick
+code may cross the link only as inert data, held and never run until a person taps on the machine that
+will run it, and a remote command on a member stays refused). How the operator
 reached a member is remembered locally in `crew-ops.json`, which is never a wire field and never merged into the trust
 store.

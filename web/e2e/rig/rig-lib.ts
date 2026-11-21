@@ -4,7 +4,7 @@
 //
 // ISOLATION, IN ONE PLACE.
 //   - Everything lives under STATE_ROOT, on disk (`~/.cache/collie-lab/browser-leg-state`). Not /tmp:
-//     bluefin's /tmp is tmpfs, and an out-of-memory crash wiped a /tmp lab on 2026-10-12.
+//     lodge's /tmp is tmpfs, and an out-of-memory crash wiped a /tmp lab on 2026-10-12.
 //   - Herdr: its own server under its own XDG_CONFIG_HOME. Every herdr call below goes through
 //     `herdrEnv()`, which drops every inherited HERDR_* name (the operator's agent session sets
 //     HERDR_SOCKET_PATH and HERDR_PANE_ID) and points XDG_CONFIG_HOME at the rig's home. The operator's
@@ -28,9 +28,9 @@ import { createConnection } from "node:net";
 import { homedir } from "node:os";
 import { basename, join, resolve } from "node:path";
 
-import { asJsonObject, asJsonString, parseJson, type JsonObject } from "../../src/lib/json";
+import { asJsonNumber, asJsonObject, asJsonString, parseJson, type JsonObject } from "../../src/lib/json";
 import type { TierPlans } from "./replay/tier";
-import { CORE_RIG_LABEL, coreRunArgs, coreSocketIn, rigMuxFrom, type RigMux } from "./rig-mux";
+import { CORE_LAYOUT_DOC, CORE_RIG_LABEL, coreRunArgs, coreSocketIn, coreSpaceLabels, coreUnnamedSpaceIds, layoutWithSpace, rigMuxFrom, type CoreSpaceIds, type RigMux } from "./rig-mux";
 import { XDG_HOME_NAME, shortXdgHome } from "./sock-path";
 
 /** True for the crew rig (lead and member); the solo rig otherwise. */
@@ -122,6 +122,20 @@ export function machineDirs(machine: Machine): MachineDirs {
 export const RIG_MUX = rigMuxFrom(process.env.COLLIE_RIG_MUX);
 export const muxOf = (machine: Machine): RigMux => RIG_MUX[machine];
 
+/**
+ * The SECOND bridge of a solo rig (`rig.ts up --second-bridge`, the chaos leg's case C3): a second
+ * `bun bridge/index.ts` on the lead's own Herdr socket, with a state, config and HOME of its own, its
+ * own port and its own paired device. A release lane and a dev lane on one machine are the same shape.
+ */
+export const SECOND = {
+  root: join(RIG, "second"),
+  state: join(RIG, "second", "state"),
+  config: join(RIG, "second", "config"),
+  bridgeHome: join(RIG, "second", "bridge-home"),
+  homeCfg: join(RIG, "second", "config", "home-config.toml"),
+  token: join(RIG, "second", "token"),
+} as const;
+
 /** The member's half of a crew rig: its port, its Herdr socket and the pids the daemon started. */
 export interface MemberRun {
   readonly port: number;
@@ -144,6 +158,8 @@ export interface Run {
   readonly scope?: string | null;
   /** The cgroup `up` ran in (a path under /sys/fs/cgroup), the owner the daemon watches; null when none was recorded. */
   readonly ownerCgroup?: string | null;
+  /** Set on a rig started with `up --second-bridge` only: the second bridge's port and pid. */
+  second?: { readonly port: number; bridgePid: number | null };
   /** Set on a crew rig only: the member, and the ids both sides enrolled under. */
   member?: MemberRun;
   leadId?: string;
@@ -201,6 +217,15 @@ export function writeRun(run: Run): void {
 
 export function readToken(): string {
   return readFileSync(P.token, "utf8").trim();
+}
+
+/** The second bridge's device token (SECOND.token), or null when this rig has no second bridge. */
+export function readSecondToken(): string | null {
+  try {
+    return readFileSync(SECOND.token, "utf8").trim();
+  } catch {
+    return null;
+  }
 }
 
 export const sleep = (ms: number): Promise<void> => new Promise((done) => setTimeout(done, ms));
@@ -316,13 +341,117 @@ export function herdrJson(args: readonly string[], machine: Machine = "lead"): J
   return asJsonObject(doc.result) ?? {};
 }
 
-/** A new workspace in a machine's Herdr with one shell pane; returns the pane id. */
-export function newWorkspacePane(cwd: string, label: string, machine: Machine = "lead"): string {
-  if (muxOf(machine) === "herdr-core") return coreNewTerminal(cwd, label, [], machine);
+/** One new Herdr workspace with a shell pane: the pane's id and its workspace's. */
+interface HerdrWorkspace {
+  readonly paneId: string;
+  readonly workspaceId: string;
+}
+
+function herdrWorkspace(cwd: string, label: string, machine: Machine): HerdrWorkspace {
   const ws = herdrJson(["workspace", "create", "--cwd", cwd, "--label", label, "--no-focus"], machine);
   const paneId = asJsonString(asJsonObject(ws.root_pane)?.pane_id) ?? null;
   if (paneId === null) throw new Error("herdr gave no pane id");
-  return paneId;
+  // The workspace's own id: Herdr names a pane `<workspace id>:<pane>`.
+  const workspaceId = asJsonString(asJsonObject(ws.workspace)?.workspace_id) ?? asJsonString(asJsonObject(ws.root_pane)?.workspace_id) ?? paneId.split(":")[0] ?? "";
+  if (workspaceId === "") throw new Error(`herdr gave no workspace id for ${paneId}`);
+  return { paneId, workspaceId };
+}
+
+/** A new workspace in a machine's Herdr with one shell pane; returns the pane id. */
+export function newWorkspacePane(cwd: string, label: string, machine: Machine = "lead"): string {
+  if (muxOf(machine) === "herdr-core") return coreNewTerminal(cwd, label, [], machine);
+  return herdrWorkspace(cwd, label, machine).paneId;
+}
+
+// ── spaces (M98 spec 06) ─────────────────────────────────────────────────────────────────────────
+//
+// A walky talky message of an agent stays in its space, so the rig must say which space each pane of
+// an agent is in, the same way on every multiplexer. The space is the multiplexer's own grouping, and
+// walky talky knows a NAMED space by its name alone, on every machine (bridge/walky/space.ts). Two
+// ways a rig pane gets one, both through the rig's own start (`startInPane`), never in a spec:
+//
+//   Herdr        a workspace labelled with the name. Two workspaces with one name are one space.
+//                A space with no name of its own: the workspace is renamed to its own id, which the
+//                adapter reads as "no name" (bridge/mux/herdr/adapter.ts `spaceNamed`).
+//   herdr-core   herdr-app's layout document names the space and the terminal carries the
+//                `herdr.space` and `herdr.tab` labels (rig-mux.ts). A terminal in a space that no
+//                document names is unnamed.
+
+/** The space a rig pane is placed in: a name (the same name is one space, on both machines too), or null for a space with no name of its own. */
+export type RigSpace = string | null;
+
+/** The space every harness pane of the rig is in unless a case says another: so the panes of one case are in one space, whichever machine they run on. */
+export const RIG_SPACE = "collie-rig-space";
+
+/** A second named space, for a pane that must be outside RIG_SPACE. */
+export const OTHER_SPACE = "collie-rig-other-space";
+
+/**
+ * One plain-mode JSON-RPC call to a machine's scratch core, as the bridge's own client makes it
+ * (bridge/mux/herdr-core/client.ts): one connection, one line, one answer. Throws on an error answer,
+ * with the core's `kind` in the message, and when the machine has no core socket (never starts a core).
+ */
+async function coreRpc(machine: Machine, method: string, params: JsonObject, ms = 10_000): Promise<JsonObject> {
+  if (!coreRunning(machine)) throw new Error(`herdr-core ${method}: no scratch core on the ${machine}`);
+  const conn = createConnection({ path: coreDirs(machine).socket });
+  conn.on("error", () => undefined);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const late = new Promise<null>((done) => {
+    timer = setTimeout(() => done(null), ms);
+  });
+  const answered = (async (): Promise<string | null> => {
+    const connected = await once(conn, "connect").then(
+      () => true,
+      () => false,
+    );
+    if (!connected) return null;
+    conn.setEncoding("utf8");
+    conn.write(`${JSON.stringify({ jsonrpc: "2.0", id: 1, method, params })}\n`);
+    let text = "";
+    for await (const chunk of conn) {
+      text += String(chunk);
+      const at = text.indexOf("\n");
+      if (at >= 0) return text.slice(0, at);
+    }
+    return null;
+  })();
+  const raw = await Promise.race([answered, late]);
+  clearTimeout(timer);
+  conn.destroy();
+  const doc = raw === null ? undefined : asJsonObject(parseJson(raw));
+  if (doc === undefined) throw new Error(`herdr-core ${method}: no answer in ${String(ms / 1000)} s`);
+  const failure = asJsonObject(doc.error);
+  if (failure !== undefined) throw new Error(`herdr-core ${method}: ${asJsonString(asJsonObject(failure.data)?.kind) ?? "error"}: ${asJsonString(failure.message) ?? ""}`);
+  return asJsonObject(doc.result) ?? {};
+}
+
+/**
+ * The labels that put a terminal of this machine's core in `space`. A named space is written into the
+ * layout document first, unless the document names it already (the write is compare-and-set: a core
+ * that moved the version under us answers `conflict`, and the read-modify-write runs again).
+ */
+async function coreSpaceLabelsFor(machine: Machine, space: RigSpace): Promise<Record<string, string>> {
+  if (space === null) return coreSpaceLabels(coreUnnamedSpaceIds(`${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`));
+  let ids: CoreSpaceIds | null = null;
+  for (let attempt = 0; ids === null && attempt < 5; attempt++) {
+    const doc = await coreRpc(machine, "doc.get", { name: CORE_LAYOUT_DOC });
+    const next = layoutWithSpace(doc.value, space);
+    if (!next.changed) {
+      ids = next.ids;
+      continue;
+    }
+    let written = false;
+    try {
+      await coreRpc(machine, "doc.set", { name: CORE_LAYOUT_DOC, value: next.value, version: asJsonNumber(doc.version) ?? 0 });
+      written = true;
+    } catch (err) {
+      // A core that moved the version under us answers `conflict`: read the document again.
+      if (!(err instanceof Error) || !err.message.includes("conflict")) throw err;
+    }
+    if (written) ids = next.ids;
+  }
+  if (ids === null) throw new Error(`herdr-core: the layout document on the ${machine} would not take the space ${space}`);
+  return coreSpaceLabels(ids);
 }
 
 /** Close a rig pane, and with it the harness in it. False when Herdr refused: the pane is already gone, or never was. */
@@ -331,21 +460,101 @@ export function paneClose(paneId: string, machine: Machine = "lead"): boolean {
   return herdr(["pane", "close", paneId], { machine }).code === 0;
 }
 
+/**
+ * The pane list of the machine's Herdr, as { pane id, tab id } rows. The tab id is what a split shares
+ * with the pane it was cut from.
+ */
+function herdrPaneTabs(machine: Machine): { readonly paneId: string; readonly tabId: string }[] {
+  const panes = herdrJson(["pane", "list"], machine).panes;
+  const out: { readonly paneId: string; readonly tabId: string }[] = [];
+  for (const p of Array.isArray(panes) ? panes : []) {
+    const pane = asJsonObject(p);
+    const paneId = asJsonString(pane?.pane_id);
+    if (paneId !== undefined) out.push({ paneId, tabId: asJsonString(pane?.tab_id) ?? "" });
+  }
+  return out;
+}
+
+/** What {@link resizeDuring} did around the work it was given. */
+export interface ResizeRun<T> {
+  readonly result: T;
+  /** The `pane.resize` calls Herdr answered while the work ran. */
+  readonly resizes: number;
+  /** How many of them moved the split's ratio (`changed`, HERDR_API.md "pane.resize"). */
+  readonly moved: number;
+}
+
+/** One resize step: a small ratio, so the pane stays wider than the longest line a chaos case sends (about 30 cells). */
+const RESIZE_STEP = 0.05;
+/** The pause between two resize steps, in ms. */
+const RESIZE_EVERY_MS = 120;
+
+/**
+ * Run `during` while the pane is resized (the chaos leg's case C4). A rig pane fills its tab, and Herdr's
+ * `pane.resize` moves only a split (HERDR_API.md, "A pane that fills its tab cannot be resized"), so this
+ * first cuts a split beside the pane (`herdr pane split --direction right --no-focus`), then moves the
+ * split's edge left and right in small steps (the same step back, so the pane ends as wide as it began)
+ * until `during` has settled, and closes the split. Every step reaches the pane's program as a SIGWINCH.
+ * The split is closed even when `during` throws.
+ *
+ * Herdr only: the core has no split call the rig knows. Throws on a machine that runs the core.
+ */
+export async function resizeDuring<T>(paneId: string, during: () => Promise<T>, machine: Machine = "lead"): Promise<ResizeRun<T>> {
+  if (muxOf(machine) === "herdr-core") throw new Error("resizeDuring needs the Herdr mux: the rig knows no split call on the core");
+  const before = herdrPaneTabs(machine);
+  const tabId = before.find((row) => row.paneId === paneId)?.tabId;
+  if (tabId === undefined) throw new Error(`resizeDuring: Herdr does not list pane ${paneId}`);
+  const split = herdr(["pane", "split", "--pane", paneId, "--direction", "right", "--no-focus"], { machine });
+  if (split.code !== 0) throw new Error(`herdr pane split: ${(split.err || split.out).trim()}`);
+  const known = new Set(before.map((row) => row.paneId));
+  const beside = herdrPaneTabs(machine).find((row) => row.tabId === tabId && !known.has(row.paneId));
+  if (beside === undefined) throw new Error(`resizeDuring: the split beside ${paneId} is not in Herdr's pane list`);
+  const state = { settled: false };
+  let resizes = 0;
+  let moved = 0;
+  const step = (direction: "left" | "right"): void => {
+    const done = herdr(["pane", "resize", "--pane", beside.paneId, "--direction", direction, "--amount", String(RESIZE_STEP)], { machine });
+    if (done.code !== 0) return;
+    resizes += 1;
+    if (asJsonObject(asJsonObject(asJsonObject(parseJson(done.out))?.result)?.resize)?.changed === true) moved += 1;
+  };
+  try {
+    const running = during().finally(() => {
+      state.settled = true;
+    });
+    // A failure of `during` is awaited below; this branch only keeps it from being reported as unhandled meanwhile.
+    running.catch(() => undefined);
+    // Both directions at least once, even when `during` is quicker than one step.
+    step("left");
+    await sleep(RESIZE_EVERY_MS);
+    step("right");
+    while (!state.settled) {
+      await sleep(RESIZE_EVERY_MS);
+      step("left");
+      await sleep(RESIZE_EVERY_MS);
+      step("right");
+    }
+    return { result: await running, resizes, moved };
+  } finally {
+    paneClose(beside.paneId, machine);
+  }
+}
+
 /** The label of the view workspace the daemon opens first (rig.ts startHerdr): the pane its attached client shows. */
 export const VIEW_LABEL = "rig-view";
 
 /** One open pane of a machine's rig, as `rig.ts pane ls` and the pane cap see it. */
 export interface OpenPane {
   readonly paneId: string;
-  /** The label of the pane's workspace: `rig-<time in base 36>` from `pane` and `start`, `leg-<harness>` from the leg. */
+  /** The label of the pane's workspace: `rig-<time in base 36>` from `pane`, the pane's space name (RIG_SPACE, OTHER_SPACE) from a harness start, which a space without a name gives a `leg-<harness>` label before it is renamed to its id. */
   readonly label: string;
   readonly cwd: string;
 }
 
 /**
- * The panes open in a machine's Herdr, less the view pane. `newWorkspacePane` gives every pane its own
- * workspace, and only the view workspace carries VIEW_LABEL, so the view pane is told apart by its
- * workspace's label, not by its id.
+ * The panes open in a machine's Herdr, less the view pane. Every pane has a workspace of its own
+ * (harness panes share a workspace NAME, which is their space), and only the view workspace carries
+ * VIEW_LABEL, so the view pane is told apart by its workspace's label, not by its id.
  */
 export function openPanes(machine: Machine = "lead"): OpenPane[] {
   if (muxOf(machine) === "herdr-core") return coreOpenPanes(machine);
@@ -399,10 +608,17 @@ export function paneRun(paneId: string, line: string, machine: Machine = "lead")
  * line typed in (the rig as it always was). herdr-core: a terminal whose program is `sh -c <line>`,
  * started over the API (`hc run --bg`), with no shell beneath; the start script carries every setting
  * the harness needs, because a program started over the API gets the core's environment, not the caller's.
+ *
+ * `space` is the pane's walky talky space ({@link RigSpace}); every pane is in {@link RIG_SPACE} unless
+ * the caller says another, so agents of different harnesses and machines can message each other as
+ * the cases always had them do. `label` names the pane's workspace for a person reading `pane ls` only
+ * where the space has no name to give it.
  */
-export async function startInPane(cwd: string, label: string, line: string, machine: Machine = "lead"): Promise<string> {
-  if (muxOf(machine) === "herdr-core") return coreNewTerminal(cwd, label, ["sh", "-c", line], machine);
-  const paneId = newWorkspacePane(cwd, label, machine);
+export async function startInPane(cwd: string, label: string, line: string, machine: Machine = "lead", space: RigSpace = RIG_SPACE): Promise<string> {
+  if (muxOf(machine) === "herdr-core") return coreNewTerminal(cwd, label, ["sh", "-c", line], machine, await coreSpaceLabelsFor(machine, space));
+  const { paneId, workspaceId } = herdrWorkspace(cwd, space ?? label, machine);
+  // A workspace labelled with its own id is a workspace with no name of its own (the Herdr adapter's `spaceNamed`).
+  if (space === null && herdr(["workspace", "rename", workspaceId, workspaceId], { machine }).code !== 0) throw new Error(`herdr would not rename workspace ${workspaceId}`);
   await sleep(800); // the shell's prompt first
   paneRun(paneId, line, machine);
   return paneId;
@@ -465,8 +681,8 @@ function hcJson(args: readonly string[], machine: Machine): JsonObject {
 }
 
 /** A new terminal on the machine's core, in `cwd`, running `argv` (none: the machine's own shell); its address. */
-function coreNewTerminal(cwd: string, label: string, argv: readonly string[], machine: Machine): string {
-  const doc = hcJson(coreRunArgs(cwd, label, argv), machine);
+function coreNewTerminal(cwd: string, label: string, argv: readonly string[], machine: Machine, labels: Readonly<Record<string, string>> = {}): string {
+  const doc = hcJson(coreRunArgs(cwd, label, argv, labels), machine);
   const address = asJsonString(doc.address);
   if (address === undefined) throw new Error("hc run gave no address");
   return address;

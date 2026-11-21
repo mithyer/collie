@@ -2,6 +2,7 @@ import { Fragment, useState, type ReactNode } from "react";
 import { Icon } from "@/components/icons/icon";
 
 import { cn } from "@/lib/utils";
+import { SQUARE_36_TAP_TARGET } from "@/components/ui/tap-target";
 import { useMuxCapability } from "@/lib/mux-capability";
 import { SectionHeader } from "@/components/section-header";
 import { LIST_ROW_CORNERS, ListGroup } from "@/components/ui/list-group";
@@ -15,6 +16,7 @@ import {
   spaceWorktreeContext,
   type WorktreeContext,
 } from "@/lib/spaces";
+import { CrossfadeText } from "@/components/ui/crossfade-text";
 import { spaceKey } from "@/lib/hosts";
 import { TRIAGE_STATUS } from "@/lib/triage";
 import { timeAgo } from "@/lib/format";
@@ -132,7 +134,10 @@ export function SpaceOverview({
                 disabled={creatingSpace}
                 aria-label={t("space.overview.new.aria")}
                 aria-busy={creatingSpace}
-                className="flex size-9 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-muted hover:text-foreground active:scale-95 disabled:opacity-100"
+                className={cn(
+                  "flex size-9 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-muted hover:text-foreground active:scale-95 disabled:opacity-100",
+                  SQUARE_36_TAP_TARGET,
+                )}
               >
                 {creatingSpace ? (
                   <Icon name="busy" className="size-4 animate-spin" aria-hidden />
@@ -248,12 +253,16 @@ export function SpaceOverview({
                       <span className="size-2.5 shrink-0 rounded-full border border-muted-foreground/40" />
                     )}
                     {context === null ? (
-                      <span className="min-w-0 flex-1 truncate font-medium">{w.label}</span>
+                      <span className="min-w-0 flex-1 truncate font-medium">
+                        <CrossfadeText text={w.label} identity={key} />
+                      </span>
                     ) : (
                       // A worktree's label is its folder, the branch slug. The second line says what
                       // it is a checkout of; every other space keeps its one line, unchanged.
                       <span className="flex min-w-0 flex-1 flex-col">
-                        <span className="truncate font-medium">{w.label}</span>
+                        <span className="truncate font-medium">
+                          <CrossfadeText text={w.label} identity={key} />
+                        </span>
                         <WorktreeLine context={context} />
                       </span>
                     )}

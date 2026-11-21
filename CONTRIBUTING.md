@@ -47,6 +47,18 @@ unmodified. The release version depends on other merged changes, so maintainers 
 collisions between competing PRs. Use `SKIP_VERSION_CHECK=1` locally. If you want a specific
 CHANGELOG entry, include it in the PR description.
 
+### Renaming something
+
+A rename depends on the surface. A **wire** field (a JSON key a cached browser bundle reads) is never
+renamed for vocabulary: add the new name, keep the old one for one MINOR release, remove it in the
+next, with a CHANGELOG note. An **operator-visible** name (`COLLIE_*` keys, action ids in
+`herdr-plugin.toml`, the unit name, CLI verbs) is frozen: a rename is MAJOR. Action ids carry a second
+freeze, because Herdr before 0.8.0 caches the action set at install. **Cosmetic** text (action titles,
+in-app strings) is free to reword. **Free** surfaces (directories, internal type names, doc prose, test
+names) are renamed when their file changes for another reason. A rename lands as one change with its
+own CHANGELOG entry, never inside feature work, and never as a repo-wide mechanical sed. An alias
+exists only for a frozen surface, and it ships with a stated removal release.
+
 ## Working on the UI
 
 Read [`DESIGN.md`](./DESIGN.md) before writing code. Check `web/src/components/ui/` for an existing
@@ -54,10 +66,10 @@ primitive before you build a new one, and extract a component as soon as two pla
 visual pattern. `DESIGN.md` also documents the layout stability constraints, radius and border
 tokens, and the Tailwind v4 issues that cause regressions.
 
-Check UI states in the playground (`web/src/playground/`, `cd web && bun run playground`) before
-changing a banner, the mark, the boot splash, the idle lock, or the crew page. Every card there
-carries a `data-state` handle, so a browser case can address it directly instead of matching its
-prose label.
+Check UI states in the design reference (`web/design.html`, `cd web && bun run design`) before
+changing a banner, the mark, the boot splash, the idle lock, or the crew page. Its search field finds
+an entry by title, id or keyword. Every card there carries a `data-state` handle, so a browser case
+can address it directly instead of matching its prose label.
 
 To add an icon set that a theme can name, follow
 [Add an icon set to Collie](./docs/themes.md#add-an-icon-set-to-collie): one pull request that maps

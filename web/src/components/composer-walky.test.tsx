@@ -209,12 +209,12 @@ describe("a reply handed in by the Messages sheet", () => {
     const user = userEvent.setup();
     const plain = watchPlainSends();
     const handle = renderComposer();
-    act(() => handle.current?.startMessage({ to: "bluefin/w6:p3", replyTo: "wt_k3f9x2m8q1a0", label: "collie-workspace#fix-465" }));
+    act(() => handle.current?.startMessage({ to: "lodge/w6:p3", replyTo: "wt_k3f9x2m8q1a0", label: "collie-workspace#fix-465" }));
     expect(await screen.findByText("Reply to collie-workspace#fix-465")).toBeInTheDocument();
     await user.type(screen.getByRole("textbox"), "Merge it");
     await user.click(screen.getByRole("button", { name: "Send" }));
     await waitFor(() => expect(recordedWalkyPosts()).toHaveLength(1));
-    expect(recordedWalkyPosts()[0]).toMatchObject({ to: "bluefin/w6:p3", body: "Merge it", replyTo: "wt_k3f9x2m8q1a0" });
+    expect(recordedWalkyPosts()[0]).toMatchObject({ to: "lodge/w6:p3", body: "Merge it", replyTo: "wt_k3f9x2m8q1a0" });
     expect(plain).toEqual([]);
     // The reply went, so the target is spent and the next Send is the ordinary one.
     await waitFor(() => expect(screen.queryByText("Reply to collie-workspace#fix-465")).toBeNull());
@@ -223,17 +223,17 @@ describe("a reply handed in by the Messages sheet", () => {
   it("keeps the token of the sender's address, and does not put the pane's own instance on a reply", async () => {
     const user = userEvent.setup();
     const handle = renderComposer(createRef<ComposerHandle>(), { instance: "zz99" });
-    act(() => handle.current?.startMessage({ to: "bluefin/w6:p3#k3f9", replyTo: "wt_k3f9x2m8q1a0", label: "peer" }));
+    act(() => handle.current?.startMessage({ to: "lodge/w6:p3#k3f9", replyTo: "wt_k3f9x2m8q1a0", label: "peer" }));
     await user.type(await screen.findByRole("textbox"), "Merge it");
     await user.click(screen.getByRole("button", { name: "Send" }));
     await waitFor(() => expect(recordedWalkyPosts()).toHaveLength(1));
-    expect(recordedWalkyPosts()[0]).toMatchObject({ to: "bluefin/w6:p3#k3f9", replyTo: "wt_k3f9x2m8q1a0" });
+    expect(recordedWalkyPosts()[0]).toMatchObject({ to: "lodge/w6:p3#k3f9", replyTo: "wt_k3f9x2m8q1a0" });
   });
 
   it("turns back into a plain reply when the strip is dismissed", async () => {
     const user = userEvent.setup();
     const handle = renderComposer();
-    act(() => handle.current?.startMessage({ to: "bluefin/w6:p3", replyTo: "wt_k3f9x2m8q1a0", label: "peer" }));
+    act(() => handle.current?.startMessage({ to: "lodge/w6:p3", replyTo: "wt_k3f9x2m8q1a0", label: "peer" }));
     await user.click(await screen.findByRole("button", { name: "Send as a plain reply again" }));
     await waitFor(() => expect(screen.queryByText("Reply to peer")).toBeNull());
   });
@@ -263,7 +263,7 @@ describe("the held mark (M62 spec 03)", () => {
     receipt: { ...heldForThisPane.receipt, id: "wt_he1de1sewhe", target: "local/w2:p1" },
   };
 
-  function renderWithRows(rows: readonly WalkyRow[], onOpenMessages: (() => void) | undefined) {
+  function renderWithRows(rows: readonly WalkyRow[], onOpenMessages: (() => void) | undefined, extra: Partial<ComponentProps<typeof Composer>> = {}) {
     const props: ComponentProps<typeof Composer> = {
       paneId: "w1:p1",
       agent: "claude",
@@ -278,6 +278,7 @@ describe("the held mark (M62 spec 03)", () => {
       display: { open: false, onToggle: vi.fn() },
       onSent: vi.fn(),
       onOpenMessages,
+      ...extra,
     };
     const router = createMemoryRouter([
       {
@@ -296,22 +297,59 @@ describe("the held mark (M62 spec 03)", () => {
     const user = userEvent.setup();
     const onOpenMessages = vi.fn();
     renderWithRows([heldForThisPane, heldElsewhere], onOpenMessages);
-    const mark = await screen.findByText("1 message waits for the box to clear");
+    const mark = await screen.findByText("1 message waits while you type");
     expect(mark).toBeInTheDocument();
-    await user.click(screen.getByRole("button", { name: "1 message waits for the box to clear" }));
+    await user.click(screen.getByRole("button", { name: "1 message waits while you type" }));
     expect(onOpenMessages).toHaveBeenCalledOnce();
+  });
+
+  it("waits for the grace: a message that began to wait a moment ago draws no mark, and the mark knows the reason", () => {
+    const recent: WalkyRow = { ...heldForThisPane, receipt: { ...heldForThisPane.receipt, at: Date.now() - 2_000 } };
+    renderWithRows([recent], vi.fn());
+    expect(screen.queryByText(/wait(s)?/)).toBeNull();
+    cleanup();
+    const busy: WalkyRow = { ...heldForThisPane, receipt: { ...heldForThisPane.receipt, reason: "turn running" } };
+    renderWithRows([busy], vi.fn());
+    expect(screen.getByText("1 message waits for the agent to finish")).toBeInTheDocument();
+    cleanup();
+    renderWithRows([heldForThisPane, busy], vi.fn());
+    expect(screen.getByText("2 messages wait")).toBeInTheDocument();
+  });
+
+  it("Deliver now that came too late says one neutral line above the box, never that the message still waits, and the mark can go", async () => {
+    const user = userEvent.setup();
+    const onDeliverNow = vi.fn(async () => "gone" as const);
+    renderWithRows([heldForThisPane], vi.fn(), { walkyLinked: true, onDeliverNow });
+    await user.click(await screen.findByRole("button", { name: "Deliver now" }));
+    expect(onDeliverNow).toHaveBeenCalledExactlyOnceWith(heldForThisPane.id);
+    expect(await screen.findByText("This message no longer waits for your text.")).toBeInTheDocument();
+    expect(screen.queryByText(/Not delivered/)).toBeNull();
+    expect(screen.queryByText("Message delivered. Your text stays here.")).toBeNull();
+  });
+
+  it("a Deliver now that went in says delivered, and one that may have arrived says neither", async () => {
+    const user = userEvent.setup();
+    renderWithRows([heldForThisPane], vi.fn(), { walkyLinked: true, onDeliverNow: vi.fn(async () => {}) });
+    await user.click(await screen.findByRole("button", { name: "Deliver now" }));
+    expect(await screen.findByText("Message delivered. Your text stays here.")).toBeInTheDocument();
+    cleanup();
+    renderWithRows([heldForThisPane], vi.fn(), { walkyLinked: true, onDeliverNow: vi.fn(async () => "unknown" as const) });
+    await user.click(await screen.findByRole("button", { name: "Deliver now" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Deliver now" })).toBeDisabled());
+    expect(screen.queryByText("Message delivered. Your text stays here.")).toBeNull();
+    expect(screen.queryByText("This message no longer waits for your text.")).toBeNull();
   });
 
   it("reads the plural, and draws nothing with no held message or no sheet to open", () => {
     const second: WalkyRow = { ...heldForThisPane, id: "wt_he1dh01dh02d", receipt: { ...heldForThisPane.receipt, id: "wt_he1dh01dh02d" } };
     renderWithRows([heldForThisPane, second], vi.fn());
-    expect(screen.getByText("2 messages wait for the box to clear")).toBeInTheDocument();
+    expect(screen.getByText("2 messages wait while you type")).toBeInTheDocument();
     cleanup();
     renderWithRows([heldElsewhere], vi.fn());
-    expect(screen.queryByText(/wait(s)? for the box to clear/)).toBeNull();
+    expect(screen.queryByText(/wait(s)? while you type/)).toBeNull();
     cleanup();
     renderWithRows([heldForThisPane], undefined);
-    expect(screen.queryByText(/wait(s)? for the box to clear/)).toBeNull();
+    expect(screen.queryByText(/wait(s)? while you type/)).toBeNull();
   });
 });
 

@@ -1,11 +1,16 @@
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { http, HttpResponse } from "msw";
 import { createMemoryRouter, RouterProvider } from "react-router";
+
+import { readAnswer, writeAnswer } from "@/lib/remembered-shape";
+import { body, serveAccountsStatus } from "@/test/accounts-fixtures";
+import { server } from "@/test/setup";
 
 import { withHeaderHost } from "@/test/header-host";
 import { ROOT_ROUTE_ID, type HomeData } from "@/lib/loaders";
 import type { UpdateInfo } from "@/lib/types";
-import { SettingsRoute } from "./settings";
+import { LIST_HOLD_MS, SettingsRoute } from "./settings";
 
 // Settings' HEADER, and only its header.
 //
@@ -223,12 +228,12 @@ describe("SettingsRoute — the index", () => {
   });
 
   // The fifth row, and the only one that can be absent: it renders while `lib/experiments.ts` holds
-  // something, because a row that opens an empty page is noise. Chat was the last thing filed
-  // there and left in 1.17.0 (ADR 0082), so the index shows four rows.
-  it("shows no Experiments row while nothing is filed under it", async () => {
+  // something, because a row that opens an empty page is noise. Chat left in 1.17.0 (ADR 0082); the Hill
+  // moved in on 2026-11-13, so the index shows the row again.
+  it("shows the Experiments row while the Hill is filed under it", async () => {
     renderSettings();
     await screen.findByRole("button", { name: /Appearance/ });
-    expect(screen.queryByRole("button", { name: /Experiments/ })).toBeNull();
+    expect(screen.getByRole("button", { name: /Experiments/ })).toBeInTheDocument();
   });
 
   // Machines is a page of its own and not a section, so its row is the one that opens `/machines`. It is
@@ -239,9 +244,8 @@ describe("SettingsRoute — the index", () => {
     const all = screen.getAllByRole("button").map((b) => b.textContent ?? "");
     const at = (word: string) => all.findIndex((text) => text.includes(word));
     expect(at("System")).toBeLessThan(at("Machines"));
-    // No Experiments row exists while the list is empty (ADR 0082), so Machines closes the index. When
-    // one returns it sits after Machines, which is where its section is placed.
-    expect(at("Experiments")).toBe(-1);
+    // The Experiments row sits after Machines, which is where its section is placed.
+    expect(at("Experiments")).toBeGreaterThan(at("Machines"));
     await userEvent.click(row);
     await waitFor(() => expect(router.state.location.pathname).toBe("/machines"));
     expect(router.state.location.state).toMatchObject({ from: "/settings" });
@@ -254,5 +258,249 @@ describe("SettingsRoute — the index", () => {
     await screen.findByRole("button", { name: /Appearance/ });
     expect(screen.queryAllByRole("switch")).toHaveLength(0);
     expect(screen.queryByRole("combobox")).toBeNull();
+  });
+});
+
+// ── THE CALM FIRST PAINT ────────────────────────────────────────────────────────────────────────
+//
+// The Profiles row (after Harnesses) and the Tricks row (before Experiments) depend on reads that end
+// after the first paint, and each sits in the middle of the list, so a row that arrived late pushed
+// every row after it down. jsdom has no layout, so these cases read the DOM instead: the order and
+// length of the rows on the first paint, and again once the reads have landed. Equal lists mean no
+// neighbour moved.
+function gate() {
+  let open: () => void = () => undefined;
+  const promise = new Promise<void>((resolve) => {
+    open = resolve;
+  });
+  return { promise, open: () => open() };
+}
+
+/** The list's rows by title, in order. */
+function listTitles(): string[] {
+  const group = document.querySelector('[data-slot="list-group"]');
+  return [...(group?.querySelectorAll("button") ?? [])].map((b) => b.querySelector(".font-medium")?.textContent ?? "");
+}
+
+/** The settled list's row count without the optional Accounts row, with the Tricks row (it shows while tricks are on): what the stand-in must hold. */
+const SETTLED_ROWS_WITHOUT_OPTIONAL = 10;
+
+function homeData(over: Partial<HomeData>): HomeData {
+  return {
+    bridge: "connected",
+    device: undefined,
+    agents: [],
+    shellPanes: [],
+    workspaces: [],
+    tabs: [],
+    sessions: [],
+    servers: [],
+    ts: 0,
+    scope: {},
+    viewAll: false,
+    snoozedUntil: null,
+    update: updateInfo(),
+    error: false,
+    authError: false,
+    ...over,
+  };
+}
+
+function renderIndex(over: Partial<HomeData>) {
+  const data = homeData(over);
+  const router = createMemoryRouter(
+    [
+      {
+        id: ROOT_ROUTE_ID,
+        path: "/",
+        loader: () => data,
+        children: [{ path: "settings", element: withHeaderHost(<SettingsRoute />) }],
+      },
+    ],
+    { initialEntries: ["/settings"] },
+  );
+  render(<RouterProvider router={router} />);
+}
+
+// THE TRICKS ROW FOLLOWS THE SWITCH (2026-11-18). The switch for tricks as a whole is the Tricks card in Settings,
+// Experiments; this row is the way into the list it switched on, so it shows only while the switch is on.
+describe("SettingsRoute — the Tricks row follows the switch for tricks", () => {
+  it("has no Tricks row while tricks are off, and the list is one row shorter from the first frame", async () => {
+    writeAnswer("settings-accounts-row", false);
+    serveAccountsStatus(404);
+    renderIndex({ tricksOff: true });
+    await screen.findByRole("button", { name: /Appearance/ });
+    const titles = listTitles();
+    expect(titles).not.toContain("Tricks");
+    expect(titles).toHaveLength(SETTLED_ROWS_WITHOUT_OPTIONAL - 1);
+    expect(titles).toContain("Experiments");
+  });
+
+  it("has the Tricks row, right before Experiments, while tricks are on", async () => {
+    writeAnswer("settings-accounts-row", false);
+    serveAccountsStatus(404);
+    renderIndex({ tricksOff: false });
+    await screen.findByRole("button", { name: /Appearance/ });
+    const titles = listTitles();
+    expect(titles.indexOf("Tricks")).toBe(titles.indexOf("Experiments") - 1);
+    expect(titles).toHaveLength(SETTLED_ROWS_WITHOUT_OPTIONAL);
+  });
+});
+
+describe("SettingsRoute — the list does not move while the page loads", () => {
+  afterEach(() => vi.useRealTimers());
+
+  it("a device that remembers both rows paints them on the first frame, and the reads change nothing", async () => {
+    writeAnswer("settings-accounts-row", true);
+    const accounts = gate();
+    server.use(
+      http.get("/api/accounts", async () => {
+        await accounts.promise;
+        return HttpResponse.json(body());
+      }),
+    );
+    renderIndex({ tricks: true });
+    await screen.findByRole("button", { name: /Appearance/ });
+
+    const first = listTitles();
+    expect(document.querySelector('[data-slot="settings-list-hold"]')).toBeNull();
+    // Profiles right after Harnesses, Tricks right before Experiments, from the first frame.
+    expect(first.indexOf("Profiles")).toBe(first.indexOf("Harness configurations") + 1);
+    expect(first.indexOf("Tricks")).toBe(first.indexOf("Experiments") - 1);
+    expect(first).toHaveLength(SETTLED_ROWS_WITHOUT_OPTIONAL + 1);
+
+    await act(async () => {
+      accounts.open();
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    });
+    expect(listTitles()).toEqual(first);
+  });
+
+  it("a device that remembers no Accounts row paints the list without it and with Tricks, and a 404 changes nothing", async () => {
+    writeAnswer("settings-accounts-row", false);
+    const accounts = gate();
+    server.use(
+      http.get("/api/accounts", async () => {
+        await accounts.promise;
+        return HttpResponse.json({ ok: false, error: "no", code: "accounts.unavailable" }, { status: 404 });
+      }),
+    );
+    renderIndex({ tricks: false });
+    await screen.findByRole("button", { name: /Appearance/ });
+
+    const first = listTitles();
+    expect(first).not.toContain("Profiles");
+    // Tricks shows while the switch is on (the snapshot says so from the first frame), with no tricks reply and no remembered answer.
+    expect(first.indexOf("Tricks")).toBe(first.indexOf("Experiments") - 1);
+    expect(first).toHaveLength(SETTLED_ROWS_WITHOUT_OPTIONAL);
+
+    await act(async () => {
+      accounts.open();
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    });
+    expect(listTitles()).toEqual(first);
+    expect(readAnswer("settings-accounts-row")).toBe(false);
+  });
+
+  it("a row the device did not remember goes into its place when it arrives, and is remembered", async () => {
+    writeAnswer("settings-accounts-row", false);
+    server.use(http.get("/api/accounts", () => HttpResponse.json(body())));
+    renderIndex({ tricks: false });
+    const row = await screen.findByRole("button", { name: /Profiles/ });
+    const titles = listTitles();
+    expect(titles.indexOf("Profiles")).toBe(titles.indexOf("Harness configurations") + 1);
+    expect(row).toHaveTextContent("One login per agent");
+    await waitFor(() => expect(readAnswer("settings-accounts-row")).toBe(true));
+  });
+
+  it("a first visit holds a quiet stand-in of the list's height, with the header painted, until both reads land", async () => {
+    const accounts = gate();
+    server.use(
+      http.get("/api/accounts", async () => {
+        await accounts.promise;
+        return HttpResponse.json({ ok: false, error: "no", code: "accounts.unavailable" }, { status: 404 });
+      }),
+    );
+    renderIndex({ tricks: false });
+    expect(await screen.findByRole("heading", { name: "Settings" })).toBeInTheDocument();
+    const hold = document.querySelector('[data-slot="settings-list-hold"]');
+    expect(hold).not.toBeNull();
+    expect(hold?.getAttribute("aria-hidden")).toBe("true");
+    // One empty row per row the settled list always has (the Updates row and `ROWS`), each of the row's
+    // exact height, so the card does not collapse and the build stamp below does not jump.
+    const rows = [...(hold?.querySelectorAll('[data-slot="list-group"] > *') ?? [])];
+    expect(rows).toHaveLength(SETTLED_ROWS_WITHOUT_OPTIONAL);
+    for (const row of rows) {
+      expect(row.classList.contains("h-11")).toBe(true);
+      expect(row.classList.contains("p-4")).toBe(true);
+      expect(row.textContent).toBe("");
+    }
+    expect(screen.queryByRole("button", { name: /Appearance/ })).toBeNull();
+
+    await act(async () => {
+      accounts.open();
+    });
+    // Both answers are in (a 404 and a snapshot with no tricks): the list replaces the stand-in, row for row.
+    await screen.findByRole("button", { name: /Appearance/ });
+    expect(document.querySelector('[data-slot="settings-list-hold"]')).toBeNull();
+    expect(listTitles()).toHaveLength(SETTLED_ROWS_WITHOUT_OPTIONAL);
+  });
+
+  it("a first visit whose reads never land draws the list at 400 ms, with the rows it has", async () => {
+    vi.useFakeTimers();
+    // The accounts read never answers; there is no snapshot, so the tricks answer is unknown too.
+    server.use(http.get("/api/accounts", () => new Promise<never>(() => undefined)));
+    const router = createMemoryRouter(
+      [{ path: "/settings", element: withHeaderHost(<SettingsRoute />) }],
+      { initialEntries: ["/settings"] },
+    );
+    render(<RouterProvider router={router} />);
+    expect(document.querySelector('[data-slot="settings-list-hold"]')).not.toBeNull();
+    expect(listTitles()).toHaveLength(0);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(LIST_HOLD_MS - 1);
+    });
+    expect(document.querySelector('[data-slot="settings-list-hold"]')).not.toBeNull();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1);
+    });
+    expect(document.querySelector('[data-slot="settings-list-hold"]')).toBeNull();
+    const titles = listTitles();
+    expect(titles).toHaveLength(SETTLED_ROWS_WITHOUT_OPTIONAL);
+    expect(titles).not.toContain("Profiles");
+    expect(titles).toContain("Tricks");
+  });
+
+  it("the Updates caption changes its words on its own line and moves no row", async () => {
+    writeAnswer("settings-accounts-row", false);
+    serveAccountsStatus(404);
+    const check = gate();
+    server.use(
+      http.get("/api/update/check", async () => {
+        await check.promise;
+        return HttpResponse.json({
+          ...updateInfo(),
+          preflight: null,
+          crew: [{ name: "badger", version: "1.25.0", verdict: "green", reasons: [], asOf: null }],
+        });
+      }),
+    );
+    renderIndex({ tricks: false });
+    const row = await screen.findByRole("button", { name: /^Updates/ });
+    const caption = row.querySelector("p");
+    const first = listTitles();
+    expect(caption?.textContent).toBe("Up to date · 1.26.4");
+    // One line that truncates, in a row whose height is its title plus that line: a longer or shorter
+    // sentence has nowhere to push, so no reserved slot is needed.
+    expect(caption?.classList.contains("truncate")).toBe(true);
+
+    await act(async () => {
+      check.open();
+    });
+    await waitFor(() => expect(caption?.textContent).toBe("1 peer behind"));
+    expect(row.querySelector("p")).toBe(caption);
+    expect(listTitles()).toEqual(first);
   });
 });

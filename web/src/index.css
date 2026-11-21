@@ -373,6 +373,15 @@
      draws its folder edge in ink. A pair and not var(--foreground), like --pane-active: the theme
      file for `collie` holds every optional token, and a theme that sets one half is filled from it. */
   --tab-active: light-dark(oklch(0.14 0 0), oklch(0.985 0 0));
+  /* The ground of a found or matched piece of text: Find in Chat, and the letters a list filter matches
+     (ui/match-text.tsx). A ground with alpha, laid over whatever the text sits on, so the ink on top
+     keeps its own colour (`text-inherit`) and a mark stays readable on a current or a blocked row.
+     The default is the amber the app drew as a literal before it had this token: Tailwind 4.3.1's
+     amber-300 at 70% in the light half (oklch(87.9% 0.169 91.605 / 0.7)) and amber-500 at 40% in the
+     dark half (oklch(76.9% 0.188 70.08 / 0.4)), written here as the same oklch with alpha, so the pixel
+     is the one it replaced. A pair, like --pane-active: the theme file for `collie` holds every optional
+     token, and a theme that sets one half is filled from it. */
+  --find: light-dark(oklch(0.879 0.169 91.605 / 0.7), oklch(0.769 0.188 70.08 / 0.4));
   --secondary: light-dark(oklch(0.915 0.004 80), oklch(0.28 0.003 80));
   --secondary-foreground: light-dark(oklch(0.16 0 0), oklch(0.985 0 0));
   /* The INERT fill — a well, a disabled track, a quiet chip on a card. Value unchanged (rgb 235
@@ -686,6 +695,7 @@
   --color-control-on-foreground: var(--control-on-foreground);
   --color-pane-active: var(--pane-active);
   --color-tab-active: var(--tab-active);
+  --color-find: var(--find);
   --color-secondary: var(--secondary);
   --color-secondary-foreground: var(--secondary-foreground);
   --color-muted: var(--muted);
@@ -1199,10 +1209,10 @@
  *
  * THE `var()` FALLBACK IS THE OFFLINE STORY, and it is not decoration. A device set to an operator
  * face that cannot be resolved — first paint before /api/config answers, offline, or the operator
- * deleted the row — has no `--font-operator-family`, so the stack starts at "Space Grotesk": the
- * DEFAULT SHIPPED FACE, never a bare `sans-serif`. Aldrich is named a second time after the
- * var() so that a resolved-but-unfetchable face lands there too rather than on the metric twin,
- * which is Arial wearing Aldrich's measurements and not the same thing at all.
+ * deleted the row, has no `--font-operator-family`, so the stack starts at "Atkinson Hyperlegible
+ * Next": the DEFAULT SHIPPED FACE, never a bare `sans-serif`. Atkinson is named a second time after
+ * the var() so that a resolved-but-unfetchable face lands there too rather than on the metric twin,
+ * which is Arial wearing Atkinson's measurements and not the same thing at all.
  *
  * The preference is NOT cleared when this happens. A phone that is briefly offline must not
  * silently forget a choice it will be able to honour again in a minute. */
@@ -1369,6 +1379,51 @@
     font-family: var(--font-sans);
     overscroll-behavior-y: none;
   }
+  /* THE HAND CURSOR (a pointer device only ever sees it; touch has no cursor). Tailwind 4's preflight
+     stopped giving a button the pointer, so on a desktop nothing clickable showed it. ONE rule here
+     names what a person can click: enabled buttons, links with an href, summary, select, a label of a
+     control, the box-like inputs, and the ARIA roles. A disabled control (`:disabled`,
+     `aria-disabled="true"`) keeps the default cursor. The whole selector sits in `:where()` so it
+     adds no specificity, and it is in the base layer, so a component's own `cursor-*` class (a
+     drag handle's `cursor-grab`, a backdrop's `cursor-default`, `disabled:cursor-not-allowed`) still
+     wins. A text field is not in the list and keeps the browser's `text` cursor. Cursor only, no
+     hover style. */
+  :where(
+    button:not(:disabled),
+    a[href],
+    summary,
+    select:not(:disabled),
+    label[for],
+    label:has(
+      :is(
+        input:is([type="checkbox"], [type="radio"], [type="range"], [type="file"]),
+        select,
+        button
+      ):not(:disabled)
+    ),
+    input:is(
+      [type="checkbox"],
+      [type="radio"],
+      [type="range"],
+      [type="file"],
+      [type="button"],
+      [type="submit"],
+      [type="reset"],
+      [type="image"]
+    ):not(:disabled),
+    :is(
+      [role="button"],
+      [role="link"],
+      [role="tab"],
+      [role="switch"],
+      [role="checkbox"],
+      [role="radio"],
+      [role="menuitem"],
+      [role="option"]
+    ):not([aria-disabled="true"], :disabled)
+  ) {
+    cursor: pointer;
+  }
 }
 
 /* THE ROWS OF A LIST GROUP (M57 spec 17). ui/list-group.tsx and the hand-rolled lists that carry
@@ -1386,6 +1441,17 @@
    its rounded corners; ui/list-group.tsx and the key board editor draw their own frame and opt out
    with `p-0`. */
 @layer components {
+  /* THE SHARED BUTTON'S PRESS REACH (components/ui/tap-target.ts, PRESS_REACH_SOFT). It is a class and not an
+     `active:before:` utility on purpose: that utility is (0,2,1), which beats a caller's own reach
+     (`before:-inset-1`, `before:-inset-y-[7px]`, (0,1,1)) while the finger is down, and the reach would SHRINK
+     under the press (composer Send, the belt's pills). `:where()` takes the pressed state out of the
+     specificity, and the components layer sits below utilities, so a caller's reach always wins and this one
+     only fills in where the caller has none. */
+  .press-reach-soft:where(:active)::before {
+    content: "";
+    position: absolute;
+    inset: -1.5%;
+  }
   [data-slot="list-group"] {
     padding: var(--row-inset);
   }
@@ -1435,7 +1501,9 @@
  * ── The name's suffix: grey at rest, the herd's three inks under a pointer ──
  *
  * "PWA" of the sidebar's ColliePWA rests in the muted ink, the same size as "Collie", as on the
- * website (collie-website `components/wordmark.tsx`). Hover the logo row, or reach its mark with the
+ * website, which draws the same generated component (`components/collie-wordmark.tsx`, made in
+ * collie-brand). The three letters are paths with their own classes, `.wordmark-ink-p|w|a`, and the
+ * stylesheet reaches them by those and never by position. Hover the logo row, or reach its mark with the
  * keyboard, and the three letters take P `--status-done`, W `--status-working`, A `--status-blocked`,
  * fading back over 240ms. Altan tried the inks at rest on 2026-10-24 and reverted it the same day.
  *
@@ -1448,21 +1516,28 @@
   transition: color 240ms ease-out;
 }
 
-.wordmark-ink:nth-child(1) {
+.wordmark-ink-p {
   --wordmark-lit: var(--status-done);
 }
 
-.wordmark-ink:nth-child(2) {
+.wordmark-ink-w {
   --wordmark-lit: var(--status-working);
 }
 
-.wordmark-ink:nth-child(3) {
+.wordmark-ink-a {
   --wordmark-lit: var(--status-blocked);
 }
 
 .wordmark-lockup:hover .wordmark-ink,
 .wordmark-lockup:focus-within .wordmark-ink {
   color: var(--wordmark-lit);
+}
+
+/* Pinch to zoom off (lib/page-zoom.ts): the browser's own pinch is not offered, one finger still pans both
+   ways. Chrome on Android cannot cancel a pinch whose second finger joins a scroll already running; it
+   reads this instead. Set on the root only while the device's switch is off. */
+:root[data-page-zoom-off] {
+  touch-action: pan-x pan-y;
 }
 
 /* A HIDDEN PAGE RUNS NO ANIMATION (issue 748, ADR 0138). lib/page-hidden.ts puts the attribute on <html> while
@@ -1478,6 +1553,35 @@
 [data-app-covered] *::before,
 [data-app-covered] *::after {
   animation-play-state: paused !important;
+}
+
+/* A RESTING MARK DRIFTS IN STEPS (issue 748, ADR 0138, amendment 2026-11-13). lib/mark-motion.ts puts
+   `.mark-steps` on a mark that drifts at rest with no input, which is for as long as the page is visible. A
+   smooth animation asks the engine for a frame at every vsync, 60 a second, for as long as the page is open.
+   A stepped timing function asks for a frame only when its value changes. The marks' keyframes run a stop
+   about every 0.8 s (every 1.6 s for the four with half the stops), and CSS applies a timing function BETWEEN
+   two stops, so `steps(10)` is 12.5 steps a second and `steps(20)` is 12.5 for the 1.6 s ones.
+   The sealed marks set `linear` (and `ease-in-out` for the twinkle) in the `animation` shorthand, so this
+   is important, and it lists two values: the second is the near/far swap's own `step-end`, which every bead
+   carries beside its orbit. It reaches every animation under the mark and names no class of a mark, so a
+   regenerated mark keeps it. Pixel is left out: its orbit is already `steps(1)`. Only a mark that drifts
+   at rest carries the class; a live state (`loading`, `applying`) turns smooth, as it is short. */
+svg[data-mark]:not([data-mark="pixel"]).mark-steps * {
+  animation-timing-function: steps(10, end), step-end !important;
+}
+svg[data-mark="glass"].mark-steps *,
+svg[data-mark="glass-front"].mark-steps *,
+svg[data-mark="sheep"].mark-steps *,
+svg[data-mark="owl"].mark-steps * {
+  animation-timing-function: steps(20, end), step-end !important;
+}
+
+/* The two puppy faces also twinkle their pearls: an opacity swell on each of 22 pearls, 7 s a swell, every
+   one on its own delay. 10 steps a half swell would still hand the engine a change every few frames, because
+   the 22 pearls are never in step, so each half swell is 4 steps (a step of about an eighth of the swell). */
+svg[data-mark].mark-steps .ck-tw,
+svg[data-mark].mark-steps .ct-tw {
+  animation-timing-function: steps(4, end) !important;
 }
 
 /* Submission progress bar — a slim indeterminate strip across the very top of the viewport while a
@@ -1529,6 +1633,30 @@
 /* No horizontal travel under reduced motion — a gentle opacity pulse across the full width instead. */
 @media (prefers-reduced-motion: reduce) {
   .busy-bar__indicator {
+    width: 100%;
+    animation: busy-bar-pulse 1.1s ease-in-out infinite;
+  }
+}
+
+/* A ROW THAT IS OPENING (components/agent-card.tsx, lib/pane-opening.ts): the busy bar's own look, 2px, along
+   the top of the row, in the same two tones and with the same reduced-motion pulse. It is drawn over the
+   row (absolute, no pointer events), so the row's box and its hit area do not change. */
+.row-opening {
+  height: 2px;
+  overflow: hidden;
+  background: color-mix(in oklab, var(--primary) 22%, transparent);
+}
+.row-opening::before {
+  content: "";
+  display: block;
+  height: 100%;
+  width: 40%;
+  border-radius: 9999px;
+  background: var(--primary);
+  animation: busy-bar-slide 1.1s ease-in-out infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .row-opening::before {
     width: 100%;
     animation: busy-bar-pulse 1.1s ease-in-out infinite;
   }
@@ -1617,9 +1745,9 @@
 }
 
 /* THE HOLD, SHOWN (hooks/use-long-press.ts, M38/02). Every element that spreads `useLongPress`'s props
-   carries `data-holding` from 150ms after the finger lands until the hold fires or is cancelled: the
+   carries `data-holding` from 250ms after the finger lands until the hold fires or is cancelled: the
    dashboard rows, the pane pills, the workspace and tab chips. While it does, the element eases toward
-   "pressed" over the time left to the hold's 450ms mark (the hook sets `animation-duration` inline to
+   "pressed" over the time left to the hold's 500ms mark (the hook sets `animation-duration` inline to
    exactly that), so the press visibly fills toward the moment the sheet opens. Linear, because the fill
    is a clock the thumb reads, not a flourish.
    - A TRANSFORM AND A TINT, NOTHING ELSE. `transform` composes with the element's own `active:scale-*`
@@ -1663,6 +1791,36 @@
 @media (prefers-reduced-motion: reduce) {
   [data-holding] {
     animation-name: hold-tint;
+  }
+}
+
+/* THE FILL OF A HOLD (components/harness-bar.tsx `ScreenStop`, components/hold-to-approve.tsx). While a
+   finger holds the belt's Stop, or the yes to a trick's code, a tinted layer opens from the start edge to
+   the end edge over the time left to the act (the hook sets `animation-duration` inline), so the button is
+   a clock: full means done. A clip, never a box change (DESIGN.md §2). Linear, and kept under reduced
+   motion, because it is the only thing that says how long to hold.
+   A cancelled hold of the yes runs its fill back to empty from where it stood (`--hold-from`, the clip's
+   right inset when the finger left) over HOLD_BACK_MS (lib/arm.ts), so the person sees the hold undone. */
+.hold-fill-layer {
+  animation: hold-fill-grow 1750ms linear both;
+}
+@keyframes hold-fill-grow {
+  from {
+    clip-path: inset(0 100% 0 0);
+  }
+  to {
+    clip-path: inset(0 0 0 0);
+  }
+}
+.hold-fill-layer-back {
+  animation: hold-fill-back 200ms ease-out both;
+}
+@keyframes hold-fill-back {
+  from {
+    clip-path: inset(0 var(--hold-from, 100%) 0 0);
+  }
+  to {
+    clip-path: inset(0 100% 0 0);
   }
 }
 
@@ -1779,6 +1937,40 @@
   .count-skeleton,
   .count-row {
     transition: none;
+  }
+}
+
+/* THE NAME FADE (components/ui/crossfade-text.tsx). A renamed session, tab or Space: the new words fade in
+   in place (the flow keeps them, so the box takes its new width at once) while the old words, an
+   out-of-flow copy, fade out over them. Opacity only: a drift read as the words dropping below the
+   label (operator, 2026-11-19), and the two copies share one line. 200ms, ease-out. Reduced motion: no animation, and the primitive draws
+   no old copy. */
+.crossfade-in {
+  animation: crossfade-in 200ms ease-out both;
+}
+.crossfade-out {
+  animation: crossfade-out 200ms ease-out both;
+}
+@keyframes crossfade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+@keyframes crossfade-out {
+  from {
+    opacity: 1;
+  }
+  to {
+    opacity: 0;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .crossfade-in,
+  .crossfade-out {
+    animation: none;
   }
 }
 

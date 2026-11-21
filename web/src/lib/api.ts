@@ -1,8 +1,9 @@
 // Thin REST client for the bridge. Everything is same-origin, so credentials/headers are
 // minimal. Each call throws on a non-2xx so callers (route loaders / action handlers) surface errors.
 
-import { apiErrorFieldsOf, parseApiErrorFields, type ApiErrorDetail, type ApiErrorFields } from "./api-error-codes";
+import { apiErrorFieldsOf, parseApiErrorFields, type ApiErrorCode, type ApiErrorDetail, type ApiErrorFields } from "./api-error-codes";
 import { trackBusy } from "./busy";
+import { isReadableWords } from "./readable-words";
 import {
   beginLongUpload,
   endLongUpload,
@@ -14,11 +15,12 @@ import {
 import { noteSnapshotTaken } from "./snapshot-clock";
 import { markDead as markPaneDead, markLive as markPaneLive } from "./liveness";
 import { abortSignalAfter, abortSignalAny } from "./env";
-import { asJsonObject, asJsonString, parseJsonObject, type JsonObject, type JsonValue } from "./json";
+import { asJsonBoolean, asJsonNumber, asJsonObject, asJsonString, parseJson, parseJsonObject, type JsonObject, type JsonValue } from "./json";
 import { readRegistryStatus } from "./theme/registry-status";
 import { readHeldCancelAnswer, readSendReceipts, readSendReply, type SendReply } from "./send-protocol";
 import { readReportContext, type ReportContext } from "./report/context";
 import type { TroubleSignal } from "./report/signal";
+import type { ComposerDiagRecord } from "./composer-offscreen";
 import { REQUEST_ID, type HeldCancelAnswer, type SendReceiptRow, type SendRequestBody } from "./surface/send";
 import type { AnswerBody } from "./surface/ask";
 import { boundedDraft, CLEAR_OUTCOMES, CLEAR_REASONS, type ClearBody, type ClearReceipt } from "./surface/clear";
@@ -27,16 +29,25 @@ import { readAskTapReply, type AskTapReply } from "./ask-reply";
 import { authHeader, clearNotPaired, EXPIRED_BODY, markExpired, markNotPaired, NOT_PAIRED_BODY } from "./pairing";
 import { pairingRefused } from "./wipe";
 import { mintRequestId } from "./worktree-name";
+import type { AccountRow, AccountsBody, AddAccountAsk } from "./accounts";
+import type { FieldValue, OfficialState, OfficialTricksReply, TrickTapReply, TricksReply, TapBody, WireTrickInfo } from "./tricks/schema";
+import { readTapReplyTolerant, readTricksReplyTolerant } from "./tricks/read";
+import { readCodeFile, readCodeIndex, type WireCodeFile, type WireCodeIndex } from "./tricks/code-wire";
+import { readOfficialAddReply, readOfficialTricksReply, readTrick } from "./tricks/wire";
+import { readRepoAddReply, readRepoListReply, type RepoAddReply, type RepoListReply } from "./tricks/repo-index";
 import { fileVersionOf } from "./file-image-cache";
 import { isLead, normalizeScope, paneScopeKey, type Scope } from "./scope";
 import { closePaneNotifications } from "./pane-notifications";
 import { textRouteFor } from "./send-path";
-import { stampSend } from "./poll-intent";
+import { stampSend, stampTricks } from "./poll-intent";
 import { observeServerBuild, SERVER_BUILD_HEADER } from "./server-build";
 import { noteServerDate } from "./server-clock";
 import { mounted } from "./base-path";
 import { WALKY_LIST_LIMIT, type WalkyReceipt, type WalkyRefusals, type WalkyRow, type WalkySendBody, type WalkySkipped, type WalkyTakeBack, type WalkyTarget, type WalkyWho } from "./walky";
 import { CHAT_UNCHANGED, type ChatAnswer } from "./chat-window";
+import { readHillCrewStateView, readHillList, readHillReceipt } from "./hill/reader";
+import type { HillAnswerRequest, HillCrewState, HillCrewStateView, HillList, HillReceipt } from "./hill/wire";
+import { readTrickViewsAnswer, readTrickViewSession, TRICK_VIEWS_ROUTE, TRICK_VIEWS_SWITCH_ROUTE, type TrickViewSession, type TrickViewsAnswer, type TrickViewSwitchBody } from "./agent-view/wire";
 import { decidedOf, parseAsk, type AnswerResult, type AskAnswer } from "./ask";
 import type { ColumnRange } from "./column-range";
 import type {
@@ -52,6 +63,7 @@ import type {
   DevicesResponse,
   CacheRulesResponse,
   CacheWatchListResponse,
+  NotificationsClearResponse,
   CacheWatchState,
   FolderBrowseResponse,
   FoldersResponse,
@@ -98,6 +110,7 @@ import type {
   WorktreeBaseChoice,
   WorktreeCreateResponse,
   WorktreeFolderChoice,
+  WorktreeFolderSettingResponse,
   WhistleStatus,
   WorktreePlanResponse,
   MathPackStatus,
@@ -284,9 +297,8 @@ export function sttTimeoutFor(bytes: number, type: string = ""): number {
 /**
  * Compose the caller's abort signal (a loader's `request.signal`, used to supersede a stale poll)
  * with a fresh timeout signal, so a fetch aborts on EITHER cause. Returns the timeout signal alone
- * when there's no caller signal. Runtime-guarded: on an older WebView missing `AbortSignal.timeout`
- * or `AbortSignal.any` we return the caller's signal unchanged rather than crash — degrading to the
- * old no-timeout behaviour instead of taking the app down.
+ * when there's no caller signal. On an older WebView missing `AbortSignal.timeout` or `AbortSignal.any`
+ * the helpers in `lib/env.ts` build both by hand, so the time limit holds there too (M102 spec 11).
  *
  * Exported for unit tests (the timeout wiring is otherwise unobservable).
  */
@@ -516,11 +528,15 @@ function captureBuild(res: Response): void {
  */
 type Recover<T> = (status: number, detail: string) => T | null;
 
-/** A request's init, plus the one deadline override a poll read asks for ({@link POLL_TIMEOUT_MS}). */
-type ReqInit = RequestInit & { timeoutMs?: number };
+/**
+ * A request's init, plus the one deadline override a poll read asks for ({@link POLL_TIMEOUT_MS}), and
+ * `provesNothing` for a write an unpaired browser may make (the pairing request, ADR 0139): its 2xx is
+ * not proof that this device is paired, so it must not clear the refusal latch the way a write does.
+ */
+type ReqInit = RequestInit & { timeoutMs?: number; provesNothing?: boolean };
 
 async function doReq<T>(path: string, reqInit?: ReqInit, recover?: Recover<T>): Promise<T> {
-  const { timeoutMs: asked, ...init } = reqInit ?? {};
+  const { timeoutMs: asked, provesNothing = false, ...init } = reqInit ?? {};
   // GET reads get the short leash; anything mutating gets the longer mutation budget.
   const method = init.method?.toUpperCase() ?? "GET";
   const timeoutMs = asked ?? (method === "GET" ? GET_TIMEOUT_MS : MUTATION_TIMEOUT_MS);
@@ -546,7 +562,7 @@ async function doReq<T>(path: string, reqInit?: ReqInit, recover?: Recover<T>): 
     if (recovered !== null && recovered !== undefined) return recovered;
     throw new ApiError(`${path} → ${res.status} ${detail}`, res.status, parseApiErrorFields(detail));
   }
-  notePairing(method, res.status);
+  if (!provesNothing) notePairing(method, res.status);
   if (res.status === 204) {
     // SAFETY: `T` is the response contract each exported wrapper below declares for its own
     // endpoint; `doReq` is the generic transport and has no shape of its own to check against. A
@@ -1311,7 +1327,9 @@ export function sendKeys(
   paneId: string,
   keys: string[],
   scope?: Scope,
-  expectedPrompt?: string,
+  // A list is the region as ordered literal parts (`DialogComparators.parts`); an older bridge refuses
+  // it as a malformed `expected_prompt` and types nothing.
+  expectedPrompt?: string | readonly string[],
   expectedStyled?: string,
   expectedColumns?: ColumnRange,
   expectedTailLines?: number,
@@ -1589,7 +1607,9 @@ const PLAIN_LINE_MAX = 160;
 export function plainFailureMessage(status: number, detail: string): string | null {
   if (parseJsonObject(detail) !== undefined) return null;
   const line = detail.split(/\r?\n/).map((part) => part.trim()).find((part) => part !== "");
-  if (line === undefined) return `HTTP ${status}`;
+  // A proxy's HTML page or a stray JSON body is no sentence: the status alone, and the display layer
+  // says it in words (`describeThrownError`, M102 spec 11).
+  if (line === undefined || !isReadableWords(line)) return `HTTP ${status}`;
   return `HTTP ${status}: ${line.length > PLAIN_LINE_MAX ? `${line.slice(0, PLAIN_LINE_MAX - 1)}…` : line}`;
 }
 
@@ -1637,7 +1657,7 @@ export async function postSend(body: SendRequestBody, scope?: Scope): Promise<Se
           withScope(`/api/pane/${encodeURIComponent(body.pane)}/reply`, scope),
           {
             method: "POST",
-            body: JSON.stringify({ text: body.text, submit: true, id: body.id, mode: body.mode, rowsHash: body.rowsHash, capAck: body.capAck, when: body.when }),
+            body: JSON.stringify({ text: body.text, submit: true, id: body.id, mode: body.mode, rowsHash: body.rowsHash, capAck: body.capAck, when: body.when, secret: body.secret, override: body.override }),
           },
           sendRecover(),
         ),
@@ -1647,6 +1667,17 @@ export async function postSend(body: SendRequestBody, scope?: Scope): Promise<Se
   if (reply === null) throw new ApiError("The send route sent a body this phone cannot read.", 502);
   if (reply.outcome === "sent" || reply.outcome === "effective" || reply.outcome === "steered") stampSend(body.pane);
   return reply;
+}
+
+/**
+ * POST /api/pane/:id/arrived (M102 spec 01): the person's "It arrived" on a send whose receipt ended
+ * `unknown`. The receipt takes `word: "arrived"` beside its outcome. True when the bridge marked it
+ * (200); a refusal (an id of another pane, a receipt that did not end unknown, a second mark) throws
+ * the route's own error. The route crosses the crew link, so a member's receipt is marked on the member.
+ */
+export async function postArrived(paneId: string, requestId: string, scope?: Scope): Promise<boolean> {
+  await req<JsonObject>(withScope(`/api/pane/${encodeURIComponent(paneId)}/arrived`, scope), { method: "POST", body: JSON.stringify({ requestId }) }, sendRecover());
+  return true;
 }
 
 /**
@@ -1722,6 +1753,90 @@ export async function postWalky(body: WalkySendBody): Promise<WalkyReceipt[]> {
   });
   if (got.receipts !== undefined) return got.receipts;
   return got.receipt === undefined ? [] : [got.receipt];
+}
+
+/**
+ * GET /api/hill (M96): the open decisions and the newest closed ones. `since` is the revision this
+ * phone holds; the bridge answers `unchanged` when nothing moved. Omit it for a whole read, after a
+ * bridge restart put the revision below the one held. Carries no scope: the hill lives on the lead.
+ * Every decision is read by `lib/hill/reader.ts`, and a body that is no list at all throws.
+ */
+export async function fetchHill(since?: number, signal?: AbortSignal): Promise<HillList> {
+  const query = since === undefined ? "" : `?since=${Math.max(0, Math.floor(since))}`;
+  const got = await req<JsonValue>(`/api/hill${query}`, { signal });
+  const list = readHillList(got);
+  if (list === null) throw new ApiError("The hill route sent a body this phone cannot read.", 502);
+  return list;
+}
+
+/**
+ * GET /api/trick-views: the views of the sessions named, keyed by (trick, session), each with its switch,
+ * head, tail, the screen its agent drew last and the lines the bridge sent from it. `since` is the
+ * revision this phone holds for the same sessions; the bridge answers `unchanged` when nothing moved, or
+ * only the views that moved and `keys`, the views held. Omit it for a whole read. `sessions` names the
+ * sessions the phone shows (`session=<address>` once each); none is every session. Carries no scope, as
+ * the hill's read does: views live on the lead. A body that is no answer at all throws.
+ */
+export async function fetchTrickViews({ since, sessions = [], signal }: { since?: number | undefined; sessions?: readonly string[]; signal?: AbortSignal } = {}): Promise<TrickViewsAnswer> {
+  const query = new URLSearchParams();
+  if (since !== undefined) query.set("since", String(Math.max(0, Math.floor(since))));
+  for (const session of sessions) query.append("session", session);
+  const text = query.toString();
+  const got = await req<JsonValue>(`${TRICK_VIEWS_ROUTE}${text === "" ? "" : `?${text}`}`, { signal });
+  const answer = readTrickViewsAnswer(got);
+  if (answer === null) throw new ApiError("The agent views route sent a body this phone cannot read.", 502);
+  return answer;
+}
+
+/**
+ * POST /api/trick-views/switch: turn one session's view of one trick on or off. An idempotent set, a
+ * paired device's write, on this bridge's own sessions only (a crew member's answers 400). Turning one
+ * trick's view on turns every other trick's view of that session off. The bridge answers 200 with the
+ * view as it now holds it; null when that body does not read, and the next read brings it. A 400, a 404
+ * (no live agent session), a 409 (the trick does not pass the gate) and a 503 (not saved) throw.
+ */
+export async function postTrickViewSwitch(body: TrickViewSwitchBody): Promise<TrickViewSession | null> {
+  const got = await req<JsonValue>(TRICK_VIEWS_SWITCH_ROUTE, { method: "POST", body: JSON.stringify(body) });
+  return readTrickViewSession(got);
+}
+
+/** The words of a refused answer: a JSON body's `reason`, else the plain text the bridge sends, else none. */
+function refusalReason(detail: string): string | null {
+  const parsed = parseJsonObject(detail);
+  if (parsed !== undefined) return asJsonString(parsed.reason) ?? null;
+  const plain = detail.trim();
+  return plain === "" ? null : plain.slice(0, 200);
+}
+
+/**
+ * POST /api/hill/answer (M96): one person's answer to one decision. The caller mints `rid` once per
+ * attempt and sends the same one on a retry, so a lost answer never answers twice: the bridge returns
+ * the receipt it already wrote for a known `rid` and runs nothing. A 401 or 403 is the guards' refusal
+ * and reads as a `denied` receipt; a 400 (a body the bridge could not read) and a 409 (the `rid` already
+ * answered with another choice) as `rejected`, with the bridge's words as the reason: the bridge says
+ * them as plain text, and a JSON `reason` is read first for a body that has one. A 503 (the first receipt
+ * could not be written, so nothing closed and nothing was sent) is NOT recovered here: it throws like a
+ * lost answer, the card says "Not sent." and the retry reuses the same `rid`. A 200 whose body is no
+ * receipt reads as `unknown`: the bridge took the request and may have acted on it, so the phone must
+ * not offer the same answer as unsent. A thrown request (no answer) is the retry case.
+ */
+export async function postHillAnswer(body: HillAnswerRequest): Promise<HillReceipt> {
+  // The refusal in the receipt's own shape, so one reader reads every answer.
+  const refused = (code: "denied" | "rejected", detail: string): JsonObject => ({
+    rid: body.rid,
+    code,
+    reason: code === "rejected" ? refusalReason(detail) : null,
+    state: null,
+    delivery: null,
+    trick: null,
+    at: Date.now(),
+  });
+  const got = await req<JsonValue>("/api/hill/answer", { method: "POST", body: JSON.stringify(body) }, (status, detail) => {
+    if (status === 401 || status === 403) return refused("denied", detail);
+    if (status === 400 || status === 409) return refused("rejected", detail);
+    return null;
+  });
+  return readHillReceipt(got) ?? { rid: body.rid, code: "unknown", reason: null, state: null, delivery: null, trick: null, at: Date.now() };
 }
 
 /**
@@ -1805,6 +1920,24 @@ export async function dropWalky(paneId: string, id: string, scope?: Scope): Prom
   if (!isLead(scope)) throw new ApiError("A message held on a crew member is dropped on that machine.", 400);
   const got = await req<{ results?: WalkyTakeBack[] }>(withScope(`/api/pane/${encodeURIComponent(paneId)}/walky/${encodeURIComponent(id)}/drop`, scope), { method: "POST" });
   return got.results ?? [];
+}
+
+/**
+ * Deliver now (M99 spec 05): the pane's owner hands one message held for their draft to the agent by data, and
+ * the draft stays in the box. Resolves when it was delivered, or with `"unknown"` when the agent took it and said
+ * nothing (it may have arrived, and it is not sent again), or with `"gone"` when the bridge answers 410: the
+ * message no longer waits for the person's text, so nothing was refused and there is no reason to say. A message
+ * that still waits is a 409 whose words say why, thrown. Only this machine's own panes: a member's message is delivered on that machine, like Drop.
+ */
+export async function deliverWalky(paneId: string, id: string, scope?: Scope): Promise<void | "unknown" | "gone"> {
+  if (!isLead(scope)) throw new ApiError("A message held on a crew member is delivered on that machine.", 400);
+  try {
+    const got = await req<{ result?: { result?: string } }>(withScope(`/api/pane/${encodeURIComponent(paneId)}/walky/${encodeURIComponent(id)}/deliver`, scope), { method: "POST" });
+    return got.result?.result === "may have arrived" ? "unknown" : undefined;
+  } catch (thrown) {
+    if (apiErrorStatus(thrown) === 410) return "gone";
+    throw thrown;
+  }
 }
 
 /**
@@ -2002,26 +2135,36 @@ export function closeTab(tabId: string, scope?: Scope): Promise<ActionResponse> 
   });
 }
 
-/** Create a new tab in a space, opening a fresh shell pane. `cwd` omitted = inherits the space dir. */
+/**
+ * Create a new tab in a space, opening a fresh shell pane. `cwd` omitted = inherits the space dir. Every
+ * call carries a request id, minted per tap unless the caller names one (the same mint the New page and the
+ * send path use): the bridge answers a repeat of the id with the first request's pane and never makes a second
+ * (M100 spec 04).
+ */
 export function createTab(
   workspaceId: string,
-  opts: { label?: string; cwd?: string } = {},
+  opts: { label?: string; cwd?: string; requestId?: string } = {},
   scope?: Scope,
 ): Promise<CreateResponse> {
+  const { requestId = mintRequestId(), ...rest } = opts;
   return req<CreateResponse>(withScope("/api/tab", scope), {
     method: "POST",
-    body: JSON.stringify({ workspaceId, ...opts }),
+    body: JSON.stringify({ workspaceId, ...rest, requestId }),
   });
 }
 
-/** Create a new space (workspace) with a fresh shell pane. `cwd` omitted = the host's home dir. */
+/**
+ * Create a new space (workspace) with a fresh shell pane. `cwd` omitted = the host's home dir. A request id
+ * rides with it, as {@link createTab} sends one.
+ */
 export function createWorkspace(
-  opts: { label?: string; cwd?: string } = {},
+  opts: { label?: string; cwd?: string; requestId?: string } = {},
   scope?: Scope,
 ): Promise<CreateResponse> {
+  const { requestId = mintRequestId(), ...rest } = opts;
   return req<CreateResponse>(withScope("/api/workspace", scope), {
     method: "POST",
-    body: JSON.stringify(opts),
+    body: JSON.stringify({ ...rest, requestId }),
   });
 }
 
@@ -2035,10 +2178,15 @@ export function createWorkspace(
 interface LaunchRequestBody {
   command: string;
   paneId?: string;
+  requestId: string;
 }
 
-export function launch(command: string, besidePaneId?: string, scope?: Scope): Promise<CreateResponse> {
-  const body: LaunchRequestBody = { command };
+/**
+ * A quick launch of a row. The request id is minted per tap unless the caller names one, so the bridge
+ * answers a repeat of it with the first pane and never starts a second agent (M100 spec 04).
+ */
+export function launch(command: string, besidePaneId?: string, scope?: Scope, requestId: string = mintRequestId()): Promise<CreateResponse> {
+  const body: LaunchRequestBody = { command, requestId };
   if (besidePaneId !== undefined) body.paneId = besidePaneId;
   return req<CreateResponse>(withScope("/api/launch", scope), {
     method: "POST",
@@ -2071,6 +2219,10 @@ export interface StartLaunchBody {
   cwd?: string;
   /** The pane whose space this opens a new tab in (the route's own `paneId` field). Absent: a new space. */
   paneId?: string;
+  /** An added account's id (M101). Sent only with `harness`; absent for Default and for every other start. */
+  account?: string;
+  /** Type the agent's sign-in line instead of the plain start. Only with `harness`. */
+  signIn?: true;
   requestId: string;
 }
 
@@ -2082,7 +2234,7 @@ export interface StartLaunchBody {
  */
 export function startLaunch(
   what: BranchableWhat,
-  opts: { cwd?: string; requestId: string; besidePaneId?: string },
+  opts: { cwd?: string; requestId: string; besidePaneId?: string; account?: string; signIn?: boolean },
   scope?: Scope,
 ): Promise<CreateResponse> {
   const body: StartLaunchBody = { requestId: opts.requestId };
@@ -2093,6 +2245,9 @@ export function startLaunch(
   // A starter has no folder: the bridge ignores one, so none is sent.
   if (opts.cwd !== undefined && what.kind !== "starter") body.cwd = opts.cwd;
   if (opts.besidePaneId !== undefined && what.kind !== "starter") body.paneId = opts.besidePaneId;
+  // An account and a sign-in belong to an agent started by id; nothing else carries them.
+  if (what.kind === "harness" && opts.account !== undefined) body.account = opts.account;
+  if (what.kind === "harness" && opts.signIn === true) body.signIn = true;
   return req<CreateResponse>(withScope("/api/launch", scope), { method: "POST", body: JSON.stringify(body) });
 }
 
@@ -2214,6 +2369,31 @@ export function planWorktree(query: { cwd: string; branch?: string; parent?: str
   return req<WorktreePlanResponse>(withScope(`/api/worktree/plan?${params.toString()}`, scope));
 }
 
+/**
+ * GET /api/worktree/folder — this machine's "Worktree folder" setting (ADR 0093 note). A read answered
+ * by the machine the scope names: a crew forwards it, so each machine has its own value.
+ */
+export function fetchWorktreeFolder(scope?: Scope): Promise<WorktreeFolderSettingResponse> {
+  return req<WorktreeFolderSettingResponse>(withScope("/api/worktree/folder", scope));
+}
+
+/** POST /api/worktree/folder/set's body. `null` clears the setting. */
+interface WorktreeFolderBody {
+  dir: string | null;
+}
+
+/**
+ * POST /api/worktree/folder/set — save the folder (or clear it with `null`) on the machine the scope
+ * names. A folder the bridge's rule refuses answers `{ ok: false, code }` with nothing stored.
+ */
+export function setWorktreeFolder(
+  dir: string | null,
+  scope?: Scope,
+): Promise<WorktreeFolderSettingResponse | { ok: false; error: string; code?: ApiErrorCode; detail?: ApiErrorDetail }> {
+  const body: WorktreeFolderBody = { dir };
+  return req(withScope("/api/worktree/folder/set", scope), { method: "POST", body: JSON.stringify(body) });
+}
+
 /** POST /api/worktree's body. A named contract so `createWorktreeAt` infers against it. */
 interface WorktreeAtBody {
   cwd: string;
@@ -2225,6 +2405,8 @@ interface WorktreeAtBody {
   /** An agent row (an operator's with a harness, or one a phone added): the allowlisted line. */
   command?: string;
   shell?: true;
+  /** An added account's id (M101). Sent only with `harness`. */
+  account?: string;
 }
 
 /**
@@ -2239,12 +2421,15 @@ export function createWorktreeAt(
     folder: WorktreeFolderChoice;
     requestId: string;
     what: BranchableWhat;
+    account?: string;
   },
   scope?: Scope,
 ): Promise<WorktreeCreateResponse> {
   const body: WorktreeAtBody = { cwd: ask.cwd, branch: ask.branch, base: ask.base, folder: ask.folder, requestId: ask.requestId };
-  if (ask.what.kind === "harness") body.harness = ask.what.id;
-  else if (ask.what.kind === "row") body.command = ask.what.command;
+  if (ask.what.kind === "harness") {
+    body.harness = ask.what.id;
+    if (ask.account !== undefined) body.account = ask.account;
+  } else if (ask.what.kind === "row") body.command = ask.what.command;
   else body.shell = true;
   return req<WorktreeCreateResponse>(withScope("/api/worktree", scope), {
     method: "POST",
@@ -2274,6 +2459,42 @@ export function outcomeUnknown<TThrown>(thrown: TThrown): boolean {
  */
 export function fetchLaunchers(scope?: Scope): Promise<LaunchersResponse> {
   return req<LaunchersResponse>(withScope("/api/launchers", scope));
+}
+
+// ── Accounts (M101) ──────────────────────────────────────────────────────────────────────────────
+//
+// A second login for an agent, kept as a folder. The list lives on the machine that holds the folders.
+
+/**
+ * GET /api/accounts — THIS scope's own machine's accounts, forwarded on `?host=` (the New page reads
+ * the chosen machine's). A 404 (`accounts.unavailable`) means the machine offers none: the app hides
+ * the feature (lib/accounts.ts).
+ */
+export async function fetchAccounts(scope?: Scope): Promise<AccountsBody> {
+  const body = await req<Partial<AccountsBody> | null>(withScope("/api/accounts", scope));
+  // A 200 whose body has no usable accounts list (an older or newer bridge, a proxy's page) is a failed read,
+  // never a body: every caller reads `.accounts` and would throw on it. The list's other two parts may be missing.
+  if (body === null || !Array.isArray(body.accounts)) throw new Error("/api/accounts answered without an accounts list");
+  return { harnesses: Array.isArray(body.harnesses) ? body.harnesses : [], accounts: body.accounts, found: Array.isArray(body.found) ? body.found : [] };
+}
+
+/**
+ * POST /api/accounts — add one account on the machine the lead answers for. `requestId` is minted per
+ * add (`mintRequestId`). The write gate checks the device; a refusal carries an `accounts.*` code.
+ */
+export function addAccount(ask: AddAccountAsk, requestId: string): Promise<{ account: AccountRow }> {
+  return req<{ account: AccountRow }>("/api/accounts", {
+    method: "POST",
+    body: JSON.stringify({ ...ask, requestId }),
+  });
+}
+
+/** POST /api/accounts/remove — forget one added account's label. The folder, its links and its login stay. */
+export function removeAccount(id: string, requestId: string): Promise<{ ok: true }> {
+  return req<{ ok: true }>("/api/accounts/remove", {
+    method: "POST",
+    body: JSON.stringify({ requestId, id }),
+  });
 }
 
 // ── Rows a phone adds for the crew (ADR 0094, amended by ADR 0127 point 4) ───────────────────────
@@ -2431,6 +2652,16 @@ export function setNotifyPrefs(patch: Partial<NotifyPrefs>): Promise<NotifyPrefs
 }
 
 /**
+ * Clear every notification: what opening every pane of this collie does, in one request. The bridge
+ * marks every pane seen (ADR 0003) and retracts every finished alert; a pane still blocked on you
+ * keeps its alert. Bridge-wide like the snooze, and never forwarded. Answers the slots it cleared,
+ * for lib/clear-notifications.ts to zero on this device.
+ */
+export function clearNotifications(): Promise<NotificationsClearResponse> {
+  return req<NotificationsClearResponse>("/api/notifications/clear", { method: "POST" });
+}
+
+/**
  * One pane's place in the prompt-cache watch list (ADR 0042).
  *
  * The scope names the machine the PANE lives on; the preference itself always lands on the collie this
@@ -2574,8 +2805,27 @@ export function setTelemetry(a: { setting: TelemetrySetting; requestId: string }
  * Fire and forget, through the transport below the busy signal: a count is no tap of the person's, so
  * the progress bar never shows it. The bridge answers 204 whether or not it counted.
  */
-export async function postTroubleSignal(signal: TroubleSignal): Promise<void> {
-  await doReq<undefined>("/api/telemetry/trouble", { method: "POST", body: JSON.stringify(signal) });
+export async function postTroubleSignal(signal: TroubleSignal, where?: { readonly paneId: string; readonly session?: string | undefined }): Promise<void> {
+  // `pane` and `session` only tell the bridge which of its own panes to ask whether it is linked. The
+  // bridge uses them once and neither stores nor sends them.
+  const body: TroubleSignal & { pane?: string; session?: string } = { ...signal };
+  if (where !== undefined) body.pane = where.paneId;
+  if (where?.session !== undefined) body.session = where.session;
+  await doReq<undefined>("/api/telemetry/trouble", { method: "POST", body: JSON.stringify(body) });
+}
+
+/**
+ * The composer diagnostic: the heights a phone measured when its reply box sat below the screen
+ * (lib/composer-offscreen.ts). Numbers, booleans and enums only; the bridge keeps it in one local file and
+ * refuses anything else. Fire and forget, through the transport below the busy signal, and a failure is
+ * ignored: this is a measurement, not something a person asked for.
+ */
+export async function postComposerDiag(record: ComposerDiagRecord): Promise<void> {
+  try {
+    await doReq<undefined>("/api/diag/composer", { method: "POST", body: JSON.stringify(record) });
+  } catch {
+    // Nothing to do: an older bridge answers 404, an offline phone throws, and neither is a person's problem.
+  }
 }
 
 /**
@@ -2690,6 +2940,177 @@ export async function pairDevice(code: string, label: string): Promise<PairResul
     recoverPairFailure,
   );
   return "token" in res ? { ok: true, token: res.token, label: res.label } : res;
+}
+
+// ── Pairing with a phone (ADR 0139) ─────────────────────────────────────────────────────────────
+//
+// The new device asks (`POST /api/pair/request`), shows the code and a QR to the approver page, and
+// polls with the secret only it holds. A paired browser opens the QR, reads the request and answers
+// it by tapping one of three codes. Every refusal the screens name is recovered into a value here, so
+// the screens switch on a state and never parse a body.
+
+/** The header the poll secret rides in. Never the URL: a URL lands in logs and history. */
+export const PAIR_POLL_HEADER = "x-collie-pair-poll";
+
+/** A started request, or why none was started. */
+export type PairRequestStart =
+  | { ok: true; publicId: string; pollSecret: string; code: string; expiresInMs: number }
+  | { ok: false; reason: "no-approver" }
+  | { ok: false; reason: "rate-limited"; retryAfterSeconds: number }
+  /** Refused before pairing by the bridge's access check (host, origin or identity). Pairing cannot fix it. */
+  | { ok: false; reason: "refused" };
+
+/** What the poll found. `gone` is an id the bridge does not know (or a wrong secret: it says the same). */
+export type PairRequestPoll =
+  | { state: "waiting"; expiresInMs: number }
+  | { state: "approved"; token: string; label: string }
+  | { state: "refused" }
+  | { state: "expired" }
+  | { state: "gone" };
+
+/** The network class a request came from, as the bridge names it (bridge/pair-audit.ts). */
+export type PairRoute = "loopback" | "tailnet" | "lan" | "internet" | "unknown";
+
+/** What the approver sees of an open request, or why it cannot answer it. */
+export type PairApproval =
+  | {
+      state: "open";
+      browser: string | null;
+      os: string | null;
+      /** The class of the socket the asker came in by: the kernel's, the one fact here. */
+      route: PairRoute;
+      /**
+       * The class a front door on the bridge's machine passed on (`X-Forwarded-For`), or null. A claim:
+       * a local program can write that header too, so the page never states it as fact.
+       */
+      claimed: PairRoute | null;
+      choices: readonly string[];
+      expiresInMs: number;
+      /** When the approver's own access ends, and so the new device's with it; null for no end. */
+      endsAt: number | null;
+    }
+  | { state: "gone" }
+  | { state: "answered" }
+  /** The bridge refused this browser as an approver: no token, a read-only credential, or not allowlisted. */
+  | { state: "forbidden" };
+
+/** The bridge's answer to the approver's tap. */
+export type PairApproveResult =
+  | { state: "approved"; label: string }
+  | { state: "refused"; reason: "wrong-code" | "refused" }
+  | { state: "gone" }
+  | { state: "answered" }
+  | { state: "bad-label" }
+  | { state: "forbidden" };
+
+const PAIR_ROUTES: readonly PairRoute[] = ["loopback", "tailnet", "lan", "internet", "unknown"];
+
+function pairRouteOf(value: JsonValue | undefined): PairRoute {
+  const named = asJsonString(value);
+  return PAIR_ROUTES.find((r) => r === named) ?? "unknown";
+}
+
+const errorOf = (detail: string): string | undefined => asJsonString(parseJsonObject(detail)?.error);
+
+/** Ask the bridge for a pairing request. Open to an unpaired browser, like `POST /api/pair`. */
+export async function startPairRequest(): Promise<PairRequestStart> {
+  const body = await req<JsonObject>(
+    "/api/pair/request",
+    { method: "POST", body: "{}", provesNothing: true },
+    (status, detail) => {
+      if (status === 409 && errorOf(detail) === "no-approver") return { [HTTP_STATUS]: 409 };
+      if (status === 429) return { [HTTP_STATUS]: 429, retryAfter: asJsonNumber(parseJsonObject(detail)?.retryAfter) ?? 60 };
+      if (status === 403) return { [HTTP_STATUS]: 403 };
+      return null;
+    },
+  );
+  const status = asJsonNumber(body[HTTP_STATUS]);
+  if (status === 409) return { ok: false, reason: "no-approver" };
+  if (status === 429) return { ok: false, reason: "rate-limited", retryAfterSeconds: asJsonNumber(body.retryAfter) ?? 60 };
+  if (status === 403) return { ok: false, reason: "refused" };
+  const publicId = asJsonString(body.publicId);
+  const pollSecret = asJsonString(body.pollSecret);
+  const code = asJsonString(body.code);
+  const expiresInMs = asJsonNumber(body.expiresInMs);
+  if (publicId === undefined || pollSecret === undefined || code === undefined || expiresInMs === undefined) {
+    throw new ApiError("/api/pair/request → 200 without a request", 200);
+  }
+  return { ok: true, publicId, pollSecret, code, expiresInMs };
+}
+
+/** One poll of a request this browser started. The secret goes in a header, never in the path. */
+export async function pollPairRequest(publicId: string, pollSecret: string, signal?: AbortSignal): Promise<PairRequestPoll> {
+  const body = await req<JsonObject>(
+    `/api/pair/request/${encodeURIComponent(publicId)}`,
+    { signal, headers: { [PAIR_POLL_HEADER]: pollSecret } },
+    (status) => (status === 404 ? { state: "gone" } : null),
+  );
+  const state = asJsonString(body.state);
+  if (state === "waiting") return { state, expiresInMs: asJsonNumber(body.expiresInMs) ?? 0 };
+  if (state === "approved") {
+    const token = asJsonString(body.token);
+    const label = asJsonString(body.label);
+    if (token !== undefined && label !== undefined) return { state, token, label };
+  }
+  if (state === "refused" || state === "expired" || state === "gone") return { state };
+  throw new ApiError(`/api/pair/request → 200 with no known state`, 200);
+}
+
+/**
+ * End a request this browser started (Cancel, or the block went away). `keepalive`, so it still leaves
+ * when the page is being closed. Nothing waits on it: the request runs out on its own anyway.
+ */
+export async function cancelPairRequest(publicId: string, pollSecret: string): Promise<void> {
+  await req<JsonObject>(
+    `/api/pair/request/${encodeURIComponent(publicId)}`,
+    { method: "DELETE", keepalive: true, provesNothing: true, headers: { [PAIR_POLL_HEADER]: pollSecret } },
+    (status) => (status === 404 ? {} : null),
+  );
+}
+
+/** A 403 from the approver's gate is an answer the page can name, whatever the body said. */
+function approverRefusal(status: number, detail: string): JsonObject | null {
+  if (status === 404) return { state: "gone" };
+  if (status === 409) return { state: "answered" };
+  if (status === 403) return { state: "forbidden" };
+  if (status === 400 && errorOf(detail) === "bad-label") return { state: "bad-label" };
+  return null;
+}
+
+/** Read an open request as the approver. Needs this browser's paired token with write access. */
+export async function fetchPairApproval(publicId: string, signal?: AbortSignal): Promise<PairApproval> {
+  const body = await req<JsonObject>(`/api/pair/approve/${encodeURIComponent(publicId)}`, { signal }, approverRefusal);
+  const state = asJsonString(body.state);
+  if (state === "gone" || state === "answered" || state === "forbidden") return { state };
+  const choices = Array.isArray(body.choices) ? body.choices.flatMap((c) => asJsonString(c) ?? []) : [];
+  if (choices.length !== 3) throw new ApiError("/api/pair/approve → 200 without three codes", 200);
+  return {
+    state: "open",
+    browser: asJsonString(body.browser) ?? null,
+    os: asJsonString(body.os) ?? null,
+    route: pairRouteOf(body.route),
+    claimed: body.forwardedFrom === null || body.forwardedFrom === undefined ? null : pairRouteOf(body.forwardedFrom),
+    choices,
+    expiresInMs: asJsonNumber(body.expiresInMs) ?? 0,
+    endsAt: asJsonNumber(body.endsAt) ?? null,
+  };
+}
+
+/** Answer a request: the tapped code and the new device's name, or `refuse` for "Not my device". */
+export async function answerPairApproval(
+  publicId: string,
+  answer: { code: string; label: string } | { refuse: true },
+): Promise<PairApproveResult> {
+  const body = await req<JsonObject>(
+    `/api/pair/approve/${encodeURIComponent(publicId)}`,
+    { method: "POST", body: JSON.stringify(answer) },
+    approverRefusal,
+  );
+  const state = asJsonString(body.state);
+  if (state === "approved") return { state, label: asJsonString(body.label) ?? "" };
+  if (state === "refused") return { state, reason: asJsonString(body.reason) === "wrong-code" ? "wrong-code" : "refused" };
+  if (state === "gone" || state === "answered" || state === "bad-label" || state === "forbidden") return { state };
+  throw new ApiError("/api/pair/approve → 200 with no known state", 200);
 }
 
 /**
@@ -2970,4 +3391,282 @@ export async function fetchSttModel(sha256: string, signal?: AbortSignal): Promi
     throw new ApiError(`${path} → ${res.status} ${detail}`, res.status, parseApiErrorFields(detail));
   }
   return res;
+}
+
+// ── TRICKS (M94) ───────────────────────────────────────────────────────────────────────────────
+
+/**
+ * The trick parts changed since `since`, the trick list and every part key present (`GET /api/tricks`).
+ * Asked only when the snapshot's `tricksRev` moved (lib/tricks/store.ts `syncTricks`), so it rides the
+ * snapshot's cadence and has no timer of its own. `since=0` gives every part. A body of another shape
+ * throws, so the store keeps what it holds rather than merging half a reply.
+ */
+export async function fetchTricks(since: number, signal?: AbortSignal): Promise<TricksReply> {
+  // `bound=1`: this phone draws a part bound to sessions only where it is bound (lib/tricks/menu.ts), so
+  // it may have them. A phone that does not ask gets none (bridge/tricks/bound.ts).
+  const body = await req<JsonValue>(`/api/tricks?since=${Math.max(0, Math.floor(since))}&bound=1`, { signal, timeoutMs: POLL_TIMEOUT_MS });
+  const reply = readTricksReplyTolerant(body);
+  if (reply === undefined) throw new Error("/api/tricks answered with a body that is not a tricks reply");
+  return reply;
+}
+
+/** A refused tap that still carries a receipt is the receipt. Anything else falls through to the error. */
+function recoverTapReceipt(_status: number, detail: string): JsonValue | null {
+  const parsed = parseJson(detail);
+  return parsed !== undefined && readTapReplyTolerant(parsed) !== undefined ? parsed : null;
+}
+
+/**
+ * Tap a trick's control: `POST /api/tricks/<host>/<id>/tap` with the request id the caller minted. The
+ * reply is the receipt (`applied`, `replayed`, `failed`, `unknown`) and the trick's changed parts. A
+ * refusal that carries a receipt on a non-2xx status is the same value; any other refusal throws an
+ * error with its status, and the store reads that as `failed` (4xx, nothing ran) or `unknown` (5xx).
+ */
+export async function tapTrick(host: string, trick: string, body: TapBody): Promise<TrickTapReply> {
+  const path = `/api/tricks/${encodeURIComponent(host)}/${encodeURIComponent(trick)}/tap`;
+  // `bound=1`, as `fetchTricks` asks: the receipt may carry the trick's bound parts too.
+  const raw = await req<JsonValue>(`${path}?bound=1`, { method: "POST", body: JSON.stringify(body) }, recoverTapReceipt);
+  const reply = readTapReplyTolerant(raw);
+  if (reply === undefined) throw new Error(`${path} answered with a body that is not a tap receipt`);
+  return reply;
+}
+
+/**
+ * POST /api/hill/switch: switch the Hill on or off for this bridge. Answers the value the switch holds
+ * now. The snapshot carries it too (`hillOff`), so a caller revalidates after a write and draws from
+ * the root data, never from this answer alone.
+ */
+export async function setHillSwitch(on: boolean): Promise<boolean> {
+  const raw = await req<JsonValue>("/api/hill/switch", { method: "POST", body: JSON.stringify({ on }) });
+  const held = asJsonBoolean(asJsonObject(raw)?.on);
+  if (held === undefined) throw new Error("/api/hill/switch answered with a body that is not { on }");
+  return held;
+}
+
+/**
+ * POST /api/tricks/switch: switch tricks as a whole on or off for this bridge (off by default). Answers the
+ * value the switch holds now. The snapshot carries it too (`tricksOff`), so a caller revalidates after a
+ * write and draws from the root data, never from this answer alone.
+ */
+export async function setTricksSwitch(on: boolean): Promise<boolean> {
+  const raw = await req<JsonValue>("/api/tricks/switch", { method: "POST", body: JSON.stringify({ on }) });
+  const held = asJsonBoolean(asJsonObject(raw)?.on);
+  if (held === undefined) throw new Error("/api/tricks/switch answered with a body that is not { on }");
+  // Switched on, every trick that was waiting for it starts at once: the next polls come fast.
+  stampTricks();
+  return held;
+}
+
+/**
+ * POST /api/hill/clear: remove every closed Decision from the Hill. Answers how many went. The lists
+ * come back through the snapshot's `hillRev`, as for any change to the Hill; a refusal or a body that is
+ * not `{ cleared }` throws, so the caller puts the rows back.
+ */
+export async function clearHillClosed(): Promise<number> {
+  const raw = await req<JsonValue>("/api/hill/clear", { method: "POST", body: JSON.stringify({}) });
+  const cleared = asJsonNumber(asJsonObject(raw)?.cleared);
+  if (cleared === undefined) throw new Error("/api/hill/clear answered with a body that is not { cleared }");
+  return cleared;
+}
+
+/**
+ * POST /api/hill/clear/spoken (1.29.0): withdraw and clear the open Decisions the person answered in their
+ * session, of `ids` (the ones this phone showed) only. Nothing is typed. Answers how many went; the list comes back through the snapshot's `hillRev`.
+ * An older bridge answers 404 and a refusal throws, so the caller says it on the status line.
+ */
+export async function clearHillSpoken(ids: readonly string[]): Promise<number> {
+  const raw = await req<JsonValue>("/api/hill/clear/spoken", { method: "POST", body: JSON.stringify({ ids }) });
+  const cleared = asJsonNumber(asJsonObject(raw)?.cleared);
+  if (cleared === undefined) throw new Error("/api/hill/clear/spoken answered with a body that is not { cleared }");
+  return cleared;
+}
+
+/**
+ * GET /api/hill/state (1.29.0): the crew state this lead holds. A crew member and a deposed lead answer
+ * 409 (the state lives on the lead), a member's page 400, an older bridge 404; each throws, and the list
+ * from such a bridge carries no `crewState` either, so the Hill shows no control.
+ */
+export async function fetchHillCrewState(signal?: AbortSignal): Promise<HillCrewStateView> {
+  const raw = await req<JsonValue>("/api/hill/state", { signal });
+  const view = readHillCrewStateView(raw);
+  if (view === null) throw new Error("/api/hill/state answered with a body that is not a crew state");
+  return view;
+}
+
+/**
+ * POST /api/hill/state (1.29.0): set the crew state to `here`, `quiet` or `away`. Answers the value as the
+ * lead now holds it; a refusal or a body of another shape throws, so the caller puts the control back.
+ */
+export async function setHillCrewState(state: HillCrewState): Promise<HillCrewStateView> {
+  const raw = await req<JsonValue>("/api/hill/state", { method: "POST", body: JSON.stringify({ state }) });
+  const view = readHillCrewStateView(raw);
+  if (view === null) throw new Error("/api/hill/state answered with a body that is not a crew state");
+  return view;
+}
+
+/**
+ * POST /api/hill/state/tell (1.29.0): "Tell all sessions now", once for the change set at `at`. The lead
+ * types one operator line into each waiting session and answers how many it reached. A second tap for the
+ * same change, or a change the phone did not see, is refused with the lead's words (409), and throws.
+ */
+export async function tellHillSessions(at: number): Promise<number> {
+  const raw = await req<JsonValue>("/api/hill/state/tell", { method: "POST", body: JSON.stringify({ at }) });
+  const told = asJsonNumber(asJsonObject(raw)?.told);
+  if (told === undefined) throw new Error("/api/hill/state/tell answered with a body that is not { told }");
+  return told;
+}
+
+/**
+ * Switch a trick on or off: `POST /api/tricks/<host>/<id>/switch` with `{ on }`. The bridge writes the
+ * file `collie trick on|off` writes and answers the trick as the list now shows it. A refusal (404 for a
+ * trick or host that is gone, 403 for a device that may not write) throws with its status; a body of
+ * another shape throws too, so the caller reverts rather than showing a switch the bridge did not take.
+ */
+export async function switchTrick(host: string, trick: string, on: boolean, hash?: string): Promise<WireTrickInfo> {
+  const path = `/api/tricks/${encodeURIComponent(host)}/${encodeURIComponent(trick)}/switch`;
+  // Review 8 V-N1: a switch on names the code the person read (the row's `approves`); the bridge refuses another.
+  const raw = await req<JsonValue>(path, { method: "POST", body: JSON.stringify(on && hash !== undefined ? { on, hash } : { on }) });
+  const info = readTrick(raw);
+  if (info === undefined) throw new Error(`${path} answered with a body that is not a trick`);
+  // The bridge starts the trick's program at once (a switch on) and drops its parts at once (off).
+  stampTricks();
+  return info;
+}
+
+/**
+ * The index of a trick's code (`GET /api/tricks/<host>/<id>/code`): every code file's name, size and how many
+ * lines the text search flags, and which copy it is. A read only, asked when a person opens the sheet's
+ * "Read the code" part. A refusal throws with its status and `error` (`unknown-host` for a trick of another
+ * machine, `moved`, `no-code`); a body of another shape throws too.
+ */
+export async function fetchTrickCodeIndex(host: string, trick: string, signal?: AbortSignal): Promise<WireCodeIndex> {
+  const path = `/api/tricks/${encodeURIComponent(host)}/${encodeURIComponent(trick)}/code`;
+  const index = readCodeIndex(await req<JsonValue>(path, { signal, timeoutMs: GET_TIMEOUT_MS }));
+  if (index === undefined) throw new Error(`${path} answered with a body that is not a code index`);
+  return index;
+}
+
+/** One file of a trick's code (`GET .../code?file=<rel>`): its lines masked and marked, or its name and size when it is binary. Asked when a fold opens. */
+export async function fetchTrickCodeFile(host: string, trick: string, file: string, signal?: AbortSignal): Promise<WireCodeFile> {
+  const path = `/api/tricks/${encodeURIComponent(host)}/${encodeURIComponent(trick)}/code?file=${encodeURIComponent(file)}`;
+  const body = readCodeFile(await req<JsonValue>(path, { signal, timeoutMs: GET_TIMEOUT_MS }));
+  if (body === undefined) throw new Error(`${path} answered with a body that is not a code file`);
+  return body;
+}
+
+/** How long the phone waits for an add from the official list: the bridge's own two-minute cap, and a margin. */
+export const OFFICIAL_ADD_TIMEOUT_MS = 130_000;
+
+/**
+ * The official list (`GET /api/tricks/official`): the official tricks this Collie release can add, each
+ * with its state on this machine. A read of the bridge's own list and folder; it fetches nothing. A body of
+ * another shape throws, so the card draws no section rather than a half one.
+ */
+export async function fetchOfficialTricks(signal?: AbortSignal): Promise<OfficialTricksReply> {
+  const body = await req<JsonValue>("/api/tricks/official", { signal, timeoutMs: GET_TIMEOUT_MS });
+  const reply = readOfficialTricksReply(body);
+  if (reply === undefined) throw new Error("/api/tricks/official answered with a body that is not the official list");
+  return reply;
+}
+
+/**
+ * Add a trick from the official list, or update one added from it: `POST
+ * /api/tricks/official/<id>/add` or `/update` with `{}`. The bridge fetches the commit the list names,
+ * checks the code, and installs it off. Answers `{ id, state }`; a refusal throws with its status and its
+ * `error` (`unreachable`, `mismatch`, `busy`, `taken`, ...), which the card turns into one status line.
+ */
+export async function addOfficialTrick(id: string, mode: "add" | "update"): Promise<{ id: string; state: OfficialState }> {
+  const path = `/api/tricks/official/${encodeURIComponent(id)}/${mode}`;
+  const raw = await req<JsonValue>(path, { method: "POST", body: JSON.stringify({}), timeoutMs: OFFICIAL_ADD_TIMEOUT_MS });
+  const reply = readOfficialAddReply(raw);
+  if (reply === undefined) throw new Error(`${path} answered with a body that is not { id, state }`);
+  return reply;
+}
+
+/**
+ * Read a repository's trick list (`POST /api/tricks/repo/list`, 2026-11-17): the bridge fetches the pasted
+ * https link, reads the repository's `collie-tricks.json` and answers the commit it read and one entry per
+ * trick, with whether a trick of that id is here already. `rid` is minted once per tap. A refusal throws
+ * with its status and `error` (`repo-invalid`, `host`, `no-index`, `index-refused`, `unreachable`, ...); a
+ * body of another shape throws too. Every text of the reply is the repository's own, cleaned by the reader.
+ */
+export async function listRepoTricks(url: string, rid: string): Promise<RepoListReply> {
+  const path = "/api/tricks/repo/list";
+  const raw = await req<JsonValue>(path, { method: "POST", body: JSON.stringify({ rid, url }), timeoutMs: OFFICIAL_ADD_TIMEOUT_MS });
+  const reply = readRepoListReply(raw);
+  if (reply === undefined) throw new Error(`${path} answered with a body that is not a repository list`);
+  return reply;
+}
+
+/**
+ * Add one trick of a repository's list (`POST /api/tricks/repo/add`): `commit` is the one the list showed,
+ * so a repository that moved since is refused (`moved`). The trick lands OFF; its own switch asks. `rid` is
+ * minted once per tap and kept for a retry of the same tap. A refusal throws with its status and `error`
+ * (`taken`, `not-listed`, `refused`, `busy`, ...); a body of another shape throws too.
+ */
+export async function addRepoTrick(body: { rid: string; url: string; folder: string; commit: string }): Promise<RepoAddReply> {
+  const path = "/api/tricks/repo/add";
+  const raw = await req<JsonValue>(path, { method: "POST", body: JSON.stringify(body), timeoutMs: OFFICIAL_ADD_TIMEOUT_MS });
+  const reply = readRepoAddReply(raw);
+  if (reply === undefined) throw new Error(`${path} answered with a body that is not { rid, code, id, hash }`);
+  return reply;
+}
+
+/**
+ * The words a refused repository call carried in its `message` (`index-refused` and `refused` name the
+ * repository's own reason there), or undefined when the throw is not a refusal with one. The caller shows
+ * it as plain text, cleaned and cut, never as markup.
+ */
+export function repoRefusalReason<TThrown>(thrown: TThrown): string | undefined {
+  if (!(thrown instanceof ApiError)) return undefined;
+  const arrow = thrown.message.indexOf(" → ");
+  if (arrow < 0) return undefined;
+  const afterStatus = thrown.message.indexOf(" ", arrow + 3);
+  if (afterStatus < 0) return undefined;
+  return asJsonString(parseJsonObject(thrown.message.slice(afterStatus + 1))?.message);
+}
+
+/**
+ * Take a trick's changes without asking, or ask again (crew slice 3): `POST /api/tricks/<host>/<id>/auto`
+ * with `{ on }`, the field `collie trick auto` writes. Answers the trick as the list now shows it. A
+ * refusal (409 for a trick that is off, 404, 403) throws with its status; a body of another shape throws.
+ */
+export async function setTrickAuto(host: string, trick: string, on: boolean): Promise<WireTrickInfo> {
+  const path = `/api/tricks/${encodeURIComponent(host)}/${encodeURIComponent(trick)}/auto`;
+  const raw = await req<JsonValue>(path, { method: "POST", body: JSON.stringify({ on }) });
+  const info = readTrick(raw);
+  if (info === undefined) throw new Error(`${path} answered with a body that is not a trick`);
+  stampTricks();
+  return info;
+}
+
+/**
+ * Set one of a trick's settings (contract 3): `POST /api/tricks/<host>/<id>/value` with `{ rid, key, value }`,
+ * null to clear it back to its default. `rid` is minted once per change, so a retry of the same change
+ * writes once. Answers the trick as the list now shows it. A refusal throws with its status and its `code`
+ * (a field rule: `kind`, `text`, `option`, `range`, `whole`; or `unknown-field`, `not-here`), which the
+ * Settings group says in its own words. A body of another shape throws.
+ */
+export async function setTrickValue(host: string, trick: string, body: { rid: string; key: string; value: FieldValue | null }): Promise<WireTrickInfo> {
+  const path = `/api/tricks/${encodeURIComponent(host)}/${encodeURIComponent(trick)}/value`;
+  const raw = await req<JsonValue>(path, { method: "POST", body: JSON.stringify(body) });
+  const info = readTrick(asJsonObject(raw)?.info);
+  if (info === undefined) throw new Error(`${path} answered with a body that is not a value receipt`);
+  // A changed value runs the trick again about a second after the last write.
+  stampTricks();
+  return info;
+}
+
+/**
+ * Go back to the version a trick ran before its last change (crew slice 3): `POST
+ * /api/tricks/<host>/<id>/undo` with `{}`. Answers the trick as the list now shows it; a refusal (409 when
+ * there is no earlier version or its copy changed, 404, 403) throws with its status.
+ */
+export async function undoTrick(host: string, trick: string): Promise<WireTrickInfo> {
+  const path = `/api/tricks/${encodeURIComponent(host)}/${encodeURIComponent(trick)}/undo`;
+  const raw = await req<JsonValue>(path, { method: "POST", body: JSON.stringify({}) });
+  const info = readTrick(raw);
+  if (info === undefined) throw new Error(`${path} answered with a body that is not a trick`);
+  stampTricks();
+  return info;
 }

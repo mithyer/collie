@@ -19,8 +19,8 @@
 //      the message for one target, the lead's pane, and answers the member with a refused receipt
 //      (`rig-member/all`, "host rig-member is unreachable") that the sheet draws as a "not sent" row.
 //      Then the member starts again and is reachable before the end.
-//   19 member agent to lead agent through the skill: pi on the member runs `collie walky who` (which lists
-//      only its own machine), sends to Claude's address on the lead, Claude's pane gets the one-line
+//   19 member agent to lead agent through the skill: pi on the member runs `collie walky who` (which asks
+//      its lead and lists its space on every machine), sends to Claude's address on the lead, Claude's pane gets the one-line
 //      nudge, Claude reads it with `collie walky inbox <id>` and replies. The MEMBER's `collie walky
 //      status <id>` says `delivered` (the lead pushed the outcome back to the machine that sent it),
 //      and the LEAD's status of the reply says `delivered` (the member's sweep report).
@@ -28,10 +28,18 @@
 //      Claude on the lead sends to pi and is told `not sent: off`, the lead's status says refused,
 //      and the Crew page's message to that machine draws a "not sent: off" row. pi's pane gets
 //      nothing. The member is restarted clean afterwards.
-//   21 the pair limit across the crew: six messages from one pane to a pane on the member are taken
+//   21 the pair limit across the crew: twelve messages from one pane to a pane on the member are taken
 //      (the member's box holds a draft, so they are held, `accepted` with `draft present`, and cost
-//      no model turn), the seventh is refused `pair limit` on the lead and never dialled. The draft
+//      no model turn), the thirteenth is refused `pair limit` on the lead and never dialled. The draft
 //      stays: this is the leg's last case, and the held messages go with the rig.
+//   34 the space border across the crew (M98 spec 06): a throwaway Claude on the lead sends `here`. A
+//      space is known by its name on every machine, so the member's pi, in the space of the same name
+//      (rig-lib.ts RIG_SPACE), receives it with the lead's Claude, and the member's own receipt says it
+//      passed as `in`. A draft in each box holds the message: no model turn.
+//   35 the same `here`, with a second pi on the member in a space that has no name of its own: it is
+//      not a target of `here`, a message sent to its address is refused `outside your space` by the
+//      member, and nothing is typed into it. No model turn.
+//      Cases 34 and 35 come after case 21 and never clear pi's draft, which holds case 21's messages.
 //   15 the lead's release line is the crew's (M60 spec 01, ADR 0110): on the lead's Updates page the
 //      Release line reads Stable, a tap on Edge shows the receipt and the lead's line record says
 //      `edge` with no run started, the Crew page says the members follow Edge, and a tap on Stable
@@ -69,7 +77,7 @@ import {
   type TapLog,
 } from "./leg";
 import { DEVICE_LABEL, LEAD_ID, MEMBER_ID, askWalky, paneClose, sleep } from "./rig-lib";
-import { PHONE, REPLY_MS, cliSend, escape, firstRow, mintId, nudgePattern, operatorHeaderPattern, refusalCount, settledWalky, startExtraAgent } from "./walky-lib";
+import { OUTSIDE_YOUR_SPACE, PHONE, REPLY_MS, cliCancel, cliSend, ensureDraft, escape, firstRow, mintId, nudgePattern, operatorHeaderPattern, refusalCount, settledWalky, startExtraAgent, takeBackFor, viaOf, withoutSubjects } from "./walky-lib";
 
 const RIG_TS = join(import.meta.dirname, "rig.ts");
 
@@ -88,6 +96,12 @@ function confirmWords(agents: number, machines: number): string {
     machines: message(machines === 1 ? "walky.crew.confirm.machines.one" : "walky.crew.confirm.machines.other", { count: machines }),
   });
 }
+
+/** The receipt of one target out of a send's receipts, or undefined. */
+const receiptFor = (rows: readonly JsonObject[], memberId: string, paneId: string): JsonObject | undefined => rows.find((r) => sameTarget(asJsonString(r.target) ?? "", memberId, paneId));
+
+/** A receipt that says the message was taken: held behind a draft (`accepted`) or kept for a pane that rests (`inbox-only`), never refused. */
+const wasTaken = (row: JsonObject | undefined): boolean => row !== undefined && (row.state === "accepted" || row.state === "inbox-only");
 
 /** The ids of every agent nudge on a screen. */
 const nudgeIds = (text: string): string[] => [...text.matchAll(/\[walky-talky (wt_[a-z0-9]{12})\] from agent /g)].map((m) => m[1]!);
@@ -271,6 +285,8 @@ test.describe("walky talky across a crew", () => {
       await resetBox(rig, piPane, MEMBER_ID);
       const notes = trail.notes;
       const token = "PING-THIRTEEN";
+      // A fixed subject that holds no token: a subject is typed on the nudge line, and the case judges that line.
+      const subject = "ping check";
       // The sender asks for the answer by walky talky, as one agent asks another: the nudge then names `collie walky reply`.
       const body = `${token}. Answer me by walky talky reply, with the single word pong.`;
       // The nudges already in pi's scrollback (a rerun on a kept rig): the case takes only a new one.
@@ -281,13 +297,13 @@ test.describe("walky talky across a crew", () => {
           await sendFromComposer(
             page,
             recorder,
-            `Use walky talky. Run \`collie walky who\`, then send the pi agent on the machine ${MEMBER_ID} this message, to its address exactly as \`who\` printed it: "${body}" Then stop.`,
+            `Use walky talky. Run \`collie walky who\`, then send the pi agent on the machine ${MEMBER_ID} this message, to its address exactly as \`who\` printed it, with \`--subject "${subject}"\`: "${body}" Then stop.`,
             "ask Claude to send",
           ),
         );
         // pi's screen, read through the lead: the one-line nudge from Claude's pane, with no body.
         const from = addressPattern(LEAD_ID, claudePane);
-        const nudge = new RegExp(nudgePattern({ id: "(wt_[a-z0-9]{12})", from, harness: "claude" }), "g");
+        const nudge = new RegExp(nudgePattern({ id: "(wt_[a-z0-9]{12})", from, harness: "claude", subject }), "g");
         const fresh = (text: string): string | null => [...text.matchAll(nudge)].map((m) => m[1]!).find((found) => !before.has(found)) ?? null;
         const nudged = await rig.until(() => rig.screen(piPane, 200, MEMBER_ID), (text) => fresh(text) !== null, REPLY_MS);
         const id = nudged === null ? null : fresh(nudged);
@@ -300,7 +316,8 @@ test.describe("walky talky across a crew", () => {
         notes.push(`Claude ${who ? "ran" : "did NOT show"} \`collie walky who\`; pi got the nudge for ${id}`);
         // The address Claude sent to, off its own Bash call, against the one the lead's `who` prints for pi.
         const listed = asJsonString(jsonRows((await askWalky("lead", { op: "who" }))?.targets).find((t) => (asJsonString(t.address) ?? "").startsWith(crewAddress(MEMBER_ID, piPane)))?.address) ?? null;
-        const typedTo = [...claudeScreen.matchAll(/collie walky send\s+["']?([a-z0-9-]+\/[^\s"'()]+)/g)].map((m) => m[1]!).findLast((address) => address.startsWith(`${MEMBER_ID}/`)) ?? null;
+        // A flag may come before the address (`send --subject "..." <address> ...`).
+        const typedTo = [...claudeScreen.matchAll(/collie walky send\s+(?:--subject\s+(?:"[^"]*"|'[^']*'|\S+)\s+|--[a-z-]+\s+)*["']?([a-z0-9-]+\/[^\s"'()]+)/g)].map((m) => m[1]!).findLast((address) => address.startsWith(`${MEMBER_ID}/`)) ?? null;
         const tokened = typedTo !== null && new RegExp(`^${escape(crewAddress(MEMBER_ID, piPane))}#[a-z0-9]{4}$`).test(typedTo) && typedTo === listed;
         notes.push(`Claude sent to ${typedTo ?? "no address on screen"}, who lists ${listed ?? "nothing"}: ${tokened ? "the address with its token" : "NOT the token address"}`);
         const bodyInNudge = nudged!.split("\n").some((line) => line.includes(`[walky-talky ${id}]`) && line.includes(token));
@@ -497,8 +514,10 @@ test.describe("walky talky across a crew", () => {
       await resetBox(rig, claudePane);
       const notes = trail.notes;
       const token = "PING-NINETEEN";
+      // A fixed subject that holds no token: a subject is typed on the nudge line, and the case judges that line.
+      const subject = "ping check";
       const body = `${token}. Answer me by walky talky reply, with the single word pong.`;
-      // `who` on the member lists its own panes only, so the lead pane's address comes from the lead's `who` and goes into the prompt.
+      // The lead pane's address comes from the lead's `who` and goes into the prompt, so the send does not depend on what pi reads.
       const leadWho = await askWalky("lead", { op: "who" });
       const target = jsonRows(leadWho?.targets).find((t) => sameTarget(asJsonString(t.address) ?? "", LEAD_ID, claudePane));
       const address = asJsonString(target?.address) ?? null;
@@ -510,7 +529,7 @@ test.describe("walky talky across a crew", () => {
           await sendFromComposer(
             page,
             recorder,
-            `Use walky talky. Run \`collie walky who\` first: it lists the panes of your own machine only. Then send the agent at ${address} this message, to that address exactly: "${body}" Then stop.`,
+            `Use walky talky. Run \`collie walky who\` first: it lists the panes of your space on every machine. Then run exactly this command: \`collie walky send ${address} --subject "${subject}" "${body}"\` Then stop.`,
             "ask pi to send",
           ),
         );
@@ -525,10 +544,10 @@ test.describe("walky talky across a crew", () => {
         const first = await settledWalky(rig, claudePane, id, 60_000);
         notes.push(`pi sent ${id} from ${from}: the lead pane's receipt ${first}, verified ${asJsonString(asJsonObject(sent.receipt)?.verified) ?? "?"}`);
         const piScreen = await rig.screen(piPane, 300, MEMBER_ID);
-        notes.push(piScreen.includes("other machines") ? "pi's `collie walky who` pointed to the lead" : "pi's screen does not show the `who` line about other machines");
+        notes.push(piScreen.includes("collie walky who") ? "pi ran `collie walky who`" : "pi's screen does not show `collie walky who`");
 
         // Claude's screen: the one-line nudge with no body, then `inbox <id>` and the body in its output.
-        const nudge = new RegExp(nudgePattern({ id, from: addressPattern(MEMBER_ID, piPane), harness: "pi" }));
+        const nudge = new RegExp(nudgePattern({ id, from: addressPattern(MEMBER_ID, piPane), harness: "pi", subject }));
         const nudged = await rig.screenUntil(claudePane, nudge, 60_000, 300);
         const read = await rig.screenUntil(claudePane, new RegExp(`Bash\\(collie walky inbox ${id}\\)[\\s\\S]*${token}`), REPLY_MS, 300);
         const claudeScreen = await rig.screen(claudePane, 300);
@@ -553,7 +572,8 @@ test.describe("walky talky across a crew", () => {
         await waitIdle(rig, piPane, REPLY_MS, MEMBER_ID);
         const finalPi = await rig.screen(piPane, 300, MEMBER_ID);
         const piCall = replyId === null ? -1 : finalPi.search(new RegExp(`collie walky inbox ${replyId}`));
-        const piRead = piCall !== -1 && /\bpong\b/i.test(finalPi.slice(piCall));
+        // A subject of Claude's own is no body: `inbox` prints it on its header line, so it is taken out first.
+        const piRead = piCall !== -1 && /\bpong\b/i.test(withoutSubjects(finalPi.slice(piCall)));
         notes.push(piRead ? "pi read the reply with `inbox`: pong" : "pi did not show the reply's body from `inbox`");
         trail.captures.push(await captureScreen(rig, claudePane, "walky-19-claude"), await captureScreen(rig, piPane, "walky-19-pi", MEMBER_ID), await capture(page, "walky-19-pi-phone"));
         const ok =
@@ -651,7 +671,7 @@ test.describe("walky talky across a crew", () => {
     });
   });
 
-  test("21 crew: six messages from one pane to a pane on the member are taken, the seventh is refused `pair limit`", async ({ rig }) => {
+  test("21 crew: twelve messages from one pane to a pane on the member are taken, the thirteenth is refused `pair limit`", async ({ rig }) => {
     await runScenario("claude", "walky-crew-pair-limit", lead, async (_claudePane, trail) => {
       const piPane = member.paneId;
       if (piPane === null) throw new NotReached(`no pi on the member: ${member.startNote}`);
@@ -671,15 +691,15 @@ test.describe("walky talky across a crew", () => {
         const mark = mintId().slice(3, 9);
         const limitBefore = refusalCount("lead", "pair limit");
         const sends = [];
-        for (let n = 1; n <= 7; n++) sends.push(await cliSend(sender, address, `Walky pair check ${mark} number ${String(n)}.`));
+        for (let n = 1; n <= 13; n++) sends.push(await cliSend(sender, address, `Walky pair check ${mark} number ${String(n)}.`));
         const words = sends.map((s, i) => `${String(i + 1)}: exit ${String(s.code)} ${s.receipts.map((r) => `${asJsonString(r.state) ?? "?"}${asJsonString(r.reason) === undefined ? "" : ` (${asJsonString(r.reason) ?? ""})`}`).join(", ") || s.out.slice(0, 80)}`);
         notes.push(`${address} from ${sender}: ${words.join("; ")}`);
         // Taken and not typed: `accepted` (held), never `inbox-only` any more.
-        const firstSix = sends.slice(0, 6).every((s) => s.code === 0 && s.receipts.length === 1 && asJsonString(s.receipts[0]!.state) === "accepted");
-        const last = sends[6]!;
-        const seventh = last.code === 4 && asJsonString(last.receipts[0]?.state) === "refused" && asJsonString(last.receipts[0]?.reason) === "pair limit";
+        const firstTwelve = sends.slice(0, 12).every((s) => s.code === 0 && s.receipts.length === 1 && asJsonString(s.receipts[0]!.state) === "accepted");
+        const last = sends[12]!;
+        const thirteenth = last.code === 4 && asJsonString(last.receipts[0]?.state) === "refused" && asJsonString(last.receipts[0]?.reason) === "pair limit";
         // The member's report carries the hold's reason to the lead (CREW_PROTOCOL §21, "A held send").
-        const ids = sends.slice(0, 6).flatMap((s) => (s.id === null ? [] : [s.id]));
+        const ids = sends.slice(0, 12).flatMap((s) => (s.id === null ? [] : [s.id]));
         const heldOnLead = await rig.until(
           async () => {
             const states = await Promise.all(ids.map(async (id) => (await leadReceipts(id))[0]));
@@ -689,19 +709,118 @@ test.describe("walky talky across a crew", () => {
           30_000,
           1000,
         );
-        notes.push(heldOnLead === true ? "the lead reads all six `accepted: draft present`" : "the lead did NOT read all six as held: draft present");
+        notes.push(heldOnLead === true ? "the lead reads all twelve `accepted: draft present`" : "the lead did NOT read all twelve as held: draft present");
         await sleep(1500);
         const boxText = await rig.tail(piPane, 6, MEMBER_ID);
         const draftKept = /draft\s*$/m.test(boxText) && !boxText.includes(mark) && !boxText.includes("[walky-talky");
         const counted = refusalCount("lead", "pair limit") > limitBefore;
         notes.push(draftKept ? "pi's draft is untouched, nothing typed" : "pi's BOX CHANGED", counted ? "the lead counted one `pair limit`" : "the lead's refusals did not count `pair limit`");
         trail.captures.push(await captureScreen(rig, piPane, "walky-21-pi", MEMBER_ID));
-        return { verdict: ids.length === 6 && firstSix && seventh && heldOnLead === true && draftKept && counted ? "pass" : "fail", taps: 0, note: notes.join("; "), taps_log: trail.log, captures: trail.captures };
+        return { verdict: ids.length === 12 && firstTwelve && thirteenth && heldOnLead === true && draftKept && counted ? "pass" : "fail", taps: 0, note: notes.join("; "), taps_log: trail.log, captures: trail.captures };
       } finally {
-        // The draft stays in pi's box on purpose: clearing it would type the six held messages and cost
-        // pi six turns. This is the crew leg's last case, and `rig.ts down` takes the holds with the
-        // rig; `up` starts from empty state. A case added after this one must cancel them first.
+        // The draft stays in pi's box on purpose: clearing it would type the twelve held messages and cost
+        // pi twelve turns. This is the crew leg's last case, and `rig.ts down` takes the holds with the
+        // rig; `up` starts from empty state. A case added after this one must cancel them first, or never
+        // clear the draft: cases 34 and 35 do the second.
         if (sender !== null) paneClose(sender);
+      }
+    });
+  });
+
+  test("34 crew: `here` from a pane in a named space reaches the member's pane in the space of the same name", async ({ rig }) => {
+    await runScenario("claude", "walky-crew-space-here", lead, async (claudePane, trail) => {
+      const piPane = member.paneId;
+      if (piPane === null) throw new NotReached(`no pi on the member: ${member.startNote}`);
+      const notes = trail.notes;
+      let sender: string | null = null;
+      try {
+        // A throwaway Claude on the lead sends, in the rig's space like every harness pane, and takes no prompt.
+        // A draft in each target's box holds the message, so neither agent costs a turn. pi's box keeps its
+        // draft after this case, as after case 21: clearing it would type what the draft holds.
+        sender = await startExtraAgent(rig, "claude");
+        await resetBox(rig, claudePane);
+        await ensureDraft(rig, claudePane);
+        await ensureDraft(rig, piPane, MEMBER_ID);
+        const mark = mintId().slice(3, 9);
+        const sent = await cliSend(sender, "here", `Walky space check ${mark}: here.`);
+        const toLead = receiptFor(sent.receipts, LEAD_ID, claudePane);
+        const toMember = receiptFor(sent.receipts, MEMBER_ID, piPane);
+        const toSelf = receiptFor(sent.receipts, LEAD_ID, sender);
+        notes.push(`here from ${sender}: exit ${String(sent.code)}, receipts ${receiptWords(sent.receipts)}`);
+        // The member's own bridge owns pi's pane, so its receipt carries the verdict: the sender is of its space.
+        const memberRows = sent.id === null ? [] : await ((id: string) => rig.until(async () => jsonRows((await askWalky("member", { op: "status", id }))?.receipts), (rows) => receiptFor(rows, MEMBER_ID, piPane) !== undefined, 30_000, 1000))(sent.id);
+        const memberVia = viaOf(receiptFor(memberRows ?? [], MEMBER_ID, piPane));
+        notes.push(`the member's own receipt for pi: via ${memberVia ?? "none"}`);
+
+        // Held, so nothing is typed over either draft. Then the lead's own hold is taken back; the member's stays.
+        await sleep(1500);
+        const leadBox = await rig.tail(claudePane, 6);
+        const piBox = await rig.tail(piPane, 6, MEMBER_ID);
+        const untouched = /draft\s*$/m.test(leadBox) && !leadBox.includes(mark) && /draft\s*$/m.test(piBox) && !piBox.includes(mark);
+        notes.push(untouched ? "both drafts are untouched, nothing typed" : "a BOX CHANGED");
+        const back = sent.id === null ? null : await cliCancel(sender, sent.id);
+        const leadBack = takeBackFor(back, (target) => sameTarget(target, LEAD_ID, claudePane));
+        notes.push(`the lead's hold taken back: ${leadBack ?? "no answer"}`);
+        trail.captures.push(await captureScreen(rig, claudePane, "walky-34-claude"), await captureScreen(rig, piPane, "walky-34-pi", MEMBER_ID));
+        const verdict = sent.id !== null && wasTaken(toLead) && wasTaken(toMember) && toSelf === undefined && memberVia === "in" && untouched && leadBack === "taken" ? "pass" : "fail";
+        return { verdict, taps: 0, note: notes.join("; "), taps_log: trail.log, captures: trail.captures };
+      } finally {
+        await resetBox(rig, claudePane);
+        if (sender !== null) paneClose(sender);
+      }
+    });
+  });
+
+  test("35 crew: a pane in an unnamed space on the member is not reached by `here` and refuses a message to its address", async ({ rig }) => {
+    await runScenario("claude", "walky-crew-space-unnamed", lead, async (claudePane, trail) => {
+      const piPane = member.paneId;
+      if (piPane === null) throw new NotReached(`no pi on the member: ${member.startNote}`);
+      const notes = trail.notes;
+      const opened: { pane: string; machine: "lead" | "member" }[] = [];
+      try {
+        // A second pi on the member, in a space with no name of its own, and the Claude that sends, in the rig's space.
+        const unnamed = await startExtraAgent(rig, "pi", { machine: "member", space: null });
+        opened.push({ pane: unnamed, machine: "member" });
+        const sender = await startExtraAgent(rig, "claude");
+        opened.push({ pane: sender, machine: "lead" });
+        await resetBox(rig, claudePane);
+        await ensureDraft(rig, claudePane);
+        await ensureDraft(rig, piPane, MEMBER_ID);
+        const mark = mintId().slice(3, 9);
+        const refusedBefore = refusalCount("member", OUTSIDE_YOUR_SPACE);
+        // The lead's merged list carries the member's word for the pane's space: unnamed, its key under the member's id.
+        const listedRow = await rig.until(async () => jsonRows((await askWalky("lead", { op: "who" }))?.targets).find((t) => sameTarget(asJsonString(t.address) ?? "", MEMBER_ID, unnamed)), (row) => row !== undefined, 30_000, 1000);
+        const listedSpace = asJsonObject(listedRow?.space);
+        const listedUnnamed = listedSpace?.named === false && (asJsonString(listedSpace.key) ?? "").startsWith(`${MEMBER_ID}\u0000`);
+        notes.push(listedSpace === undefined ? "the lead's who does not list the unnamed pane" : listedUnnamed ? "the lead lists it in an unnamed space of the member" : `the lead lists it in space ${JSON.stringify(listedSpace)}`);
+
+        // `here` reaches the two panes of the rig's space, and not the unnamed one.
+        const sent = await cliSend(sender, "here", `Walky space check ${mark}: here.`);
+        const reached = wasTaken(receiptFor(sent.receipts, LEAD_ID, claudePane)) && wasTaken(receiptFor(sent.receipts, MEMBER_ID, piPane));
+        const skipped = receiptFor(sent.receipts, MEMBER_ID, unnamed) === undefined;
+        notes.push(`here: exit ${String(sent.code)}, receipts ${receiptWords(sent.receipts)}`, skipped ? "the unnamed pane is not a target" : "the unnamed pane IS a target");
+
+        // Its address is refused by the member, which owns the pane and enforces the border.
+        const direct = await cliSend(sender, crewAddress(MEMBER_ID, unnamed), `Walky space check ${mark}: direct.`);
+        const refused = direct.code === 4 && asJsonString(direct.receipts[0]?.state) === "refused" && asJsonString(direct.receipts[0]?.reason) === OUTSIDE_YOUR_SPACE;
+        notes.push(`a message to ${crewAddress(MEMBER_ID, unnamed)}: exit ${String(direct.code)}, ${asJsonString(direct.receipts[0]?.state) ?? "no receipt"} (${asJsonString(direct.receipts[0]?.reason) ?? "no reason"})`);
+
+        // Nothing is typed into it, and the member counted the refusal.
+        await sleep(3000);
+        const screen = await rig.screen(unnamed, 200, MEMBER_ID);
+        const typed = screen.includes(mark) || (sent.id !== null && screen.includes(`[walky-talky ${sent.id}]`)) || (direct.id !== null && screen.includes(`[walky-talky ${direct.id}]`));
+        const counted = refusalCount("member", OUTSIDE_YOUR_SPACE) > refusedBefore;
+        notes.push(typed ? "the unnamed pane's screen shows the message" : "the unnamed pane's screen shows nothing", counted ? "the member counted the refusal" : "the member did not count a refusal");
+
+        // The lead's hold is taken back; the member's pi keeps its draft and what it holds.
+        const back = sent.id === null ? null : await cliCancel(sender, sent.id);
+        const leadBack = takeBackFor(back, (target) => sameTarget(target, LEAD_ID, claudePane));
+        notes.push(`the lead's hold taken back: ${leadBack ?? "no answer"}`);
+        trail.captures.push(await captureScreen(rig, unnamed, "walky-35-unnamed", MEMBER_ID));
+        return { verdict: listedUnnamed && reached && skipped && refused && !typed && counted && leadBack === "taken" ? "pass" : "fail", taps: 0, note: notes.join("; "), taps_log: trail.log, captures: trail.captures };
+      } finally {
+        await resetBox(rig, claudePane);
+        for (const open of opened) paneClose(open.pane, open.machine);
       }
     });
   });

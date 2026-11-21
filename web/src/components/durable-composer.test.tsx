@@ -1,5 +1,5 @@
 import { createRef, useState } from "react";
-import { act, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 import { createMemoryRouter, RouterProvider } from "react-router";
@@ -10,6 +10,7 @@ import type { ChatMessageListHandle } from "@/components/ui/chat/chat-message-li
 import type { ChatFeed } from "@/hooks/use-chat-window";
 import { EMPTY_CHAT_WINDOW } from "@/lib/chat-window";
 import { __resetPending } from "@/lib/durable-pending";
+import { __resetEnterSendsStore, setEnterSends } from "@/lib/enter-sends-store";
 import { paneScopeKey } from "@/lib/scope";
 import type { ChatEntry } from "@/lib/types";
 import { server } from "@/test/setup";
@@ -44,6 +45,7 @@ beforeAll(() => {
 });
 
 beforeEach(() => {
+  __resetEnterSendsStore();
   __resetPending();
   __resetOperatorCommands();
   declares({ steerTurn: true, abortTurn: true });
@@ -953,5 +955,136 @@ describe("the Send Protocol on this machine (M56 spec 14)", () => {
     await user.click(sendButton());
     await waitFor(() => expect(old).toHaveLength(1));
     expect(protocol).toHaveLength(0);
+  });
+});
+
+// M100 spec 02, item 2: a failed send puts the old words back only into an empty field.
+describe("a failed send keeps whatever was written since", () => {
+  it("restores the old words into an empty field, as before", async () => {
+    stub("send", () => HttpResponse.json({ ok: false, outcome: "refused", reason: "refused", detail: "Name a turn." }, { status: 409 }));
+    draw();
+    const user = await type("hello");
+    await user.click(sendButton());
+    await waitFor(() => expect(field()).toHaveValue("hello"));
+    expect(loadDraft(undefined, "c1")).toBe("hello");
+  });
+
+  it("joins the old words and the new ones with a newline, and saves both as the draft", async () => {
+    let answer: () => void = () => undefined;
+    const gateOpen = new Promise<void>((resolve) => {
+      answer = resolve;
+    });
+    server.use(
+      http.post(/\/api\/pane\/[^/]+\/send$/, async () => {
+        await gateOpen;
+        return HttpResponse.json({ ok: false, outcome: "refused", reason: "refused", detail: "Name a turn." }, { status: 409 });
+      }),
+    );
+    draw();
+    const user = await type("old words");
+    await user.click(sendButton());
+    await waitFor(() => expect(screen.getByPlaceholderText("Sending…")).toBeDisabled());
+    // Words written into the field while the send is on its way (a dictation, a restored draft).
+    fireEvent.change(screen.getByPlaceholderText("Sending…"), { target: { value: "new words" } });
+    answer();
+    await waitFor(() => expect(screen.getByTestId("said")).toHaveTextContent("Name a turn."));
+    expect(field()).toHaveValue("old words\nnew words");
+    expect(loadDraft(undefined, "c1")).toBe("old words\nnew words");
+  });
+
+  it("the Send Protocol path joins them the same way when no answer came", async () => {
+    let answer: () => void = () => undefined;
+    const gateOpen = new Promise<void>((resolve) => {
+      answer = resolve;
+    });
+    server.use(
+      http.post(/\/api\/send$/, async () => {
+        await gateOpen;
+        return new HttpResponse("down", { status: 502 });
+      }),
+    );
+    draw({ sendProtocol: true });
+    const user = await type("old words");
+    await user.click(sendButton());
+    await waitFor(() => expect(screen.getByPlaceholderText("Sending…")).toBeDisabled());
+    fireEvent.change(screen.getByPlaceholderText("Sending…"), { target: { value: "new words" } });
+    answer();
+    await waitFor(() => expect(field()).toHaveValue("old words\nnew words"));
+    expect(loadDraft(undefined, "c1")).toBe("old words\nnew words");
+  });
+});
+
+// The durable agent's reply box follows the same Enter rule as the main one (ADR 0157): a bare Enter is a new
+// line until the person turns "Enter sends" on, and then only a physical keyboard's Enter sends. It offers no
+// switch of its own; the offer lives in the main reply box.
+describe("Enter sends", () => {
+  const HARDWARE = { key: "Enter", code: "Enter", keyCode: 13 } as const;
+  const ok = () => stub("send", () => HttpResponse.json({ ok: true, outcome: "ok" }));
+
+  it("with the switch on, a hardware Enter sends once", async () => {
+    setEnterSends(true);
+    const seen = ok();
+    draw();
+    await type("go left");
+    expect(fireEvent.keyDown(field(), HARDWARE)).toBe(false);
+    await waitFor(() => expect(seen).toHaveLength(1));
+    expect(seen[0]).toMatchObject({ text: "go left" });
+    await waitFor(() => expect(field()).toHaveValue(""));
+    expect(seen).toHaveLength(1);
+  });
+
+  it("with the switch on, Shift+Enter and an Enter with an empty code are left to the field", async () => {
+    setEnterSends(true);
+    const seen = ok();
+    draw();
+    await type("keep");
+    expect(fireEvent.keyDown(field(), { ...HARDWARE, shiftKey: true })).toBe(true);
+    expect(fireEvent.keyDown(field(), { key: "Enter", code: "", keyCode: 13 })).toBe(true);
+    expect(fireEvent.keyDown(field(), { ...HARDWARE, isComposing: true })).toBe(true);
+    expect(seen).toHaveLength(0);
+    expect(field()).toHaveValue("keep");
+  });
+
+  it("with the switch on, a held Enter sends once and its repeats add no new line", async () => {
+    setEnterSends(true);
+    const seen = ok();
+    draw();
+    await type("once");
+    // The placeholder changes while the send runs, so the field is taken once.
+    const box = field();
+    expect(fireEvent.keyDown(box, HARDWARE)).toBe(false);
+    expect(fireEvent.keyDown(box, { ...HARDWARE, repeat: true })).toBe(false);
+    await waitFor(() => expect(seen).toHaveLength(1));
+  });
+
+  it("with nothing stored, a hardware Enter is a new line and offers nothing here", async () => {
+    const seen = ok();
+    draw();
+    await type("keep");
+    expect(fireEvent.keyDown(field(), HARDWARE)).toBe(true);
+    expect(seen).toHaveLength(0);
+    expect(screen.queryByText("Using a keyboard? Enter can send.")).toBeNull();
+  });
+
+  it("with the switch off, a hardware Enter is a new line", async () => {
+    setEnterSends(false);
+    const seen = ok();
+    draw();
+    await type("keep");
+    expect(fireEvent.keyDown(field(), HARDWARE)).toBe(true);
+    expect(seen).toHaveLength(0);
+  });
+
+  it.each([
+    ["nothing stored", null],
+    ["off", false],
+    ["on", true],
+  ] as const)("Ctrl+Enter sends with the choice %s", async (_name, choice) => {
+    if (choice !== null) setEnterSends(choice);
+    const seen = ok();
+    draw();
+    await type("go");
+    expect(fireEvent.keyDown(field(), { key: "Enter", ctrlKey: true })).toBe(false);
+    await waitFor(() => expect(seen).toHaveLength(1));
   });
 });

@@ -175,6 +175,37 @@ export const API_ERROR_CODES = [
   // The anonymous install count, POST /api/telemetry
   "telemetry.setting_invalid",
   "telemetry.request_id_required",
+
+  // Accounts, GET /api/accounts, POST /api/accounts[/remove], an account on a launch (M101)
+  "accounts.unavailable",
+  "accounts.label_taken",
+  "accounts.bad_label",
+  "accounts.bad_folder",
+  "accounts.folder_taken",
+  "accounts.kind_unsupported",
+  "accounts.limit",
+  "accounts.link_failed",
+  "accounts.default",
+  "accounts.unknown",
+  "accounts.store_unreadable",
+
+  // The bridge's local key, <stateDir>/local-secret (bridge/local-key.ts)
+  "local.no_text",
+
+  // The local API, the socket at <stateDir>/api/sock (M105 spec 03)
+  "api.unknown_op",
+  "api.denied",
+  "api.no_run_token",
+  "api.bad_request",
+  "api.session_unknown",
+  "api.session_replaced",
+  "api.too_many_waits",
+  "api.too_many_requests",
+  "api.busy",
+  "api.too_many_connections",
+  "api.answer_too_large",
+  "api.closing",
+  "api.failed",
 ] as const;
 
 /** Every code the bridge can send. Derived from the list, so there is exactly one place to edit. */

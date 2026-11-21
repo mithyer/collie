@@ -3,6 +3,7 @@ import { join, relative } from "node:path";
 
 import { FakeIDBFactory, uninstallFakeIndexedDB } from "@/test/fake-indexeddb";
 import { dropLegacyLastSeen } from "./last-seen";
+import { dropLegacySendAgain } from "./send-again";
 import { __resetStore, getRecord, putRecord, STORE_NAME } from "./store";
 import { wipeDevice } from "./wipe";
 
@@ -25,6 +26,7 @@ const NOT_STORAGE = new Map<string, string>([
   ["collie:open", "a service-worker postMessage type (lib/notification-open.ts)"],
   ["collie:herd", "a notification tag (lib/push-decision.ts)"],
   ["collie:herd@<host>", "the per-host notification tag, named in a comment"],
+  ["collie.json", "a theme file name in the theme catalogue (lib/theme/catalogue.ts), not a storage key"],
 ]);
 
 type Area = "local" | "session";
@@ -43,11 +45,15 @@ const KEYS = new Map<string, KeyFate>([
   ["collie:draft:", { area: "local", prefix: true, fate: "wiped", why: "unsent words typed under the pairing" }],
   // The draft store's second version (lib/drafts.ts, PR 560); under the first one's prefix, so its wipe covers both.
   ["collie:draft:v2:", { area: "local", prefix: true, fate: "wiped", why: "unsent words typed under the pairing" }],
+  ["collie:draft:back~", { area: "local", prefix: true, fate: "wiped", why: "unsent words waiting on Put back, stored with the draft" }],
   // The token and the push endpoint are named by constants, so the scan sees them through those.
   ["collie:device-token", { area: "local", prefix: false, fate: "wiped", why: "the credential itself" }],
   ["collie:push-endpoint", { area: "local", prefix: false, fate: "wiped", why: "names this phone's push endpoint" }],
   // Cleared with the token (lib/pairing.ts `clearDeviceToken`): it caps the store at this pairing's expiry.
   ["collie:pairing-expires", { area: "local", prefix: false, fate: "wiped", why: "the ended pairing's expiry" }],
+  ["collie:shape:", { area: "local", prefix: true, fate: "wiped", why: "remembered shape facts: a flag, a small number or a fixed word per page part (lib/remembered-shape.ts)" }],
+  // Decision ids of trick proposals closed with "Not now" in their session (lib/hill/session-later.ts, 2026-11-17): they name this pairing's bridge decisions, so they go with it.
+  ["collie:session-later", { area: "local", prefix: false, fate: "wiped", why: "decision ids of this pairing's trick proposals, closed in their session" }],
   ["collie:slot:v1:", { area: "local", prefix: true, fate: "wiped", why: "the last pane address and workspace name of each browser tile" }],
   // Written first by the wipe and removed last; present only while a wipe is unfinished (lib/wipe.ts).
   ["collie:wipe-pending", { area: "local", prefix: false, fate: "wiped", why: "a wipe's resume mark" }],
@@ -73,6 +79,7 @@ const KEYS = new Map<string, KeyFate>([
   ["collie:wide-layout:v1", { area: "local", prefix: false, fate: "kept", why: "large-screen columns per space: pane addresses and widths, no content (ADR 0120)" }],
   ["collie:wide-sidebar:v1", { area: "local", prefix: false, fate: "kept", why: "preference" }],
   ["collie:wide-layout-mode:v1", { area: "local", prefix: false, fate: "kept", why: "preference: Auto or Off for the large-screen layout (ADR 0120)" }],
+  ["collie:enter-sends:v1", { area: "local", prefix: false, fate: "kept", why: "preference: whether Enter sends or adds a line on this device (lib/enter-sends-store.ts)" }],
   ["collie:pin-hint:v1", { area: "local", prefix: false, fate: "kept", why: "a dismissed hint" }],
   ["collie:masked-hint:v1", { area: "local", prefix: false, fate: "kept", why: "a dismissed hint" }],
   ["collie:pane-nav-hint:v1", { area: "local", prefix: false, fate: "kept", why: "the Two fingers first-arm hint was shown (ADR 0121)" }],
@@ -81,6 +88,10 @@ const KEYS = new Map<string, KeyFate>([
   ["collie:mirror-native:", { area: "local", prefix: true, fate: "kept", why: "a per-pane colour choice" }],
   ["collie:tour:v1", { area: "local", prefix: false, fate: "kept", why: "the tour was seen" }],
   ["collie:diff-comments:v1:", { area: "session", prefix: true, fate: "wiped", why: "the Changes batch of diff comments: quoted lines and the notes on them" }],
+  ["collie:tab-pane:v1:", { area: "session", prefix: true, fate: "wiped", why: "the pane id each tab was last open on, per machine, session and tab (lib/tab-pane-memory.ts)" }],
+  ["collie:chat-silhouette:v1:", { area: "session", prefix: true, fate: "wiped", why: "the silhouette of each pane's Chat page: row kinds, heights and line counts, never a word (lib/chat-silhouette.ts)" }],
+  ["collie:send-intent:", { area: "session", prefix: true, fate: "wiped", why: "the request id of a send with no answer, and the text of the draft it carried (lib/send-intent.ts)" }],
+  ["collie:create-intent:", { area: "session", prefix: true, fate: "wiped", why: "the request id of a quick launch, tab or space create with no answer, kept 30 seconds, and the folder it names (lib/create-intent.ts)" }],
   ["collie:new-sheet:again:v1", { area: "local", prefix: false, fate: "wiped", why: "the last start per machine names its folders" }],
   ["collie:no-prompts-confirmed:v1", { area: "local", prefix: false, fate: "wiped", why: "the per-device No prompts confirms name machines and command lines" }],
   ["collie:new-page:kind:v1", { area: "local", prefix: false, fate: "kept", why: "Agent or Command per machine, one word, no folder" }],
@@ -102,6 +113,7 @@ const KEYS = new Map<string, KeyFate>([
   // ── Dropped: the 1.17 last-seen mirror, moved into the on-device store (ADR 0087) ──
   ["collie:last-snapshot:", { area: "session", prefix: true, fate: "dropped", why: "lib/last-seen.ts deletes it at boot" }],
   ["collie:last-pane:", { area: "session", prefix: true, fate: "dropped", why: "lib/last-seen.ts deletes it at boot" }],
+  ["collie:send-again:", { area: "session", prefix: true, fate: "dropped", why: "an earlier build stored a fingerprint of an unknown send's text here; lib/send-again.ts deletes it at boot" }],
 ]);
 
 /**
@@ -178,6 +190,7 @@ describe("storage keys and the wipe", () => {
     const dropped = [...KEYS].filter(([, fate]) => fate.fate === "dropped");
     for (const [name, fate] of dropped) storageOf(fate.area).setItem(keyOf(name, fate), "1");
     dropLegacyLastSeen();
+    dropLegacySendAgain();
     const left = dropped.filter(([name, fate]) => storageOf(fate.area).getItem(keyOf(name, fate)) !== null);
     expect(left.map(([name]) => name)).toEqual([]);
   });

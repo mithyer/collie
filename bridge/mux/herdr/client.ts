@@ -1,6 +1,6 @@
 import type { JsonObject } from "../../json.ts";
 import type { AgentStatus } from "../../types.ts";
-import { dialHerdr, type DialMode, type SockHandle } from "../../dial.ts";
+import { dialHerdr, mayHaveReachedPeer, type DialMode, type SockHandle } from "../../dial.ts";
 import { decodeReplyLine, decodeStreamLine, type EventData } from "../../wire.ts";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -232,6 +232,7 @@ export type HerdrRpc = Pick<
   | "renameTab"
   | "closeTab"
   | "createWorkspace"
+  | "openWorktree"
   | "subscribeEvents"
 >;
 
@@ -239,6 +240,32 @@ let idCounter = 0;
 
 /** Per-request wall-clock budget. Exported so callers can pass it explicitly alongside a dial mode. */
 export const DEFAULT_TIMEOUT_MS = 5000;
+
+/**
+ * A request Herdr did not answer inside the client's budget. The message is the one a plain Error carried
+ * before; the class lets a write tell "not confirmed, it may still land" from a transport that failed
+ * (MuxRefusal `unconfirmed`, bridge/mux/types.ts).
+ */
+export class HerdrTimeout extends Error {
+  constructor(method: string, timeoutMs: number) {
+    super(`herdr ${method}: timed out after ${String(timeoutMs)}ms`);
+    this.name = "HerdrTimeout";
+  }
+}
+
+/**
+ * A connection that closed, or failed with a socket error, after the request was handed to the socket
+ * and before a reply came. A close keeps the message a plain Error carried before; an error carries its
+ * own message after the method. Like {@link HerdrTimeout} it means "not confirmed": Herdr may have read
+ * the request and acted on it (MuxRefusal `unconfirmed`, bridge/mux/types.ts). A close or an error
+ * before the request went out (a failed dial) stays the plain error.
+ */
+export class HerdrNoReply extends Error {
+  constructor(method: string, cause?: Error) {
+    super(cause === undefined ? `herdr ${method}: connection closed before reply` : `herdr ${method}: ${cause.message}`, { cause });
+    this.name = "HerdrNoReply";
+  }
+}
 
 export class HerdrClient {
   constructor(
@@ -262,6 +289,9 @@ export class HerdrClient {
       // Aborts a dial that is still connecting — a timeout that fires mid-connect has no socket
       // to end() yet, and without this the pending OS handle lives until the connect settles.
       let cancelDial: (() => void) | null = null;
+      // True once the request was handed to the socket: a close or an error after that may follow a
+      // request Herdr already acted on ({@link HerdrNoReply}); one before it cannot.
+      let sent = false;
       // Stream-decode so a multi-byte UTF-8 codepoint split across chunk boundaries isn't
       // corrupted into replacement characters.
       const decoder = new TextDecoder("utf-8");
@@ -290,7 +320,7 @@ export class HerdrClient {
         cancelDial = null;
       };
       const timer = setTimeout(
-        () => finish(() => reject(new Error(`herdr ${method}: timed out after ${this.timeoutMs}ms`))),
+        () => finish(() => reject(new HerdrTimeout(method, this.timeoutMs))),
         this.timeoutMs,
       );
 
@@ -316,10 +346,10 @@ export class HerdrClient {
           });
         },
         error(_s, err) {
-          finish(() => reject(err));
+          finish(() => reject(sent && mayHaveReachedPeer(err) ? new HerdrNoReply(method, err) : err));
         },
         close() {
-          finish(() => reject(new Error(`herdr ${method}: connection closed before reply`)));
+          finish(() => reject(sent ? new HerdrNoReply(method) : new Error(`herdr ${method}: connection closed before reply`)));
         },
       }, this.dialMode);
 
@@ -344,6 +374,7 @@ export class HerdrClient {
           // one go; the dialer owns that continuation, so there is nothing to retry here (dial.ts,
           // write-drain.ts). A connection that dies mid-write lands in close/error above and
           // rejects like any other transport failure.
+          sent = true;
           s.write(JSON.stringify({ id, method, params }) + "\n");
           s.flush();
         } catch (err) {
@@ -533,6 +564,40 @@ export class HerdrClient {
       workspace: WireWorkspace;
       root_pane: WirePane;
     }>("workspace.create", params);
+    const p = r.root_pane;
+    return {
+      paneId: p.pane_id,
+      workspaceId: p.workspace_id,
+      workspaceLabel: r.workspace.label,
+      tabId: p.tab_id,
+      cwd: p.cwd,
+    };
+  }
+
+  /**
+   * Open a linked worktree that already exists on disk as a workspace, so Herdr records it as a
+   * worktree of its repository (`worktree.open`, herdr 0.9.5, protocol 22; ADR 0126 note).
+   *
+   * Where `workspace.create` makes a plain workspace with no `worktree` block, this one gets
+   * `repo_key`, `is_linked_worktree` and `checkout_path`, and Herdr's sidebar nests it under the
+   * repository's own workspace. Probed 2026-11-13:
+   *   - `cwd` is the REPO ROOT and is required. `path` alone answers `linked_worktree_source`, and a
+   *     `cwd` whose repo is not the checkout's answers `worktree_not_found`.
+   *   - the answer carries the same `workspace` and `root_pane` as `workspace.create`, so the same
+   *     {@link CreatedShell} comes out, plus `already_open`.
+   *   - a checkout that is already open answers `already_open: true` with the space showing it, and
+   *     renames that space to `label`. It never opens a second one.
+   *   - when the repo has no workspace of its own open, Herdr opens one (unfocused) as the parent.
+   *   - a Herdr without the method answers `invalid_request` with "unknown variant `worktree.open`".
+   *
+   * No `trust_repository`: that flag grants Git trust for the request, and the operator gives it in
+   * Herdr, never from the phone (ADR 0089). `focus:false`, as every create here.
+   */
+  async openWorktree(opts: { cwd: string; path: string; label?: string }): Promise<CreatedShell> {
+    // See createTab: an empty label stays omitted.
+    const params: JsonObject = { cwd: opts.cwd, path: opts.path, focus: false };
+    if (opts.label) params.label = opts.label;
+    const r = await this.request<{ workspace: WireWorkspace; root_pane: WirePane }>("worktree.open", params);
     const p = r.root_pane;
     return {
       paneId: p.pane_id,

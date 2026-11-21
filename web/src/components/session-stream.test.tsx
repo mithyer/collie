@@ -2,13 +2,16 @@ import { act, createEvent, fireEvent, render, screen, within } from "@testing-li
 import userEvent from "@testing-library/user-event";
 import { createRef } from "react";
 
-import { SessionStream, type QueuedCardAction } from "./session-stream";
+import { SessionStream, type QueuedCardAction, type QueuedCardResult } from "./session-stream";
 import type { ChatFeed } from "@/hooks/use-chat-window";
 import type { ChatMessageListHandle } from "@/components/ui/chat/chat-message-list";
 import { EMPTY_CHAT_WINDOW, type ChatWindow } from "@/lib/chat-window";
 import type { ChatItem } from "@/lib/chat-items";
 import type { ChatEntry } from "@/lib/types";
 import { BLOCK_HOLD_MS } from "./stream-block";
+import { USER_WELL, USER_WELL_HUG, USER_WELL_META, USER_WELL_TIME } from "./user-well";
+import { clockTimeOf } from "@/lib/format";
+import { CHAT_LOOK_BEFORE, ChatLookContext } from "@/lib/chat-look";
 
 // The pane view's second body. The load-bearing behaviours: the two empty answers are never drawn
 // alike, a pane with nothing to read says nothing until it has actually asked, older turns come off
@@ -72,6 +75,23 @@ function renderStream(
 }
 
 describe("SessionStream", () => {
+  it("draws the 1.29 look by default and carries no chat-look marker class into the app's markup", () => {
+    const { container } = renderStream(
+      feedOf({
+        status: { kind: "live" },
+        entries: [
+          entry("u", BASE, "a question", { role: "user" }),
+          entry("a", BASE + 1, "an answer with `code`\n\n```\nblock\n```"),
+        ],
+      }),
+    );
+    expect(container.querySelector("[class*='chat-look-mark']")).toBeNull();
+    expect(Array.from(container.querySelectorAll("*")).some((el) => Array.from(el.classList).some((c) => c.startsWith("chat-look-mark")))).toBe(false);
+    // The hug well, and a code block on the neutral ground at 12px.
+    expect(screen.getByText("a question").parentElement).toHaveClass("w-fit");
+    expect(container.querySelector("pre")).toHaveClass("bg-muted", "text-xs");
+  });
+
   it("draws the turns it holds, oldest first", () => {
     renderStream(
       feedOf({
@@ -122,10 +142,11 @@ describe("SessionStream", () => {
   });
 
   // #508: the bridge refused to guess between two Muse sessions in one folder. The empty Chat says
-  // why and how to fix it, on a new pane too, since nothing will appear on its own.
+  // why and how to fix it, on a new pane too, since nothing will appear on its own. The remedy names
+  // no resume command: pi's `--resume` is only a picker, and its flags are `--session`/`--session-id` (#780).
   it("names a shared folder and its remedy under the empty state, and only when the bridge says so", () => {
     const line =
-      "Two Muse sessions share this folder, so Collie cannot tell which one is this pane's. Start the agent with its resume command and session id, then Collie reads the right one.";
+      "Two Muse sessions share this folder, so Collie cannot tell which one is this pane's. Start the agent with the flag that names its session id, then Collie reads the right one.";
     for (const starting of [false, true]) {
       const r = renderStream(
         feedOf({ status: { kind: "unavailable", reason: "no-session", detail: "shared-folder" } }),
@@ -434,7 +455,7 @@ describe("SessionStream", () => {
           parts: [
             exec(1, "ls"),
             exec(2, "pwd"),
-            exec(3, 'collie walky send bluefin/w6:p3 "Merged."'),
+            exec(3, 'collie walky send lodge/w6:p3 "Merged."'),
             exec(4, "git status"),
             exec(5, "git log"),
           ],
@@ -686,7 +707,7 @@ describe("SessionStream — Send now", () => {
 // Rows from Collie's own receipts: still waiting (no button at all, one sentence), or given back to the
 // input box by a Stop (Send and Discard). The journal's own queue card is the "Send now" block above.
 describe("SessionStream — queued sends from the receipts", () => {
-  function renderReceipts(window: Partial<ChatWindow>, onReturned?: (requestId: string, action: QueuedCardAction) => Promise<boolean>) {
+  function renderReceipts(window: Partial<ChatWindow>, onReturned?: (requestId: string, action: QueuedCardAction, text: string) => Promise<QueuedCardResult>) {
     const listRef = createRef<ChatMessageListHandle>();
     return render(
       <SessionStream
@@ -733,7 +754,7 @@ describe("SessionStream — queued sends from the receipts", () => {
     expect(container.querySelector("[data-slot='stream-queued-receipts']")).toBeNull();
   });
 
-  it("an unconfirmed card says Collie cannot tell, and offers Discard alone, which asks to dismiss", async () => {
+  it("an unconfirmed card says Collie cannot tell, and offers Discard and Send again, Discard asking to dismiss", async () => {
     const onReturned = vi.fn(async () => true);
     const { container } = renderReceipts({ queuedSends: [LOST] }, onReturned);
     const card = container.querySelector("[data-slot='stream-unconfirmed']")!;
@@ -742,11 +763,40 @@ describe("SessionStream — queued sends from the receipts", () => {
       "Collie cannot tell where this message went. Check the agent.",
       "where did it go",
     ]);
-    expect(card.querySelectorAll("button")).toHaveLength(1);
+    // Discard first, Send again on its right, as on the "cannot tell" card.
+    expect([...card.querySelectorAll("button")].map((button) => button.textContent)).toEqual(["Discard", "Send again"]);
     const discard = screen.getByRole("button", { name: "Discard this card. Nothing is sent to the agent." });
     expect(discard).toHaveTextContent("Discard");
     await userEvent.click(discard);
-    expect(onReturned).toHaveBeenCalledWith("req-lost-00001", "dismiss");
+    expect(onReturned).toHaveBeenCalledWith("req-lost-00001", "dismiss", "where did it go");
+  });
+
+  it("cannot tell: an unconfirmed card's Send again hands the row's id and its own text over, once, and waits while it runs", async () => {
+    let finish: (done: QueuedCardResult) => void = () => undefined;
+    const onReturned = vi.fn(() => new Promise<QueuedCardResult>((resolve) => (finish = resolve)));
+    renderReceipts({ queuedSends: [LOST] }, onReturned);
+    const again = screen.getByRole("button", { name: "Send again" });
+    await userEvent.click(again);
+    expect(onReturned).toHaveBeenCalledWith("req-lost-00001", "sendAgain", "where did it go");
+    expect(again).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Discard this card. Nothing is sent to the agent." })).toBeDisabled();
+    await userEvent.click(again);
+    expect(onReturned).toHaveBeenCalledTimes(1);
+    await act(async () => finish(true));
+  });
+
+  it("cannot tell: a Send again that finds the card gone says nothing was sent again, and the buttons come back", async () => {
+    const onReturned = vi.fn(async (): Promise<QueuedCardResult> => "gone");
+    renderReceipts({ queuedSends: [LOST] }, onReturned);
+    await userEvent.click(screen.getByRole("button", { name: "Send again" }));
+    expect(await screen.findByText("This message is not waiting any more, so nothing was sent again.")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Send again" })).toBeEnabled();
+  });
+
+  it("cannot tell: a card whose text the bridge masked offers no Send again, because the dots are not the message", () => {
+    renderReceipts({ queuedSends: [{ requestId: "req-mask-00001", state: "unconfirmed", text: "use the key sk-o••••••••" }] }, vi.fn(async () => true));
+    expect(screen.getByRole("button", { name: "Discard this card. Nothing is sent to the agent." })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Send again" })).toBeNull();
   });
 
   it("a returned run is one card with its joined text and one pair of buttons", () => {
@@ -777,7 +827,7 @@ describe("SessionStream — queued sends from the receipts", () => {
     const send = screen.getByRole("button", { name: "Send this message from the agent's box" });
     const discard = screen.getByRole("button", { name: "Discard this message from the agent's box" });
     await userEvent.click(send);
-    expect(onReturned).toHaveBeenCalledWith("req-back-00001", "submit");
+    expect(onReturned).toHaveBeenCalledWith("req-back-00001", "submit", "second message");
     expect(send).toBeDisabled();
     expect(discard).toBeDisabled();
     await userEvent.click(discard);
@@ -786,7 +836,7 @@ describe("SessionStream — queued sends from the receipts", () => {
     await act(async () => finish(false));
     expect(send).not.toBeDisabled();
     await userEvent.click(discard);
-    expect(onReturned).toHaveBeenLastCalledWith("req-back-00001", "discard");
+    expect(onReturned).toHaveBeenLastCalledWith("req-back-00001", "discard", "second message");
   });
 
   it("draws nothing on a window that is not live", () => {
@@ -881,7 +931,7 @@ describe("SessionStream — the prompt pin", () => {
       return DOMRect.fromRect({ x: 0, y: index * step - scrolled, width: 390, height: 100 });
     });
   }
-  const prompt = (uuid: string, seq: number, text: string) => entry(uuid, seq, text, { role: "user" });
+  const prompt = (uuid: string, seq: number, text: string, ts = "2026-09-30T10:00:00.000Z") => entry(uuid, seq, text, { role: "user", ts });
 
   afterEach(() => vi.restoreAllMocks());
 
@@ -895,6 +945,110 @@ describe("SessionStream — the prompt pin", () => {
     );
     const pin = document.querySelector('[data-slot="prompt-pin"]');
     expect(pin).toHaveTextContent("fix the flaky test");
+  });
+
+  it("the pin leans right in the same well as the resting turn, so the message does not move when it sticks", () => {
+    layOut(250);
+    renderStream(
+      feedOf({
+        status: { kind: "live" },
+        entries: [prompt("p1", BASE, "fix the flaky test"), entry("a", BASE + 1, "one"), entry("b", BASE + 2, "two"), entry("c", BASE + 3, "three")],
+      }),
+    );
+    const pin = document.querySelector<HTMLElement>('[data-slot="prompt-pin"]')!;
+    // The resting turn: the well that holds the same words in the thread.
+    const resting = screen.getAllByText("fix the flaky test").map((el) => el.closest<HTMLElement>("[data-block]")).find((el) => el !== null)!;
+    const well = resting.querySelector<HTMLElement>(".ml-auto")!;
+    // Side, width cap and hairline sit on the button; the wash and the padding on the well inside it
+    // (the button's own ground stays opaque, so the thread does not show through the tint).
+    for (const cls of USER_WELL_HUG.split(" ")) {
+      expect(well).toHaveClass(cls);
+      expect(pin).toHaveClass(cls);
+    }
+    const inner = pin.querySelector<HTMLElement>(":scope > span")!;
+    for (const cls of USER_WELL.split(" ")) {
+      expect(well).toHaveClass(cls);
+      expect([pin, inner].some((el) => el.classList.contains(cls))).toBe(true);
+    }
+    expect(pin).not.toHaveClass("w-full");
+    // No prompt icon: the resting turn has none, and it would push the words right.
+    expect(pin.querySelector("svg")).toBeNull();
+    // The pin sits beside the scrollport, so the chat font size tokens ride on its wrapper.
+    expect(pin.parentElement?.style.getPropertyValue("--text-sm")).toBe("14px");
+  });
+
+  describe("the time on the pin", () => {
+    const TS = "2026-09-30T10:07:00.000Z";
+    // An empty `ts` is a prompt with no time: the resting turn draws none, and so must the pin.
+    const stampedFeed = (ts: string) =>
+      feedOf({
+        status: { kind: "live" },
+        entries: [prompt("p1", BASE, "fix the flaky test", ts), entry("a", BASE + 1, "one"), entry("b", BASE + 2, "two"), entry("c", BASE + 3, "three")],
+      });
+    const pinOf = () => document.querySelector<HTMLElement>('[data-slot="prompt-pin"]')!;
+    const restingMeta = () => {
+      const resting = screen.getAllByText("fix the flaky test").map((el) => el.closest<HTMLElement>("[data-block]")).find((el) => el !== null)!;
+      return resting.querySelector<HTMLElement>("p > span.float-right");
+    };
+
+    it("shows the resting turn's time, in the same element classes, under the 1.29 look", () => {
+      layOut(250);
+      renderStream(stampedFeed(TS));
+      const expected = clockTimeOf(TS);
+      expect(expected).not.toBe("");
+      const resting = restingMeta()!;
+      expect(resting).toHaveTextContent(expected);
+      const time = pinOf().querySelector<HTMLElement>('[data-slot="prompt-pin-time"]')!;
+      expect(time).toHaveTextContent(expected);
+      // Same classes as the resting turn's small print, and inside the well, not a row of its own.
+      for (const cls of USER_WELL_META.split(" ")) expect(time).toHaveClass(cls);
+      expect(resting.className).toBe(USER_WELL_META);
+      expect(time.firstElementChild).toHaveClass(USER_WELL_TIME);
+      expect(pinOf().querySelector(":scope > span")!.contains(time)).toBe(true);
+      // The fixed two-line height holds.
+      expect(pinOf()).toHaveClass("h-14");
+    });
+
+    it("shows none under the look before 1.29", () => {
+      layOut(250);
+      const listRef = createRef<ChatMessageListHandle>();
+      render(
+        <ChatLookContext.Provider value={CHAT_LOOK_BEFORE}>
+          <SessionStream feed={stampedFeed(TS)} address="w1:p1" working={false} showToolCalls showCompactions={false} fontSize={14} listRef={listRef} agent="muse" />
+        </ChatLookContext.Provider>,
+      );
+      expect(pinOf()).toBeInTheDocument();
+      expect(pinOf().querySelector('[data-slot="prompt-pin-time"]')).toBeNull();
+      expect(pinOf()).not.toHaveTextContent(clockTimeOf(TS));
+    });
+
+    it("shows none for a prompt with no time, as the resting turn does", () => {
+      layOut(250);
+      renderStream(stampedFeed(""));
+      expect(restingMeta()).toBeNull();
+      expect(pinOf()).toBeInTheDocument();
+      expect(pinOf().querySelector('[data-slot="prompt-pin-time"]')).toBeNull();
+    });
+  });
+
+  it("the look before 1.29 keeps the pin full width with its icon", () => {
+    layOut(250);
+    const feed = feedOf({
+      status: { kind: "live" },
+      entries: [prompt("p1", BASE, "fix the flaky test"), entry("a", BASE + 1, "one"), entry("b", BASE + 2, "two"), entry("c", BASE + 3, "three")],
+    });
+    const listRef = createRef<ChatMessageListHandle>();
+    render(
+      <ChatLookContext.Provider value={CHAT_LOOK_BEFORE}>
+        <SessionStream feed={feed} address="w1:p1" working={false} showToolCalls showCompactions={false} fontSize={14} listRef={listRef} agent="muse" />
+      </ChatLookContext.Provider>,
+    );
+    const pin = document.querySelector<HTMLElement>('[data-slot="prompt-pin"]')!;
+    expect(pin).toHaveClass("w-full");
+    expect(pin).not.toHaveClass("ml-auto");
+    expect(pin).not.toHaveClass("w-fit");
+    expect(pin.querySelector("svg")).not.toBeNull();
+    expect(pin.parentElement?.style.getPropertyValue("--text-sm")).toBe("");
   });
 
   it("pins nothing while the prompt itself is the top block", () => {

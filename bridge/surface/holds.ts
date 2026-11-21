@@ -29,7 +29,7 @@
 import { chmodSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { asJsonNumber, asJsonObject, asJsonString, type JsonValue } from "../../web/src/lib/json.ts";
-import { HELD_CAUSES, REQUEST_ID, SEND_MODES, SEND_OUTCOMES, SEND_REASONS, type HeldCause, type HeldRow, type HeldState, type SendMode, type SendOutcome, type SendReason } from "../../web/src/lib/surface/send.ts";
+import { HELD_CAUSES, HELD_LONG_MS, REQUEST_ID, SEND_MODES, SEND_OUTCOMES, SEND_REASONS, WALKY_MESSAGE_ID, type HeldCause, type HeldRow, type HeldState, type SendMode, type SendOutcome, type SendReason } from "../../web/src/lib/surface/send.ts";
 
 /** How long a text stays held before it ends `expired` (decision 4). */
 export const HOLD_MS = 30 * 60 * 1000;
@@ -83,6 +83,10 @@ export interface HeldEntry {
   readonly cause?: HoldCause;
   /** Held for a turn only because the harness's version could not be read (see {@link HeldRow.versionUnread}). */
   readonly versionUnread?: true;
+  /** The id of the WalkyTalky message this request types (see {@link HeldRow.walky}). */
+  readonly walky?: string;
+  /** Held {@link HELD_LONG_MS} or more, marked by the hold poll (see {@link HeldRow.heldLong}, M102 spec 12). */
+  readonly heldLong?: true;
 }
 
 export interface HoldInput {
@@ -103,6 +107,8 @@ export interface HoldInput {
   readonly cause?: HoldCause;
   /** See {@link HeldEntry.versionUnread}. */
   readonly versionUnread?: boolean;
+  /** See {@link HeldEntry.walky}. */
+  readonly walky?: string;
   /** The caller's own end of the hold, epoch ms: it replaces {@link HOLD_MS} and {@link HOLD_COMMAND_MS}. */
   readonly expiresAt?: number;
 }
@@ -144,16 +150,25 @@ export function parseHeldEntry(raw: JsonValue | undefined): HeldEntry | null {
   const cause = pick(node.cause, HELD_CAUSES);
   if (cause !== undefined) entry = { ...entry, cause };
   if (node.versionUnread === true) entry = { ...entry, versionUnread: true };
+  const walky = asJsonString(node.walky);
+  if (walky !== undefined && WALKY_MESSAGE_ID.test(walky)) entry = { ...entry, walky };
+  if (node.heldLong === true) entry = { ...entry, heldLong: true };
   return entry;
 }
 
-/** The phone's row for an entry: what the composer's queued row shows. */
-export function heldRow(entry: HeldEntry): HeldRow {
+/**
+ * The phone's row for an entry: what the composer's queued row shows. `now` marks a row still held
+ * {@link HELD_LONG_MS} or more `heldLong` (M102 spec 12): the wait goes on as before, the row only says so.
+ */
+export function heldRow(entry: HeldEntry, now?: number): HeldRow {
   let row: HeldRow = { requestId: entry.id, mode: entry.mode, text: entry.text, heldAt: entry.heldAt, expiresAt: entry.expiresAt, state: entry.state };
   if (entry.outcome !== undefined) row = { ...row, outcome: entry.outcome };
   if (entry.reason !== undefined) row = { ...row, reason: entry.reason };
   if (entry.cause !== undefined) row = { ...row, cause: entry.cause };
   if (entry.versionUnread === true) row = { ...row, versionUnread: true };
+  if (entry.walky !== undefined) row = { ...row, walky: entry.walky };
+  const long = entry.heldLong === true || (now !== undefined && now - entry.heldAt >= HELD_LONG_MS);
+  if (entry.state === "held" && long) row = { ...row, heldLong: true };
   return row;
 }
 
@@ -212,12 +227,13 @@ export class HoldStore {
   /** A new request at the end of its pane's queue. */
   add(input: HoldInput): HeldEntry {
     const at = this.now();
-    const { command, waitsForTurn, draftHolds, cause, versionUnread, expiresAt, ...rest } = input;
+    const { command, waitsForTurn, draftHolds, cause, versionUnread, expiresAt, walky, ...rest } = input;
     let entry: HeldEntry = { ...rest, heldAt: at, expiresAt: expiresAt ?? at + (command ? HOLD_COMMAND_MS : HOLD_MS), seq: this.nextSeq++, state: "held", tries: 0 };
     if (waitsForTurn === true) entry = { ...entry, waitsForTurn: true };
     if (draftHolds === true) entry = { ...entry, draftHolds: true };
     if (cause !== undefined) entry = { ...entry, cause };
     if (versionUnread === true) entry = { ...entry, versionUnread: true };
+    if (walky !== undefined) entry = { ...entry, walky };
     return this.write(entry);
   }
 
@@ -237,6 +253,13 @@ export class HoldStore {
 
   get(id: string): HeldEntry | null {
     return this.entries.get(id) ?? null;
+  }
+
+  /** A request still held {@link HELD_LONG_MS} after it was held is marked `heldLong`, once. Null when it is not held. */
+  markLong(id: string): HeldEntry | null {
+    const known = this.get(id);
+    if (known === null || known.state !== "held") return null;
+    return known.heldLong === true ? known : this.write({ ...known, heldLong: true });
   }
 
   /** Every entry, in queue order; with a session and a pane, only that pane's. */

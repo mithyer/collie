@@ -6,9 +6,13 @@ import { DEVICES_SUBCOMMANDS } from "./pairing.ts";
 import { PUSH_SUBCOMMANDS } from "./push.ts";
 import { STT_SUBCOMMANDS } from "./stt.ts";
 import { CONFIG_SUBCOMMANDS } from "./config.ts";
+import { HILL_SUBCOMMANDS } from "./hill.ts";
+import { VIEW_SUBCOMMANDS, viewTopLines } from "./trick-view.ts";
 import { WALKY_SUBCOMMANDS } from "./walky.ts";
 import { DURABLE_SUBCOMMANDS } from "./durable-attach.ts";
 import { MUX_SUBCOMMANDS } from "./mux-list.ts";
+import { HARNESS_SUBCOMMANDS } from "./harness-link.ts";
+import { TRICK_SUBCOMMANDS } from "./trick.ts";
 import { SESSIONS_VERB } from "./sessions.ts";
 import {
   type Command,
@@ -96,14 +100,23 @@ const PUSH_VERBS = ["push"];
 const STT_VERBS = ["stt"];
 /** The config-file tree (ADR 0040). Declared right after `stt`, for the same reasons. */
 const CONFIG_VERBS = ["config"];
+// Collie tricks (M94 slice 01). Declared after `config`: a trick is a folder in the same config dir.
+// `tricks` is the switch for tricks as a whole (cli/tricks-switch.ts), beside the one trick's verb.
+const TRICK_VERBS = ["trick", "tricks"];
 const DURABLE_VERBS = ["durable"];
 // `mux list` (M76 spec 02). Declared after `durable`: it reads the multiplexers the durable adapter is one of.
 const MUX_VERBS = ["mux"];
+// The harness parts (M99 spec 09), declared right after `mux`: both are about the programs Collie drives.
+const HARNESS_VERBS = ["harness"];
 // The agent-session list (M76 spec 03), declared right after `mux`. The name is `SESSIONS_VERB`.
 const SESSIONS_VERBS = [SESSIONS_VERB];
 // Walky talky (M62). Declared after `sessions`. One spelling: the `wt` alias was dropped before
 // release, because Windows Terminal's binary is `wt.exe`.
 const WALKY_VERBS = ["walky"];
+// The hill (M96), declared right after `walky`: an agent posts a decision over the same socket.
+const HILL_VERBS = ["hill"];
+// The local API's command face (M105), declared right after `hill`.
+const API_VERBS = ["api"];
 // `theme check` (M59 spec 05), declared after `walky`. It reads files and touches no state.
 const THEME_VERBS = ["theme"];
 // The manual, printed out of the binary: `collie skill` for an AI agent, `collie docs` for the
@@ -127,10 +140,14 @@ describe("the verb table", () => {
       ...PUSH_VERBS,
       ...STT_VERBS,
       ...CONFIG_VERBS,
+      ...TRICK_VERBS,
       ...DURABLE_VERBS,
       ...MUX_VERBS,
+      ...HARNESS_VERBS,
       ...SESSIONS_VERBS,
       ...WALKY_VERBS,
+      ...HILL_VERBS,
+      ...API_VERBS,
       ...THEME_VERBS,
       ...CREW_VERBS,
       ...MANUAL_VERBS,
@@ -309,6 +326,30 @@ describe("dispatch", () => {
     expect(ran).toEqual(["serve status"]);
   });
 
+  test("the bare `link` and `unlink` refuse an argument with exit 2 and name `collie harness link` (M99 spec 09)", async () => {
+    for (const verb of ["link", "unlink"]) {
+      for (const argv of [[verb, "claude"], [verb, "status"], [verb, "sync"]]) {
+        // The real table: the refusal comes before any seam is built, so nothing on this machine is read.
+        const io = capture();
+        expect(await run(argv, io)).toBe(EXIT.USAGE);
+        expect(io.stdout).toEqual([]);
+        expect(io.stderr).toEqual([`error: \`collie ${verb}\` takes no argument; it ${verb === "link" ? "puts `collie` on your PATH" : "removes `collie` from your PATH"}. To ${verb} a harness, run \`collie harness ${verb} <harness>\`.`]);
+      }
+    }
+  });
+
+  test("`link --help` names only the PATH name; a bare `harness` names the harness verbs", async () => {
+    const io = capture();
+    expect(await run(["link", "--help"], io, spied().table)).toBe(EXIT.OK);
+    expect(io.stdout.join("\n")).toContain("~/.local/bin/collie");
+    expect(io.stdout.join("\n")).not.toContain("<harness>");
+    // The bare tree, as `mux`: its usage on stderr, exit 2. The real table: it reads nothing.
+    const tree = capture();
+    expect(await run(["harness"], tree)).toBe(EXIT.USAGE);
+    const words = tree.stderr.join("\n");
+    for (const sub of ["link", "unlink", "status", "sync"]) expect(words).toContain(`harness ${sub}`);
+  });
+
   test("`_apply-update --help` runs nothing and exits non-zero", async () => {
     const { table, ran } = spied();
     const io = capture();
@@ -431,12 +472,34 @@ describe("the subcommand trees", () => {
     expect(findCommand("wt")).toBeUndefined();
   });
 
+  test("`hill` declares exactly `cli/hill.ts`'s sub-verbs, in its order", () => {
+    expect(findCommand("hill")?.subcommands?.map((s) => s.name)).toEqual([...HILL_SUBCOMMANDS]);
+  });
+
+  test("there is no `morph` verb any more: an agent view is `trick view <trick> <verb>`", () => {
+    expect(findCommand("morph")).toBeUndefined();
+    const view = findCommand("trick")?.subcommands?.find((s) => s.name === "view");
+    expect(view).toBeDefined();
+    expect(view?.usage?.()).toEqual(viewTopLines());
+    for (const verb of VIEW_SUBCOMMANDS) expect(view?.summary).toContain(verb);
+  });
+
   test("`durable` declares exactly `cli/durable-attach.ts`'s sub-verbs, in its order", () => {
     expect(findCommand("durable")?.subcommands?.map((s) => s.name)).toEqual([...DURABLE_SUBCOMMANDS]);
   });
 
+  test("`trick` declares exactly `cli/trick.ts`'s sub-verbs, in its order", () => {
+    // `view` is declared first in cli/program.ts but listed last in `TRICK_SUBCOMMANDS` (cli/trick.ts): the
+    // rest keep one order, and one of the two lists should move `view` so this reads as a plain equality.
+    expect(findCommand("trick")?.subcommands?.map((s) => s.name)).toEqual([...TRICK_SUBCOMMANDS]);
+  });
+
   test("`mux` declares exactly `cli/mux-list.ts`'s sub-verbs, in its order", () => {
     expect(findCommand("mux")?.subcommands?.map((s) => s.name)).toEqual([...MUX_SUBCOMMANDS]);
+  });
+
+  test("`harness` declares exactly `cli/harness-link.ts`'s sub-verbs, in its order", () => {
+    expect(findCommand("harness")?.subcommands?.map((s) => s.name)).toEqual([...HARNESS_SUBCOMMANDS]);
   });
 
   test("no other verb declares a tree — the grammar is one level deep everywhere else", () => {
@@ -449,9 +512,14 @@ describe("the subcommand trees", () => {
       "push",
       "stt",
       "config",
+      "trick",
+      // `tricks on|off|status`: the switch for tricks as a whole (cli/tricks-switch.ts).
+      "tricks",
       "durable",
       "mux",
+      "harness",
       "walky",
+      "hill",
       "theme",
       "crew",
       // The alias carries the SAME array — that is what `cli/crew.test.ts` pins.
@@ -578,13 +646,30 @@ describe("exit codes", () => {
       // that same real path before they decide anything. cli/config.test.ts drives all three against
       // fakes in a temp dir.
       ...CONFIG_VERBS,
+      // `trick on`/`off`/`init` write into the developer's own config and state dirs, `list` dials this
+      // host's bridge, and `check --run` runs a provider. cli/trick.test.ts drives all five against temp dirs.
+      // `add`/`update` fetch over the network and write a trick folder, `remove` deletes one;
+      // cli/trick-add.test.ts drives them against a local bare repository through the test seam.
+      // `trick view` talks to this host's running bridges over their local sockets, and a `show` puts a
+      // screen on one; cli/trick-view.test.ts drives every sub-verb against a temp socket.
+      // `tricks on|off` write the switch for tricks as a whole into the state dir; cli/tricks-switch.test.ts.
+      ...TRICK_VERBS,
       ...DURABLE_VERBS,
       // `mux list` resolves the real context and reads the real hook target registry, and removes the
       // record of a dead bridge there. cli/mux-list.test.ts drives it against fakes.
       ...MUX_VERBS,
+      // `harness link` and `unlink` run the harness's own CLI and write a part into the config dir; `status`
+      // and `sync` read and rewrite it. cli/harness-link.test.ts drives every sub-verb against temp dirs.
+      ...HARNESS_VERBS,
       // `walky` talks to this host's running bridges over their local sockets, and a `send`
       // would type into a real pane. cli/walky.test.ts drives every sub-verb against a temp socket.
       ...WALKY_VERBS,
+      // `hill` talks to the same sockets, and a `post` puts a decision on a running bridge's hill.
+      // cli/hill.test.ts drives every sub-verb against a temp socket.
+      ...HILL_VERBS,
+      // `api` dials the local API socket of this host's own running bridge, when a trick is on there.
+      // cli/api.test.ts drives it against a scratch socket.
+      ...API_VERBS,
       // `sessions` dials this host's own running bridge for its snapshot. cli/sessions.test.ts drives it against a fake fetch.
       ...SESSIONS_VERBS,
     ];

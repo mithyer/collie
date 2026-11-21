@@ -22,10 +22,12 @@ import {
   taskWorkingDirectory,
   unitDirectives,
   unitFilePath,
+  serviceSpec,
   windowsArg,
   xmlAscii,
   xmlEscape,
 } from "./unit.ts";
+import { context } from "./fakes.ts";
 import { parseSuperviseArgs, parseWindowsArgs } from "./task-scheduler.ts";
 
 // The service definition is the one artifact an operator never sees us write and can't easily
@@ -58,10 +60,10 @@ describe("the discovered Host allowlist", () => {
   });
 
   test("a discovered value is baked into both supervisors", () => {
-    const spec = { ...SPEC, tailscaleHosts: "desk.ts.net,100.64.0.1" };
-    expect(systemdUnit(spec)).toContain("Environment=COLLIE_TAILSCALE_HOSTS=desk.ts.net,100.64.0.1");
+    const spec = { ...SPEC, tailscaleHosts: "desk.ts.net,100.64.10.1" };
+    expect(systemdUnit(spec)).toContain("Environment=COLLIE_TAILSCALE_HOSTS=desk.ts.net,100.64.10.1");
     expect(launchAgentPlist(spec)).toContain(
-      "<key>COLLIE_TAILSCALE_HOSTS</key>\n        <string>desk.ts.net,100.64.0.1</string>",
+      "<key>COLLIE_TAILSCALE_HOSTS</key>\n        <string>desk.ts.net,100.64.10.1</string>",
     );
   });
 
@@ -494,7 +496,7 @@ describe("the Task Scheduler task (Windows)", () => {
   });
 
   test("the launcher reads back exactly the words the task writes", () => {
-    const spec = { ...WIN_SPEC, instance: "v1", tailscaleHosts: "desk.ts.net,100.64.0.1" };
+    const spec = { ...WIN_SPEC, instance: "v1", tailscaleHosts: "desk.ts.net,100.64.10.1" };
     const argv = superviseArgs(spec);
     expect(argv.slice(0, 3)).toEqual(["_supervise", "--instance", "v1"]);
     expect(parseSuperviseArgs(argv.slice(1))).toEqual({ instance: "v1", env: bridgeEnvironment(spec) });
@@ -553,5 +555,18 @@ describe("the stable copy a macOS binary install runs", () => {
       "--instance",
       "v1",
     ]);
+  });
+});
+
+describe("the parts folder in the service (M99 spec 09)", () => {
+  test("a default folder writes no line; a moved one is pinned in the unit and the plist", () => {
+    expect(serviceSpec(context({})).partsDir).toBeNull();
+    expect(bridgeEnvironment(serviceSpec(context({}))).COLLIE_PARTS_DIR).toBeUndefined();
+    const moved = serviceSpec(context({ XDG_CONFIG_HOME: "/data/cfg" }));
+    expect(moved.partsDir).toBe(join("/data/cfg", "collie", "inside"));
+    expect(systemdUnit(moved)).toContain(`Environment=COLLIE_PARTS_DIR=${join("/data/cfg", "collie", "inside")}`);
+    expect(launchAgentPlist(moved)).toContain("<key>COLLIE_PARTS_DIR</key>");
+    // A relative XDG value is ignored on both sides: nothing to pin.
+    expect(serviceSpec(context({ XDG_CONFIG_HOME: "cfg" })).partsDir).toBeNull();
   });
 });

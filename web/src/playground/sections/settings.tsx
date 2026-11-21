@@ -15,7 +15,7 @@ import { CodexConsentSheet, SpeechCards, type SpeechCardsProps } from "@/compone
 import { DEFAULT_THEME_ID, type Theme } from "@/lib/theme/schema";
 import { addImported, removeImported, shippedThemes } from "@/lib/theme/store";
 import { commandChoice, commandKey, commandOptions, offerFor, pickOfKey } from "@/lib/new-page";
-import type { FolderBrowseResponse, LauncherItem, RecentRun, SttCapability, SttHostStatus, WhistleStatus } from "@/lib/types";
+import type { LauncherItem, RecentRun, SttCapability, SttHostStatus, WhistleStatus } from "@/lib/types";
 import {
   devicesPaired,
   devicesUnpaired,
@@ -24,6 +24,7 @@ import {
   spacesWithWorktrees,
   watchedPanes,
 } from "../fixtures";
+import { BROWSE_HOME, browseFixture } from "../folder-browse-fixture";
 import { NewRouter, SettingsRouter } from "../harness";
 import { Card, Group, Section, Stage, type SectionDef } from "../layout";
 import { PhoneFrameCard } from "./shared";
@@ -90,43 +91,6 @@ function CommandPickerDemo({ run, pick, line = "" }: { run: boolean; pick: strin
 }
 
 // ── The New page's Browse row (#467) ──────────────────────────────────────────────────────────────
-
-const BROWSE_HOME = "/home/op";
-/** A small disk for the card: each folder's sub-folders, `*` marking a repository. */
-const BROWSE_TREE = new Map<string, readonly string[]>([
-  [BROWSE_HOME, ["docs", "src", "notes"]],
-  [`${BROWSE_HOME}/docs`, []],
-  [`${BROWSE_HOME}/notes`, []],
-  [`${BROWSE_HOME}/src`, ["*collie", "*plektra-api", "plektra-web", "*website"]],
-  [`${BROWSE_HOME}/src/collie`, []],
-  [`${BROWSE_HOME}/src/plektra-api`, []],
-  [`${BROWSE_HOME}/src/plektra-web`, []],
-  [`${BROWSE_HOME}/src/website`, []],
-]);
-
-/**
- * The bridge's walk over {@link BROWSE_TREE}: the text resolved under home, the nearest folder that
- * exists, the rest as a case-insensitive name filter. Outside home is the bridge's `unknown-path`.
- */
-const browseFixture: NonNullable<Parameters<typeof FolderBrowse>[0]["read"]> = (text) => {
-  const raw = text.trim();
-  const abs = (raw === "" || raw === "~" ? BROWSE_HOME : raw.startsWith("~/") ? `${BROWSE_HOME}/${raw.slice(2)}` : raw.startsWith("/") ? raw : `${BROWSE_HOME}/${raw}`).replace(/\/+$/u, "");
-  if (abs !== BROWSE_HOME && !abs.startsWith(`${BROWSE_HOME}/`)) return Promise.resolve({ outcome: "unknown-path" });
-  const parts = abs.slice(BROWSE_HOME.length).split("/").filter(Boolean);
-  for (let depth = parts.length; depth >= 0; depth--) {
-    const path = [BROWSE_HOME, ...parts.slice(0, depth)].join("/");
-    const subs = BROWSE_TREE.get(path);
-    if (subs === undefined) continue;
-    const filter = parts.slice(depth).join("/");
-    const folders = subs
-      .map((s) => ({ name: s.replace(/^\*/u, ""), git: s.startsWith("*") }))
-      .filter((f) => f.name.toLowerCase().startsWith(filter.toLowerCase()));
-    const parent = depth === 0 ? null : [BROWSE_HOME, ...parts.slice(0, depth - 1)].join("/");
-    const body: FolderBrowseResponse = { path, parent, folders, filter, truncated: false };
-    return Promise.resolve({ outcome: "body", body });
-  }
-  return Promise.resolve({ outcome: "unknown-path" });
-};
 
 /** The Folder field and the Browse row under it, over the fixed tree. Use this folder only fills the field. */
 function BrowseDemo({ initial }: { initial: string }) {
@@ -676,7 +640,7 @@ export function SettingsSection() {
                 changedAt: "2026-10-11T09:41:00.000Z",
                 switchable: { ...OPEN_ALL, codex: { ok: false, reason: "codex-signed-out" } },
               }}
-              hostName="bluefin"
+              hostName="lodge"
             />
           </Stage>
         </Card>
@@ -722,7 +686,7 @@ export function SettingsSection() {
               engine="phone"
               local={PHONE_COPY}
               persisted
-              hostName="bluefin"
+              hostName="lodge"
             />
           </Stage>
         </Card>
@@ -741,7 +705,7 @@ export function SettingsSection() {
               engine="phone"
               local={PHONE_COPY}
               persisted
-              hostName="bluefin"
+              hostName="lodge"
               initialOpen
             />
           </Stage>
@@ -787,7 +751,7 @@ export function SettingsSection() {
           <Stage height={420}>
             <div className="p-4">
               <NotifyPrefsCard
-                prefs={{ blocked: true, done: false, individual: true, updates: true, cache: false, machines: true }}
+                prefs={{ blocked: true, done: false, individual: true, updates: true, cache: false, machines: true, decisions: true }}
                 busy={false}
                 onToggle={() => {}}
                 entries={watchedPanes}
@@ -874,7 +838,7 @@ export function SettingsSection() {
           state="new-page-run-typed"
           label="New page, Shell, Type a command"
           reach="on the New page, switch to Shell and pick Type a command… in the Command select. It shows when the machine's launchers.toml leaves [phone] run on, which is the default."
-          note="One monospace field right under the select, with the corrections of the keyboard turned off and Go on the return key. The row is reserved only while the option is chosen, so picking it is a choice and typing moves nothing. On the real page the summary above Start reads Runs `htop` in ~/projects on bluefin, and Start checks the line first, so a line that skips permission prompts asks before its first run."
+          note="One monospace field right under the select, with the corrections of the keyboard turned off and Go on the return key. The row is reserved only while the option is chosen, so picking it is a choice and typing moves nothing. On the real page the summary above Start reads Runs `htop` in ~/projects on lodge, and Start checks the line first, so a line that skips permission prompts asks before its first run."
         >
           <Stage height={240}>
             <CommandPickerDemo run pick="typed" line="htop" />

@@ -25,3 +25,19 @@ M62 shipped the walky talky skill with one rule: only `collie skill install` wri
 - An operator who never typed `collie skill install` gets the skill in every harness on the machine at the next update. That is the point; the opt-out is the switch and the uninstall marker.
 - A fresh install gets the skill at its first update, or when the operator runs `collie skill sync`. `scripts/install.sh` promises to write nothing outside its own folder and `~/.local/bin`, and `collie start` runs at every start, so neither is a single fresh-install point to hook.
 - The uninstall marker lives in one instance's state directory. Two instances on one machine with different binaries each render the skill with their own path, so whichever updates last owns the text, and an uninstall through one instance does not reach the other's marker. Revisit if a machine with two self-updating instances becomes ordinary.
+
+## Note 2026-11-13 (ADR 0140)
+
+The same step now also refreshes a linked harness part: after the skill sync, the new binary runs
+`collie harness sync` when a harness is linked and the binary reports 1.29.0 or later. It never replaces a
+newer part, and it never fails the update.
+
+## Addendum 2026-11-16: a change of the Hill's switch runs the same sync (M96)
+
+The skill holds the Hill's words only while the Hill is on, so a real change of an instance's Hill
+switch runs the same `skill sync` as the update, with the same guards and the same uninstall marker.
+The phone's `POST /api/hill/switch` and the takeover's adopt spawn the bridge's own binary with `skill
+sync --json` and do not wait for it; `collie hill on|off` runs the sync in its own process. A write of
+the same value and a bridge start sync nothing, `COLLIE_SKILL_SYNC=off` keeps the files as they are,
+and a fault is one log line that never fails the switch. The sentence "the bridge still never writes a
+harness file" above now holds except for this sync. The rule is in the header of `cli/skill-install.ts`.

@@ -50,6 +50,24 @@ describe("sendText", () => {
     ]);
   });
 
+  it("the commit's override rides the body only when true and with a rows hash, never on a sign-in field, and is its own intent (M102 spec 01)", async () => {
+    await sendText({ paneId: "w1:p1", text: "check this", mode: "send", rowsHash: "0abc12", held: null, mint });
+    await sendText({ paneId: "w1:p1", text: "check this", mode: "send", rowsHash: "0abc12", override: true, held: null, mint });
+    await sendText({ paneId: "w1:p1", text: "check this", mode: "send", override: true, held: null, mint });
+    await sendText({ paneId: "w1:p1", text: "check this", mode: "send", rowsHash: "0abc12", override: true, secret: true, held: null, mint });
+    const [plain, over, noHash, secret] = recordedSends();
+    expect(plain).not.toHaveProperty("override");
+    expect(over).toMatchObject({ rowsHash: "0abc12", override: true });
+    expect(noHash).not.toHaveProperty("override");
+    expect(secret).not.toHaveProperty("override");
+    server.use(http.post("/api/send", () => HttpResponse.error()));
+    const lost = await sendText({ paneId: "w1:p1", text: "check this", mode: "send", rowsHash: "0abc12", held: null, mint });
+    if (lost.status !== "noAnswer") throw new Error("the lost answer was expected");
+    server.resetHandlers();
+    await sendText({ paneId: "w1:p1", text: "check this", mode: "send", rowsHash: "0abc12", override: true, held: lost.intent, mint });
+    expect(recordedSends().at(-1)?.id).not.toBe(lost.intent.requestId);
+  });
+
   it("a resend names the old request id and sends an empty text; a plain send carries no resendOf", async () => {
     await sendText({ paneId: "w1:p1", text: "", mode: "send", resendOf: "req00001", held: null, mint });
     await sendText({ paneId: "w1:p1", text: "plain", held: null, mint });
@@ -137,7 +155,7 @@ describe("sendText", () => {
         }),
       ),
     );
-    const out = await sendText({ paneId: "w1:p1", text: "/model", scope: { host: "minibuch" }, held: null, mint });
+    const out = await sendText({ paneId: "w1:p1", text: "/model", scope: { host: "workshop" }, held: null, mint });
     expect(out).toMatchObject({ status: "answered", reading: { clear: false, note: "refused", detail } });
   });
 
@@ -147,7 +165,7 @@ describe("sendText", () => {
         HttpResponse.json({ ok: false, textDelivered: false, error: "nope", code: "reply.send_failed", detail: { reason: "update the lead" } }),
       ),
     );
-    const out = await sendText({ paneId: "w1:p1", text: "/model", scope: { host: "minibuch" }, held: null, mint });
+    const out = await sendText({ paneId: "w1:p1", text: "/model", scope: { host: "workshop" }, held: null, mint });
     expect(out).toMatchObject({ status: "noAnswer", error: "The message couldn't be sent: update the lead" });
   });
 });
@@ -156,6 +174,8 @@ describe("plainFailureMessage", () => {
   it("keeps the status and the first line that has words, and leaves a JSON body to the catalogue", () => {
     expect(plainFailureMessage(404, "\n  no such terminal pane  \nmore")).toBe("HTTP 404: no such terminal pane");
     expect(plainFailureMessage(502, "")).toBe("HTTP 502");
+    // A proxy's page is no sentence: the status alone, which the display layer says in words (M102 spec 11).
+    expect(plainFailureMessage(502, "<html><body>Bad Gateway</body></html>")).toBe("HTTP 502");
     expect(plainFailureMessage(400, `{"error":"x"}`)).toBeNull();
     expect(plainFailureMessage(400, "x".repeat(400))).toHaveLength("HTTP 400: ".length + 160);
   });

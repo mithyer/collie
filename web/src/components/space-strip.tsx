@@ -9,6 +9,7 @@ import {
   STRIP_TAP_TARGET_SQUARE,
 } from "@/components/ui/labelled-strip";
 import { SpaceActionsSheet } from "@/components/space-actions-sheet";
+import { spaceKey } from "@/lib/hosts";
 import { cn } from "@/lib/utils";
 import { worstTriage } from "@/lib/triage";
 import { useMuxCapability, useMuxDeclared, useMuxHasSpaces } from "@/lib/mux-capability";
@@ -88,7 +89,7 @@ export function SpaceStrip({
   const scrollerRef = useRef<HTMLDivElement>(null);
   // Keyed on `selected`; the drill-in (`onBack` set) has no active chip at all — "Back" isn't one —
   // so there is nothing this strip needs to reveal there, and the hook simply finds no element.
-  useRevealActive(scrollerRef, selected);
+  useRevealActive(scrollerRef, selected, `spaces:${host ?? ""}`);
   // On a one-space multiplexer the tab strip is the top level and this row has nothing to offer —
   // except the way back, which is navigation rather than a space and must not disappear with them.
   // With no back button there is nothing left to render at all.
@@ -133,6 +134,7 @@ export function SpaceStrip({
             <Chip
               key={w.workspaceId}
               label={w.label}
+              fade={spaceKey(host, w.workspaceId)}
               active={selected === w.workspaceId}
               ring={w.focused}
               // Same dot language as the tab strip directly below it, and as the herd list. Host-

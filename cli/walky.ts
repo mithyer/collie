@@ -6,12 +6,14 @@ import { holdSocketSafe } from "./hold.ts";
 import { EXIT, type Io } from "./io.ts";
 import type { JsonObject, JsonValue } from "../bridge/json.ts";
 import { asJsonBoolean, asJsonNumber, asJsonObject, asJsonString, parseJsonObject } from "../web/src/lib/json.ts";
-import { inScope, labelScope, LOCAL_MEMBER, parseAddress, type WalkyScope } from "../bridge/walky/address.ts";
-import { readMessage, readReceipt } from "../bridge/walky/parse.ts";
+import { inScope, LOCAL_MEMBER, parseAddress, type WalkyScope } from "../bridge/walky/address.ts";
+import { OUTSIDE_YOUR_SPACE } from "../bridge/walky/border.ts";
+import { readMessage, readReceipt, readSpace } from "../bridge/walky/parse.ts";
 import { BARE_BAD_REQUEST, UNREAD_BY_OLDER_BRIDGE } from "../bridge/walky/refusals.ts";
 import type { WalkyTotals } from "../bridge/walky/service.ts";
 import { walkySocketPath } from "../bridge/walky/socket.ts";
-import { formatRead, mintWalkyId, OUTCOME_ON_LEAD, RESTING, SENDER_OFF, WALKY_ID, WALKY_OFF, type WalkyMessage, type WalkyReceipt } from "../bridge/walky/types.ts";
+import type { WalkySpace } from "../bridge/walky/space.ts";
+import { formatRead, mintWalkyId, OUTCOME_ON_LEAD, readSubject, replyLine, SUBJECT_LEFT_OUT, RESTING, SENDER_OFF, WALKY_ID, WALKY_OFF, type WalkyMessage, type WalkyReceipt } from "../bridge/walky/types.ts";
 
 // `collie walky`: walky talky from a terminal (M62 spec 02). It talks to the
 // running bridge over its local socket, `<stateDir>/walky/sock`, one JSON request per connection.
@@ -41,8 +43,12 @@ export interface WalkyDeps extends EdgeTargetDeps {
   readStdin(): Promise<string>;
   /** Whether stdin is a terminal: then no body on the command line is a usage error, not a wait. */
   readonly stdinIsTty: boolean;
-  /** One request line to one socket: the answer line, or null when nothing answered. */
-  ask(path: string, line: string): Promise<string | null>;
+  /**
+   * One request line to one socket: the answer line, or null when nothing answered. `ms` is the wait,
+   * {@link ASK_MS} when absent. Rejects with {@link AskLate} when the socket took the line and did not
+   * answer in time: the request may still run there.
+   */
+  ask(path: string, line: string, ms?: number): Promise<string | null>;
   /** The socket of every live bridge. Defaults to the hook target registry, then this install's own. */
   sockets?(): readonly string[];
   readonly mintId?: () => string;
@@ -110,9 +116,31 @@ async function request(deps: WalkyDeps, body: JsonObject, path?: string, first?:
 export type PaneKind = "agent" | "shell" | "unknown";
 
 /**
+ * Ask the local bridges whether this pane runs an agent (crew slice 3). Outside a pane, with no bridge
+ * answering, or with only bridges that do not know the op, the answer is `unknown`: the caller decides
+ * what that means. The person-only verbs refuse on it (`paneNotProvenShell`); `collie trick init` does not.
+ */
+export async function askPaneKind(deps: WalkyDeps): Promise<PaneKind> {
+  return (await askPanePlace(deps)).kind;
+}
+
+/**
+ * Whether a verb that is a person's choice (`collie trick on`, `collie tricks on`, `collie hill on`, and the
+ * other person-only verbs) must refuse here. It fails closed: a process with pane markers runs in a
+ * multiplexer pane, and it passes only when the bridge proves the pane a shell. `agent`, `unknown` (no
+ * bridge answers, or an older one) and a check that throws all refuse. A process with no pane markers is a
+ * person's own terminal and never refuses; so does one that gives no `paneKind` to ask (a unit's deps, not
+ * the program, which always gives it).
+ */
+export async function paneNotProvenShell(env: Parameters<typeof readEnvMarkers>[0], paneKind: (() => Promise<PaneKind>) | undefined): Promise<boolean> {
+  if (readEnvMarkers(env).length === 0 || paneKind === undefined) return false;
+  return (await paneKind().catch(() => "unknown" as const)) !== "shell";
+}
+
+/**
  * Where the bridge placed this pane, with {@link PaneKind}. `session` and `paneId` are set only when the
- * bridge named them: `collie pair` writes them on the pending code so the pairing's audit line can say
- * which pane made it.
+ * bridge named them (a bridge before 2026-11-11 answers `agent` alone): `collie pair` writes them on the
+ * pending code so the pairing's audit line can say which pane made it.
  */
 export interface PanePlace {
   readonly kind: PaneKind;
@@ -179,6 +207,9 @@ export const RESTING_WORDS = "waiting in the inbox, not typed: the session rests
 /** What a refusal from a session that turned its walky talky off reads (M89): the sender's next step is the operator. */
 export const WALKY_OFF_WORDS = `not sent: ${WALKY_OFF}. This session takes messages from its operator only. Ask your operator.`;
 
+/** What a refusal across the space border reads (M98, README decision 10): the three ways through. */
+export const OUTSIDE_SPACE_WORDS = `not sent: ${OUTSIDE_YOUR_SPACE}. Use here, reply to a message, or add --outside if your operator asked for it.`;
+
 /** What a refusal reads when the sender's own session is off (M89): the fix is one command. */
 export const SENDER_OFF_WORDS = `not sent: ${SENDER_OFF}. Turn it on: collie walky on`;
 
@@ -226,6 +257,7 @@ export function stateWords(receipt: WalkyReceipt, elsewhere = false): string {
     case "refused":
       if (receipt.reason === WALKY_OFF) return WALKY_OFF_WORDS;
       if (receipt.reason === SENDER_OFF) return SENDER_OFF_WORDS;
+      if (receipt.reason === OUTSIDE_YOUR_SPACE) return OUTSIDE_SPACE_WORDS;
       return reason === undefined ? "not sent" : `not sent: ${reason}`;
     case "expired":
       return "expired";
@@ -279,23 +311,36 @@ function windows(deps: WalkyDeps): boolean {
   return true;
 }
 
-/** What `who` was asked to list: everything, a named workspace, or the asking pane's own. */
-type WhoFilter = { readonly kind: "all" } | { readonly kind: "workspace"; readonly scope: WalkyScope } | { readonly kind: "here" };
+/** What `who` was asked to list (M98): the flags, and the folder filter inside what is listed. */
+interface WhoArgs {
+  readonly json: boolean;
+  /** `--all`: every pane, not only the asking pane's space. */
+  readonly all: boolean;
+  /** `--here`: the asking pane's space. It is the default from an agent pane; the flag says so, and needs a pane. */
+  readonly here: boolean;
+  /** `--workspace <repo>[#<branch>]`: a folder, inside the panes listed. */
+  readonly folder: WalkyScope | null;
+}
 
 /** The scope in words, as the person typed it: `<repo>` or `<repo>#<branch>`. */
 function scopeWords(scope: WalkyScope): string {
   return scope.branch === null ? scope.repo : `${scope.repo}#${scope.branch}`;
 }
 
-/** `who`'s flags: `--json`, and at most one of `--workspace <repo>[#<branch>]` and `--here`. An error is the one-line reason. */
-function parseWhoArgs(args: readonly string[]): { readonly json: boolean; readonly filter: WhoFilter } | { readonly error: string } {
+/** `who`'s flags: `--json`, `--all`, `--here`, `--workspace <repo>[#<branch>]`. An error is the one-line reason. */
+function parseWhoArgs(args: readonly string[]): WhoArgs | { readonly error: string } {
   let json = false;
+  let all = false;
   let here = false;
-  let named: WalkyScope | null = null;
+  let folder: WalkyScope | null = null;
   for (let i = 0; i < args.length; i++) {
     const arg = args[i]!;
     if (arg === "--json") {
       json = true;
+      continue;
+    }
+    if (arg === "--all") {
+      all = true;
       continue;
     }
     if (arg === "--here") {
@@ -307,15 +352,14 @@ function parseWhoArgs(args: readonly string[]): { readonly json: boolean; readon
     if (value === undefined || value.startsWith("--")) return { error: "`--workspace` needs a folder name: <repo> or <repo>#<branch>" };
     const address = parseAddress(value);
     if (address === null || address.kind !== "workspace") return { error: `\`${value}\` is not a workspace: give a folder name, <repo> or <repo>#<branch>` };
-    named = { repo: address.repo, branch: address.branch };
+    folder = { repo: address.repo, branch: address.branch };
     i += 1;
   }
-  if (here && named !== null) return { error: "`--workspace` and `--here` both pick the panes: use one of them" };
-  if (named !== null) return { json, filter: { kind: "workspace", scope: named } };
-  return { json, filter: here ? { kind: "here" } : { kind: "all" } };
+  if (all && here) return { error: "`--all` lists every pane and `--here` lists your space: use one of them" };
+  return { json, all, here, folder };
 }
 
-/** The panes a filter keeps. The same rule as the bridge's scope (`inScope`), read over the label column. */
+/** The panes a folder filter keeps. The same rule as the bridge's scope (`inScope`), read over the label column. */
 function inFilter(rows: readonly JsonObject[], scope: WalkyScope): JsonObject[] {
   return rows.filter((row) => {
     const address = parseAddress(asJsonString(row.address) ?? "");
@@ -324,12 +368,62 @@ function inFilter(rows: readonly JsonObject[], scope: WalkyScope): JsonObject[] 
   });
 }
 
-/** `walky who [--workspace <repo>[#<branch>] | --here] [--json]`: every reachable target, or the ones a scope would reach. */
+/** A space as the bridge sent it, or null when there is none or it is not one (a bridge before 1.29.0 sends none). */
+function spaceFromWire(value: JsonValue | undefined): WalkySpace | null {
+  const space = readSpace(value);
+  if (space === undefined || space === null || space === false) return null;
+  return space;
+}
+
+/** A row's space, or null for a row from a bridge that sends none. */
+function spaceOfRow(row: JsonObject | undefined): WalkySpace | null {
+  return spaceFromWire(row?.space);
+}
+
+/** The SPACE cell: the label, and for a space with no name of its own that it is this machine's alone. */
+function spaceCell(row: JsonObject): string {
+  const space = spaceOfRow(row);
+  if (space === null) return "-";
+  return space.named ? space.label : `${space.label} (this machine)`;
+}
+
+/** The line under `who`'s table when panes sit outside the asker's space: how many, and how to list them. */
+export function outsideLine(count: number): string {
+  return `${String(count)} ${count === 1 ? "pane is" : "panes are"} outside your space. List every pane: collie walky who --all`;
+}
+
+/**
+ * The columns of `who`'s table. SPACE is the workspace, FOLDER the pane's `<repo>#<branch>` (the row's
+ * `label`), NAME the name a person gave the session, TITLE the title the agent gave it. An agent
+ * addresses "the session in workspace X" by matching any of the four. A bridge before 1.29.0 sends no
+ * name and no title, and those cells read `-`.
+ */
+export const WHO_HEAD = ["ADDRESS", "MACHINE", "HARNESS", "SPACE", "FOLDER", "NAME", "TITLE", "STATE"] as const;
+
+/** One row's cells, in {@link WHO_HEAD}'s order. A missing cell is undefined. */
+export function whoCells(row: JsonObject): (string | undefined)[] {
+  return [
+    asJsonString(row.address),
+    asJsonString(row.machine),
+    asJsonString(row.harness),
+    spaceCell(row),
+    asJsonString(row.label),
+    asJsonString(row.name),
+    asJsonString(row.title),
+    stateCell(row),
+  ];
+}
+
+/**
+ * `walky who [--all] [--workspace <repo>[#<branch>]] [--json]` (M98): from an agent pane, the panes of
+ * its own space, with a last line for the ones outside it; `--all` lists every pane. A shell that is no
+ * agent pane lists every pane. On a crew member the bridge lists the crew as its lead does.
+ */
 export async function cmdWalkyWho(deps: WalkyDeps, args: readonly string[]): Promise<number> {
   if (windows(deps)) return EXIT.STATE;
   const parsed = parseWhoArgs(args);
   if ("error" in parsed) return usage(deps, "who", parsed.error);
-  const { json, filter } = parsed;
+  const { json, all, here, folder } = parsed;
   const answer = await request(deps, { op: "who" });
   if (!answer.ok) return failure(deps, answer);
   const everyone = Array.isArray(answer.body.targets) ? answer.body.targets.flatMap((entry) => {
@@ -337,46 +431,44 @@ export async function cmdWalkyWho(deps: WalkyDeps, args: readonly string[]): Pro
     return row === undefined ? [] : [row];
   }) : [];
   const note = asJsonString(answer.body.note);
-  const scope = filter.kind === "workspace" ? filter.scope : filter.kind === "here" ? ownScope(everyone, asJsonString(answer.body.self)) : null;
-  if (filter.kind === "here" && scope === null) {
-    deps.io.err(`walky talky: ${asJsonString(answer.body.self) === undefined ? "`--here` needs a pane: run it inside an agent's pane, or name the folder with `--workspace <repo>`" : "this pane has no workspace folder to match: name one with `--workspace <repo>`"}`);
+  const self = asJsonString(answer.body.self);
+  // The asker's space: the bridge's word, else the asker's own row. A bridge before 1.29.0 says neither.
+  const own = spaceFromWire(answer.body.ownSpace) ?? spaceOfRow(everyone.find((row) => self !== undefined && asJsonString(row.address) === self));
+  if (here && own === null) {
+    deps.io.err(`walky talky: ${self === undefined ? "`--here` needs a pane: run it inside an agent's pane, or use `--all`" : "this bridge does not say which space this pane is in: use `--all`"}`);
     return EXIT.STATE;
   }
-  const targets = scope === null ? everyone : inFilter(everyone, scope);
+  const bySpace = !all && own !== null;
+  const inSpace = own === null ? everyone : everyone.filter((row) => spaceOfRow(row)?.key === own.key);
+  const outside = bySpace ? everyone.length - inSpace.length : 0;
+  const listed = bySpace ? inSpace : everyone;
+  const targets = folder === null ? listed : inFilter(listed, folder);
   if (json) {
-    deps.io.out(JSON.stringify(note === undefined ? { self: answer.body.self ?? null, targets } : { self: answer.body.self ?? null, targets, note }));
+    deps.io.out(JSON.stringify(note === undefined ? { self: answer.body.self ?? null, ownSpace: own, targets } : { self: answer.body.self ?? null, ownSpace: own, targets, note }));
     return EXIT.OK;
   }
-  const self = asJsonString(answer.body.self);
   if (targets.length === 0) {
-    deps.io.out(scope === null ? "no agent panes to message" : `no agent panes in ${shown(scopeWords(scope))}`);
+    deps.io.out(folder === null ? "no agent panes to message" : `no agent panes in ${shown(scopeWords(folder))}${bySpace ? " (your space)" : ""}`);
     if (note !== undefined) deps.io.out(note);
+    if (outside > 0) deps.io.out(outsideLine(outside));
     return EXIT.OK;
   }
   // A solo install with this one agent pane: nobody to message yet, and the reason in one line.
-  if (scope === null && note === undefined && self !== undefined && self.startsWith(`${LOCAL_MEMBER}/`) && targets.length === 1 && asJsonString(targets[0]!.address) === self) {
+  if (folder === null && note === undefined && outside === 0 && self !== undefined && self.startsWith(`${LOCAL_MEMBER}/`) && targets.length === 1 && asJsonString(targets[0]!.address) === self) {
     deps.io.out(`You are ${shown(self)}. No other agent pane yet. A message needs two.`);
     if (answer.body.selfOff === true) deps.io.out(YOU_ARE_OFF_WORDS);
     return EXIT.OK;
   }
-  const rows = targets.map((row) => [asJsonString(row.address), asJsonString(row.machine), asJsonString(row.harness), asJsonString(row.label), stateCell(row)].map((cell) => shown(cell ?? "-")));
-  const head = ["ADDRESS", "MACHINE", "HARNESS", "LABEL", "STATE"];
+  const rows = targets.map((row) => whoCells(row).map((cell) => shown(cell ?? "-")));
+  const head = WHO_HEAD;
   const widths = head.map((title, column) => Math.max(title.length, ...rows.map((row) => row[column]!.length)));
   const line = (cells: readonly string[]): string => cells.map((cell, column) => cell.padEnd(widths[column]!)).join("  ").trimEnd();
   deps.io.out(line(head));
   for (const row of rows) deps.io.out(`${line(row)}${row[0] === self ? "  (you)" : ""}`);
   if (note !== undefined) deps.io.out(note);
+  if (outside > 0) deps.io.out(outsideLine(outside));
   if (answer.body.selfOff === true) deps.io.out(YOU_ARE_OFF_WORDS);
   return EXIT.OK;
-}
-
-/** The folder of the asking pane's own label, any branch (`here`), or null off a pane or for a pane whose label names no folder. */
-function ownScope(rows: readonly JsonObject[], self: string | undefined): WalkyScope | null {
-  const address = parseAddress(self ?? "");
-  if (address === null || address.kind !== "pane") return null;
-  const own = rows.find((row) => asJsonString(row.address) === self);
-  const folder = labelScope(asJsonString(own?.label) ?? "", address.paneId);
-  return folder === null ? null : { repo: folder.repo, branch: null };
 }
 
 interface SendArgs {
@@ -386,14 +478,20 @@ interface SendArgs {
   readonly json: boolean;
   /** `--wake` (M85): a scope or `all` also types into sessions that rest. */
   readonly wake: boolean;
+  /** `--outside` (M98): the message may leave the sender's space. */
+  readonly outside: boolean;
+  /** `--subject <words>` (M98 spec 07): what the message is about, cleaned and within the limits. Null: none. */
+  readonly subject: string | null;
 }
 
-/** `send <address> [text...]`, `--to` and `--reply-to` as aliases, `--wake`, `--` before a text that starts with a dash. */
+/** `send <address> [text...]`, `--to` and `--reply-to` as aliases, `--wake`, `--outside`, `--subject <words>`, `--` before a text that starts with a dash. */
 export function parseSendArgs(args: readonly string[]): SendArgs | { readonly error: string } {
   let to: string | null = null;
   let replyTo: string | null = null;
   let json = false;
   let wake = false;
+  let outside = false;
+  let subject: string | null = null;
   const words: string[] = [];
   let i = 0;
   for (; i < args.length; i++) {
@@ -404,11 +502,17 @@ export function parseSendArgs(args: readonly string[]): SendArgs | { readonly er
     }
     // Once the address (or the id) is named, the first word that is not a flag starts the text.
     if (to !== null && !arg.startsWith("--")) break;
-    if (arg === "--to" || arg === "--reply-to") {
+    if (arg === "--to" || arg === "--reply-to" || arg === "--subject") {
       const value = args[i + 1];
       if (value === undefined) return { error: `\`${arg}\` needs a value` };
       if (arg === "--to") to = value;
-      else replyTo = value;
+      else if (arg === "--reply-to") replyTo = value;
+      else {
+        // Refused here, before any bridge is asked, with the same sentence the bridge would answer.
+        const read = readSubject(value);
+        if ("error" in read) return { error: read.error };
+        subject = read.subject;
+      }
       i += 1;
       continue;
     }
@@ -420,12 +524,16 @@ export function parseSendArgs(args: readonly string[]): SendArgs | { readonly er
       wake = true;
       continue;
     }
+    if (arg === "--outside") {
+      outside = true;
+      continue;
+    }
     if (arg.startsWith("--")) return { error: `unknown flag \`${arg}\`` };
     to = arg;
   }
   words.push(...args.slice(i));
   if (replyTo !== null && !WALKY_ID.test(replyTo)) return { error: `\`${replyTo}\` is not a message id` };
-  return { to, replyTo, text: words.length === 0 ? null : words.join(" "), json, wake };
+  return { to, replyTo, text: words.length === 0 ? null : words.join(" "), json, wake, outside, subject };
 }
 
 function usage(deps: WalkyDeps, verb: (typeof WALKY_SUBCOMMANDS)[number], why: string): number {
@@ -435,9 +543,9 @@ function usage(deps: WalkyDeps, verb: (typeof WALKY_SUBCOMMANDS)[number], why: s
 }
 
 const USAGE = {
-  who: "usage: collie walky who [--workspace <repo>[#<branch>] | --here] [--json]",
-  send: "usage: collie walky send <address> [--wake] [text...]   (no text: the body is read from stdin; --wake types a scope or all into sessions that rest too)",
-  reply: "usage: collie walky reply <id> [text...]   (no text: the body is read from stdin)",
+  who: "usage: collie walky who [--all | --here] [--workspace <repo>[#<branch>]] [--json]   (from an agent pane the list is your space, the default; --all lists every pane)",
+  send: "usage: collie walky send <address> [--subject <words>] [--wake] [--outside] [text...]   (no text: the body is read from stdin; --subject says in 4 to 6 words what the message is about; --wake types a scope or all into sessions that rest too; --outside lets the message leave your space, only when your operator asked)",
+  reply: "usage: collie walky reply <id> [--subject <words>] [--outside] [text...]   (no text: the body is read from stdin)",
   inbox: "usage: collie walky inbox [<id>] [--all] [--keep] [--json]",
   status: "usage: collie walky status <id> [--json]",
   cancel: "usage: collie walky cancel <id> [--json]   (a held message you sent; it stays in the inbox, not typed)",
@@ -467,10 +575,14 @@ function targetLine(target: JsonValue | undefined, fallback: string): string {
  * Send, then wait up to 15 s for each receipt to leave `accepted`, and print three lines: the id, the
  * pane it went to, and the state in words. A message not typed yet adds where to look later.
  */
-async function sendAndWait(deps: WalkyDeps, to: string | null, replyTo: string | null, body: string, json: boolean, first?: string, wake = false): Promise<number> {
+async function sendAndWait(deps: WalkyDeps, to: string | null, replyTo: string | null, body: string, json: boolean, first?: string, wake = false, outside = false, subject: string | null = null): Promise<number> {
   const id = (deps.mintId ?? mintWalkyId)();
-  // `wake` rides the request only when it is true: a request without it is the one every bridge reads.
-  const answer = await request(deps, wake ? { op: "send", id, to, body, replyTo, wake } : { op: "send", id, to, body, replyTo }, undefined, first);
+  // `wake`, `outside` and `subject` ride the request only when set: a request without them is the one every bridge reads.
+  const line: JsonObject = { op: "send", id, to, body, replyTo };
+  if (wake) line.wake = true;
+  if (outside) line.outside = true;
+  if (subject !== null) line.subject = subject;
+  const answer = await request(deps, line, undefined, first);
   if (!answer.ok) return failure(deps, answer);
   let receipts = receiptsOf(answer.body.receipts);
   let elsewhere = new Set<string>();
@@ -487,8 +599,10 @@ async function sendAndWait(deps: WalkyDeps, to: string | null, replyTo: string |
     elsewhere = elsewhereOf(status.body.elsewhere);
     if (fresh.length > 0) receipts = fresh;
   }
+  // M98 spec 07: the bridge signed the message without its subject, because the crew's lead cannot read one.
+  const leftOut = answer.body.subjectLeftOut === true;
   if (json) {
-    deps.io.out(JSON.stringify({ id, receipts }));
+    deps.io.out(JSON.stringify(leftOut ? { id, receipts, subjectLeftOut: true } : { id, receipts }));
     return exitOf(receipts);
   }
   deps.io.out(id);
@@ -497,8 +611,17 @@ async function sendAndWait(deps: WalkyDeps, to: string | null, replyTo: string |
   else if (receipts.length === 1) deps.io.out(receiptLine(receipts[0]!, false, elsewhere));
   else for (const receipt of receipts) deps.io.out(receiptLine(receipt, true, elsewhere));
   if (receipts.some(isHeld)) deps.io.out(HELD_HINT);
+  if (leftOut) deps.io.out(SUBJECT_LEFT_OUT);
   if (receipts.length === 0 || receipts.some(notTypedYet)) deps.io.out(`check later: collie walky status ${id}`);
   return exitOf(receipts);
+}
+
+/** What `--outside` answers from a shell that is no agent pane: an operator's message is not bound to a space. */
+export const OUTSIDE_NEEDS_A_PANE = "`--outside` is for an agent's message: run it inside an agent's pane. An operator's message is not bound to a space, so the flag changes nothing";
+
+/** Whether this process runs inside a multiplexer pane (its environment carries a marker), so the bridge takes it for an agent. */
+function inAgentPane(deps: WalkyDeps): boolean {
+  return readEnvMarkers(deps.ctx.env).length > 0;
 }
 
 /** `walky send <address> [text...]`. */
@@ -508,9 +631,12 @@ export async function cmdWalkySend(deps: WalkyDeps, args: readonly string[]): Pr
   if ("error" in parsed) return usage(deps, "send", parsed.error);
   if (parsed.to === null) return usage(deps, "send", "name an address (see `collie walky who`)");
   if (parseAddress(parsed.to) === null) return usage(deps, "send", `\`${parsed.to}\` is not an address: <member>/<pane>, <member>/<pane>#<token> as \`who\` prints it, <member>/all, all, <repo>, <repo>#<branch> or here`);
+  if (parsed.outside && !inAgentPane(deps)) return usage(deps, "send", OUTSIDE_NEEDS_A_PANE);
   const body = await bodyOf(deps, parsed.text);
   if (body === null) return usage(deps, "send", "no text: give it after the address, or on stdin");
-  return sendAndWait(deps, parsed.to, parsed.replyTo, body, parsed.json, undefined, parsed.wake);
+  // `here` is the sender's space whatever else is said: the flag is accepted and not sent, so nothing about it changes.
+  const outside = parsed.outside && parseAddress(parsed.to)?.kind !== "here";
+  return sendAndWait(deps, parsed.to, parsed.replyTo, body, parsed.json, undefined, parsed.wake, outside, parsed.subject);
 }
 
 /** The first bridge that holds a message, and the message; else the words for why none does. */
@@ -536,6 +662,7 @@ export async function cmdWalkyReply(deps: WalkyDeps, args: readonly string[]): P
   const parsed = parseSendArgs(args);
   if ("error" in parsed) return usage(deps, "reply", parsed.error);
   if (parsed.wake) return usage(deps, "reply", "a reply goes to one pane: `--wake` is for a scope or `all`");
+  if (parsed.outside && !inAgentPane(deps)) return usage(deps, "reply", OUTSIDE_NEEDS_A_PANE);
   const id = parsed.replyTo ?? parsed.to;
   if (id === null || !WALKY_ID.test(id)) return usage(deps, "reply", "name the message id to reply to (wt_ and 12 characters)");
   // The bridge that holds the message answers the reply: an older one asked first may know this pane
@@ -547,7 +674,7 @@ export async function cmdWalkyReply(deps: WalkyDeps, args: readonly string[]): P
   const body = await bodyOf(deps, parsed.text);
   if (body === null) return usage(deps, "reply", "no text: give it after the id, or on stdin");
   // No address: the bridge sends a reply to the stored sender of what it answers, never elsewhere.
-  return sendAndWait(deps, null, id, body, parsed.json, holder);
+  return sendAndWait(deps, null, id, body, parsed.json, holder, false, parsed.outside, parsed.subject);
 }
 
 /**
@@ -585,7 +712,9 @@ export async function cmdWalkyInbox(deps: WalkyDeps, args: readonly string[]): P
   }
   messages.forEach(({ message, receipt }, index) => {
     if (index > 0) deps.io.out("");
-    for (const line of formatRead(message).split("\n")) deps.io.out(line);
+    for (const line of formatRead(message, receipt?.via).split("\n")) deps.io.out(line);
+    // An agent's message ends with the command that answers it (M98 spec 07): the typed line no longer names it.
+    if (message.from.address !== null) deps.io.out(replyLine(message.id));
     if (all && receipt !== null) deps.io.out(`-- ${receiptLine(receipt, true)}`);
   });
   return EXIT.OK;
@@ -763,19 +892,32 @@ export function cmdWalky(deps: Pick<WalkyDeps, "io">, args: readonly string[]): 
   return EXIT.USAGE;
 }
 
-/** One request line to a socket, and its one answer line. Null when it does not accept or answer in time. */
+/** Thrown by {@link askSocket} when a socket took the request line and gave no answer within the wait. */
+export class AskLate extends Error {
+  constructor(readonly ms: number) {
+    super(`no answer within ${String(Math.round(ms / 1000))} s`);
+  }
+}
+
+/**
+ * One request line to a socket, and its one answer line. Null when nothing accepts it or the connection
+ * ends without an answer. Rejects with {@link AskLate} when the line was written and no answer came
+ * within `ms`: the request may still be running on the other side, so it is not "nothing answered".
+ */
 export async function askSocket(path: string, line: string, ms = ASK_MS): Promise<string | null> {
   const conn = createConnection({ path });
   conn.on("error", () => undefined);
   let timer: ReturnType<typeof setTimeout> | undefined;
-  const late = new Promise<null>((done) => {
-    timer = setTimeout(() => done(null), ms);
+  let written = false;
+  const late = new Promise<"late">((done) => {
+    timer = setTimeout(() => done("late"), ms);
   });
   const answered = (async (): Promise<string | null> => {
     const connected = await once(conn, "connect").then(() => true, () => false);
     if (!connected) return null;
     conn.setEncoding("utf8");
     conn.write(line);
+    written = true;
     let text = "";
     for await (const chunk of conn) {
       text += String(chunk);
@@ -788,5 +930,7 @@ export async function askSocket(path: string, line: string, ms = ASK_MS): Promis
   const result = await Promise.race([answered, late]);
   clearTimeout(timer);
   conn.destroy();
-  return result;
+  if (result !== "late") return result;
+  if (written) throw new AskLate(ms);
+  return null;
 }

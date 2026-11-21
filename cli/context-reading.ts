@@ -2,28 +2,46 @@ import { isAbsolute, relative, sep } from "node:path";
 
 import { asJsonNumber, asJsonObject, asJsonString } from "../web/src/lib/json.ts";
 import type { JsonObject } from "../bridge/json.ts";
-import { contextPercent, customClaudeConfigDir, type UsageRecord } from "../bridge/usage.ts";
+import { contextPercent, customClaudeConfigDir, WINDOW_BY_STATUSLINE, type UsageRecord } from "../bridge/usage.ts";
 import type { CliContext } from "./context.ts";
 import { agentConfigRoot } from "./hold-entry.ts";
 import { mergeBeacon, readUsage, writeUsage, type BeaconChange, type UsageStoreDeps } from "./usage-store.ts";
 
-// The context use of a Claude Code session, taken by the beacon hooks with no statusLine (.adr/0115,
-// amended 2026-10-24). Two hooks feed it, and neither alone is enough.
+// The context use of a Claude Code session, taken by the beacon hooks (.adr/0115, amended 2026-10-24
+// and 2026-11-13). Two hooks feed it, and neither alone is enough.
 //
-//  - `SessionStart` says how BIG the context window is, and when the context is unknown or known at
-//    once. Its input carries `source`, `model` (the session's model setting, with a `[1m]` suffix for
-//    the 1M window) and, on resume and fork, `context_tokens`. The transcript never names the window:
-//    its `message.model` is the API id and has no `[1m]`.
 //  - `Stop` and `PostToolUse` carry `transcript_path`. The last assistant line in that file holds the
-//    token counts of the agent's latest request, which is how the agent's own /context counts.
+//    token counts of the agent's latest request: `input_tokens + cache_creation_input_tokens +
+//    cache_read_input_tokens`, output not counted. That is the numerator Claude Code's own
+//    `context_window.used_percentage` uses (code.claude.com/docs/en/statusline, "Context window fields").
+//  - `SessionStart` says when the context is unknown (`compact`, `clear`) or known at once (`resume`
+//    and `fork` carry `context_tokens`).
 //
-// NO WINDOW, NO CONTEXT. A percentage needs a window, and a window guessed as 200k would read a 1M
-// session five times too full. So the transcript reading writes a context only to a record that
-// already carries a `window` (written by `SessionStart`), and a session whose start named no model
-// (`claude -p` sends none) has no context dot. Honest beats guessed.
+// ONLY A STATED WINDOW. A percentage needs the window Claude Code itself divides by, and only its
+// statusLine document states it: `context_window.context_window_size`, which `collie beacon statusline`
+// writes with `windowBy: "statusline"` (cli/statusline.ts). No hook input, no transcript line and no
+// model id names it. The transcript's `message.model` is the bare API id, and the window behind one id
+// is not fixed: Claude Code 2.1.323 picks it per model capability, account, opt-in and
+// `CLAUDE_CODE_MAX_CONTEXT_TOKENS` (read in its bundle on 2026-11-13). A table of model windows was
+// tried and was wrong within a day: it read a 1M Fable session against 400k (222,200 tokens showed 55%
+// where Claude Code showed 22%) and 1M Opus and Sonnet sessions against 200k (pinned at 100% from
+// 200k tokens up). So the beacon writes a context share only to a record whose window the statusLine
+// stated. Honest beats guessed.
 //
-// KNOWN LIMIT: `/model` mid-session fires no `SessionStart`, so the window stays the one from the last
-// start, compact or clear.
+// THE COUNT NEEDS NO WINDOW. Every reading also writes the token count itself (`contextTokens`), and a
+// session whose window nobody stated shows that, `222k`, in place of the share: no wrap on Windows,
+// none where the operator has no statusLine (Collie adds none: a configured statusLine hides Claude
+// Code's footer hints), or `hooks install claude --no-statusline`. A compaction or a clear removes
+// both, and the next answer measures them again.
+//
+// THE NUMBER MATCHES CLAUDE CODE'S. Same numerator, same denominator: the statusLine's own
+// `used_percentage` lands when the wrapper runs, and between two runs the transcript reading divides
+// the newest line's tokens by the stated size. Claude Code rounds to a whole percent, Collie floors to
+// one decimal (22.2 against 22). After a `/model` switch the transcript reading divides by the old
+// size until the statusLine runs again. That is the first answer on the new model: Claude Code runs the
+// statusLine on every assistant message, 300 ms debounced (code.claude.com/docs/en/statusline, "When the
+// status line updates"), and the wrapper writes before it runs the operator's command, so the stale
+// share lasts well under a second and the statusLine's own `used_percentage` replaces it.
 //
 // ── WHAT IT COSTS ─────────────────────────────────────────────────────────────────────────────────
 //
@@ -44,14 +62,11 @@ import { mergeBeacon, readUsage, writeUsage, type BeaconChange, type UsageStoreD
 export const TAIL_BYTES = 256 * 1024;
 
 /**
- * The context window, in tokens, a `SessionStart` model setting names, or undefined when it names no
- * model. THE ONE PLACE TO GROW IT: a model with another window gets a row here. Claude Code puts the
- * `[1m]` suffix on the 1M variants (`claude-opus-5-5[1m]`, seen on 2.1.310); every other model is the
- * 200k window.
+ * The window a reading may divide by: the size Claude Code's statusLine stated for this session, or
+ * undefined when it stated none. Never a window from a model id.
  */
-export function windowFromModel(model: string | undefined): number | undefined {
-  if (model === undefined || model.trim() === "") return undefined;
-  return model.includes("[1m]") ? 1_000_000 : 200_000;
+export function statedWindow(existing: UsageRecord | null): number | undefined {
+  return existing?.windowBy === WINDOW_BY_STATUSLINE ? existing.window : undefined;
 }
 
 /** Tokens billed for one request's input, as Claude Code's `/context` counts the live context. */
@@ -62,7 +77,7 @@ function tokensOf(value: JsonObject | undefined, key: string): number {
 
 /** What the end of a transcript says about the context. */
 export type TailReading =
-  /** The newest assistant line's input tokens. */
+  /** The newest assistant line's input tokens: input, cache creation and cache read, as Claude Code counts them. */
   | { readonly kind: "used"; readonly tokens: number }
   /** A compaction came after the newest assistant line: no response has measured the new context yet. */
   | { readonly kind: "compacted" };
@@ -180,14 +195,12 @@ export function takeContextReading(
     writeChange(deps, stateDirs(), input.session, input.harness, now, (existing) => {
       const dirChanged = existing?.configDir !== configDir;
       if (reading === null && !cut) return dirChanged ? { configDir } : null;
-      if (reading === null || reading.kind === "compacted") return { context: null, configDir };
-      const window = existing?.window;
-      // No window, no context; a configDir change is still recorded so the session is scoped or cleared at once.
-      return window === undefined
-        ? dirChanged
-          ? { configDir }
-          : null
-        : { context: contextPercent(reading.tokens, window), configDir };
+      if (reading === null || reading.kind === "compacted") return { context: null, tokens: null, configDir };
+      // The count always; the share only against a stated window. With none, a context on file is the
+      // statusLine's own percent (an older Claude Code that states no size), and it stays.
+      const window = statedWindow(existing);
+      if (window === undefined) return { tokens: reading.tokens, configDir };
+      return { context: contextPercent(reading.tokens, window), tokens: reading.tokens, configDir };
     });
   } catch {
     // Same: no reading.
@@ -198,32 +211,33 @@ export function takeContextReading(
 const SESSION_SOURCES = ["startup", "resume", "clear", "compact", "fork"] as const;
 
 /**
- * Take what `SessionStart` says: the window the model setting names, a context that is unknown after a
- * `compact` or a `clear`, and a context known at once on `resume` and `fork` when the input carries
- * `context_tokens`. NEVER THROWS.
+ * Take what `SessionStart` says: a context that is unknown after a `compact` or a `clear`, and a context
+ * known at once on `resume` and `fork` when the input carries `context_tokens`: the count, and the
+ * share too when the statusLine stated the window before. The start's `model` names no window, so it
+ * is not read. NEVER THROWS.
  */
 export function takeSessionStart(
   deps: ContextReadingDeps,
-  input: { readonly session: string; readonly harness: string; readonly source: string | undefined; readonly model: string | undefined; readonly contextTokens: number | undefined },
+  input: { readonly session: string; readonly harness: string; readonly source: string | undefined; readonly contextTokens: number | undefined },
   stateDirs: () => string[],
   now: number,
 ): void {
   try {
     const source = SESSION_SOURCES.find((name) => name === input.source);
     if (source === undefined) return;
-    const model = input.model !== undefined && input.model.length <= 256 ? input.model : undefined;
-    const named = windowFromModel(model);
-    const tokens = input.contextTokens !== undefined && Number.isFinite(input.contextTokens) && input.contextTokens >= 0 ? input.contextTokens : undefined;
+    const tokens = input.contextTokens !== undefined && Number.isFinite(input.contextTokens) && input.contextTokens >= 0 ? Math.round(input.contextTokens) : undefined;
     const configDir = customClaudeConfigDir(deps.ctx.env, deps.ctx.home);
     writeChange(deps, stateDirs(), input.session, input.harness, now, (existing) => {
-      const window = named ?? existing?.window;
-      // The context is unknown until the next assistant message measures it.
-      const forgotten = source === "compact" || source === "clear";
-      const resumed = (source === "resume" || source === "fork") && tokens !== undefined && window !== undefined;
-      const context = forgotten ? null : resumed ? contextPercent(tokens, window) : undefined;
+      const window = statedWindow(existing);
       const dirChanged = existing?.configDir !== configDir;
-      const change: BeaconChange = { context, window: named, configDir };
-      return named === undefined && context === undefined && !dirChanged ? null : change;
+      // The context is unknown until the next assistant message measures it.
+      if (source === "compact" || source === "clear") {
+        const held = existing?.context !== undefined || existing?.contextTokens !== undefined;
+        return held || dirChanged ? { context: null, tokens: null, configDir } : null;
+      }
+      const resumed = (source === "resume" || source === "fork") && tokens !== undefined;
+      if (!resumed) return dirChanged ? { configDir } : null;
+      return window === undefined ? { tokens, configDir } : { context: contextPercent(tokens, window), tokens, configDir };
     });
   } catch {
     // No reading.

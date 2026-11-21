@@ -45,8 +45,9 @@
 //
 // Pure: no DOM, no Bun API, no harness name. One log and one context always give one Surface.
 
+import { signInShown } from "./secret-field";
 import { edgeListHolds, readCuesFor, runningSign, type CueRead } from "./cues";
-import { coveredFrame, findInputFrame, frameEdge, overlayInRows, rowText, type Frame, type FrameRow, type IdleProfile } from "./frame";
+import { coveredFrame, dialogRowShown, findInputFrame, frameEdge, overlayInRows, rowText, type Frame, type FrameRow, type IdleProfile } from "./frame";
 import { LOST_STOP_READS, LOST_STOP_SPAN_MS, SETTLE_MS, type EdgeKind } from "./edges";
 import { isFree, type Ask, type Surface, type SurfaceComposer, type SurfaceModal, type SurfaceReason, type SurfaceTurn } from "./surface";
 
@@ -272,6 +273,7 @@ export function surfaceOfScreen(input: ScreenInput, idle: IdleProfile | null): S
   // A dialog the profile names drawn over the screen above a live box (`idle.overlayRows`), or a command
   // list in the box's edge run that is not the box's own typeahead: Enter acts on it (`commandList.inEdgeRun`).
   const covered = frame !== null && idle !== null && (coveredFrame(rows, frame, idle) || edgeListHolds(rows.map(rowText), frame, idle, rows));
+  const unreadDialog = frame === null && found === null && idle !== null && dialogRowShown(rows, idle);
   let modal: SurfaceModal;
   // A box that reads as a wrapped draft but for a row cut by an ellipsis (`cutWrap`, cues.ts `draftWrap`)
   // is unreadable: a draft or a menu cut to the box's width. No ask from it either, since a tap's Enter
@@ -281,6 +283,10 @@ export function surfaceOfScreen(input: ScreenInput, idle: IdleProfile | null): S
   else if (cues.strength === "strong") modal = "unreadable";
   // No frame, and a row the profile names (`idle.overlayRows`) in the cues' cluster: a full-screen picker.
   else if (frame === null && found === null && idle !== null && cues.strength !== "none" && overlayInRows(rows, cues.cluster, idle)) modal = "unreadable";
+  // No box, and a row the profile names as a dialog it does not read (`idle.dialogRows`): a screen that
+  // names no key, so no cue reads it (Claude Code's first-run theme step when no grammar read its list;
+  // the theme grammar's ask wins above).
+  else if (unreadDialog) modal = "unreadable";
   else if (cues.strength === "weak") modal = "unknown";
   else if (covered) modal = "unreadable";
   else if (frame !== null) modal = "none";
@@ -295,18 +301,28 @@ export function surfaceOfScreen(input: ScreenInput, idle: IdleProfile | null): S
   // Torn is a read cut inside the box. A whole box the dialog rule hid above is not one: its strong cue
   // already keeps it from free, and the person may check the screen and confirm.
   if (found === null && idle !== null && endsInsideFrame(rows, idle)) reason = "torn";
-  else if (cues.cutWrap === true || (frame === null && input.ask === null && cues.strength === "none")) reason = "no-match";
+  else if (cues.cutWrap === true || (frame === null && input.ask === null && cues.strength === "none" && !unreadDialog)) reason = "no-match";
 
-  const surface: Surface = reason === undefined ? { revision: input.revision, turn, modal, composer } : { revision: input.revision, turn, modal, composer, reason };
+  const read: Surface = reason === undefined ? { revision: input.revision, turn, modal, composer } : { revision: input.revision, turn, modal, composer, reason };
+  // A sign-in field (`idle.frame.secret`) the screen can claim: the phone names it and keeps no draft of it.
+  // Where no layout read it (a box that is no ordinary one, or none at all), a row the profile names
+  // (`idle.signInRows`) still names it: the read stays as it is, so nothing is offered that was not,
+  // but a code typed for it keeps no draft and no line (fail closed).
+  const claimed = frame?.secret !== undefined && composer !== "unknown";
+  const named = !claimed && idle !== null && (frame === null || frame.secret !== undefined) && signInShown(rows.map(rowText), idle);
+  const surface: Surface = claimed || named ? { ...read, field: "secret" } : read;
   return { surface, frame, cues };
 }
 
 /** A stale Surface: every claim only the screen may make becomes unknown. An ask or `unreadable`
- *  stays, since neither is ever free. */
+ *  stays, since neither is ever free. So does a sign-in field (`field: "secret"`): a stale read never
+ *  downgrades it, so a code typed while the read is old keeps no draft and no line (fail closed). A
+ *  stale read never adds one either; the next fresh read decides it again. */
 function staled(surface: Surface): Surface {
   const modal: SurfaceModal = surface.modal === "none" ? "unknown" : surface.modal;
   const composer: SurfaceComposer = surface.composer === "unreachable" ? "unreachable" : "unknown";
-  return { revision: surface.revision, turn: "unknown", modal, composer, reason: "stale" };
+  const stale: Surface = { revision: surface.revision, turn: "unknown", modal, composer, reason: "stale" };
+  return surface.field === "secret" ? { ...stale, field: "secret" } : stale;
 }
 
 /**

@@ -66,6 +66,8 @@ interface ReplyBody {
 interface CreateSpaceBody {
   readonly label?: string;
   readonly cwd?: string;
+  /** Minted per tap (M100 spec 04); the stub does not read it. */
+  readonly requestId?: string;
 }
 
 /** The home the stub's multiplexer opens a blank create in — the fixture new space's own folder. */
@@ -224,7 +226,7 @@ async function answer(route: Route, path: string, pins: PinStub): Promise<void> 
   // home, and reported back the way a multiplexer reports it.
   if (path === "/api/workspace" && method === "POST") {
     // SAFETY: the body is the app's own — `lib/api.ts`'s `createWorkspace` is the only caller and it
-    // posts `{ label?, cwd? }`. Both fields are optional there, so a body with neither is a create in
+    // posts `{ label?, cwd?, requestId }`. The first two are optional there, so a body with neither is a create in
     // home, which is what the bridge reads it as too.
     const body = route.request().postDataJSON() as CreateSpaceBody;
     const typed = body.cwd ?? "";
@@ -262,6 +264,9 @@ async function answer(route: Route, path: string, pins: PinStub): Promise<void> 
   }
   if (path === "/api/notifications/snooze") {
     return fulfillJson(route, { snoozedUntil: null });
+  }
+  if (path === "/api/notifications/clear") {
+    return fulfillJson(route, { clearedSlots: [] });
   }
   if (path === "/api/update/check") {
     // Level with itself: nothing on offer, so the ribbon has nothing to say on any route.

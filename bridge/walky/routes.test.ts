@@ -4,12 +4,17 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { AuditLog } from "../audit.ts";
-import { walkyCancelRoute, walkyDropRoute, walkyOffRoute, walkyOlderMemberAnswer, walkyPaneRoute, walkyPostRoute, walkyWhoRoute, WALKY_OFF_TEXT, WALKY_OLDER_MEMBER_TEXT } from "../server.ts";
-import type { SendResult, WalkyHost, WalkyPane } from "./deliver.ts";
+import { DELIVER_NOW_WORDS, walkyCancelRoute, walkyDeliverRoute, walkyDropRoute, walkyOffRoute, walkyOlderMemberAnswer, walkyPaneRoute, walkyPostRoute, walkyWhoRoute, WALKY_OFF_TEXT, WALKY_OLDER_MEMBER_TEXT } from "../server.ts";
+import type { OverDraftResult, SendResult, WalkyHost, WalkyPane } from "./deliver.ts";
 import { WalkyLog, type SiblingSource } from "./log.ts";
 import { WalkyOff } from "./off.ts";
 import { WalkyService } from "./service.ts";
-import type { WalkyEntry } from "./types.ts";
+import { SUBJECT_TOO_LONG, type WalkyEntry } from "./types.ts";
+
+import { spaceOf } from "./space.ts";
+
+/** One unnamed space on one machine: every fixture pane shares it, and no rule reads it yet. */
+const SOLO_SPACE = spaceOf({ memberId: "local", spaceId: "w1", spaceLabel: "w1" });
 
 const roots: string[] = [];
 afterEach(() => {
@@ -17,8 +22,8 @@ afterEach(() => {
 });
 
 const panes: WalkyPane[] = [
-  { session: "main", paneId: "w1:p1", agent: true, harness: "agent-x", label: "repo#a", state: "idle", activeAt: null, instance: "aaaa", terminal: true, off: false },
-  { session: "main", paneId: "w1:p2", agent: true, harness: "agent-y", label: "repo#b", state: "idle", activeAt: null, instance: "aaaa", terminal: true, off: false },
+  { session: "main", paneId: "w1:p1", agent: true, harness: "agent-x", label: "repo#a", state: "idle", activeAt: null, instance: "aaaa", terminal: true, off: false, space: SOLO_SPACE },
+  { session: "main", paneId: "w1:p2", agent: true, harness: "agent-y", label: "repo#b", state: "idle", activeAt: null, instance: "aaaa", terminal: true, off: false, space: SOLO_SPACE },
 ];
 const host: WalkyHost = { panes: () => panes, send: async () => ({ outcome: "sent" }), sendState: () => null, cancelHeld: () => undefined };
 
@@ -33,7 +38,7 @@ function context(lines: string[]) {
     audit: new AuditLog((line) => {
       lines.push(line);
     }),
-    device: "phone-altan",
+    device: "phone-dev",
     acceptEncoding: null,
   };
 }
@@ -45,7 +50,7 @@ describe("POST /api/walky", () => {
     const res = await walkyPostRoute(walky, { id: "wt_aaaaaaaaaaa1", to: "local/w1:p1", body: "Stop and report." }, context(audit));
     expect(res.status).toBe(200);
     expect(await res.json()).toMatchObject({ receipt: { id: "wt_aaaaaaaaaaa1", target: "local/w1:p1", state: "accepted" } });
-    expect(walky.status("wt_aaaaaaaaaaa1").message).toMatchObject({ kind: "operator", from: { label: "phone-altan", address: null } });
+    expect(walky.status("wt_aaaaaaaaaaa1").message).toMatchObject({ kind: "operator", from: { label: "phone-dev", address: null } });
     expect(audit.join("")).toContain("walky.send");
     expect(audit.join("")).not.toContain("Stop and report");
   });
@@ -64,6 +69,26 @@ describe("POST /api/walky", () => {
     const fits = await walkyPostRoute(walky, { id: "wt_aaaaaaaaaaa2", to: "local/w1:p1", body: "x".repeat(4000) }, context([]));
     expect(await fits.json()).toMatchObject({ receipt: { state: "accepted" } });
     expect(walky.status("wt_aaaaaaaaaaa2").message?.body).toHaveLength(4000);
+  });
+
+  test("the API takes `subject`: cleaned and stored; past a limit the send is refused, never cut, and counted (M98 spec 07)", async () => {
+    const walky = service();
+    const res = await walkyPostRoute(walky, { id: "wt_aaaaaaaaaaa1", to: "local/w1:p1", body: "hi", subject: ' standup:  "in" 5 ' }, context([]));
+    expect(await res.json()).toMatchObject({ receipt: { state: "accepted" } });
+    expect(walky.status("wt_aaaaaaaaaaa1").message).toMatchObject({ subject: "standup in 5" });
+    const long = await walkyPostRoute(walky, { id: "wt_aaaaaaaaaaa2", to: "local/w1:p1", body: "hi", subject: "one two three four five six seven" }, context([]));
+    expect(await long.json()).toMatchObject({ receipt: { target: "local/w1:p1", state: "refused", reason: SUBJECT_TOO_LONG } });
+    expect(walky.status("wt_aaaaaaaaaaa2").receipts).toEqual([]);
+    expect(walky.refusals().counts).toEqual({ "subject over 6 words or 48 characters": 1 });
+    // Only stripped characters, or null: no subject, and the message goes.
+    for (const [id, subject] of [["wt_aaaaaaaaaaa3", '"::"'], ["wt_aaaaaaaaaaa4", null]] as const) {
+      await walkyPostRoute(walky, { id, to: "local/w1:p1", body: "hi", subject }, context([]));
+      expect(walky.status(id).message).not.toHaveProperty("subject");
+    }
+    // A subject that is not text is a body this bridge cannot read.
+    const bad = await walkyPostRoute(walky, { id: "wt_aaaaaaaaaaa5", to: "local/w1:p1", body: "hi", subject: 7 }, context([]));
+    expect(bad.status).toBe(400);
+    expect(await bad.text()).toBe("bad subject");
   });
 
   test("the address is signed and logged without the blanks around it", async () => {
@@ -90,7 +115,7 @@ describe("`who` for the Crew page", () => {
   test("adds the shell panes a broadcast skips, and the refusal counts with no body", async () => {
     const root = mkdtempSync(join(tmpdir(), "walky-routes-"));
     roots.push(root);
-    const withShell: WalkyHost = { ...host, panes: () => [...panes, { session: "main", paneId: "w1:p3", agent: false, harness: null, label: "repo#c", state: "idle", activeAt: null, instance: "aaaa", terminal: true, off: false }] };
+    const withShell: WalkyHost = { ...host, panes: () => [...panes, { session: "main", paneId: "w1:p3", agent: false, harness: null, label: "repo#c", state: "idle", activeAt: null, instance: "aaaa", terminal: true, off: false, space: SOLO_SPACE }] };
     const walky = new WalkyService({ log: new WalkyLog(join(root, "walky")), host: withShell, memberId: null, enabled: () => true, machine: "desk", keyPem: () => null, now: () => 7 });
     await walky.send({ id: "wt_aaaaaaaaaaa1", to: "local/w9:p9", body: "secret words", replyTo: null }, { kind: "operator", label: "cli" });
     const body = await walkyWhoRoute(walky, null).json();
@@ -280,13 +305,86 @@ describe("the take-backs (M62 spec 03)", () => {
   });
 });
 
+describe("POST /api/pane/<pane>/walky/<id>/deliver, Deliver now (M99 spec 05)", () => {
+  /** A message to w1:p2 held for the draft; the Send Protocol's answer to a Deliver now is `answer`, its calls counted. */
+  async function held(answer: OverDraftResult) {
+    const root = mkdtempSync(join(tmpdir(), "walky-routes-"));
+    roots.push(root);
+    const states = new Map<string, SendResult>();
+    const calls: string[] = [];
+    const heldHost: WalkyHost = {
+      panes: () => panes,
+      send: async (_pane, sendId): Promise<SendResult> => {
+        states.set(sendId, { outcome: "held", reason: "draft_present" });
+        return { outcome: "held", reason: "draft_present" };
+      },
+      sendState: (sendId) => states.get(sendId) ?? null,
+      cancelHeld: () => undefined,
+      deliverOverDraft: async (_session, _paneId, sendId) => {
+        calls.push(sendId);
+        if (answer === "sent") states.set(sendId, { outcome: "sent" });
+        return answer;
+      },
+    };
+    const walky = new WalkyService({ log: new WalkyLog(join(root, "walky")), host: heldHost, memberId: null, enabled: () => true, machine: "desk", keyPem: () => null, sleep: () => new Promise(() => undefined) });
+    await walky.send({ id: "wt_aaaaaaaaaaa1", to: "local/w1:p2", body: "secret body", replyTo: null }, { kind: "agent", pane: panes[0]! });
+    for (let i = 0; i < 50 && walky.status("wt_aaaaaaaaaaa1").receipts[0]?.reason !== "draft present"; i++) await Bun.sleep(2);
+    return { walky, calls };
+  }
+
+  test("a delivery answers 200 with the receipt that says so; a repeat answers the stored receipt and asks nothing again", async () => {
+    const { walky, calls } = await held("sent");
+    const audit: string[] = [];
+    const res = await walkyDeliverRoute(walky, "main", "w1:p2", "wt_aaaaaaaaaaa1", context(audit));
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ result: { target: "local/w1:p2", result: "delivered", receipt: { state: "delivered", overDraft: true } } });
+    const again = await walkyDeliverRoute(walky, "main", "w1:p2", "wt_aaaaaaaaaaa1", context(audit));
+    expect(await again.json()).toMatchObject({ result: { result: "repeat", receipt: { state: "delivered", overDraft: true } } });
+    expect(calls).toHaveLength(1);
+    expect(audit.join("")).toContain("walky.deliverNow");
+    expect(audit.join("")).not.toContain("secret body");
+  });
+
+  test("a refusal is a 409 in words and the message keeps waiting; another pane, no such pane and a bad id ask nothing", async () => {
+    const { walky, calls } = await held("busy");
+    const res = await walkyDeliverRoute(walky, "main", "w1:p2", "wt_aaaaaaaaaaa1", context([]));
+    expect(res.status).toBe(409);
+    expect(await res.text()).toBe(DELIVER_NOW_WORDS.busy);
+    expect(walky.status("wt_aaaaaaaaaaa1").receipts[0]).toMatchObject({ state: "accepted", reason: "draft present" });
+    expect("overDraft" in walky.status("wt_aaaaaaaaaaa1").receipts[0]!).toBe(false);
+    expect((await walkyDeliverRoute(walky, "main", "w1:p1", "wt_aaaaaaaaaaa1", context([]))).status).toBe(404);
+    expect((await walkyDeliverRoute(walky, "main", "w9:p9", "wt_aaaaaaaaaaa1", context([]))).status).toBe(404);
+    expect((await walkyDeliverRoute(walky, "main", "w1:p2", "nope", context([]))).status).toBe(400);
+    expect((await walkyDeliverRoute(undefined, "main", "w1:p2", "wt_aaaaaaaaaaa1", context([]))).status).toBe(404);
+    expect(calls).toHaveLength(1);
+  });
+
+  test("a message that no longer waits answers 410, not 409: it did not stay waiting", async () => {
+    // The hold ended a moment before the tap (it went in, was dropped, cancelled or expired): the Send Protocol finds nothing held.
+    const { walky, calls } = await held("not-held");
+    const res = await walkyDeliverRoute(walky, "main", "w1:p2", "wt_aaaaaaaaaaa1", context([]));
+    expect(res.status).toBe(410);
+    expect(await res.text()).toBe(DELIVER_NOW_WORDS["not held"]);
+    expect(calls).toHaveLength(1);
+  });
+
+  test("may have arrived answers 200 with the unknown receipt, and a repeat sends nothing", async () => {
+    const { walky, calls } = await held("unknown");
+    const res = await walkyDeliverRoute(walky, "main", "w1:p2", "wt_aaaaaaaaaaa1", context([]));
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ result: { result: "may have arrived", receipt: { state: "unknown", reason: "no evidence", overDraft: true } } });
+    expect(await (await walkyDeliverRoute(walky, "main", "w1:p2", "wt_aaaaaaaaaaa1", context([]))).json()).toMatchObject({ result: { result: "repeat" } });
+    expect(calls).toHaveLength(1);
+  });
+});
+
 describe("POST /api/walky/off, the phone's switch (M89 spec 04)", () => {
   /** A service whose panes carry the flag a real store holds, as bridge/index.ts wires it, with one shell pane. */
   function switched() {
     const root = mkdtempSync(join(tmpdir(), "walky-routes-"));
     roots.push(root);
     const off = new WalkyOff(join(root, "walky"));
-    const shell: WalkyPane = { session: "main", paneId: "w1:p9", agent: false, harness: null, label: "repo", state: "idle", activeAt: null, instance: "cccc", terminal: true, off: false };
+    const shell: WalkyPane = { session: "main", paneId: "w1:p9", agent: false, harness: null, label: "repo", state: "idle", activeAt: null, instance: "cccc", terminal: true, off: false, space: SOLO_SPACE };
     const offHost: WalkyHost = { ...host, panes: () => [...panes, shell].map((pane): WalkyPane => Object.assign({}, pane, { off: off.isOff(pane) })) };
     const walky = new WalkyService({ log: new WalkyLog(join(root, "walky")), host: offHost, memberId: null, enabled: () => true, machine: "desk", keyPem: () => null, off });
     return { walky, off };
@@ -300,7 +398,7 @@ describe("POST /api/walky/off, the phone's switch (M89 spec 04)", () => {
     expect(await res.json()).toEqual({ off: true });
     expect(off.all()).toMatchObject([{ session: "main", paneId: "w1:p1", token: "aaaa", by: "operator" }]);
     expect(audit).toHaveLength(1);
-    expect(JSON.parse(audit[0]!)).toMatchObject({ action: "walky.off", device: "phone-altan", session: "main", paneId: "w1:p1", detail: { off: true } });
+    expect(JSON.parse(audit[0]!)).toMatchObject({ action: "walky.off", device: "phone-dev", session: "main", paneId: "w1:p1", detail: { off: true } });
     // A retry sets the same value: the same answer, the same one row.
     expect(await walkyOffRoute(walky, "main", { pane: "w1:p1", off: true }, context([])).json()).toEqual({ off: true });
     expect(off.all()).toHaveLength(1);

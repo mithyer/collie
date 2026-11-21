@@ -7,10 +7,14 @@ import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import type { Modifier } from "@/lib/key-queue";
 import { usePendingConfirm } from "@/hooks/use-pending-confirm";
+import { ignoreHeldEnter, useArm } from "@/hooks/use-arm";
+import { ENTER_ARM_MS } from "@/lib/arm";
 import { useKeyQueue } from "@/hooks/use-key-queue";
 import { useActionEcho } from "@/hooks/use-action-echo";
 import { useHoldRepeat } from "@/hooks/use-hold-repeat";
 import { KeyQueueStrip } from "@/components/key-queue-strip";
+import { Collapse } from "@/components/ui/collapse";
+import { setStatus } from "@/lib/status";
 import { useLocale } from "@/hooks/use-locale";
 import { t } from "@/lib/i18n";
 import { keysSendable } from "@/lib/mux-capability";
@@ -81,15 +85,18 @@ interface NavTrayProps {
   onQueueChange?: (staged: number) => void;
   /** The key board. Defaults to the shipped one, so a test or a playground needs no store. */
   board?: KeyBoard;
+  /** The pad cannot send: the link is down (the composer's `!way.keysSendable`). Every key waits, and a line
+   *  at the top of the pad says why (M102 spec 11). */
   disabled?: boolean;
   /**
    * Clear (ADR 0116, the Clear paragraph): the button at the chip row's end that empties the harness's
    * input box in one tap. Absent, no button is drawn (a playground, a test, a pane with no screen).
-   * `available` is the composer's reading of the Surface: the box holds a draft and no dialog is up. The
+   * `available` is the composer's reading of the Surface: the box holds a draft and no dialog is up;
+   * `unavailable` says which of the two is missing, for the words a tap on the greyed button answers with. The
    * composer owns the request and shows the receipt under the box; the tray owns the spinner and takes
    * no second tap while the request is in flight.
    */
-  clearBox?: { readonly available: boolean; readonly onClear: () => Promise<void> };
+  clearBox?: { readonly available: boolean; readonly onClear: () => Promise<void>; readonly unavailable?: "empty" | "dialog" };
   /**
    * Neutral key spellings this multiplexer refuses (`/api/config`, M10/06). A button whose chord
    * uses one is greyed — the door is open (`sendKeys`), this key is simply not behind it.
@@ -98,6 +105,12 @@ interface NavTrayProps {
    * everything it renders from its parent, so a test can drive it without a config fetch.
    */
   unsupportedKeys?: readonly string[];
+  /**
+   * Enter asks a second tap, as Ctrl+D does (M102 spec 03): while a card for a screen Collie cannot
+   * read is open, the pad opened by itself next to the thumb, and Enter there may confirm a menu's
+   * highlighted default ("Yes"). The person's own second tap is the decision.
+   */
+  confirmEnter?: boolean;
 }
 
 /** Stable default so an omitted prop never re-renders the pad. */
@@ -141,6 +154,18 @@ function textLabel(s: string) {
 // single row's height), so it stretches to the rows it spans.
 const tall = (key: BoardKey) => (key.h === 2 ? "h-auto self-stretch" : undefined);
 
+/** A chord this multiplexer refuses: the tap answers with the key's name (M102 spec 11). */
+function refuseKeys(keys: readonly string[]): void {
+  setStatus(t("keys.pad.refused", { key: stepsWords(keys, t("keys.pad.then")) }), "info");
+}
+
+/** The words a tap on a greyed Clear answers with: the link first, then a dialog, else no draft. */
+function clearOffKey(offline: boolean, unavailable: "empty" | "dialog" | undefined): "keys.pad.offline" | "keys.clear.off.dialog" | "keys.clear.off.empty" {
+  if (offline) return "keys.pad.offline";
+  if (unavailable === "dialog") return "keys.clear.off.dialog";
+  return "keys.clear.off.empty";
+}
+
 export function NavTray({
   onSend,
   presets = CONTROL_PRESETS,
@@ -149,6 +174,7 @@ export function NavTray({
   disabled,
   clearBox,
   unsupportedKeys = NO_REFUSED_KEYS,
+  confirmEnter = false,
 }: NavTrayProps) {
   useLocale();
   const [open, setOpen] = useState<OpenPanel>(null);
@@ -156,7 +182,12 @@ export function NavTray({
   const [clearing, setClearing] = useState(false);
   const clearingRef = useRef(false);
   async function runClear() {
-    if (clearBox === undefined || disabled || !clearBox.available || clearingRef.current) return;
+    if (clearBox === undefined || clearingRef.current) return;
+    // A greyed Clear keeps the tap and says why (M102 spec 11): the link, a dialog, or no draft.
+    if (disabled || !clearBox.available) {
+      setStatus(t(clearOffKey(disabled === true, clearBox.unavailable)), "info");
+      return;
+    }
     clearingRef.current = true;
     setClearing(true);
     try {
@@ -171,6 +202,15 @@ export function NavTray({
   const { queue, mods, activeMods, composing, arm, press, pushBase, removeAt, clear, take, releaseAbsent } =
     useKeyQueue();
   const { pending, confirm, reset } = usePendingConfirm(); // danger ctrl two-tap (immediate path only)
+  // Enter while the unread card is open (`confirmEnter`) arms through `useArm`, as the card's own Enter cap
+  // does (the M102 review 3): one length, ENTER_ARM_MS, and a second tap inside ARM_DWELL_MS keeps the arm and
+  // sends nothing, so one double tap cannot arm and fire Enter.
+  const enterArm = useArm<string>(ENTER_ARM_MS);
+  const disarmEnter = enterArm.disarm;
+  // The arm drops with the card, and when the pad stops being pressable (the link is down), as the card's own arm does.
+  useEffect(() => {
+    if (!confirmEnter || disabled === true) disarmEnter();
+  }, [confirmEnter, disabled, disarmEnter]);
   const echo = useActionEcho();
   // Hold-to-repeat, WHITELISTED to the arrows (see navBtn's `repeat` flag). Deliberately a whitelist
   // rather than a blacklist: Enter/Esc/Space/digits/Ctrl-presets structurally must not repeat, and
@@ -215,6 +255,7 @@ export function NavTray({
   // danger chords (d/z) keep the original two-tap confirm.
   function pressCtrl(item: CtrlDef) {
     if (disabled) return;
+    disarmEnter();
     if (!composing && item.danger && !confirm(item.label)) return; // first tap arms the confirm
     fire(item.keys, item.label);
   }
@@ -228,6 +269,7 @@ export function NavTray({
     if (disabled) return;
     const keys = take();
     reset();
+    disarmEnter();
     if (keys.length > 0) void onSend(keys);
   }
 
@@ -255,8 +297,18 @@ export function NavTray({
     const id = keys.join(" ");
     // A key with a step that can stop a program asks a second tap, but only on the immediate path.
     // While composing, the strip's Send is the review (the same split the Ctrl presets make).
-    const armed = needsConfirm && pending === id;
+    // Enter under the unread card arms through `enterArm` (its dwell and its length); every other confirm
+    // keeps the pending two-tap. One arm at a time: arming one drops the other.
+    const viaEnterArm = needsConfirm && confirmEnter && keys.includes("Enter");
+    const armed = viaEnterArm ? enterArm.armed === id : needsConfirm && pending === id;
     const tap = () => {
+      if (viaEnterArm && !composing) {
+        reset();
+        if (enterArm.tap(id) !== "fire") return; // the first tap arms; a tap inside the dwell keeps the arm
+        fire(keys, id);
+        return;
+      }
+      disarmEnter();
       if (needsConfirm && !composing && !confirm(id)) return; // first tap arms the confirm
       fire(keys, id);
     };
@@ -269,14 +321,18 @@ export function NavTray({
     // its own place is the lesser harm here — the opposite call from the action sheets, and for a
     // reason those sheets do not have.
     const refused = !keysSendable(keys, unsupportedKeys);
+    // A refused chord keeps the tap and says why (M102 spec 11): `aria-disabled` and dimmed, never `disabled`.
+    const refuse = () => refuseKeys(keys);
     return (
       <Button
         type="button"
         variant={armed ? "destructive" : held || phase !== "idle" ? "default" : "outline"}
         size="sm"
-        disabled={disabled || refused}
+        disabled={disabled}
+        aria-disabled={refused ? true : undefined}
         style={style}
-        {...(bind ?? { onClick: tap })}
+        {...(refused ? { onClick: refuse } : (bind ?? { onClick: tap }))}
+        onKeyDown={viaEnterArm ? ignoreHeldEnter : undefined}
         aria-label={armed && aria !== undefined ? t("keys.pad.tapAgain", { key: aria }) : aria}
         // A hover title for the icon keys — an icon-only button gives a desktop pointer nothing to
         // read until it commits to a tap. Harmless on the text keys that also pass `aria`.
@@ -289,6 +345,7 @@ export function NavTray({
         // under `truncate` on the label itself.
         className={cn(
           "h-9 min-w-0 overflow-hidden touch-manipulation select-none px-0 text-sm font-medium",
+          refused && "opacity-50",
           extraClassName,
           resting && restingClassName,
         )}
@@ -397,7 +454,7 @@ export function NavTray({
           only !== undefined && REPEATS.has(only),
           cn("w-full", KEY_TAP_TARGET, tall(key)),
           isEnter ? "bg-primary/15 border-primary/40" : undefined,
-          needsSecondTap(key),
+          needsSecondTap(key) || (confirmEnter && key.steps.includes("Enter")),
           areaCss(cell, key),
         )}
       </Fragment>
@@ -406,6 +463,15 @@ export function NavTray({
 
   return (
     <div className="space-y-0.5 border-t border-rule bg-muted/30 px-2 py-1.5">
+      {/* The link is down: every key waits, and this line says why (M102 spec 11). It comes through Collapse,
+          so the pad's keys never move for it. */}
+      <Collapse open={disabled === true}>
+        {disabled === true && (
+          <p data-slot="keys-offline" role="status" className="px-1 pb-1 text-xs leading-snug text-muted-foreground">
+            {t("keys.pad.offline")}
+          </p>
+        )}
+      </Collapse>
       {/* Staging strip — visible only while composing (a modifier armed or keys queued). */}
       <KeyQueueStrip
         queue={queue}
@@ -444,10 +510,12 @@ export function NavTray({
             variant="outline"
             size="sm"
             data-slot="keys-clear"
-            disabled={disabled || !clearBox.available || clearing}
+            // Greyed with `aria-disabled`, the tap kept: it says why there is nothing to clear (M102 spec 11).
+            disabled={clearing}
+            aria-disabled={disabled || !clearBox.available ? true : undefined}
             aria-label={t("keys.clear.aria")}
             onClick={() => void runClear()}
-            className={cn("ml-auto h-9 gap-1.5 px-3 text-sm font-medium touch-manipulation select-none", "relative before:absolute before:inset-x-0 before:-inset-y-[4px] before:content-['']")}
+            className={cn("ml-auto h-9 gap-1.5 px-3 text-sm font-medium touch-manipulation select-none", (disabled || !clearBox.available) && "opacity-50", "relative before:absolute before:inset-x-0 before:-inset-y-[4px] before:content-['']")}
           >
             {clearing ? <Icon name="busy" className="size-4 animate-spin" aria-hidden="true" /> : <Icon name="clear-keys" className="size-4" aria-hidden="true" />}
             {t("keys.clear.label")}
@@ -472,10 +540,12 @@ export function NavTray({
                 type="button"
                 variant={variant}
                 size="sm"
-                disabled={disabled || !keysSendable(item.keys, unsupportedKeys)}
-                onClick={() => pressCtrl(item)}
+                disabled={disabled}
+                aria-disabled={keysSendable(item.keys, unsupportedKeys) ? undefined : true}
+                onClick={() => (keysSendable(item.keys, unsupportedKeys) ? pressCtrl(item) : refuseKeys(item.keys))}
                 className={cn(
                   "h-9 text-sm font-medium",
+                  !keysSendable(item.keys, unsupportedKeys) && "opacity-50",
                   item.danger && !isPending && phase === "idle" && "text-destructive",
                 )}
               >

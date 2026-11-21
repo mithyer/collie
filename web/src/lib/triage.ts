@@ -12,6 +12,7 @@
 // "settled since you last looked" is `lastActiveAt > lastSeenAt`, which is the Ready·unseen bucket.
 import type { AgentStatus, AgentView } from "./types";
 import { t } from "./i18n";
+import { isTrickPane, realAgentPanes } from "./tricks/places";
 
 /** Which way the Recent section runs. Attention sections never invert. */
 export type RecentDir = "newest" | "oldest";
@@ -43,24 +44,53 @@ export interface TriageSection {
  * Both timestamps absent (an older bridge) yields `false`, so the section is simply empty there.
  */
 export function isUnseen(a: AgentView): boolean {
-  return a.kind !== "shell" &&
-    (a.status === "done" || a.status === "idle") &&
-    (a.lastActiveAt ?? 0) > (a.lastSeenAt ?? 0);
+  return a.kind !== "shell" && (a.status === "done" || a.status === "idle") && settledUnseen(a);
+}
+
+/**
+ * Whether a pane stopped on an error (`blockedBy: "error"`): `blocked`, so it needs you, but it waits on
+ * no answer. No question card, no dialog guard; it rests like a finished pane once seen ({@link shownStatus}).
+ */
+export function isErrorBlocked(a: Pick<AgentView, "status" | "blockedBy">): boolean {
+  return a.status === "blocked" && a.blockedBy === "error";
+}
+
+/**
+ * Whether a pane waits on an answer: a question, a dialog or an answer box. Every `blocked` pane but one
+ * that stopped on an error; a plain `blocked` from an older machine is a question.
+ */
+export function isQuestion(a: Pick<AgentView, "status" | "blockedBy">): boolean {
+  return a.status === "blocked" && a.blockedBy !== "error";
 }
 
 /**
  * The status a pane's dot draws. The multiplexer's `done` means "finished its turn", and the green
  * disc means "finished and nobody opened it yet" (issue 665). Once the shared seen mark has caught up
- * (ADR 0003) a finished pane rests as `idle`, a ring. Shell panes and every other status pass through.
+ * (ADR 0003) a finished pane rests as `idle`, a ring. A pane that stopped on an error
+ * ({@link isErrorBlocked}) needs you until then and rests the same way, because it asks for a look and
+ * not for an answer; the next status the agent reports replaces it. Shell panes and every other
+ * status pass through.
  */
 export function shownStatus(a: AgentView): AgentStatus {
-  return a.kind !== "shell" && a.status === "done" && !isUnseen(a) ? "idle" : a.status;
+  if (a.kind === "shell") return a.status;
+  if (a.status === "done" && !isUnseen(a)) return "idle";
+  if (isErrorBlocked(a) && !settledUnseen(a)) return "idle";
+  return a.status;
+}
+
+/** Whether the pane's last status change is newer than the last time it was seen (both from the bridge). */
+function settledUnseen(a: AgentView): boolean {
+  return (a.lastActiveAt ?? 0) > (a.lastSeenAt ?? 0);
 }
 
 /** Which section an agent belongs to. The single classifier — {@link triage} and
  *  {@link worstTriage} both route through it, so a list and a chip can't disagree. */
 export function bucketOf(a: AgentView): TriageKey {
-  if (a.status === "blocked") return "needs";
+  // A trick session is outside triage (M94): it never needs you, is never ready and never counts as
+  // working. Every list function below reads `realAgentPanes`; this holds for a single pane too.
+  if (isTrickPane(a)) return "recent";
+  // A pane that stopped on an error needs you only until it is seen (shownStatus).
+  if (shownStatus(a) === "blocked") return "needs";
   if (isUnseen(a)) return "ready";
   if (a.status === "working") return "working";
   return "recent";
@@ -84,7 +114,7 @@ export function needsYou(a: AgentView): boolean {
  */
 export function countBlocked(agents: readonly AgentView[]): number {
   let n = 0;
-  for (const a of agents) if (bucketOf(a) === "needs") n++;
+  for (const a of realAgentPanes(agents)) if (bucketOf(a) === "needs") n++;
   return n;
 }
 
@@ -95,7 +125,7 @@ export function countBlocked(agents: readonly AgentView[]): number {
  */
 export function countAlerting(agents: readonly AgentView[], kinds: { blocked: boolean; done: boolean }): number {
   let n = 0;
-  for (const a of agents) {
+  for (const a of realAgentPanes(agents)) {
     const bucket = bucketOf(a);
     if ((bucket === "needs" && kinds.blocked) || (bucket === "ready" && kinds.done)) n++;
   }
@@ -104,7 +134,7 @@ export function countAlerting(agents: readonly AgentView[], kinds: { blocked: bo
 
 /** Whether any pane is in the "ready" bucket: finished and unseen. The "Focus" tab's dot. */
 export function hasReady(agents: readonly AgentView[]): boolean {
-  return agents.some((a) => bucketOf(a) === "ready");
+  return realAgentPanes(agents).some((a) => bucketOf(a) === "ready");
 }
 
 /** Display order, most urgent first. */
@@ -128,7 +158,7 @@ export const TRIAGE_STATUS = {
  */
 export function worstTriage(agents: readonly AgentView[]): TriageKey | null {
   let best: number | null = null;
-  for (const a of agents) {
+  for (const a of realAgentPanes(agents)) {
     const rank = TRIAGE_ORDER.indexOf(bucketOf(a));
     if (best === null || rank < best) best = rank;
   }
@@ -172,7 +202,7 @@ export function triage(agents: readonly AgentView[], dir: RecentDir = "newest"):
   const recent: AgentView[] = [];
 
   const into = { needs, ready, working, recent };
-  for (const a of agents) into[bucketOf(a)].push(a);
+  for (const a of realAgentPanes(agents)) into[bucketOf(a)].push(a);
 
   if (dir === "oldest") recent.reverse();
 

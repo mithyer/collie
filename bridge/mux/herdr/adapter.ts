@@ -37,6 +37,7 @@ import {
   muxGone,
   muxOk,
   muxRefused,
+  muxUnconfirmed,
   muxUnreachable,
   requestedCwd,
   type MuxAck,
@@ -59,6 +60,8 @@ import {
 import {
   DEFAULT_TIMEOUT_MS,
   HerdrClient,
+  HerdrNoReply,
+  HerdrTimeout,
   paneAgentSession,
   type CreatedShell,
   type HerdrRpc,
@@ -162,10 +165,28 @@ function reason<T>(err: T): string {
  */
 const GONE_CODES: readonly string[] = ["pane_not_found", "tab_not_found", "workspace_not_found"];
 
+/**
+ * What an error REPLY to `worktree.open` reads like once the client has folded it into an Error:
+ * `herdr worktree.open: <code>: <message>`. A timeout and a closed connection do not match, and
+ * those are the rejections that may have opened the folder anyway.
+ */
+const WORKTREE_OPEN_ANSWER = /^herdr worktree\.open: [a-z_]+: /;
+
 /** Which refusal an exception off the socket is: a dead pane/tab, or a multiplexer that did not answer. */
 function transportRefusal<T>(err: T): MuxRefusalOutcome {
   const detail = reason(err);
   return GONE_CODES.some((code) => detail.includes(code)) ? muxGone(detail) : muxUnreachable(detail);
+}
+
+/**
+ * The refusal for a failure of a CREATE call. A call Herdr did not answer, in time ({@link HerdrTimeout})
+ * or before it closed a connection that carried the request ({@link HerdrNoReply}), may still have made
+ * the tab or the workspace, so it is `unconfirmed` and not `unreachable`: the route looks in the snapshot
+ * before it says anything (bridge/create-confirm.ts).
+ */
+function createRefusal<T>(err: T): MuxRefusalOutcome {
+  if (err instanceof HerdrTimeout || err instanceof HerdrNoReply) return muxUnconfirmed(reason(err));
+  return transportRefusal(err);
 }
 
 export class HerdrMux implements MuxAdapter {
@@ -177,6 +198,9 @@ export class HerdrMux implements MuxAdapter {
   // method (see snapshot()), after which every read uses the legacy three-call path. Adapter state
   // rather than engine state: which methods a server has is a fact about this multiplexer.
   private supportsSessionSnapshot = true;
+
+  // `worktree.open` is the second such method: flipped off once a server answers that it does not know it.
+  private supportsWorktreeOpen = true;
 
   /** Per pane, the last `pane.get` scroll answer (in flight or settled) and when it stops standing. */
   private readonly scrollByPane = new Map<string, { until: number; scroll: Promise<NonNullable<WirePane["scroll"]> | null> }>();
@@ -352,7 +376,7 @@ export class HerdrMux implements MuxAdapter {
   }
 
   async typeText(paneId: string, text: string): Promise<MuxAck> {
-    return this.attempt(() => this.client.sendPaneText(paneId, text));
+    return this.attemptWrite(paneId, () => this.client.sendPaneText(paneId, text));
   }
 
   /**
@@ -365,7 +389,7 @@ export class HerdrMux implements MuxAdapter {
   async pasteBlock(paneId: string, text: string): Promise<MuxAck> {
     const body = [...text].filter(pasteKeeps).join("");
     if (body.length === 0) return muxAck();
-    return this.attempt(() => this.client.sendPaneText(paneId, `${PASTE_START}${body}${PASTE_END}`));
+    return this.attemptWrite(paneId, () => this.client.sendPaneText(paneId, `${PASTE_START}${body}${PASTE_END}`));
   }
 
   /**
@@ -388,7 +412,16 @@ export class HerdrMux implements MuxAdapter {
       }
       translated.push(result.key);
     }
-    return this.attempt(() => this.client.sendPaneKeys(paneId, translated));
+    // Keys Herdr did not confirm, by a time-out or a closed connection, may still land: `unconfirmed`,
+    // never sent again (M100 spec 03).
+    try {
+      await this.client.sendPaneKeys(paneId, translated);
+      return muxAck();
+    } catch (err) {
+      if (err instanceof HerdrTimeout) return muxUnconfirmed(`Herdr did not confirm the keys on ${paneId} in time (${err.message}). They may still arrive, so they were not sent again.`);
+      if (err instanceof HerdrNoReply) return muxUnconfirmed(`Herdr closed the connection before it confirmed the keys on ${paneId} (${err.message}). They may have arrived, so they were not sent again.`);
+      return transportRefusal(err);
+    }
   }
 
   async renamePane(paneId: string, label: string | null): Promise<MuxAck> {
@@ -423,7 +456,7 @@ export class HerdrMux implements MuxAdapter {
       const created = await this.client.createTab(request.spaceId, opts);
       return muxOk(toCreatedPane(created));
     } catch (err) {
-      return transportRefusal(err);
+      return createRefusal(err);
     }
   }
 
@@ -443,10 +476,48 @@ export class HerdrMux implements MuxAdapter {
     const opts: Parameters<HerdrClient["createWorkspace"]>[0] = { cwd: request.cwd };
     if (request.label !== undefined) opts.label = request.label;
     try {
+      const opened = await this.openAsWorktree(request, opts.label);
+      if (opened !== null) return muxOk(toCreatedPane(opened));
+    } catch (err) {
+      // Only an answer that REFUSED the open falls through (see openAsWorktree). A timeout or a
+      // dropped connection may have opened it, and a second space on the folder is worse than a
+      // refusal: the retry that follows asks again and Herdr answers `already_open`.
+      return createRefusal(err);
+    }
+    try {
       const created = await this.client.createWorkspace(opts);
       return muxOk(toCreatedPane(created));
     } catch (err) {
-      return transportRefusal(err);
+      return createRefusal(err);
+    }
+  }
+
+  /**
+   * Open the folder as a linked worktree, so Herdr files it under its repository (`worktree.open`).
+   *
+   * Answers the pane, or `null` for "open it the plain way": the request names no worktree, this
+   * server predates the method (learned once, then never asked again, like `session.snapshot`), or
+   * Herdr refused with an answer of its own (`worktree_not_found`, `not_git_worktree`, a trust
+   * refusal). A plain space is what Collie opened before this call existed, so a refusal costs the
+   * nesting and nothing else. A rejection that is not an answer (timeout, closed connection) is
+   * thrown: the open may have happened.
+   */
+  private async openAsWorktree(request: MuxSpaceRequest, label: string | undefined): Promise<CreatedShell | null> {
+    if (request.worktree === undefined || !this.supportsWorktreeOpen) return null;
+    const opts: Parameters<HerdrClient["openWorktree"]>[0] = { cwd: request.worktree.repoRoot, path: request.cwd };
+    if (label !== undefined) opts.label = label;
+    try {
+      return await this.client.openWorktree(opts);
+    } catch (err) {
+      const detail = reason(err);
+      if (detail.includes("unknown variant") && detail.includes("worktree.open")) {
+        this.supportsWorktreeOpen = false;
+        console.log("[mux] herdr predates worktree.open — worktrees open as plain spaces");
+        return null;
+      }
+      if (!WORKTREE_OPEN_ANSWER.test(detail)) throw err;
+      console.log(`[mux] herdr refused worktree.open, opening a plain space: ${detail}`);
+      return null;
     }
   }
 
@@ -481,6 +552,22 @@ export class HerdrMux implements MuxAdapter {
       },
       onDown: (why) => options.onDown(why),
     });
+  }
+
+  /**
+   * {@link attempt} for a text write. A write Herdr did not confirm, by a time-out or a closed connection
+   * that carried it, may still have reached the pane: it is `unconfirmed`, never `unreachable`, and the
+   * caller's next read decides (MuxRefusal).
+   */
+  private async attemptWrite(paneId: string, call: () => Promise<void>): Promise<MuxAck> {
+    try {
+      await call();
+      return muxAck();
+    } catch (err) {
+      if (err instanceof HerdrTimeout) return muxUnconfirmed(`Herdr did not confirm the text written to ${paneId} in time (${err.message}). It may still arrive, so it was not written again.`);
+      if (err instanceof HerdrNoReply) return muxUnconfirmed(`Herdr closed the connection before it confirmed the text written to ${paneId} (${err.message}). It may have arrived, so it was not written again.`);
+      return transportRefusal(err);
+    }
   }
 
   /** One RPC that answers nothing but "it happened", as the contract's ack-or-refusal. */
@@ -530,6 +617,8 @@ function toMuxPane(
     paneId: raw.pane_id,
     spaceId: raw.workspace_id,
     spaceLabel,
+    // A workspace Herdr lists with a label of its own is named; the id a missing record falls back to is not.
+    spaceNamed: space !== undefined && space.label.trim() !== "" && space.label !== raw.workspace_id,
     spaceNumber: space?.number ?? 0,
     tabId: raw.tab_id,
     // The program in front, else the launch folder: any non-empty string wins, as in herdr-core (layout.ts).

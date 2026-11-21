@@ -43,6 +43,7 @@ vi.mock("@/lib/chat-gate", async (importOriginal) => ({
 import { server } from "@/test/setup";
 import { __resetBeltIntents, queueBeltIntent, takeBeltIntent } from "@/lib/belt-intent";
 import { paneScopeKey } from "@/lib/scope";
+import { __forgetTabPaneMemory, rememberTabPane } from "@/lib/tab-pane-memory";
 import { clearStatus, setStatus, useStatus } from "@/lib/status";
 import { setAutoZenEnabled, setZenEnabled, __resetZen } from "@/lib/zen";
 import { HarnessPrefsControl } from "@/components/harness-prefs-control";
@@ -63,11 +64,12 @@ import { CrewProvider } from "./crew-provider";
 import type { AgentStatus, AgentView, ChatWindowBody, ServerSummary, TabView, WorkspaceView } from "@/lib/types";
 import { ROOT_ROUTE_ID } from "@/lib/loaders";
 import { withHeaderHost } from "@/test/header-host";
+import { CROSSFADE_QUIET_MS } from "@/components/ui/crossfade-text";
 import { COLLAPSE_MS } from "./ui/collapse";
 import { AgentChat } from "./agent-chat";
 import { saveChatTail } from "@/lib/chat-tail";
 import { __resetMaskedHint, maskedHintRetired } from "@/lib/masked-hint";
-import { ARM_DWELL_MS } from "@/lib/arm";
+import { ARM_DWELL_MS, STOP_HOLD_MS } from "@/lib/arm";
 
 // M46 spec 11 turns every send off for a pane the bridge has not answered lately (lib/liveness.ts).
 // These suites drive sends against a mocked network and never poll first, so they pin the pane live;
@@ -1979,7 +1981,7 @@ describe("AgentChat — statusline strip scroll containment", () => {
 // ─────────────────────────────────────────────────────────────────────────────
 
 const crewRoster: ServerSummary[] = [
-  { id: "bluefin", name: "bluefin", isLead: true, reachable: true, protocol: "ok", lastSeenAt: 5_000 },
+  { id: "lodge", name: "lodge", isLead: true, reachable: true, protocol: "ok", lastSeenAt: 5_000 },
   // Reachable-but-long-unseen would be equally stale; unreachable is the case the operator meets.
   { id: "workshop", name: "workshop", isLead: false, reachable: false, protocol: "ok", lastSeenAt: 1_000 },
   {
@@ -2069,7 +2071,7 @@ describe("AgentChat — a pane on a host the lead can't reach", () => {
   });
 
   it("a live host in the same crew is completely untouched", () => {
-    renderCrewChat("bluefin");
+    renderCrewChat("lodge");
     expect(screen.queryByRole("status")).not.toBeInTheDocument();
     expect(screen.getByPlaceholderText(/type a reply/i)).not.toBeDisabled();
   });
@@ -2120,7 +2122,8 @@ describe("AgentChat — the mirror's top edge", () => {
     // `pt-0` stated, not merely absent: the base `py-4` is still on the element and Tailwind's own
     // sheet order is what lets the later `pt-0` beat it, so dropping the class restores 16px.
     expect(scroller?.className).toMatch(/\bpt-0\b/);
-    expect(scroller?.className).toMatch(/\bpb-3\b/);
+    // The tail keeps 12px of clearance, and more while the model tag floats over it (#759).
+    expect(scroller?.className).toMatch(/pb-\[max\(0\.75rem,var\(--tail-room,0px\)\)\]/);
   });
 });
 
@@ -2237,6 +2240,57 @@ describe("AgentChat — closing the current tab", () => {
     // were in is gone and you are somewhere else now. A status on only one branch would be silent on
     // the more disorienting of the two.
     expect(await screen.findByText("Tab closed")).toBeInTheDocument();
+  });
+});
+
+// Opening a tab from the in-pane strip returns to the pane the tab was last open on (lib/tab-pane-memory.ts),
+// not its first pane. The route writes the memory when a pane is shown; these cases write it the same way.
+describe("AgentChat \u2014 a tab opens on the pane it was last open on", () => {
+  afterEach(() => {
+    sessionStorage.clear();
+    __forgetTabPaneMemory();
+  });
+
+  const paneIn = (paneId: string, tabId: string): AgentView => ({
+    paneId,
+    workspaceId: "w6",
+    workspaceLabel: "collie",
+    workspaceNumber: 6,
+    tabId,
+    agent: "claude",
+    status: "idle",
+    cwd: "/home/you/collie",
+    focused: false,
+  });
+  const tabsOf = (...ids: string[]): TabView[] =>
+    ids.map((tabId, i) => ({ tabId, workspaceId: "w6", number: i + 1, label: `tab${i + 1}`, focused: false, paneCount: 2 }));
+  const here = paneIn("w6:pA", "w6:t1");
+  const sideBySide = [here, paneIn("w6:pB", "w6:t2"), paneIn("w6:pC", "w6:t2")];
+
+  async function openTab(label: string, onSelect = vi.fn()) {
+    renderChat({ agent: here, agents: sideBySide, shellPanes: [], tabs: tabsOf("w6:t1", "w6:t2"), onSelect });
+    await userEvent.setup().click(screen.getByRole("button", { name: new RegExp(`${label}$`) }));
+    return onSelect;
+  }
+
+  it("returns to the remembered pane of the tab", async () => {
+    rememberTabPane(sideBySide[2]!);
+    expect(await openTab("tab2")).toHaveBeenCalledExactlyOnceWith("w6:pC");
+  });
+
+  it("keeps the memory over a reload (sessionStorage), not only in memory", async () => {
+    rememberTabPane(sideBySide[2]!);
+    __forgetTabPaneMemory();
+    expect(await openTab("tab2")).toHaveBeenCalledExactlyOnceWith("w6:pC");
+  });
+
+  it("opens the first pane when the tab was never visited", async () => {
+    expect(await openTab("tab2")).toHaveBeenCalledExactlyOnceWith("w6:pB");
+  });
+
+  it("falls back to the first pane when the remembered pane is gone", async () => {
+    rememberTabPane(paneIn("w6:pGone", "w6:t2"));
+    expect(await openTab("tab2")).toHaveBeenCalledExactlyOnceWith("w6:pB");
   });
 });
 
@@ -2401,6 +2455,20 @@ describe("the pane fits its viewport", () => {
     } finally {
       kb.restore();
     }
+  });
+  // A permission card with subject rows fits the dock (card-dock.tsx): the floor turns soft for it,
+  // the same share as a flex basis that shrinks first, so a short phone shows every button of the card
+  // and less chat. The heights are a layout engine's: e2e/permission-card-fits.spec.ts.
+  it("softens the reading floor for a permission card that fits the dock", () => {
+    const text = readFileSync(join(import.meta.dirname, "..", "fixtures", "panes", "claude--v2322-permission-bash-cut-top--w160.txt"), "utf8");
+    const { container } = renderChat({ text });
+    const reading = container.querySelector<HTMLElement>('[data-slot="pane-reading"]')!;
+    expect(reading.className).toMatch(/(?:^|\s)flex-\[1_1000_30dvh\](?=\s|$)/);
+    expect(reading.className).toMatch(/(?:^|\s)min-h-0(?=\s|$)/);
+    expect(reading.className).not.toMatch(/min-h-\[30dvh\]|(?:^|\s)flex-1(?=\s|$)/);
+    const dock = container.querySelector<HTMLElement>('[data-slot="card-dock"]')!;
+    expect(dock.className).toMatch(/(?:^|\s)grow-\[1000\](?=\s|$)/);
+    expect(dock.querySelector("[data-fit] [data-fit-shrink]")).not.toBeNull();
   });
 
   it("keeps a floor under the folder tab — the gap above the mirror may shrink, never close", () => {
@@ -3165,7 +3233,11 @@ describe("AgentChat — folding the tab and pane rows", () => {
 interface LaunchPostedBody {
   command?: string;
   paneId?: string;
+  requestId?: string;
 }
+
+/** A request id as the phone mints it: a UUID, one per tap (M100 spec 04). */
+const A_REQUEST_ID = expect.stringMatching(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u);
 
 describe("AgentChat: Launch section in the switcher", () => {
   function declareLaunchers() {
@@ -3238,7 +3310,7 @@ describe("AgentChat: Launch section in the switcher", () => {
     renderChat();
     await user.click(screen.getByRole("button", { name: "Switch pane" }));
     await user.click(await screen.findByText("Runs & quota"));
-    await waitFor(() => expect(posted).toEqual({ command: "rumen-peek", paneId: agent.paneId }));
+    await waitFor(() => expect(posted).toEqual({ command: "rumen-peek", paneId: agent.paneId, requestId: A_REQUEST_ID }));
   });
 
   // THE NO PROMPTS CONFIRM (ADR 0094) in the switcher: a row that skips permission prompts asks first.
@@ -3289,7 +3361,7 @@ describe("AgentChat: Launch section in the switcher", () => {
       await user.click(screen.getByRole("button", { name: "Switch pane" }));
       await user.click(await screen.findByText("Claude, no prompts"));
       await user.click(within(await screen.findByRole("dialog", { name: "Start without prompts?" })).getByRole("button", { name: "Start" }));
-      await waitFor(() => expect(posted).toEqual([{ command: "claude --yolo", paneId: agent.paneId }]));
+      await waitFor(() => expect(posted).toEqual([{ command: "claude --yolo", paneId: agent.paneId, requestId: A_REQUEST_ID }]));
       expect(noPromptsConfirmed("", "claude --yolo")).toBe(true);
     });
 
@@ -4181,7 +4253,7 @@ describe("AgentChat: a new agent pane draws Chat from the first frame", () => {
 
   /** One recorded frame: which body is drawn, and which phase the layer is in (or none). */
   type Frame = { body: "chat" | "terminal"; phase: string };
-  function renderShell() {
+  function renderShell(truncated = false) {
     let setAgent: (a: AgentView) => void = () => {};
     let revalidate: () => void = () => {};
     function Host() {
@@ -4197,6 +4269,7 @@ describe("AgentChat: a new agent pane draws Chat from the first frame", () => {
           shellPanes={agent.kind === "shell" ? [agent] : []}
           tabs={[]}
           text={paneTextWithDraft("recent pane output")}
+          truncated={truncated}
           onBack={vi.fn()}
           onSelect={vi.fn()}
         />
@@ -4372,7 +4445,7 @@ describe("AgentChat: a new agent pane draws Chat from the first frame", () => {
 
   it("(d) a log that never appears: the terminal says so after the read that follows the turn's end", async () => {
     chatAnswer = "no-log";
-    const view = renderShell();
+    const view = renderShell(true);
     await handOver(view, agentOf("pi", "idle", true));
     view.set(agentOf("pi", "working", true));
     await advance(view, 120_000);
@@ -4389,11 +4462,14 @@ describe("AgentChat: a new agent pane draws Chat from the first frame", () => {
     await advance(view, 100);
     expect(screen.getByText(/recent pane output/)).toBeInTheDocument();
     expect(screen.getByText("No transcript file was found for this pane's session yet.")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /load older/i })).toBeEnabled();
+    expect(screen.queryByRole("button", { name: /show entire history/i })).toBeNull();
 
     chatAnswer = "live";
     view.poll();
     await advance(view, 300);
     expect(screen.getByText("what changed today?")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /load older/i })).toBeNull();
     expect(bodies(view.frames)).toEqual(["terminal", "chat", "terminal", "chat"]);
     swapsOnlyUnderCover(view.frames);
   });
@@ -4405,7 +4481,7 @@ describe("AgentChat: a new agent pane draws Chat from the first frame", () => {
     ["a 404 from an older member", () => new HttpResponse(null, { status: 404 })],
   ])("(g) a server that cannot read (%s) draws the terminal, not an empty Chat", async (_name, answer) => {
     server.use(http.get(/\/api\/pane\/[^/]+\/chat/, answer));
-    const view = renderShell();
+    const view = renderShell(true);
     await handOver(view, agentOf("claude", "idle", true));
     await advance(view, 500);
     view.poll();
@@ -4413,6 +4489,8 @@ describe("AgentChat: a new agent pane draws Chat from the first frame", () => {
     expect(view.container.querySelector('[data-slot="session-stream"]')).toBeNull();
     expect(screen.getByText(/recent pane output/)).toBeInTheDocument();
     expect(startLine()).toBeNull();
+    expect(screen.getByRole("button", { name: /load older/i })).toBeEnabled();
+    expect(screen.queryByRole("button", { name: /show entire history/i })).toBeNull();
   });
 
   it("(f) a question with nothing to read: the terminal at once, so the dialog is on screen", async () => {
@@ -4697,6 +4775,34 @@ describe("AgentChat header — the branch on the path line", () => {
   });
 });
 
+// The added account the session runs under (M101) is a word on the same line, after the branch.
+describe("AgentChat header — the account on the path line", () => {
+  const pathLine = (c: HTMLElement) => c.querySelector<HTMLElement>('[data-slot="pane-place"]')!.parentElement!;
+
+  it("draws the label after the branch and before the meta, in the line's own 12px box", () => {
+    const agent: AgentView = { ...fixtureAgents[0]!, gitHead: { kind: "branch", name: "fix-login" }, account: { id: "acc-work", label: "Work" } };
+    const { container } = renderChat({ agent, agents: [agent, ...fixtureAgents.slice(1)] });
+    const line = pathLine(container);
+    expect(line).toHaveClass("h-3");
+    const tag = line.querySelector<HTMLElement>('[data-slot="pane-account"]')!;
+    expect(tag).toHaveTextContent("Work");
+    expect(tag).toHaveClass("leading-3");
+    expect(tag.previousElementSibling).toHaveAttribute("data-slot", "branch-label");
+    expect(tag.nextElementSibling).toHaveAttribute("data-slot", "pane-meta");
+  });
+
+  it("draws nothing, and the line's markup is as before, for a pane with no account", () => {
+    const base = fixtureAgents[0]!;
+    const plain = renderChat({ agent: { ...base, gitHead: { kind: "branch", name: "fix-login" } } });
+    expect(plain.container.querySelector('[data-slot="pane-account"]')).toBeNull();
+    const html = pathLine(plain.container).innerHTML;
+    cleanup();
+    const withKeyAbsent = renderChat({ agent: { ...base, gitHead: { kind: "branch", name: "fix-login" } } });
+    expect(pathLine(withKeyAbsent.container).innerHTML).toBe(html);
+    expect(html).not.toContain("pane-account");
+  });
+});
+
 // A durable program's subtitle takes the header's second line, in the same 12px box (WIRE.md 7.11).
 // SAFETY: the header reads the field through the JSON guard (lib/pane-marks.ts); this hands it a shape a peer could send.
 const wrongSubtitle = (value: JsonValue): AgentView["subtitle"] => value as AgentView["subtitle"];
@@ -4823,7 +4929,7 @@ describe("AgentChat — the model label and a footer that already names it", () 
     expect(tag(container)).toBeNull();
   });
 
-  it("with a gauge to draw, the tag names the model beside the dots even while the screen names it", () => {
+  it("with a gauge to draw, the tag names the model beside the figures even while the screen names it", () => {
     terminal();
     const footer = pane("codex--v0157-idle.txt");
     const usage = { context: 42, limits: [{ window: "5h" as const, used: 30 }] };
@@ -4831,7 +4937,7 @@ describe("AgentChat — the model label and a footer that already names it", () 
     expect(screen.getAllByText(/GPT-6-Luna low/).length).toBeGreaterThan(0); // the footer names it
     const shown = tag(container);
     expect(shown?.querySelector("[aria-hidden]")?.textContent).toContain("gpt-6-luna · low");
-    expect(shown?.querySelectorAll('[data-slot="usage-dots"]').length).toBe(2);
+    expect([...(shown?.querySelectorAll('[data-slot="usage-percent"]') ?? [])].map((f) => f.textContent)).toEqual(["42%", "30%"]);
     cleanup();
     // No gauge: the model alone would repeat the footer, so there is no tag at all.
     const bare = renderChat({ text: footer, agent: on("codex", "gpt-6-luna", { usage: {} }) });
@@ -5112,7 +5218,7 @@ describe("AgentChat, the newest turn's picture on a pi pane (M39, #292)", () => 
 });
 
 // M68 spec 02: Stop on the belt of a pane with a screen. The rule is `stopFor` (the bridge says a key exists;
-// the turn only decides live or dimmed); the first tap arms, the second posts the request id alone and the receipt shows under the box.
+// the turn only decides live or dimmed); a hold of two seconds posts the request id alone and the receipt shows under the box.
 describe("AgentChat: Stop on a pane with a screen", () => {
   const RUNNING: Surface = { revision: 4, turn: "running", modal: "none", composer: "empty" };
   const IDLE_SURFACE: Surface = { revision: 4, turn: "idle", modal: "none", composer: "empty" };
@@ -5157,26 +5263,35 @@ describe("AgentChat: Stop on a pane with a screen", () => {
     expect(screen.queryByRole("button", { name: "Tap again to stop the turn" })).toBeNull();
   });
 
-  it("arms on the first tap, posts one fresh request id on the second and tells the receipt under the box", async () => {
+  it("a short tap posts nothing and says Hold; a hold posts one fresh request id and tells the receipt under the box", async () => {
     const user = userEvent.setup();
     const posted = serveStop({ requestId: "echo-0001", outcome: "stopped", keys: ["Escape"] });
     renderChat({ agent: stopAgent({ surface: RUNNING, canStop: true }) });
-    await user.click(await screen.findByRole("button", { name: "Stop the turn" }));
+    const stop = await screen.findByRole("button", { name: "Stop the turn" });
+    await user.click(stop);
     expect(posted).toHaveLength(0);
-    await pastTheDwell();
-    await user.click(screen.getByRole("button", { name: "Tap again to stop the turn" }));
-    await waitFor(() => expect(posted).toHaveLength(1));
+    expect(stop).toHaveTextContent("Hold");
+    expect(screen.queryByRole("button", { name: "Tap again to stop the turn" })).toBeNull();
+    // The hold: the finger rests for STOP_HOLD_MS, and the Stop goes out with the finger still down.
+    fireEvent.pointerDown(stop, { button: 0, clientX: 5, clientY: 5, pointerType: "touch" });
+    await new Promise<void>((resolve) => setTimeout(resolve, STOP_HOLD_MS - 300));
+    expect(posted).toHaveLength(0);
+    await waitFor(() => expect(posted).toHaveLength(1), { timeout: 2000 });
     expect(posted[0]).toEqual({ requestId: expect.stringMatching(/^[A-Za-z0-9_-]{8,64}$/) });
     expect(await screen.findByText("Stopped.")).toBeInTheDocument();
   });
 
-  it("tells a refusal in its own words and presses nothing more", async () => {
+  // A key cannot hold, so it keeps the two presses: the first arms, the second stops.
+  it("by keyboard: arms on the first press, stops on the second, and tells a refusal in its own words", async () => {
     const user = userEvent.setup();
     const posted = serveStop({ requestId: "echo-0002", outcome: "refused", reason: "draft_present" });
     renderChat({ agent: stopAgent({ surface: RUNNING, canStop: true }) });
-    await user.click(await screen.findByRole("button", { name: "Stop the turn" }));
+    (await screen.findByRole("button", { name: "Stop the turn" })).focus();
+    await user.keyboard("{Enter}");
+    expect(posted).toHaveLength(0);
     await pastTheDwell();
-    await user.click(screen.getByRole("button", { name: "Tap again to stop the turn" }));
+    screen.getByRole("button", { name: "Tap again to stop the turn" }).focus();
+    await user.keyboard("{Enter}");
     expect(await screen.findByText("The box holds your text and this harness's stop key would clear it.")).toBeInTheDocument();
     expect(posted).toHaveLength(1);
   });
@@ -5478,5 +5593,64 @@ describe("AgentChat — the Authentication box lifts as a card", () => {
     const backOnB = screen.getByRole("group", { name: "Login output" });
     expect(within(backOnB).getByText(WAITING_LINE)).toBeInTheDocument();
     expect(backOnB.textContent).not.toContain("ABCD-EFGH");
+  });
+});
+
+// THE NAME FADE (ui/crossfade-text.tsx). A rename of the open pane or of its Space fades the header's
+// words instead of swapping them; opening another pane swaps at once. The test drives the header from
+// state, so the same mounted header sees the new agent.
+describe("AgentChat header — a rename fades", () => {
+  function Renamable({ first, second }: { first: AgentView; second: AgentView }) {
+    const [agent, setAgent] = useState(first);
+    return (
+      <>
+        <button type="button" onClick={() => setAgent(second)}>
+          rename-test
+        </button>
+        <AgentChat
+          paneId={agent.paneId}
+          agent={agent}
+          agents={[agent]}
+          shellPanes={[]}
+          tabs={[]}
+          text={paneTextWithDraft("recent pane output")}
+          onBack={vi.fn()}
+          onSelect={vi.fn()}
+        />
+      </>
+    );
+  }
+  const out = (c: HTMLElement, slot: string) => c.querySelector(`[data-slot="${slot}"] [data-slot="crossfade-out"]`);
+
+  // A name fades only after it held still for the quiet time (ui/crossfade-text.tsx): move the clock on.
+  beforeEach(() => vi.useFakeTimers({ toFake: ["Date"] }));
+  afterEach(() => vi.useRealTimers());
+
+  function mount(first: AgentView, second: AgentView) {
+    const router = createMemoryRouter([{ path: "/", element: withHeaderHost(<Renamable first={first} second={second} />) }]);
+    return render(<RouterProvider router={router} />).container;
+  }
+
+  it("fades the pane's name and its Space when the same pane is renamed", () => {
+    const base = fixtureAgents[0]!;
+    const container = mount(
+      { ...base, paneLabel: "plumbing", workspaceLabel: "webapp" },
+      { ...base, paneLabel: "wiring", workspaceLabel: "frontend" },
+    );
+    expect(out(container, "pane-name")).toBeNull();
+    vi.setSystemTime(Date.now() + CROSSFADE_QUIET_MS);
+    fireEvent.click(screen.getByRole("button", { name: "rename-test" }));
+    expect(out(container, "pane-name")).toHaveTextContent("plumbing");
+    expect(out(container, "pane-name")).toHaveAttribute("aria-hidden", "true");
+    expect(container.querySelector('[data-slot="pane-name"]')).toHaveTextContent("wiring");
+    expect(out(container, "pane-place")).toHaveTextContent("webapp");
+  });
+
+  it("swaps at once when the header shows another pane", () => {
+    const base = fixtureAgents[0]!;
+    const container = mount({ ...base, paneLabel: "plumbing" }, { ...base, paneId: "w9:p9", paneLabel: "wiring" });
+    fireEvent.click(screen.getByRole("button", { name: "rename-test" }));
+    expect(container.querySelector('[data-slot="pane-name"]')).toHaveTextContent("wiring");
+    expect(container.querySelector('[data-slot="crossfade-out"]')).toBeNull();
   });
 });

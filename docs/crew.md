@@ -27,7 +27,7 @@ other machine is a member, and the deputy is the one member allowed to take over
 `collie pack` still works too, for every verb in this table. It is an alias of `collie crew` with
 the same arguments and exit codes. `collie docs pack` prints this page, and the web app's `/pack`
 address redirects to `/crew`. All three go away in 2.0.0
-([ADR 0038](../.adr/0038-the-group-is-a-crew-the-wire-keeps-pack.md)).
+([ADR 0144](../.adr/0144-one-lead-one-door-and-the-operator-moves-the-crown.md)).
 
 The `deputy`, `approve-promote`, and `promote` commands manage failover. For setup and recovery
 instructions, see
@@ -324,11 +324,30 @@ a machine of its own in the list.
 ![Code reaches a member over your own ssh, never over the crew link.](images/crew/crew-ssh-rides.svg)
 
 Code rides your own ssh to every machine. `crew add` installs a member that way and `crew update`
-levels it. The crew link carries runtime data, and it never becomes a distribution channel.
+levels it. The crew link carries runtime data, and it never becomes a distribution channel for Collie.
+
+The code of a trick may cross the link only as inert data. It is held, never installed and never run,
+until you tap on the screen of the machine that will run it. No machine of the crew can run a command
+on another.
+
+So an agent on a member can hand you a trick with `collie trick propose <folder>`. The files go to the
+lead and wait there, unused, as a card on the Hill. Nothing runs until you tap "Switch it on" on that
+card. `collie trick guide` tells an agent how to write a trick.
+
+A tap on a dialog card of a member's pane goes to that member's own ask route, as it does on the
+lead's own panes: the lead carries `POST /api/ask/<id>` to the member, and the member checks your
+device, the card and the screen, sends the keys, and writes the answer in its own audit log. A member
+from before this change keeps the older way, where the card presses keys on the pane, and the card
+says that the machine runs an older Collie. Update the member to give its cards the same checks.
+
+When a machine refuses a tap, it writes one line about it in its audit log with a reason code and the
+pane, and never the text: the member for its own refusal, the lead for a member it holds unreachable
+or one that did not answer in time. A refusal because of a member's version names the Collie version
+that member runs.
 
 ![The deputy's standby door opens only when the lead goes quiet.](images/crew/crew-deputy-standby.svg)
 
-A deputy is one peer the lead named ahead of time. It binds a standby door with three routes, and
+A deputy is one peer the lead named ahead of time. It binds a standby door with four routes, and
 that door is never published. The lead's silence arms it, and your own pairing credential spends it,
 so the phone can reach the deputy while the lead is gone.
 
@@ -368,17 +387,17 @@ Terminal tab polls a pane that has no terminal. The member says so once in its l
 
 ## Messages between machines
 
-An agent can message an agent on another machine of the crew, and the lead relays every such message.
+An agent can message an agent of its own space on another machine of the crew, and the lead relays every such message. A space of the same name on two machines is one space ([Your space](walky-talky.md#your-space)).
 
 ```sh
-# on the lead: every agent pane of every machine
+# every agent pane of your space, on every machine
 collie walky who
 ```
 
 A member sends the message to the lead. The lead checks the member's signature, then passes the
 message on to the machine that the address names, and that machine checks the lead's. The lead also
-sends the sender's certificate, so that machine checks the sender's signature too. A member's own
-`who` lists its own panes only. The lead learns the outcome of every message, and sends it back to the
+sends the sender's certificate, so that machine checks the sender's signature too. A member's
+`who` asks the lead for the crew's panes, and lists its own panes, with a note that other machines are the lead's to list, only when the lead does not answer. The lead learns the outcome of every message, and sends it back to the
 member that sent it. Run `collie walky status <id>` on the sender's machine or on the lead
 ([Across a crew](walky-talky.md#across-a-crew)).
 
@@ -399,6 +418,168 @@ read well.
 > the pins of its own panes, so a pane on an older member offers no Pin, and a pin call that reaches it
 > answers "That machine's Collie is older and cannot keep pins. Update it." Run `collie crew update --all`
 > to level the crew ([Update a crew](upgrading.md#updating-the-rest-of-the-crew)).
+
+## Decisions from any machine
+
+An agent on any machine of the crew can put a Decision on the Hill with `collie hill post`, and follow
+it up with `collie hill status`, `withdraw` and `list`. The crew has one Hill, on the lead. The phone
+shows every Decision there, with the machine it came from on its first line.
+
+A member checks its own switches first: with the Hill or WalkyTalky off on that machine, the post is
+refused there. It reads the images from its own disk, under the same rules as on the lead, and sends
+them to the lead before the post. The lead checks the member's signature, and takes the machine from
+it. A member cannot post for a session of another machine, and its `--reply-to` and `--about` must
+name a session on that same machine.
+
+Your answer goes back to the session as a WalkyTalky message, through the lead. When the session's
+machine is not answering, the phone says "laptop is not answering. Your answer was not sent." The
+card stays open, and you can answer again when the machine is back. A Decision is never closed
+because its machine went away. Dismiss still closes the card: the phone then says the session was not
+told.
+
+The Hill is an experiment, off until switched on. A member with no Hill switch file of its own follows
+the lead: it does not refuse the post or the image, it sends them, and the lead's switch decides. A
+lead with the Hill off refuses with "the Hill is off on the lead of this crew; your person can switch
+it on in Settings, Experiments, on the phone". Only a member whose own switch says off refuses on its
+own machine.
+
+A machine removed from the crew is another matter. After `collie crew remove` on the lead, or
+`collie leave` on the member, the cards whose answer would go to that machine close as undeliverable
+at the next look, with nothing typed. No answer can reach that machine any more.
+
+When the lead does not answer, `collie hill post` says so, exits 5, and posts nothing. When the answer
+comes late, it says the post is not confirmed, and exits 5. Either way it prints the command to send
+the same post again, with its `--request-id`: the lead keeps one Decision for it.
+
+One machine's agents hold at most 40 open Decisions on the lead, and ring the phone at most four
+times an hour. All members together ring it at most six times an hour, so the lead's own sessions
+always keep a share.
+
+> **Note.** Decisions from a member need Collie 1.29.0 on the lead and on that member. An older lead
+> is refused with "the lead runs a Collie older than 1.29.0", and the post is not sent. Post from a
+> session on the lead machine, or run `collie crew update --all` to level the crew
+> ([Update a crew](upgrading.md#updating-the-rest-of-the-crew)).
+
+## Tricks that read files on every machine
+
+A trick runs on the lead of a crew, and a member runs none ([Tricks in a crew](tricks.md#tricks-in-a-crew)).
+A trick on the lead sees the sessions of every machine of the crew. A trick may also list files to
+read from its agent sessions' folders, in `trick.toml`:
+
+```toml
+contract = 2
+inputs = ["TODO.md", "shots/*.png"]
+```
+
+Before each run, the lead asks each member for the files those patterns match in the folders of that
+member's agent sessions, and copies them into the trick's folder. The trick reads them as data. It
+cannot run anything on a member, and it reads nothing outside a session's folder.
+
+A member serves these reads by default, unless it sets `COLLIE_DEVICE_HEADER` (the table below).
+It serves only the files that match the patterns a person
+approved for the trick on the lead. The patterns are part of the trick's rights: the trick's row in
+Settings says what it reads, "Reads TODO.md, shots/*.png in your agent sessions' folders on every
+machine of the crew." A new version that changes the patterns waits for your yes.
+
+A member reads the files with the same rules as the Files view, and a few more. It reads only the
+folders of its own agent sessions, never a shell session's folder. It never serves:
+
+- A link, at any level. It never follows one.
+- A name that starts with a dot, unless that step of the pattern starts with a dot too. `*` never
+  matches a leading dot, so `*.md` skips `.notes.md`, and `.editorconfig` is read only by a pattern
+  such as `.editorconfig` or `.e*`.
+- A `.env` file: any name that starts with `.env`, in any case and in any folder, such as `.env`,
+  `.env.local`, `.envrc` or `.ENV`. This holds whatever the pattern says, and a pattern that names
+  one is refused.
+- Anything in a `.git` folder, in any case. A pattern that names `.git` is refused.
+- Collie's own state and config folders, and a file named like one of Collie's state files, such as
+  `crew-trust.json` or `paired-devices.json`, wherever it sits.
+- A file or folder whose name holds a control character, a direction mark or a zero-width character.
+  Such a file counts as skipped.
+
+A text file is at most 256 KB and a picture (PNG, JPEG or WebP) at most 2 MB, and a member sends at
+most 32 files per session. Each member writes one audit line per read, with the trick, the number of
+files and their size, never a file name.
+
+Each member decides whether the lead's tricks may read its files. Set `COLLIE_CREW_TRICK_READS` in
+that machine's `.env`, or `crew_trick_reads` under `[crew]` in its `config.toml`
+([Configure Collie](configure.md)):
+
+| `COLLIE_CREW_TRICK_READS` | what the member does |
+| --- | --- |
+| unset | allows the reads while `COLLIE_DEVICE_HEADER` is unset, and refuses them while it is set |
+| `on` | allows the reads |
+| `off`, or any other word | refuses the reads |
+
+To switch the reads off on a member, add `COLLIE_CREW_TRICK_READS=off` to that member's `.env`, then
+run `collie restart` on that member. The member reads the setting only when it starts.
+
+A session on a member that refuses shows `refused` to the trick, and one on a machine that is not
+answering shows `offline`.
+
+> **Note.** Reads from a member need Collie 1.29.0 on the lead and on that member. A session on an
+> older member shows `older` to the trick, and the lead does not ask that member. Run `collie crew
+> update --all` to level the crew ([Update a crew](upgrading.md#updating-the-rest-of-the-crew)).
+
+## Tricks after a takeover
+
+The crew's lead runs its tricks. When the deputy takes over, the tricks start again there, at the
+version you approved on the lead.
+
+The lead keeps a copy of each trick that is on, on its deputy: the trick's code, its switch and
+timer setting, its `config.toml`, and its small state with its pictures, up to 32 tricks. The deputy
+runs none of it while the lead is alive. Its standby page lists every trick that the Take over button
+starts again: eight in a sentence, and all of them under "Show all". Only that button starts them.
+`collie promote` typed on the deputy starts them too. Either way the deputy starts them as it restarts
+as the lead.
+
+The deputy trusts what its lead says you approved. It cannot see your yes on the lead. Before a trick
+starts, the deputy checks that its code is the version the lead names. A trick that does not match does
+not start, and the Hill says so after the takeover, with an OK button. It also checks that the trick
+asks for the rights the lead says you approved. A trick that asks for other rights stays off, and the
+Hill says "The trick `<name>` is off after the takeover". Read its rights in Settings → Tricks before you
+switch it on. When the deputy
+already has a trick folder of that name, Collie leaves the folder as it is, runs the approved version,
+and shows the folder's own code as a new version that waits for your yes.
+
+`collie crew status` on the lead says whether its deputy holds the copy. `collie crew approve-promote`
+says whether the tricks come along: only the deputy holds a copy.
+
+The copy holds each trick's `config.toml` and its state folder. A token or key in either also rests on
+the deputy, until it stops being the deputy: a trick may keep a login token in its state folder. When
+the deputy changes, the old one removes its copy.
+
+### Open questions on the Hill come along
+
+The lead also keeps a copy of its Hill's open Decisions on its deputy, with their pictures, up to 32 MB
+of pictures, newest first. The deputy shows none of them while the lead is alive. Its standby page says
+how many come along, and the Take over button or `collie promote` on the deputy puts them on the
+deputy's Hill. Each keeps its place, and no phone gets a second notification for it.
+
+A picture that did not reach the deputy is left out, and the card says
+"A picture stayed on `<old lead>`." A question from a trick that did not start on the deputy closes,
+with the reason "Its trick did not start on this machine after the takeover."
+
+Collie's own cards about a trick's new version or a proposed trick stay on the old lead, because their
+files do not come along. The deputy shows its own new versions. Ask for a proposal again on the new
+lead.
+
+A question you answered on the lead stays answered. After the takeover the old lead takes no answer:
+"This machine is not the crew's lead any more. Answer on the new lead."
+
+Known limits:
+
+- A carried question keeps the old lead's sender address and reply address. An answer that goes back
+  to an agent goes to that address, which names a pane on the old lead.
+- A takeover against a lead that is up but cut off splits the crew, and both machines can run the
+  same tricks at the same time.
+- While the standby door is armed, its page names the tricks and the number of open questions to a
+  browser that has not signed in. The Take over button needs a paired device.
+
+> **Note.** The copy needs Collie 1.29.0 on the lead and on the deputy. An older deputy keeps no copy;
+> `collie crew status` on the lead says so, and a takeover there starts no trick and brings no
+> question along. An answer you gave on the lead in the last seconds before it went down may not have
+> reached the deputy yet, so that question can be open again there.
 
 ## A machine can run several Collies
 
@@ -658,7 +839,7 @@ it says the same thing there: update the lead first, the members follow.
 
 1.8.0 renames the names a machine reads. The wire paths, the two environment keys, the three state
 files and the journal prefix all say crew now
-([ADR 0039](../.adr/0039-the-machine-says-crew-too.md)). The link behaves exactly as before, and
+([ADR 0144](../.adr/0144-one-lead-one-door-and-the-operator-moves-the-crown.md)). The link behaves exactly as before, and
 nothing you scripted has to move on the same day.
 
 **1.8.0 carried a 1.7.0 member for one release, and 1.9.0 does not.** A 1.8.0 lead also answered the

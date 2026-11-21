@@ -35,9 +35,10 @@ CSS in it.
 - A colour is `#rrggbb`, `#rrggbbaa` or `oklch(L C H)` with an optional `/ A`. No named colour, no
   `rgb()`, no `var()`.
 - Write the lowest `version` that holds the file: 1 for colours and `fonts.ui` only, 2 with `surface`,
-  `fonts.display` or `ansi`, 3 with `pane-active` or `tab-active`, 4 with `character` or `glyphs`.
+  `fonts.display` or `ansi`, 3 with `pane-active`, `tab-active` or `find`, 4 with `character` or `glyphs`, 5 with `characterMotion`.
 - `character` is optional. See "Characters" below.
 - `glyphs` is optional. See "Glyphs" below.
+- `characterMotion` is optional: `moves` (the default) or `still`. `still` stops the character's slow drift at rest. Set it only when the operator asks. A file with it is version 5, and a person's own switch in Settings wins over it.
 - A font is one of the six names under "Write a theme". A theme cannot add a font.
 - Give both halves when you change the page colours. A dark half left out takes Collie's dark colours,
   which rarely match a new light half.
@@ -46,12 +47,14 @@ CSS in it.
 ## Characters
 
 A character is a goodie for theme authors: the animated creature in the app header, a head with beads that
-circle it on an orbit. Only a theme file can name one; Settings has no switch for it, so a theme that sets
-one is the only way anyone sees it. The favicon, the app icon and the splash always stay Collie.
+circle it on an orbit. A theme file names one with `character`. A person can also pick one for a single
+device in Settings, which wins over the theme on that device only. The favicon, the app icon and the splash always stay Collie.
 
 | `character` | What it is |
 | --- | --- |
 | `collie` | The original profile collie head, drawn in the ink of the page. |
+| `collie-collar` | The collie head in profile with a white collar, drawn in the colour of the page. |
+| `collie-blaze` | The collie head in profile with a white blaze, drawn in a soft grey. |
 | `kawaii` | A round anime puppy face from the front, with big glossy eyes and candy pearls. |
 | `kawaii-tilt` | The same puppy, with its head tilted. |
 | `pixel` | An 8-bit pixel-art collie head with square beads that hop. |

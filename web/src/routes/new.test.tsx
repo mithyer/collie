@@ -182,8 +182,8 @@ function serveLaunch(bodies: unknown[], fail: number[] = []): void {
 }
 
 const roster: ServerSummary[] = [
-  { id: "lead", name: "bluefin", isLead: true, reachable: true, protocol: "ok", lastSeenAt: 0 },
-  { id: "mini", name: "minibuch", isLead: false, reachable: true, protocol: "ok", lastSeenAt: 0 },
+  { id: "lead", name: "lodge", isLead: true, reachable: true, protocol: "ok", lastSeenAt: 0 },
+  { id: "mini", name: "workshop", isLead: false, reachable: true, protocol: "ok", lastSeenAt: 0 },
 ];
 
 /** A pane on the lead, in a repo, on `fix-old`. */
@@ -204,6 +204,13 @@ afterEach(() => {
   localStorage.clear();
   __resetOperatorCommands();
 });
+
+/** The Again row, once the launcher read made it tappable: the row is drawn from the device's own record before that. */
+async function againRow(name: RegExp): Promise<HTMLElement> {
+  const row = await screen.findByRole("button", { name });
+  await waitFor(() => expect(row).toBeEnabled());
+  return row;
+}
 
 describe("the New page: the route", () => {
   it("is a full page: the app header with a 44px back arrow, a New title, and Start in the bottom bar", async () => {
@@ -232,7 +239,7 @@ describe("the New page: the address", () => {
     mount({ entries: ["/new?machine=mini"], servers: roster });
     const select = await screen.findByRole("combobox", { name: "Host" });
     expect(select).toHaveValue("mini");
-    await waitFor(() => expect(summary()).toHaveTextContent("on minibuch"));
+    await waitFor(() => expect(summary()).toHaveTextContent("on workshop"));
   });
 
   it("no ?machine= opens on the machine the lead shows", async () => {
@@ -402,8 +409,8 @@ describe("the New page: Agent and Command", () => {
       servers: [roster[0]!, { ...roster[1]!, reachable: false, lastSeenAt: 0 }],
     });
     const select = await screen.findByRole("combobox", { name: "Host" });
-    expect(within(select).getByRole("option", { name: "minibuch (unreachable)" })).toBeDisabled();
-    expect(within(select).getByRole("option", { name: "bluefin" })).toBeEnabled();
+    expect(within(select).getByRole("option", { name: "workshop (unreachable)" })).toBeDisabled();
+    expect(within(select).getByRole("option", { name: "lodge" })).toBeEnabled();
   });
 
   it("a machine that stops taking writes while chosen says why, in full, under the select, and Start waits", async () => {
@@ -414,10 +421,10 @@ describe("the New page: Agent and Command", () => {
     expect(screen.getByRole("button", { name: "Start" })).toBeEnabled();
     router.data.servers = [roster[0]!, { ...roster[1]!, reachable: false }];
     await router.revalidate();
-    expect(await screen.findByText(/minibuch is unreachable/)).toBeInTheDocument();
+    expect(await screen.findByText(/workshop is unreachable/)).toBeInTheDocument();
     // jest-dom skips a disabled option in `toHaveValue`; the browser shows it, so read the selection itself.
     if (!(select instanceof HTMLSelectElement)) throw new Error("the machine control is a select");
-    expect(select.selectedOptions[0]?.textContent).toBe("minibuch (unreachable)");
+    expect(select.selectedOptions[0]?.textContent).toBe("workshop (unreachable)");
     expect(screen.getByRole("button", { name: "Start" })).toBeDisabled();
   });
 
@@ -432,10 +439,10 @@ describe("the New page: Agent and Command", () => {
     // The same machine opens on Shell; another machine has no memory and opens on Agent.
     mount({ servers: roster });
     expect(await screen.findByRole("radio", { name: "Shell" })).toHaveAttribute("aria-checked", "true");
-    await userEvent.selectOptions(screen.getByRole("combobox", { name: "Host" }), "minibuch");
+    await userEvent.selectOptions(screen.getByRole("combobox", { name: "Host" }), "workshop");
     await waitFor(() => expect(screen.getByRole("radio", { name: "Agent" })).toHaveAttribute("aria-checked", "true"));
     await userEvent.click(screen.getByRole("radio", { name: "Shell" }));
-    await userEvent.selectOptions(screen.getByRole("combobox", { name: "Host" }), "bluefin");
+    await userEvent.selectOptions(screen.getByRole("combobox", { name: "Host" }), "lodge");
     // Back on the first machine, Shell is still what it chose.
     await waitFor(() => expect(screen.getByRole("radio", { name: "Shell" })).toHaveAttribute("aria-checked", "true"));
     expect(JSON.parse(localStorage.getItem(KIND_KEY) ?? "{}")).toEqual({ lead: "shell", mini: "shell" });
@@ -550,7 +557,7 @@ describe("the New page: Start", () => {
     await userEvent.click(screen.getByRole("button", { name: "Start" }));
     await waitFor(() => expect(router.state.location.pathname).toBe("/pane/w9%3Ap1"));
     await router.navigate("/new");
-    await userEvent.click(await screen.findByRole("button", { name: /Again: Codex/ }));
+    await userEvent.click(await againRow(/Again: Codex/));
     await waitFor(() => expect(bodies).toHaveLength(2));
     expect(bodies[1]).toMatchObject({ harness: "codex" });
     await waitFor(() => expect(readAgentLaunch(router.state.location.state, "w9:p1")?.harness).toBe("codex"));
@@ -572,7 +579,8 @@ describe("the New page: Start", () => {
     await waitFor(() => expect(screen.getByRole("button", { name: "Start" })).toBeEnabled());
     await userEvent.click(screen.getByRole("button", { name: "Start" }));
     await waitFor(() => expect(router.state.location.pathname).toBe("/pane/w9%3Ap1"));
-    expect(created).toEqual([{}]);
+    // The create it always was, plus the request id every create carries (M100 spec 04).
+    expect(created).toEqual([{ requestId: expect.any(String) }]);
   });
 });
 
@@ -1057,7 +1065,7 @@ describe("the New page: Start without prompts?", () => {
     const sheet = await screen.findByRole("dialog", { name: "Start without prompts?" });
     expect(within(sheet).getByTestId("no-prompts-command")).toHaveTextContent(NO_PROMPTS_LINE);
     expect(within(sheet).getByText("~/src/app")).toBeInTheDocument();
-    expect(within(sheet).getByText("bluefin")).toBeInTheDocument();
+    expect(within(sheet).getByText("lodge")).toBeInTheDocument();
     expect(within(sheet).getByText("This one will not ask before it acts.")).toBeInTheDocument();
     expect(bodies).toHaveLength(0);
   });
@@ -1108,7 +1116,7 @@ describe("the New page: Start without prompts?", () => {
     // Forget the confirm (another day, another phone): Again must ask like Start does.
     localStorage.removeItem(NO_PROMPTS_KEY);
     await router.navigate("/new");
-    await userEvent.click(await screen.findByRole("button", { name: /Again: Claude, no prompts/ }));
+    await userEvent.click(await againRow(/Again: Claude, no prompts/));
     const sheet = await screen.findByRole("dialog", { name: "Start without prompts?" });
     expect(bodies).toHaveLength(1);
     await userEvent.click(within(sheet).getByRole("button", { name: "Cancel" }));
@@ -1128,7 +1136,7 @@ describe("the New page: Start without prompts?", () => {
     await pickNoPrompts();
     await userEvent.click(screen.getByRole("button", { name: "Start" }));
     const sheet = await screen.findByRole("dialog", { name: "Start without prompts?" });
-    expect(within(sheet).getByText("minibuch")).toBeInTheDocument();
+    expect(within(sheet).getByText("workshop")).toBeInTheDocument();
     expect(bodies).toHaveLength(0);
   });
 
@@ -1321,7 +1329,7 @@ describe("the New page: Type a command", () => {
     expect(screen.getByRole("button", { name: "Start" })).toBeDisabled();
     await userEvent.type(await commandField(), "htop");
     await userEvent.type(screen.getByRole("textbox", { name: "Folder" }), "~/projects");
-    expect(summary()).toHaveTextContent("Runs `htop` in ~/projects on bluefin");
+    expect(summary()).toHaveTextContent("Runs `htop` in ~/projects on lodge");
     expect(screen.getByRole("button", { name: "Start" })).toBeEnabled();
   });
 
@@ -1626,7 +1634,7 @@ describe("the New page: Again repeats a one-off run", () => {
     await userEvent.click(screen.getByRole("button", { name: "Start" }));
     await waitFor(() => expect(router.state.location.pathname).toBe("/pane/w9%3Ap1"));
     await router.navigate("/new");
-    await userEvent.click(await screen.findByRole("button", { name: /Again: make deploy/ }));
+    await userEvent.click(await againRow(/Again: make deploy/));
     await waitFor(() => expect(bodies).toHaveLength(2));
     expect(bodies[1]).toMatchObject({ run: "make deploy", cwd: "/home/op/app" });
     expect(bridge.checks).toEqual([]);
@@ -1642,7 +1650,7 @@ describe("the New page: Again repeats a one-off run", () => {
     await userEvent.click(screen.getByRole("button", { name: "Start" }));
     await waitFor(() => expect(router.state.location.pathname).toBe("/pane/w9%3Ap1"));
     await router.navigate("/new");
-    await userEvent.click(await screen.findByRole("button", { name: /Again: htop/ }));
+    await userEvent.click(await againRow(/Again: htop/));
     await waitFor(() => expect(bodies).toHaveLength(2));
     expect(bridge.checks).toEqual(["htop", "htop"]);
     expect(bodies[1]).toMatchObject({ run: "htop" });
@@ -1660,7 +1668,7 @@ describe("the New page: Again repeats a one-off run", () => {
     // Another day, another phone: Again must ask.
     localStorage.removeItem(NO_PROMPTS_KEY);
     await router.navigate("/new");
-    await userEvent.click(await screen.findByRole("button", { name: /Again: codex --yolo/ }));
+    await userEvent.click(await againRow(/Again: codex --yolo/));
     const sheet = await noPromptsSheet();
     expect(bodies).toHaveLength(1);
     await userEvent.click(within(sheet).getByRole("button", { name: "Cancel" }));
@@ -1678,7 +1686,8 @@ describe("the New page: Again repeats a one-off run", () => {
     serveRuns({ run: false });
     mount();
     await openShell(false);
-    expect(screen.queryByRole("button", { name: /Again:/ })).toBeNull();
+    // The record paints the row on the first frame; the read that finds runs off closes it, through Collapse.
+    await waitFor(() => expect(screen.queryByRole("button", { name: /Again:/ })).toBeNull());
   });
 });
 

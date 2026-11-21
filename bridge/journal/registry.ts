@@ -15,9 +15,11 @@ import { claudeJournal } from "./claude.ts";
 import { codexJournal } from "./codex.ts";
 import { dshJournal } from "./dsh.ts";
 import { durableJournal } from "./durable.ts";
+import type { RootSource } from "./files.ts";
 import { grokJournal } from "./grok.ts";
 import { hermesJournal } from "./hermes.ts";
 import { kiroJournal } from "./kiro.ts";
+import { mcodeJournal } from "./mcode.ts";
 import { museJournal } from "./muse.ts";
 import { openclawJournal } from "./openclaw.ts";
 import { opencodeJournal } from "./opencode.ts";
@@ -65,6 +67,9 @@ export interface JournalRoots {
   /** OpenClaw's state folder (`$OPENCLAW_STATE_DIR`, `~/.openclaw`), one SQLite per agent under
    *  `agents/<id>/agent/`. */
   openclaw: readonly string[];
+  /** MiniMax Code's `$MINIMAX_DATA_DIR/v2/sessions` — dated `…-session_<base64url(id)>` folders under
+   *  it, and the SQLite index at `../sqlite/runtime-state.sqlite`. */
+  mcode: readonly string[];
 }
 
 /**
@@ -83,19 +88,28 @@ export interface ModelCatalogs {
  * The map is built FROM each adapter's own `agent` field (not a hand-written literal), so a key can
  * never drift from the adapter it points at — the same guarantee the frontend registry gives.
  */
-export function buildJournalRegistry(roots: JournalRoots, catalogs: ModelCatalogs = {}): Record<string, JournalAdapter> {
+export function buildJournalRegistry(
+  roots: JournalRoots,
+  catalogs: ModelCatalogs = {},
+  extra?: (agent: string) => readonly string[],
+): Record<string, JournalAdapter> {
+  // The roots an added account brings (M101, ADR 0141), asked at each lookup, after the configured
+  // ones: a configured root keeps its place and its meaning, and no extra root is listed twice.
+  const live = (agent: string, configured: readonly string[]): RootSource =>
+    extra === undefined ? configured : () => [...new Set([...configured, ...extra(agent)])];
   const adapters: JournalAdapter[] = [
     agyJournal(roots.agy),
-    claudeJournal(roots.claude),
-    codexJournal(roots.codex),
-    piJournal(roots.pi),
+    claudeJournal(live("claude", roots.claude)),
+    codexJournal(live("codex", roots.codex)),
+    piJournal(live("pi", roots.pi)),
     opencodeJournal(roots.opencode, catalogs.opencode),
-    grokJournal(roots.grok),
+    grokJournal(live("grok", roots.grok)),
     hermesJournal(roots.hermes),
     kiroJournal(roots.kiro),
     museJournal(roots.muse),
     openclawJournal(roots.openclaw),
     dshJournal(roots["dsh-tui"]),
+    mcodeJournal(roots.mcode),
   ];
   if (roots.durable !== undefined) adapters.push(durableJournal(roots.durable));
   return Object.fromEntries(adapters.map((a) => [a.agent, a]));
@@ -164,7 +178,7 @@ export const DRAWS_IMAGES_OFF_GRID: readonly string[] = ["omp", "pi"];
  * history section must not advise `herdr integration install` for an agent no hook could ever
  * report. Pinned against the adapters themselves in registry.test.ts, so the two cannot drift.
  */
-export const DISCOVERS_OWN_SESSIONS: readonly string[] = ["agy", "muse", "openclaw", "kiro", "dsh-tui", "pi"];
+export const DISCOVERS_OWN_SESSIONS: readonly string[] = ["agy", "muse", "openclaw", "kiro", "dsh-tui", "grok", "mcode", "pi"];
 
 /**
  * The same pairs as a Map, which is how {@link adapterFor} asks.
@@ -214,5 +228,5 @@ export function journalAgents(registry: Record<string, JournalAdapter>): string[
  * identity off a match against it — see `bridge/mux/types.ts` § `MuxPane.agent`.
  */
 export const KNOWN_HARNESS_NAMES: readonly string[] = journalAgents(
-  buildJournalRegistry({ agy: [], claude: [], codex: [], pi: [], opencode: [], grok: [], hermes: [], muse: [], openclaw: [], kiro: [], "dsh-tui": [] }),
+  buildJournalRegistry({ agy: [], claude: [], codex: [], pi: [], opencode: [], grok: [], hermes: [], muse: [], openclaw: [], kiro: [], "dsh-tui": [], mcode: [] }),
 );

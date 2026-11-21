@@ -1,4 +1,4 @@
-import { forwardRef, useContext, useEffect, useImperativeHandle, useLayoutEffect, useRef, useState } from "react";
+import { forwardRef, useContext, useEffect, useImperativeHandle, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createPortal, flushSync } from "react-dom";
 import type { ChangeEvent, ClipboardEvent, CSSProperties, MouseEvent, ReactNode } from "react";
 import { useRevalidator } from "react-router";
@@ -9,9 +9,13 @@ import type { DisplayPrefs, Hand } from "@/hooks/use-display-prefs";
 import { usePendingConfirm } from "@/hooks/use-pending-confirm";
 import { useDirectTyping } from "@/hooks/use-direct-typing";
 import { useLocale } from "@/hooks/use-locale";
+import { useKeyboardOpen } from "@/hooks/use-keyboard";
+import { enterKeyAnswer } from "@/lib/enter-key";
+import { setEnterSends, useEnterSendsChoice } from "@/lib/enter-sends-store";
 import { t as translate, tn as translatePlural } from "@/lib/i18n";
+import { serverSkewMs } from "@/lib/server-clock";
 import { holdsMask } from "@/lib/masked-text";
-import { setStatus } from "@/lib/status";
+import { clearStatus, currentStatus, setStatus } from "@/lib/status";
 import { buzz } from "@/lib/haptics";
 import { stampSend } from "@/lib/poll-intent";
 import { useBusyWhile } from "@/lib/busy";
@@ -26,33 +30,36 @@ import { SentSheet } from "@/components/sent-sheet";
 import { SuggestionStrip } from "@/components/suggestion-strip";
 import { useSentSuggestions } from "@/hooks/use-sent-suggestions";
 import { QuickActionsContent } from "@/components/quick-actions";
-import { ActionsRow, type GeneralAction } from "@/components/actions-row";
+import { ActionsRow, type BeltMark, type GeneralAction } from "@/components/actions-row";
 import { SectionLabel } from "@/components/ui/section-label";
 import { Collapse } from "@/components/ui/collapse";
 import { BottomSheet } from "@/components/ui/sheet";
 import { SendOfferStrip } from "@/components/send-offer-strip";
-import { HeldCard, type HeldAction } from "@/components/composer-held";
+import { HeldCard, drawnHeldRows, type HeldAction } from "@/components/composer-held";
 import { offerMode, type SendNote } from "@/lib/send-protocol";
+import { SecretField } from "@/components/secret-field";
 import { modeFor, sendText } from "@/lib/reply-action";
-import { fieldLocked, sendSlot, unreachable } from "@/lib/send-slot";
+import { viewRefusalKey, type ViewRequestNote } from "@/lib/agent-view/reader";
+import { fieldLocked, sendSlot, unreachable, type SendSlot } from "@/lib/send-slot";
 import { wayOut } from "@/lib/way-out";
 import type { Surface } from "@/lib/surface/surface";
 import { parseAnsi } from "@/lib/ansi";
-import { splitLines } from "@/lib/blocks";
+import { splitLines, type StyledLine } from "@/lib/blocks";
 import { detectNoEchoPrompt } from "@/lib/no-echo";
-import type { HeldRow, SendMode, SendOffer, SendWhen } from "@/lib/surface/send";
-import type { IntentId } from "@/lib/durable-control";
+import type { HeldRow, SendMode, SendOffer, SendRequestBody, SendWhen } from "@/lib/surface/send";
 import { Notice, NOTICE_ACTION } from "@/components/ui/notice";
 import { ActionRow } from "@/components/action-sheet-rows";
 import { AnchoredMenu } from "@/components/ui/anchored-menu";
 import { WalkyAimStrip, WalkyHeldStrip, WalkyNoteStrip } from "@/components/walky-composer-strip";
 import { WalkyIcon } from "@/components/walky-icon";
 import { slideOut, useFlip } from "@/hooks/use-flip";
+import { addPending, dropPending, handOverPending, setPendingState } from "@/lib/durable-pending";
 import { ExpandedEditor } from "@/components/composer-expanded";
 import { useVisibleHeight } from "@/hooks/use-visible-height";
 import { DRAFT_LINE_HEIGHT, draftCapPx, pastDraftCap } from "@/lib/draft-cap";
 import { useLongPress } from "@/hooks/use-long-press";
 import { useWalkyComposer, type WalkyAim } from "@/hooks/use-walky-composer";
+import type { DeliverNow } from "@/lib/walky";
 import * as api from "@/lib/api";
 import { describeApiError, describeThrownError } from "@/lib/api-error-message";
 import { commandsFor, suggestCommands, type AgentCommand } from "@/lib/agent-commands";
@@ -80,8 +87,11 @@ import {
 import { ctrlPresetsFor } from "@/lib/operator-keys";
 import { useKeyBoard } from "@/lib/key-board-store";
 import { isDestructiveInput } from "@/lib/destructive";
+import { asksSendAgain, forgetUnknownSend, rememberUnknownSend, SEND_AGAIN_CONFIRM_DELAY_MS, sendAgainId, sentForm } from "@/lib/send-again";
 import { useHostLabel } from "@/components/crew-provider";
-import { fitsDraftStore, loadDraftEntry, saveDraft } from "@/lib/drafts";
+import { fitsDraftStore, loadDraftEntry, loadPutBack, saveDraft, savePutBack, type PutBackItem } from "@/lib/drafts";
+import { clearIntent, clearIntentIfDraftChanged, loadIntent, saveIntent } from "@/lib/send-intent";
+import type { IntentId } from "@/lib/durable-control";
 import { wipeDevice } from "@/lib/wipe";
 import { AttachmentChip, type ComposerAttachment } from "@/components/attachment-chip";
 import { ImageEditor } from "@/components/image-editor";
@@ -98,6 +108,7 @@ import { useLive } from "@/lib/liveness";
 import { useCatchingUp, useLocked } from "@/lib/idle";
 import { ClearNotice, OfflineDraftNote, TerminalDraftPreview } from "@/components/terminal-draft-preview";
 import { ReportCard } from "@/components/report-card";
+import { SEND_SLOW_MS, SendToast, useHeldThroughExit, useSendToastFade } from "@/components/send-toast";
 import { textToKeySequence } from "@/lib/key-queue";
 import { isLead, paneScopeKey, scopeKey, type Scope } from "@/lib/scope";
 import { closeTrouble, noteSend, openReport, streakIds, useTroubleOffer } from "@/lib/report/store";
@@ -115,9 +126,10 @@ import { useHandsFree, useSttCapability } from "@/lib/stt";
 import { NoEchoNotice } from "@/components/no-echo-notice";
 import type { TranscriptEntry } from "@/lib/types";
 import { findUnknownSendMatch, type UnknownSend } from "@/lib/unknown-send";
-import { clearNotice, phoneRefusal, readingRefusal, refusalKey, SendRefusalNotice, stopNotice, type SendRefusal } from "@/components/send-notice";
+import { clearNotice, phoneRefusal, readingRefusal, RefusalActions, refusalKey, SendRefusalNotice, stepLabel, stopNotice, type SendRefusal } from "@/components/send-notice";
 import { mintRequestId } from "@/lib/worktree-name";
 import { Icon } from "@/components/icons/icon";
+import type { ArrivedAnswer, CannotTellFacts } from "@/components/cannot-tell-card";
 
 /** The status line a verified send leaves, by where the text went. */
 const STATUS_KEY = {
@@ -129,6 +141,23 @@ const STATUS_KEY = {
 } as const;
 
 /** What a cleared reading tells the status line; a steer the harness queued says so (M69). */
+/**
+ * The sentence the notice says, where the answer's own note is not the whole story: a returned draft,
+ * an override typed after words already in the agent's box (`draftSeen`), and an override the screen
+ * moved under, which comes back armed on the screen now (M102 spec 12).
+ */
+function refusalSentence(
+  sentence: string,
+  facts: { returnedDraft: boolean; note: SendNote; draftSeen: boolean; overrideMoved: boolean; alreadyTyped: boolean },
+): string {
+  if (facts.returnedDraft && facts.note === "draft") return translate("composer.protocol.draftIsReturned");
+  // The box already held this text: nothing typed again, no key (spec 12, the lead's decision 2026-11-17).
+  if (facts.alreadyTyped) return translate("composer.protocol.alreadyTyped");
+  if (facts.note === "overrideTyped" && facts.draftSeen) return translate("composer.protocol.overrideTypedDraft");
+  if (facts.overrideMoved) return translate("composer.protocol.overrideMoved");
+  return sentence;
+}
+
 function verifiedNote(note: SendNote, when: SendWhen | undefined): keyof typeof STATUS_KEY {
   if (note === "steered" || note === "held") return note;
   if (note === "queued") return when === "steer" ? "queuedInstead" : "queued";
@@ -144,6 +173,95 @@ export interface ComposerHandle {
    * until the person turns it off or the message leaves.
    */
   startMessage: (aim: WalkyAim) => void;
+  /**
+   * Send a tap in the agent view on screen through this composer's own send path (`send`): the same Send
+   * Protocol request with its request id and the same refusal notice at the thumb. The request carries
+   * the view's key, the screen's rev and the control and no text: the bridge builds the line from its own
+   * stored screen (agent views SECURITY rule 2). Answers how it ended (components/agent-view-screen.tsx).
+   */
+  sendViewTap: (tap: ViewTap) => Promise<ViewSendResult>;
+  /** The unread card's caps (M102 spec 03): keys through the Keys pad's own road, with its receipt. */
+  padKeys: (keys: string[]) => Promise<boolean>;
+  /** The unread card's "Send past this screen": the Keys drawer goes, the field takes the focus, one send past the screen is armed. */
+  typeAnyway: () => void;
+  /**
+   * The "cannot tell" card's "It arrived" (M102 spec 04): marks the unknown send `arrived` on the bridge, then clears the
+   * kept draft through the belt's own clear (so "Undo clear" shows) and ends the card. Resolves false when the bridge
+   * could not record it, and nothing else changes.
+   */
+  markArrived: () => Promise<ArrivedAnswer>;
+  /** The "cannot tell" card's Close after a final answer to "It arrived": the question ends; nothing is sent or cleared. */
+  closeCannotTell: () => void;
+  /**
+   * The "cannot tell" card's second button: Send again (a new request through the whole Send Protocol, no "Send it
+   * again?" asked on top), or for a sign-in code Enter it again (the field opens empty, nothing is restored).
+   */
+  answerAgain: () => void;
+  /**
+   * Send a text again as a new send from this composer (M102 spec 04, the queued card's Send again): a new request id
+   * through the Send Protocol, never a draft, so the box keeps whatever the person is typing. Resolves true when it went.
+   */
+  sendLine: (line: string) => Promise<boolean>;
+  /**
+   * Whether a `sendLine` could start now (the M102 review, G): false raises the composer's notice with the reason and
+   * sends nothing, so a caller that would drop something first (the queued card) keeps it.
+   */
+  lineCanStart: () => boolean;
+  /**
+   * Keep a text the composer could not start (the M102 review 2, G): the queued card's Send again dropped its card, and
+   * then the composer refused. It takes the calm send's road for a text that did not go (M104): into an empty box, or,
+   * when the box holds a draft, onto the Put back notice, never merged into the draft (the M102 review 3). Nothing
+   * sends it by itself.
+   */
+  keepLine: (line: string) => void;
+}
+
+/** A tap in an agent view: the screen's rev and the control path the bridge reads, and the words it names (display only). */
+export interface ViewTap {
+  readonly rev: number;
+  readonly control: string;
+  /** What the tap names on the screen the phone holds (`tapped "<label>"`), for the view's receipt while it is in flight. Never sent. */
+  readonly words: string;
+  /** What the tap answered on that screen (`tapAbout`: the question or the title), for the receipt. Never sent. */
+  readonly about: string | null;
+}
+
+/** How a send from an agent view ended. */
+export interface ViewSendResult {
+  /** The bridge took it. */
+  readonly sent: boolean;
+  /** The exact text the bridge typed (its answer's `view.line`), or null. */
+  readonly line: string | null;
+  /** The bridge's refusal code before the Send Protocol (`stale_view`, `busy`...), or null. */
+  readonly code: string | null;
+}
+
+/** The last send from this composer, for Send again. A sign-in code names no text: it is never kept. */
+type LastSend = { readonly secret: false; readonly value: string; readonly isDraft: boolean } | { readonly secret: true };
+const SECRET_SEND: LastSend = { secret: true };
+
+/**
+ * A sent text the box let go of at the tap (M104): what the box held (text and chips) and whose box it was. It goes
+ * back into that box on any end that is not a success, or waits beside the notice (Put back, stored with the pane's
+ * draft in lib/drafts.ts) when the box holds a new text or an open Undo window by then. `intent` is the request id a lost answer left, so a text put back sends again under that id.
+ */
+interface SentBack {
+  readonly draft: string;
+  readonly chips: readonly ComposerAttachment[];
+  readonly pane: string;
+  readonly scope: Scope | undefined;
+  readonly line: string;
+  readonly intent?: IntentId;
+}
+
+/** A stored Put back item's request id, as the optional field of a {@link SentBack} (never an `intent: undefined`). */
+function intentOf(item: PutBackItem): { intent?: IntentId } {
+  return item.intent === undefined ? {} : { intent: item.intent };
+}
+
+/** A box send in flight (M104): its text, and its line in Chat (`row`), which a pane with no thread does not get. */
+interface CalmSend extends SentBack {
+  readonly row: { readonly key: string; readonly id: string } | null;
 }
 
 interface ComposerProps {
@@ -159,7 +277,7 @@ interface ComposerProps {
   surface: Surface;
   /**
    * A launch this phone started has not shown its first screen to the bridge yet: the draft stays
-   * editable and on the phone, and nothing sends it. The keys and Type here stay as they are.
+   * editable and on the phone, and nothing sends it. The keys and Send anyway stay as they are.
    */
   starting?: boolean;
   /** Why the box cannot be reached, for the placeholder, when `surface.composer` is `unreachable`. */
@@ -212,7 +330,7 @@ interface ComposerProps {
   /** The "Answer the dialog" word's tap: scroll to the dialog card and focus its first button. It sends
    * no text and no key. The same tap is the control of a refusal notice whose screen holds an ask or
    * an overlay Collie cannot read. */
-  onAnswerDialog?: () => void;
+  onAnswerDialog?: () => boolean | void;
   /** A dialog card stands in the card dock. A refusal notice offers "Answer the dialog" only then: an
    *  unreadable screen with no card has nothing to go to (the 2026-10-16 field case). */
   dialogCard?: boolean;
@@ -247,11 +365,21 @@ interface ComposerProps {
    * where the pane has no sheet, and then no mark is drawn.
    */
   onOpenMessages?: (() => void) | undefined;
+  /** Whether this session has the data transport (the pane read's `linked`). Deliver now on the held mark needs it. */
+  walkyLinked?: boolean | undefined;
+  /** Deliver now (the seam, `DeliverNow`). Absent: the mark has no button. */
+  onDeliverNow?: DeliverNow | undefined;
   /**
    * The pane's held sends from the snapshot (M56 spec 15), oldest first: a send the harness could not
-   * take mid-turn, kept by the bridge and sent when the pane reads free. One queued row each, above the box.
+   * take mid-turn, kept by the bridge and sent when the pane reads free. One queued row each, above the box,
+   * except a WalkyTalky message's row (its `walky` field): the held mark and the Messages sheet carry that.
    */
   held?: readonly HeldRow[] | undefined;
+  /**
+   * The pane's live screen, the rows AgentChat already parsed. A held row that waited two minutes draws it
+   * under its label, so the person can look before tapping Send it now (M102 spec 12). Absent: no screen box.
+   */
+  heldScreen?: { lines: StyledLine[]; wrap: boolean } | undefined;
   /**
    * The Chat window's journal turns, as AgentChat already read them. Their one job here is settling
    * a send that ended `unknown` (#511, `lib/unknown-send.ts`): when the sent text lands as a new
@@ -333,6 +461,8 @@ interface ComposerProps {
    * Settings → Pane navigation is Joystick (ADR 0121). The pane decides; absent, nothing is drawn.
    */
   aboveBelt?: ReactNode;
+  /** The tricks' marks (M94 slice 03), in manifest order, at the end of the belt's scrolling strip, never in its pinned block. Absent: the belt is what it was. */
+  beltMarks?: readonly BeltMark[];
 
   /**
    * One more floating notice from the pane, nearest the belt in the floating group (ADR 0061): the Two
@@ -347,6 +477,12 @@ interface ComposerProps {
    * the pill would have nothing to show.
    */
   screen?: { on: boolean; onToggle: () => void };
+  /**
+   * The name of the crew member this pane lives on, when that member runs an older Collie (lib/send-path.ts
+   * `cardsOnOlderMember`): its bridge types a code without checking that the sign-in field is still there, and the
+   * field says so in one line (the M102 review 3). Empty when the member's name is not known. Absent on every other pane.
+   */
+  olderMember?: string;
   /** The pane's active todo list, drawn as a belt pill and an in-flow dock when non-empty. */
   todos?: readonly PaneTodo[];
   /**
@@ -372,7 +508,47 @@ interface ComposerProps {
     /** Show in Chat. False when the block is not loaded. */
     onShow: (pin: PinRow) => boolean;
   };
+  /**
+   * The agent view on screen, `{ trick, session }` (hooks/use-agent-view-pane.ts). While it is set, every
+   * text this composer sends goes as typed with a `view` field: the bridge puts the head and the tail on
+   * it (a head typed by any other door is refused `bad_head`). The phone adds nothing. Absent (no view, or
+   * a question waits in the session, so the text answers it): sending is exactly as before.
+   */
+  agentView?: { readonly trick: string; readonly session: string } | undefined;
+  /**
+   * Told when a send from the view starts, and how it ended: the text as typed (or the words a tap names),
+   * the phase, the refusal's own words for a send that failed, and the exact line the bridge typed.
+   */
+  onViewRequest?: ((note: ViewRequestNote) => void) | undefined;
+  /**
+   * The pane's unread state, or null when it has none: a word for the state ("unread", or the answer exit's own), never
+   * the screen's rows. The Keys drawer opens once when the pane goes into a state, and not again until it ends
+   * (the M102 review 2, I). It also asks Enter on the Keys pad for a second tap.
+   */
+  unreadState?: string | null | undefined;
+  /** A send was refused on a screen Collie cannot read: the pane opens the unread card (M102 spec 03). */
+  onScreenUnread?: (() => void) | undefined;
+  /**
+   * A send met the `answer` slot while no card shows its dialog (M102 spec 10, the sign-in code case): the
+   * pane opens the exit, the live screen and the person's Keys pad. Absent, the slot only says to answer first.
+   */
+  onAnswerUnseen?: (() => void) | undefined;
+  /**
+   * The send that ended `unknown` asks the pane for its card (M102 spec 04): called with the card's facts while that
+   * send stands unsettled, and with null when it is settled, answered or superseded. Absent, there is no card: the
+   * notice and the second-tap question are all that speak, as before.
+   */
+  onCannotTell?: ((card: CannotTellFacts | null) => void) | undefined;
+  /** A tap on Send over the unchanged kept draft sent nothing: the pane puts a ring on the card (spec 04). */
+  onCannotTellRing?: (() => void) | undefined;
+  /**
+   * The card is on screen (the dock shows it: no dialog card lifts, no unread card stands). While it is, the box's own
+   * notice for the unknown send stays down and a tap on Send over the unchanged draft only rings the card. Default:
+   * true when `onCannotTell` is given.
+   */
+  cannotTellInView?: boolean | undefined;
 }
+
 
 // The composer cluster at the bottom of the pane view — everything a phone keyboard can't do on its
 // own: quick actions, an agent-aware slash-command palette, an inline key tray (via
@@ -501,6 +677,12 @@ interface ClearNote {
 /** How long a Clear's floating notice, and its Restore, stand. */
 export const CLEAR_NOTE_MS = 120_000;
 
+/** The text and the chips the box held at one moment (a send's start). */
+interface ComposerDraftNow {
+  text: string;
+  chips: readonly ComposerAttachment[];
+}
+
 interface ClearedDraft {
   text: string;
   /** The chips, preview URLs included: those stay alive until the window ends. */
@@ -521,8 +703,36 @@ function moveCaret(from: HTMLTextAreaElement | null, to: HTMLTextAreaElement | n
   to.setSelectionRange(start, end);
 }
 
+/** A file the box would have taken, dropped because the field locked after the tap (M102 spec 11). */
+function sayFileLocked(): void {
+  setStatus(translate("composer.tap.fileLocked"), "warn");
+}
+
+/** Why a locked field is locked, in the placeholder's own words (M102 spec 11); null when it is not locked. */
+/**
+ * The receipt's wait end, a moment on the bridge's clock, moved onto the phone's, so the card's timer
+ * and the bridge agree on when the agent's own word stops being awaited (M102 spec 04, decision 7). A
+ * sign-in code waits too: entering it twice is worse than waiting. Null when the bridge awaits nothing.
+ */
+function awaitingOnPhone(until: number | undefined): number | null {
+  return until === undefined ? null : until - serverSkewMs();
+}
+
+function lockWordsFor(slot: SendSlot, unreachableWords: string): string | null {
+  switch (slot) {
+    case "gone":
+      return translate("composer.placeholder.gone");
+    case "readOnly":
+      return translate("composer.placeholder.readOnly");
+    case "unreachable":
+      return unreachableWords;
+    default:
+      return null;
+  }
+}
+
 export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Composer(
-  { paneId, instance, surface, starting = false, unreachableNote, scope, stopOffered = false, agent, canSteer, returnedDraft = false, isShell, cwd, gone, readOnly, composing, onAnswerDialog, dialogCard = false, text, terminalDraft, rawTerminalDraft, prefs, display, onSent, onOpenMessages, held: heldRows, chatEntries, pullHandle, draftNoticeSlot, expandArea, changesPill, zoomPill, stale, hand = "right", layout = "field", aboveBelt, floatingHint, screen, todos, subagents, jobs, pins },
+  { paneId, instance, surface, starting = false, unreachableNote, scope, stopOffered = false, agent, canSteer, returnedDraft = false, isShell, cwd, gone, readOnly, composing, onAnswerDialog, dialogCard = false, text, terminalDraft, rawTerminalDraft, prefs, display, onSent, onOpenMessages, walkyLinked = false, onDeliverNow, held: heldRows, chatEntries, pullHandle, draftNoticeSlot, expandArea, changesPill, zoomPill, stale, hand = "right", layout = "field", aboveBelt, beltMarks, floatingHint, screen, todos, subagents, jobs, pins, agentView, onViewRequest, unreadState = null, onScreenUnread, onAnswerUnseen, onCannotTell, onCannotTellRing, cannotTellInView, heldScreen, olderMember },
   ref,
 ) {
   const revalidator = useRevalidator();
@@ -561,6 +771,24 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
   const canSendKeys = useMuxCapability("sendKeys", scope);
   const missingSend = !canType.capable ? canType : !canSendKeys.capable ? canSendKeys : null;
   const shownSurface = missingSend !== null ? unreachable(surface) : surface;
+  // A sign-in field (the Surface's `field: "secret"`): the agent asks for the code or the redirect
+  // address a login page shows, or for a key. What is typed for it is a secret: it is never written to
+  // the draft store or the request-id store, the send names it to the bridge, and the "sent" line does
+  // not repeat it. A ref beside it, because the draft write-through reads it in the tick it changes.
+  const hasCannotTellHost = onCannotTell !== undefined;
+  const secretField = surface.field === "secret";
+  const secretFieldRef = useRef(secretField);
+  secretFieldRef.current = secretField;
+  // THE FRAMED SIGN-IN FIELD (M102 spec 06): while the screen asks for a code, the box gives way to
+  // `SecretField`, which holds its own text, so the normal draft is kept apart. Its cross closes it for
+  // this field and sends nothing; the notice then offers it back. A field that goes away resets it.
+  const [secretClosed, setSecretClosed] = useState(false);
+  // "Enter it again" on the "cannot tell" card (M102 spec 04) opens the frame EMPTY and takes the focus: the field's text
+  // is its own state, so a new key remounts it. 0 is the frame as it stands, with no focus taken.
+  const [secretFresh, setSecretFresh] = useState(0);
+  useEffect(() => {
+    if (!secretField) setSecretClosed(false);
+  }, [secretField]);
   const unreachableWords =
     missingSend !== null
       ? missingSend.note || translate("composer.placeholder.noMuxSend")
@@ -576,15 +804,22 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
   // draft stays in the box.
   const live = useLive(paneId, scope);
   const offline = stale === true || !live;
-  const slot = sendSlot(shownSurface, { gone, readOnly, offline });
+  // A fact blocks the box: the caller's note (a host it cannot reach, sending off) or a multiplexer that
+  // cannot type into a pane at all. Both lock. A box the read could not reach takes the override
+  // (M102 spec 03).
+  const blocked = unreachableNote !== undefined || missingSend !== null;
+  const slot = sendSlot(shownSurface, { gone, readOnly, offline, blocked });
   // THE WAY OUT (M56 spec 07, lib/way-out.ts): which state this is, and whether the Keys dock opens and
   // can send. The rule is one function so that no refusal, no flag and no lock can hide the key pad on
   // its own; only a pane that is gone, a device that may not write and a multiplexer that sends no key
   // at all do.
-  const way = wayOut(shownSurface, { gone, readOnly, offline }, { keysCapable: canSendKeys.capable });
+  const way = wayOut(shownSurface, { gone, readOnly, offline, blocked }, { keysCapable: canSendKeys.capable });
   // The field itself is off only when nothing typed here can ever leave for this pane: a gone pane,
   // a read-only device, a box out of reach. Derived from the slot, never passed in.
   const locked = fieldLocked(slot);
+  // WHY THE FIELD IS LOCKED, as one sentence (M102 spec 11): the field's placeholder, the notice a refused tap
+  // raises, the sign-in frame's line and the Mic's reason all read it, so the words never drift apart.
+  const lockWords = lockWordsFor(slot, unreachableWords);
   const lockedRef = useRef(locked);
   lockedRef.current = locked;
   // Clear (ADR 0116) is offered while the box holds a draft and no dialog owns the keys. The Surface's own
@@ -702,8 +937,13 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
     // what the operator just put there. The clear itself writes "" and so never ends its own window.
     if (value !== "" || attachmentsRef.current.length > 0) endUndoWindow();
     inputValueRef.current = value;
+    // Text typed while a sign-in field is up stays out of the store until the field is emptied, also
+    // after the field has gone: it may be a code that was never sent.
+    secretDraftRef.current = value !== "" && (secretFieldRef.current || secretDraftRef.current);
     setInput(value);
     persistDraft();
+    // A draft that changed is no longer the text a send left without an answer: its request id goes.
+    clearIntentIfDraftChanged(scope, paneId, composeLine(value, attachmentsRef.current, isShell));
   }
 
   /** The write-through, text and chips together. The chip writers (addAttachment, removeAttachment,
@@ -714,7 +954,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
     if (inputValueRef.current.trim() === "" && attachmentsRef.current.length === 0) {
       nextAttachmentRef.current = 1;
     }
-    if (noEchoRef.current !== null) return;
+    if (noEchoRef.current !== null || secretDraftRef.current) return;
     saveDraft(scope, paneId, inputValueRef.current, attachmentsRef.current, nextAttachmentRef.current);
   }
 
@@ -728,7 +968,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
   useEffect(() => {
     const prev = draftPaneRef.current;
     if (prev.paneId === paneId && prev.scopeId === scopeId) return;
-    if (noEchoRef.current === null) {
+    if (noEchoRef.current === null && !secretDraftRef.current) {
       saveDraft(prev.scope, prev.paneId, inputValueRef.current, attachmentsRef.current, nextAttachmentRef.current);
     }
     // The outgoing pane's previews die here: its chips come back from the store as icon tiles.
@@ -740,21 +980,62 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
     draftPaneRef.current = { scope, scopeId, paneId };
     const restored = loadDraftEntry(scope, paneId);
     inputValueRef.current = restored?.text ?? "";
+    secretDraftRef.current = false;
     setInput(inputValueRef.current);
     attachmentsRef.current = restored?.attachments ?? [];
     setAttachments(attachmentsRef.current);
     nextAttachmentRef.current = restored?.next ?? 1;
+    // This pane's Put back list, and never the outgoing pane's.
+    setPutBackList(loadPutBack(scope, paneId));
+    setHeldBackFull(false);
     caretRef.current = null;
     setPreviewDismissed(false); // it was about the pane we just left
     noticeNoEchoRef.current(null); // it described the pane we just left
   }, [scope, scopeId, paneId]);
   const [sending, setSending] = useState(false);
-  // The Send Protocol's held intent (its request id) and the offers its last answer made (M56 spec 05).
-  const protocolIntent = useRef<IntentId | null>(null);
+  // The Send Protocol's held intent (its request id) lives in lib/send-intent.ts, per pane, so a pane
+  // switch, a reload or a killed tab keeps it with the draft; the offers its last answer made sit below (M56 spec 05).
   // A send that ended `unknown`, remembered until the journal settles it (#511, lib/unknown-send.ts):
   // the person may submit the stranded text by hand, and the user turn landing in Chat is then the
   // proof it went through. Memory only, like the notice it retires; a new send replaces it.
   const [pendingUnknown, setPendingUnknown] = useState<UnknownSend | null>(null);
+  // WHAT THE "CANNOT TELL" CARD IS ABOUT (M102 spec 04): the request id of the `unknown` send, whether it was a sign-in
+  // code, how long the agent's own word may still come, and which notice the send raised (so the card, while it is
+  // on screen, can stand in for exactly that one). It lives and goes with `pendingUnknown`: one open question.
+  const [unknownAnswer, setUnknownAnswer] = useState<{ requestId: string; secret: boolean; awaitingUntil: number | null; noticeKey: string; interrupted: boolean } | null>(null);
+  const unknownAnswerRef = useRef(unknownAnswer);
+  unknownAnswerRef.current = unknownAnswer;
+  // THE WAIT OF AN `unknown` SEND (spec 13), for every Send again of it, the card's and the notice's alike
+  // (the M102 review, E): while the agent's own word may still come, Send again sends nothing. A clock
+  // that turns Send again on when the wait ends; it never sends.
+  const awaitingUntil = unknownAnswer?.awaitingUntil ?? null;
+  const [awaitNow, setAwaitNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (awaitingUntil === null) return;
+    const left = awaitingUntil - Date.now();
+    if (left <= 0) {
+      if (awaitNow < awaitingUntil) setAwaitNow(Date.now());
+      return;
+    }
+    const timer = setTimeout(() => setAwaitNow(Date.now()), Math.min(left, 60_000));
+    return () => clearTimeout(timer);
+  }, [awaitingUntil, awaitNow]);
+  const awaitingWord = awaitingUntil !== null && awaitNow < awaitingUntil;
+  const onCannotTellRef = useRef(onCannotTell);
+  onCannotTellRef.current = onCannotTell;
+  const cannotTellFacts = useMemo<CannotTellFacts | null>(
+    () => (unknownAnswer === null || !hasCannotTellHost ? null : { requestId: unknownAnswer.requestId, secret: unknownAnswer.secret, readOnly, awaitingUntil: unknownAnswer.awaitingUntil, interrupted: unknownAnswer.interrupted }),
+    [unknownAnswer, hasCannotTellHost, readOnly],
+  );
+  useEffect(() => {
+    onCannotTellRef.current?.(cannotTellFacts);
+  }, [cannotTellFacts]);
+  useEffect(
+    () => () => {
+      onCannotTellRef.current?.(null);
+    },
+    [],
+  );
   // The journal as this render has it, for the send path to snapshot which turns predate a send.
   const chatEntriesRef = useRef(chatEntries);
   chatEntriesRef.current = chatEntries;
@@ -765,9 +1046,11 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
   const [protocolOffer, setProtocolOffer] = useState<{ text: string; isDraft: boolean; rowsHash: string | null; offers: readonly SendOffer[]; capAck: boolean } | null>(null);
   const [uploading, setUploading] = useState(false);
   const activeUploadsRef = useRef(0);
-  // Pending-send preview: set on a successful send, cleared when the mirror catches up (next text
-  // update) or after a 6s safety timeout. Shows "You sent: …" so the user knows the message landed.
+  // Pending-send preview: set when a confirmed send is still not echoed `SEND_SLOW_MS` after the tap, cleared when the
+  // mirror catches up (next text update) or 6s after it showed. Shows "You sent: …" so the user knows the message
+  // landed. A toast over the mirror (`SendToast`), never a row: nothing moves when it comes or goes.
   const [lastSent, setLastSent] = useState<string | null>(null);
+  const sendToast = useHeldThroughExit(lastSent, useSendToastFade());
   const [justSent, setJustSent] = useState(false); // brief ✓ on the send button after a send
   // Terminal-draft preview bookkeeping. The composer input is EXCLUSIVELY phone-owned — a host draft
   // is never written into it implicitly; it only surfaces in a read-only preview the user can
@@ -788,6 +1071,9 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
   const [previewDismissed, setPreviewDismissed] = useState(false);
   // Composer sheets are mutually exclusive — at most one open (Keys / Quick / Agent / Display).
   const [drawer, setDrawer] = useState<ComposerDrawer>(null);
+  // The drawer as it is now, for an answer that arrives after the render its send started in.
+  const drawerRef = useRef<ComposerDrawer>(null);
+  drawerRef.current = drawer;
   // Keys staged in the (unmounted-on-close) NavTray, pushed up so leaving the Keys dock can guard a
   // composed sequence. See requestDrawer.
   const [queuedKeys, setQueuedKeys] = useState(0);
@@ -817,11 +1103,39 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
     setDrawer(next);
   }
   const closeDrawer = () => requestDrawer(null);
+  // THE UNREAD CARD'S KEYS ARE THE PERSON'S OWN PAD (M102 spec 03, option "Your Keys pad"): when a pane goes into
+  // an unread state, the Keys drawer opens, once, and only when no drawer is open. A drawer the person opened or
+  // closed while the state lasts is left as it is, whatever the rows do; the state's end lets the next one open it
+  // again (the M102 review 2, I). The pad's "123" chip stays as the person left it: a digit is never an offer.
+  const unreadOpened = useRef<string | null>(null);
+  useEffect(() => {
+    if (unreadState === null) {
+      unreadOpened.current = null;
+      return;
+    }
+    const state = `${paneId}\n${unreadState}`;
+    if (unreadOpened.current === state) return;
+    unreadOpened.current = state;
+    if (drawer === null && !locked) setDrawer("keys");
+    // A later change of the drawer or the lock finds the same state and does nothing.
+  }, [unreadState, paneId, drawer, locked]);
   // Two-tap guard for destructive commands (rm -rf, force-push, …): the first tap arms a "Really
   // send?" state on the Send button (auto-disarms after 3 s), the second actually sends. Same shared
   // confirm the command palette uses for /clear.
   const sendConfirm = usePendingConfirm();
   const armedWhen = useRef<SendWhen | undefined>(undefined);
+  // When "Send it again?" was armed (ms since the epoch): a confirming tap counts only after a short delay.
+  const sendAgainArmedAt = useRef(0);
+  // True for the first SEND_AGAIN_CONFIRM_DELAY_MS (700 ms) after "Send it again?" is armed: the word cannot confirm yet, so it
+  // is drawn at reduced opacity (a cue that a tap now does nothing, not a frozen button). Flipped by a timer set at the arm.
+  const [sendAgainWaiting, setSendAgainWaiting] = useState(false);
+  const sendAgainWaitTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(
+    () => () => {
+      if (sendAgainWaitTimer.current !== null) clearTimeout(sendAgainWaitTimer.current);
+    },
+    [],
+  );
   // The password prompt the last refused send was looking at, if it was one (#103). Since M56 spec 06
   // the phone reads nothing before a send; this is a display read of the screen the composer already
   // has (`text`), taken when the bridge refused or left the text unsubmitted, and only to say so and
@@ -844,6 +1158,56 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
   // (field case 2026-10-15, M56 spec 07): a refusal, a text left in the box, a send that ended unknown,
   // no answer, a link that is down, a dialog that owns the keys.
   const [sendRefusal, setSendRefusalState] = useState<SendRefusal | null>(null);
+  // The sentence of the notice just raised, for the agent view's "Not sent" line to mirror (`onViewRequest`).
+  const refusalWordsRef = useRef<string | null>(null);
+  // The text of the last send from this composer, for the notice's Send again (M102 spec 02). A send
+  // from the field is sent again from the field as it reads now; a quick reply keeps its own words.
+  // A sign-in code is never kept (the M102 review, A): its entry names no text, and its Send again is
+  // "Enter it again", the code field opened empty.
+  const lastSendRef = useRef<LastSend | null>(null);
+  // ── ONE MOVE AT THE TAP (M104) ──────────────────────────────────────────────
+  // A send of the box lets go of the box at the tap: the box empties and takes its closed shape in that frame with no
+  // animation, and the person's line stands in Chat at once (lib/durable-pending.ts, the line a durable pane draws).
+  // The text is held here until the send has an end. A success leaves it in Chat. Any other end takes the line out of
+  // Chat in the frame its notice shows and puts the text back into the box when the box is still empty; when the person
+  // has typed since, it waits beside the notice with Put back, and two texts are never merged. The store of drafts keeps
+  // the sent text until the end, so a reload in between loses nothing. A sign-in code, a text typed while a sign-in
+  // field is up and a text for a prompt that does not echo never take this road: they are never held or shown.
+  const calmRef = useRef<CalmSend | null>(null);
+  const [calmHeld, setCalmHeld] = useState(false);
+  // ── THE SEND CLOSES THE SOFT KEYBOARD (Altan, 2026-11-18) ───────────────────
+  // The reply is what the person wants to see next, and the keyboard covers it. So a box send that let go of the
+  // box (`startCalm`) also blurs the field, when a SOFT keyboard is up (`useKeyboardOpen`: the viewport shrank AND a
+  // field that types has focus). A hardware keyboard or a wide layout shows no such keyboard and keeps the focus, so
+  // the next message can be typed at once. The blur needs no answer from the bridge. The first tap still sends (issue
+  // 691: the press never moved the focus, so the click reaches Send); the blur comes after the send is dispatched.
+  // `keyboardReleased` is the calm send whose blur we did, so a send that fails (its text goes back into the box)
+  // can give the focus back: a try, since iPhone WebKit raises no keyboard from a focus outside a tap.
+  const softKeyboard = useKeyboardOpen();
+  // Whether a bare Enter from a hardware keyboard sends (Settings → Enter sends, ADR 0157): the person's own
+  // choice on this device, or null before they made one. A guess never sets it, only a tap does.
+  const enterChoice = useEnterSendsChoice();
+  // The one-time offer of that switch, above the box. It shows after a bare Enter that looks like a real keyboard's
+  // while nothing is chosen, goes with the pane or a reload, and never shows again once a choice is stored.
+  const [enterOffer, setEnterOffer] = useState(false);
+  useEffect(() => setEnterOffer(false), [paneId]);
+  const keyboardReleased = useRef<CalmSend | null>(null);
+  const flipInstantRef = useRef(false);
+  // The texts waiting on Put back for the pane on screen, oldest first (the M102 review 3): stored with the pane's draft
+  // (lib/drafts.ts), so a pane switch or a reload keeps them, and never a list with a cap, so none is dropped.
+  const [putBackList, setPutBackList] = useState<readonly PutBackItem[]>(() => loadPutBack(scope, paneId));
+  const [heldBackFull, setHeldBackFull] = useState(false);
+  // A line the bridge held: it waits for the held row above the box and goes in the frame that row arrives.
+  const handoverRef = useRef<{ readonly key: string; readonly id: string; readonly requestId: string } | null>(null);
+  // Set when a code send ended `unknown`: the code may have gone, so the code field empties (`sendSecret`).
+  const secretSpentRef = useRef(false);
+  // The request of a code send whose answer was lost (the M102 review 2, D): the next tap on the same code asks with
+  // the same id, so the bridge's "one id writes once" holds. In memory only, and it names no code: the intent's key
+  // leaves the text out (`sendText`), and the id is dropped when the field's text changes, the field goes, or any
+  // answer arrives. `where` is the pane it was for.
+  const secretIntentRef = useRef<{ readonly where: string; readonly intent: IntentId } | null>(null);
+  // What the bridge said of the last send from an agent view: the line it typed, or its refusal code.
+  const viewAnswerRef = useRef<{ line: string | null; code: string | null }>({ line: null, code: null });
   // Which notice that is (send-notice.tsx `refusalKey`: the screen it is about and its words), and
   // the one the person hid with its ✕ or the offers' ✕. A hidden notice stays hidden until a refusal
   // reads another Surface (its hash or its revision) or says other words, or a tap meets the same
@@ -856,6 +1220,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
    * the notice is the tap's only visible answer (review of 2026-10-16). With offers, the strip answers.
    */
   function setSendRefusal(next: SendRefusal | null, on: Surface | null = shownSurface, offers = false) {
+    refusalWordsRef.current = next?.sentence ?? null;
     setSendRefusalState(next);
     const key = next === null ? null : refusalKey(next, on);
     setShownRefusalKey(key);
@@ -871,10 +1236,10 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
     const requestId = mintRequestId();
     try {
       const receipt = await api.abortPane(paneId, { requestId }, scope);
-      setSendRefusal(stopNotice(receipt), shownSurface);
+      setSendRefusal({ ...stopNotice(receipt), isReceipt: true }, shownSurface);
       if (receipt.keys !== undefined) onSent();
     } catch (e) {
-      if (api.outcomeUnknown(e)) setSendRefusal(stopNotice({ requestId, outcome: "unknown" }), shownSurface);
+      if (api.outcomeUnknown(e)) setSendRefusal({ ...stopNotice({ requestId, outcome: "unknown" }), isReceipt: true }, shownSurface);
       else setStatus(describeThrownError(e), "error");
     }
   }
@@ -954,6 +1319,8 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
   // which holds nothing a person must act on, M56 spec 07). Shown only while the confirm is armed.
   const [destructiveNote, setDestructiveNote] = useState<string | null>(null);
   const noEchoRef = useRef<{ prompt: string; typed: boolean } | null>(null);
+  // True while the field holds text typed for a sign-in field (see `secretField`): the draft store skips it.
+  const secretDraftRef = useRef(false);
 
   /** Raise or clear the password-prompt notice. Raising it also DROPS the stored draft: at that moment
    *  we know the field holds a secret the pane never accepted, and leaving it in a 48h store to be
@@ -983,12 +1350,31 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
   const idleLocked = useLocked();
   const catchingUp = useCatchingUp();
   const directSuspended = locked || idleLocked || catchingUp;
+  // SEND PAST THIS SCREEN (M102 spec 03, spec 01's override): the rows hash of the screen the card showed at
+  // the tap, read fresh by a `prepare`. The next send from the field carries it with `override`, so the
+  // bridge types only while the screen still hashes the same. One send; any answer disarms it.
+  const [overrideHash, setOverrideHash] = useState<string | null>(null);
+  // A sign-in field ends the arm (the M102 review, L): the arm was for another screen, a code never goes with
+  // `override` or its rows hash, and an arm left standing would go out with the next normal send after the field.
+  useEffect(() => {
+    if (secretField) setOverrideHash(null);
+  }, [secretField]);
+  // The send in flight is the one "Send past this screen" armed (not a commit tap's override): only its refusal
+  // re-arms on the rows the bridge read now.
+  const typeAnywaySendRef = useRef(false);
   const direct = useDirectTyping({
     paneKey: `${scopeId}\0${paneId}`,
     inputRef,
     // The ref, not `input`: the password-prompt handoff clears the draft and arms in one tick.
     replyDraft: () => inputValueRef.current,
     canActivate: () => !(directSuspended || sending || uploading),
+    // Why a tap on Type armed nothing (M102 spec 11): the lock's words, a send or an upload that runs, or the
+    // idle cover and the catch-up after it.
+    refusalWords: () => {
+      if (locked) return lockWords ?? unreachableWords;
+      if (sending || uploading) return translate("composer.tap.typeBusy");
+      return translate("composer.tap.typeWait");
+    },
     // Field locks and the idle cover both revoke direct mode. A LOST CONNECTION is deliberately
     // not added here: the mode already disarms on a failed batch, the same event observed directly
     // rather than inferred from a timer, whether or not a banner has declared the connection lost.
@@ -1071,12 +1457,30 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
     paneId,
     instance,
     scope,
-    onTaken: () => {
-      clearComposedDraft();
+    stamp: draftNow,
+    onTaken: (sent) => {
+      clearSentDraft(sent);
       revalidator.revalidate();
     },
     onChanged: () => revalidator.revalidate(),
   });
+
+  // Deliver now, from the held mark: the call, then the note over the box that the person's text stays.
+  const { delivered, tooLate } = walky;
+  const deliverNow = useMemo(
+    () =>
+      onDeliverNow === undefined
+        ? undefined
+        : async (id: string) => {
+            const end = await onDeliverNow(id);
+            // "gone": it no longer waited at the tap, so no note says delivered or still waiting.
+            if (end === "gone") tooLate();
+            // "unknown": it may have arrived, so no note says delivered; the row says the rest.
+            else if (end !== "unknown") delivered();
+            return end;
+          },
+    [onDeliverNow, delivered, tooLate],
+  );
 
   const hasDraft = input.trim() !== "" || attachments.length > 0;
   const micIsPrimary = micShown && !direct.active && !hasDraft;
@@ -1088,6 +1492,14 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
   const steerRow = canSteer === true && shownSurface.turn === "running" && walky.aim === null;
   // The Send button when it cannot act: it stays focusable and under the finger instead of `disabled`.
   const sendInert = locked || sending || ((starting || offline) && !direct.active);
+  // THE BOX IS OFF WHILE A LAUNCH STARTS (Altan, 2026-11-17): a launch this phone started refuses every send until
+  // the bridge has read the agent's first screen (`starting`, hooks/use-startup-readiness.ts: at most
+  // STARTUP_GATE_MS, 2 minutes, then it ends by itself), so the field is off for exactly that time, in the look of a
+  // locked one, and its placeholder says "Starting…". Type mode is not held (it sends keys, `sendInert` above lets it
+  // through), and a real lock keeps its own words. The draft is not touched: it comes back editable with the box.
+  // A box the phone cannot read live (a failed read, a reconnect, a stale copy) is not held either: it takes the
+  // ordinary offline rules, where the draft is saved and nothing is sent, and the hold comes back with the read.
+  const startHeld = starting && !locked && !offline && !direct.active;
   const sendHold = useLongPress(canMessage ? () => setSendMenu(true) : undefined);
 
   // ── THE VOICE TAKEOVER (design 3.3) ───────────────────────────────────────────────────────────
@@ -1194,6 +1606,9 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
 
   const sentTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastSentTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // The timer that shows the preview once the send is slow, and the tap it counts from.
+  const lastSentShowRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const tapAtRef = useRef(0);
   // What we last sent, and when — so we can recognise our OWN reply momentarily echoing on the "❯"
   // line (between the bridge's type and its Enter) and NOT treat it as a stranded draft. A
   // ref, not state: it feeds a render-time derivation but must not itself trigger re-renders.
@@ -1226,10 +1641,22 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
   };
   // effectiveStable gates the preview's APPEARANCE (stabilised value); effectiveRaw is the live line
   // its text tracks.
-  const effectiveStable = suppressEcho(terminalDraft);
-  const effectiveRaw = suppressEcho(rawTerminalDraft);
+  // A sign-in field's text is no draft to take over: it is a secret, and the field may show only its mask.
+  const effectiveStable = secretField ? null : suppressEcho(terminalDraft);
+  const effectiveRaw = secretField ? null : suppressEcho(rawTerminalDraft);
 
   const startMessage = walky.startMessage;
+  // The latest `send`, for the handle's `sendViewTap`: the handle is made once per `startMessage`, and a
+  // send must read this render's gates (sending, locked, the Surface), never the first render's.
+  const sendViewTapRef = useRef<(tap: ViewTap) => Promise<ViewSendResult>>(() => Promise.resolve({ sent: false, line: null, code: null }));
+  const padKeysRef = useRef<(keys: string[]) => Promise<boolean>>(() => Promise.resolve(false));
+  const typeAnywayRef = useRef<() => void>(() => undefined);
+  const markArrivedRef = useRef<() => Promise<ArrivedAnswer>>(() => Promise.resolve("failed"));
+  const closeCannotTellRef = useRef<() => void>(() => undefined);
+  const answerAgainRef = useRef<() => void>(() => undefined);
+  const sendLineRef = useRef<(line: string) => Promise<boolean>>(() => Promise.resolve(false));
+  const lineCanStartRef = useRef<() => boolean>(() => false);
+  const keepLineRef = useRef<(line: string) => void>(() => undefined);
   useImperativeHandle(
     ref,
     () => ({
@@ -1238,6 +1665,15 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
         startMessage(aim);
         focusInputImmediately();
       },
+      sendViewTap: (tap) => sendViewTapRef.current(tap),
+      padKeys: (keys) => padKeysRef.current(keys),
+      typeAnyway: () => typeAnywayRef.current(),
+      markArrived: () => markArrivedRef.current(),
+      closeCannotTell: () => closeCannotTellRef.current(),
+      answerAgain: () => answerAgainRef.current(),
+      sendLine: (line) => sendLineRef.current(line),
+      lineCanStart: () => lineCanStartRef.current(),
+      keepLine: (line) => keepLineRef.current(line),
     }),
     [startMessage],
   );
@@ -1246,6 +1682,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
     () => () => {
       if (sentTimer.current) clearTimeout(sentTimer.current);
       if (lastSentTimerRef.current) clearTimeout(lastSentTimerRef.current);
+      if (lastSentShowRef.current) clearTimeout(lastSentShowRef.current);
       if (keyRevalidateTimer.current) clearTimeout(keyRevalidateTimer.current);
       for (const attachment of attachmentsRef.current) revokePreview(attachment);
       // An open Undo window dies with the view, and so do the previews it was holding.
@@ -1262,6 +1699,11 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
       clearTimeout(lastSentTimerRef.current);
       lastSentTimerRef.current = null;
     }
+    // A send echoed within `SEND_SLOW_MS` never shows the preview: the wait for it ends here too.
+    if (lastSentShowRef.current) {
+      clearTimeout(lastSentShowRef.current);
+      lastSentShowRef.current = null;
+    }
   }, [text]);
 
   // Block a self-update reload while there's unsent work here: real typed text OR an upload in flight.
@@ -1274,6 +1716,8 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
   useHoldReload(
     `composer:${paneId}`,
     hasDraft ||
+      calmHeld ||
+      putBackList.length > 0 ||
       clearedDraft !== null ||
       direct.active ||
       direct.value !== "" ||
@@ -1321,6 +1765,8 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
     if (pendingUnknown === null || chatEntries === undefined) return;
     if (findUnknownSendMatch(pendingUnknown, chatEntries) === undefined) return;
     setPendingUnknown(null);
+    setUnknownAnswer(null);
+    forgetUnknownSend(scope, paneId, pendingUnknown.sentText, isShell); // it went: nothing is left to ask about
     setProtocolOffer(null);
     setSendRefusal(null);
     if (
@@ -1334,7 +1780,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
       setHandledKey(normalizeDraft(effectiveRaw));
       setPreviewLatched(false);
     }
-  }, [pendingUnknown, chatEntries, effectiveRaw, isShell]);
+  }, [pendingUnknown, chatEntries, effectiveRaw, isShell, scope, paneId]);
 
   // Show the preview while it's latched, the host line still carries a (non-echo) draft, and the user
   // hasn't already handled this exact text. Its displayed text is the LIVE raw line — host typing
@@ -1382,18 +1828,30 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
   // held send moves nothing (ADR 0061, amended 2026-10-18). It is keyed by pane: the card's Show all
   // is per pane and in memory, and a pane switch starts it collapsed. Rendered only while there is a
   // row, so an empty queue leaves nothing in the slot.
+  // A WalkyTalky message's row is left out (`drawnHeldRows`): its mark and the Messages sheet carry it.
+  const drawnHeld = heldRows === undefined ? undefined : drawnHeldRows(heldRows);
+  // A line the bridge held leaves Chat in the frame its held row arrives above the box (M104), before the paint.
+  useLayoutEffect(() => {
+    const handover = handoverRef.current;
+    if (handover === null || heldRows === undefined || !heldRows.some((row) => row.requestId === handover.requestId)) return;
+    handoverRef.current = null;
+    dropPending(handover.key, [handover.id]);
+  }, [heldRows]);
   const heldCard =
-    heldRows !== undefined && heldRows.length > 0 ? (
+    drawnHeld !== undefined && drawnHeld.length > 0 ? (
       <HeldCard
         key={`${scopeId}|${paneId}`}
         paneId={paneId}
         scope={scope}
-        rows={heldRows}
+        rows={drawnHeld}
         canAct={!locked}
         canSend={isLead(scope)}
-        sending={sending}
+        sending={sending || starting}
         onSend={resendHeld}
         onChanged={onSent}
+        onReturn={(words) => returnHeldWords(words, paneId)}
+        onSendNow={sendHeldNow}
+        {...(heldScreen === undefined ? {} : { screen: heldScreen })}
       />
     ) : null;
 
@@ -1423,7 +1881,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
       <ClearNotice refusal={clearNote.refusal} onRestore={restoreOpen ? () => void restoreDraft() : null} restoring={restoring} onDismiss={() => setClearNote(null)} />
     ) : null;
   const floating =
-    heldCard !== null || reportCard !== null || floatingNotice !== null || clearCard !== null || (floatingHint !== undefined && floatingHint !== null) ? (
+    sendToast.held !== null || heldCard !== null || reportCard !== null || floatingNotice !== null || clearCard !== null || (floatingHint !== undefined && floatingHint !== null) ? (
       <div
         data-slot="floating-cards"
         className={cn(
@@ -1431,6 +1889,8 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
           draftNoticeSlot ? undefined : "absolute inset-x-3 bottom-full z-20 mb-2",
         )}
       >
+        {/* First, so the column's bottom edge is the belt's and the toast coming or going moves no card under it. */}
+        {sendToast.held !== null && <SendToast text={sendToast.held} open={sendToast.open} />}
         {heldCard}
         {reportCard}
         {floatingNotice}
@@ -1609,17 +2069,44 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
     focusInputEnd();
   }
 
+  /** What the box holds now: its text and its chips. Read when a send starts, it says what went out. */
+  function draftNow(): ComposerDraftNow {
+    return { text: inputValueRef.current, chips: attachmentsRef.current };
+  }
+
+  /** The draft of a send that landed goes only while the box still holds what went out (as the `unknown`
+   *  path settles it). A box that still begins with the sent text keeps only what came after it (leading
+   *  whitespace trimmed), stored as the draft, with the chips added since; the chips that went out leave
+   *  with their markers. A box edited inside the sent text keeps everything: nothing says what is new.
+   *  No snapshot: the box goes whole. */
+  function clearSentDraft(sent: ComposerDraftNow | undefined) {
+    if (sent === undefined || inputValueRef.current === sent.text) return clearComposedDraft();
+    const wentOut = (a: ComposerAttachment) => sent.chips.some((c) => c.n === a.n && c.path === a.path);
+    const now = inputValueRef.current;
+    let kept = sent.text !== "" && now.startsWith(sent.text) ? now.slice(sent.text.length).trimStart() : now;
+    for (const a of attachmentsRef.current.filter(wentOut)) {
+      revokePreview(a);
+      kept = removeMarker(kept, markerFor(a));
+    }
+    attachmentsRef.current = attachmentsRef.current.filter((a) => !wentOut(a));
+    setAttachments(attachmentsRef.current);
+    updateInput(kept);
+  }
+
   // What a confirmed send (`sent` or `effective`) does to this composer: the draft goes, the check
   // mark flashes, the pill says sent, the preview keeps the text.
   // `note` says where the text went: out (`sent`), into the harness's own queue (`queued`), or into the
   // bridge's held row above the box (`held`), which is not a send yet and so leaves no "You sent" preview.
-  function afterVerifiedSend(t: string, isDraft: boolean, note: "sent" | "queued" | "held" | "steered" | "queuedInstead" = "sent") {
+  function afterVerifiedSend(t: string, isDraft: boolean, note: "sent" | "queued" | "held" | "steered" | "queuedInstead" = "sent", sent?: ComposerDraftNow) {
+    // Read before the draft is cleared below: a text for a sign-in field is not repeated on screen.
+    const secret = secretFieldRef.current || secretDraftRef.current;
     // The bridge has a new line now (a shell pane only: the read is off elsewhere).
     suggestions.refresh();
     // Phone-owned input, cleared once the reply is on its way. Via updateInput, so the stored
     // draft goes with it (an empty value removes the key).
     // The chips go with the text: their paths were in the line that just went out.
-    if (isDraft) clearComposedDraft();
+    // A box that let go of the text at the tap (M104) holds only what was typed since: nothing of it goes.
+    if (isDraft && calmRef.current === null) clearSentDraft(sent);
     // Remember what/when we sent, so the next few polls recognise this text echoing on the "❯"
     // line as our own in-flight reply rather than a stranded draft (suppressEcho above).
     if (note !== "held") lastSentRef.current = { text: t, at: Date.now() };
@@ -1643,12 +2130,22 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
     // in the place "Sent" stands, never as a refusal.
     // A steer (M69) has two more words: `steered`, and `queuedInstead` when the harness queued the text
     // the person asked to steer with. A steer never leaves a plain "Sent" behind that says neither.
-    setStatus(translate(STATUS_KEY[note]), "success");
+    // Beside the session's name and time in the header, never in their place (M104).
+    setStatus(translate(STATUS_KEY[note]), "success", undefined, true);
     if (note !== "held") {
-      const preview = t.length > 60 ? `${t.slice(0, 57)}…` : t;
-      setLastSent(preview);
-      if (lastSentTimerRef.current) clearTimeout(lastSentTimerRef.current);
-      lastSentTimerRef.current = setTimeout(() => setLastSent(null), 6000);
+      const preview = secret ? "••••••" : t.length > 60 ? `${t.slice(0, 57)}…` : t;
+      // Only a send still not echoed `SEND_SLOW_MS` after the tap says so, and the clock counts from the tap, not from
+      // the answer: the wait the person sees began when they pressed Send.
+      const show = () => {
+        lastSentShowRef.current = null;
+        setLastSent(preview);
+        if (lastSentTimerRef.current) clearTimeout(lastSentTimerRef.current);
+        lastSentTimerRef.current = setTimeout(() => setLastSent(null), 6000);
+      };
+      if (lastSentShowRef.current) clearTimeout(lastSentShowRef.current);
+      const wait = SEND_SLOW_MS - (Date.now() - tapAtRef.current);
+      if (wait <= 0) show();
+      else lastSentShowRef.current = setTimeout(show, wait);
     }
     setSendRefusal(null); // a clean send answers the last refusal
     noticeNoEcho(null); // whatever prompt it described, the pane has moved past it
@@ -1665,25 +2162,324 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
   // no key of its own: no pre-flight, no type-then-verify, no sweep of a stranded draft (a draft in
   // the box is refused `draft_present` and offered Add, Replace or Cancel). A text that starts with a
   // reserved lead (`/`, `!`, `@`) goes as a `command`, whose popup under the box is expected.
-  async function send(value: string, isDraft: boolean, when?: SendWhen): Promise<boolean> {
+  /** The words for a send that cannot start now: the lock, the launch, or the send still running. */
+  function refusedTapWords(): string | null {
+    // The lock speaks through the field's own placeholder (`lockedWhy`), so only a launch needs this line.
+    if (starting && !locked) return translate("newPage.starting");
+    if (sending) return translate("composer.tap.sending");
+    return null;
+  }
+  /** Say why a tap did nothing, in the notice at the Send slot (M102 spec 11). */
+  function sayTap(words: string): void {
+    setSendRefusal(phoneRefusal(words));
+  }
+  /** The round Send button while it cannot act: the reason, never a dead tap. A running send keeps its spinner. */
+  function onInertSendTap(): void {
+    if (locked) {
+      sayTap(lockWords ?? unreachableWords);
+      return;
+    }
+    if (sending) {
+      // The spinner is the answer, except where this button is the Type-mode stop and shows no spinner.
+      if (direct.active) sayTap(translate("composer.tap.sending"));
+      return;
+    }
+    if (offline) {
+      sayTap(translate("composer.send.reconnect"));
+      return;
+    }
+    if (starting) sayTap(translate("newPage.starting"));
+  }
+  /** The line under the sign-in frame while it waits: the launch, else an older crew member's missing check. */
+  function secretReason(): string | null {
+    // The lock speaks through the field's own placeholder (`lockedWhy`), so only a launch needs this line.
+    if (starting && !locked) return translate("newPage.starting");
+    if (olderMember === undefined) return null;
+    // An unknown name gets a neutral word (the M102 review 3), never a sentence that starts with a space.
+    if (olderMember.trim() === "") return translate("composer.secret.olderMachineUnnamed");
+    return translate("composer.secret.olderMachine", { machine: olderMember });
+  }
+  /** The "Answer the dialog" word and the notice's card button: a tap that found no card says so. */
+  function answerDialog(): void {
+    if (onAnswerDialog !== undefined && onAnswerDialog() !== false) return;
+    // No card shows the dialog at all (the sign-in code case, M102 spec 10): the pane opens the exit, the
+    // live screen and the person's Keys pad, rather than send the person to look for a card.
+    if (!dialogCard && onAnswerUnseen !== undefined) {
+      onAnswerUnseen();
+      setSendRefusal(phoneRefusal(translate("answerExit.unseen")));
+      return;
+    }
+    setSendRefusal({ ...phoneRefusal(translate("composer.tap.noCard")), screen: true });
+  }
+  /**
+   * The code field's own send (M102 spec 06): the one path a text for a sign-in field takes. True when the
+   * frame should empty: the code went, or it may have gone (`unknown`). A code that may have gone is not
+   * left in the field for a tap that would send it twice; "Enter it again" is the way on (the M102 review, D).
+   */
+  async function sendSecret(code: string): Promise<boolean> {
+    secretSpentRef.current = false;
+    // A code never carries an armed Send past this screen (the M102 review, L): the arm goes with this send.
+    setOverrideHash(null);
+    const went = await send(code, false, undefined, undefined, true);
+    return went || secretSpentRef.current;
+  }
+  /**
+   * Why a text from elsewhere (not the code field, not a view tap) cannot start now, in the order `send` asks: a
+   * launch or a running send, a sign-in field, a link that is down, a dialog that owns the keys. Null: it can.
+   */
+  function lineRefusal(): SendRefusal | null {
+    const tapWords = refusedTapWords();
+    if (tapWords !== null) return phoneRefusal(tapWords);
+    const notTheField = secretRefusal(false);
+    if (notTheField !== null) return notTheField;
+    if (offlineRef.current) return phoneRefusal(translate("composer.send.reconnect"));
+    if (slot === "answer") return phoneRefusal(translate("composer.status.dialogWaiting"), true);
+    return null;
+  }
+  /** Why a send that did not come from the code field cannot go now (the M102 review, B), or null. */
+  function secretRefusal(fromSecret: boolean): SendRefusal | null {
+    return secretFieldRef.current && !fromSecret ? phoneRefusal(translate("composer.secret.onlyField")) : null;
+  }
+  async function send(value: string, isDraft: boolean, when?: SendWhen, tap?: ViewTap, fromSecret = false): Promise<boolean> {
     // A shell line keeps its leading space or tab, which keeps it out of Sent (M61): the bridge checks
     // the raw text. An agent pane's text is trimmed at both ends, as it always was. The emptiness
     // check and the mode read the fully trimmed text on both, so neither sees a difference.
     const trimmed = value.trim();
     const t = isShell ? value.trimEnd() : trimmed;
-    if (!trimmed || starting || locked || sending) return false;
+    if (!trimmed) return false;
+    // A tap that cannot go out says why (M102 spec 11): the quick reply, the palette, the harness pill and the
+    // view tap have no spinner of their own. Only the round Send button answers these states by itself.
+    const tapWords = refusedTapWords();
+    if (tapWords !== null) {
+      const refusal = phoneRefusal(tapWords);
+      setSendRefusal(refusal);
+      if (agentView !== undefined) onViewRequest?.({ text: t, phase: "failed", reason: refusal.sentence, line: null, about: tap?.about ?? null });
+      return false;
+    }
+    // While the screen asks for a sign-in code, a text from anywhere but the code field (a quick reply, a
+    // harness command, a Send again, the queued card, the normal box behind a closed frame) would be typed
+    // into that field and submitted. The phone refuses it, with words, and sends nothing (the M102 review, B).
+    const notTheField = secretRefusal(fromSecret);
+    if (notTheField !== null) {
+      setSendRefusal(notTheField);
+      if (agentView !== undefined) onViewRequest?.({ text: t, phase: "failed", reason: notTheField.sentence, line: null, about: tap?.about ?? null });
+      return false;
+    }
+    // AN AGENT VIEW ON SCREEN: the text goes as typed with the view's key, and a tap goes with the
+    // screen's rev and its control and no text at all. The bridge builds the line, head and tail included,
+    // from its own stored screen (agent views SECURITY rule 2); the phone adds nothing. A send from the view
+    // is a request to it: the view is told the words now, and how it ended, with the line the bridge typed.
+    const view = agentView === undefined ? undefined : tap === undefined ? { trick: agentView.trick, session: agentView.session } : { trick: agentView.trick, session: agentView.session, rev: tap.rev, control: tap.control };
+    if (tap !== undefined && view === undefined) return false;
+    viewAnswerRef.current = { line: null, code: null };
+    if (view === undefined) lastSendRef.current = fromSecret ? SECRET_SEND : { secret: false, value, isDraft };
+    const tell = (phase: ViewRequestNote["phase"], reason: string | null = null): void => {
+      if (view !== undefined) onViewRequest?.({ text: t, phase, reason, line: phase === "sent" ? viewAnswerRef.current.line : null, about: tap?.about ?? null });
+    };
     if (offlineRef.current) {
-      setSendRefusal(phoneRefusal(translate("composer.send.reconnect")));
+      const refusal = phoneRefusal(translate("composer.send.reconnect"));
+      setSendRefusal(refusal);
+      tell("failed", refusal.sentence);
       return false;
     }
     // A modal ask is a parsed fact: its own buttons answer it, and its word stands in the Send slot.
     // A typed text would be refused by the bridge anyway; the phone does not ask (spec 10). A send that
     // comes from elsewhere (a quick reply, a harness command) is told so at the Send slot.
     if (slot === "answer") {
-      setSendRefusal(phoneRefusal(translate("composer.status.dialogWaiting"), true));
+      // With no card for that dialog, "Answer it first" has nowhere to go: the pane opens the exit, the
+      // screen and the Keys pad, and the words say so (M102 spec 10, diagnosis B). Nothing is typed.
+      const unseen = !dialogCard && onAnswerUnseen !== undefined;
+      const refusal = unseen ? phoneRefusal(translate("answerExit.unseen")) : phoneRefusal(translate("composer.status.dialogWaiting"), true);
+      if (unseen) onAnswerUnseen();
+      setSendRefusal(refusal);
+      tell("failed", refusal.sentence);
       return false;
     }
-    return sendThroughProtocol(t, isDraft, modeFor(trimmed), null, false, undefined, when);
+    tell("sending");
+    try {
+      // "Send past this screen" armed one send past the screen the card showed: it carries that screen's rows
+      // hash and the person's word, override, and the armed state goes with this send (M102 spec 03).
+      const past = tap === undefined && view === undefined && !fromSecret ? overrideHash : null;
+      if (past !== null) setOverrideHash(null);
+      typeAnywaySendRef.current = past !== null;
+      const sent =
+        past !== null
+          ? await sendThroughProtocol(t, isDraft, modeFor(trimmed), past, false, undefined, undefined, undefined, t, true).finally(() => {
+              typeAnywaySendRef.current = false;
+            })
+          : await sendThroughProtocol(tap === undefined ? t : "", isDraft, tap === undefined ? modeFor(trimmed) : "send", null, false, undefined, view === undefined ? when : undefined, view, t, false, fromSecret);
+      tell(sent ? "sent" : "failed", sent ? null : refusalWordsRef.current);
+      return sent;
+    } catch (thrown) {
+      tell("failed", thrown instanceof Error ? thrown.message : String(thrown));
+      throw thrown;
+    }
+  }
+  // "Send past this screen" (M102 spec 03): the Keys drawer goes, the field takes the focus, and a `prepare`
+  // reads the screen fresh for the rows hash the next send carries with `override` (spec 01). Nothing is
+  // typed here. A read that brings back no hash says so, and the send stays the ordinary two taps.
+  async function typeAnyway(): Promise<void> {
+    if (locked) {
+      sayTap(lockWords ?? unreachableWords);
+      return;
+    }
+    requestDrawer(null);
+    inputRef.current?.focus();
+    // The read takes up to 20 s, so the status line says what the wait is (M102 spec 11), and goes with it.
+    const reading = translate("unreadDialog.reading");
+    setStatus(reading, "info", null);
+    try {
+      const reply = await api.postSend({ id: mintRequestId(), pane: paneId, text: "", mode: "prepare" }, scope);
+      if (reply.rowsHash === null) {
+        setSendRefusal(phoneRefusal(translate("unreadDialog.typeAnywayFailed")));
+        return;
+      }
+      setOverrideHash(reply.rowsHash);
+    } catch (e) {
+      setStatus(describeThrownError(e), "error");
+    } finally {
+      if (currentStatus()?.text === reading) clearStatus();
+    }
+  }
+  padKeysRef.current = (keys) => direct.sendPaneKeys(keys);
+  typeAnywayRef.current = () => void typeAnyway();
+  markArrivedRef.current = markUnknownArrived;
+  closeCannotTellRef.current = endCannotTell;
+  answerAgainRef.current = answerCannotTellAgain;
+  sendLineRef.current = (line) => send(line, false);
+  lineCanStartRef.current = () => {
+    const refusal = lineRefusal();
+    if (refusal !== null) setSendRefusal(refusal);
+    return refusal === null;
+  };
+  keepLineRef.current = (line) => giveBack({ draft: line, chips: [], pane: paneId, scope, line });
+  sendViewTapRef.current = async (tap) => {
+    const sent = await send(tap.words, false, undefined, tap);
+    return { sent, ...viewAnswerRef.current };
+  };
+
+  /** This composer shows the box of `back`'s pane now. */
+  function boxOf(back: SentBack): boolean {
+    return draftPaneRef.current.paneId === back.pane && scopeKey(draftPaneRef.current.scope) === scopeKey(back.scope);
+  }
+  /** The box holds nothing: no text, no chip. */
+  function boxEmpty(): boolean {
+    return inputValueRef.current.trim() === "" && attachmentsRef.current.length === 0;
+  }
+  /** Write `back` into its box, or into the stored draft of its pane when another pane is shown. The stored intent stays. */
+  function writeBack(back: SentBack): void {
+    if (boxOf(back)) {
+      // Not through updateInput: its intent check would drop the request id a lost answer left with this very text.
+      inputValueRef.current = back.draft;
+      attachmentsRef.current = [...back.chips];
+      setInput(back.draft);
+      setAttachments(attachmentsRef.current);
+      persistDraft();
+    } else {
+      const next = back.chips.reduce((n, chip) => Math.max(n, chip.n + 1), 1);
+      saveDraft(back.scope, back.pane, back.draft, back.chips, next);
+    }
+    if (back.intent !== undefined) saveIntent(back.scope, back.pane, back.intent, back.line);
+  }
+  /**
+   * Whether `back`'s box (shown, or stored for another pane) is free for it. An open Undo window from the belt's X is not
+   * free (the M102 review 3): its draft is one tap from coming back, and that tap would write over the returned text.
+   */
+  function roomFor(back: SentBack): boolean {
+    if (boxOf(back)) return boxEmpty() && clearedDraftRef.current === null;
+    const stored = loadDraftEntry(back.scope, back.pane);
+    return stored === null || (stored.text.trim() === "" && stored.attachments.length === 0);
+  }
+  /** The tap of a box send that may go (M104): the box lets go, and the line stands in Chat. */
+  function startCalm(sent: ComposerDraftNow, t: string, mode: SendMode, seen: ReadonlySet<string>, at: number): CalmSend {
+    const row = !isShell && mode === "send" ? { key: paneScopeKey(scope, paneId), id: `calm-${mintRequestId()}` } : null;
+    if (row !== null) addPending(row.key, { requestId: row.id, text: t, at, state: "sending", seen });
+    const calm: CalmSend = { draft: sent.text, chips: sent.chips, pane: paneId, scope, line: t, row };
+    calmRef.current = calm;
+    setCalmHeld(true);
+    flipInstantRef.current = true;
+    inputValueRef.current = "";
+    attachmentsRef.current = [];
+    setInput("");
+    setAttachments([]);
+    // Only the reply field: another field that has focus (the code field, a rename) keeps its keyboard.
+    const field = inputRef.current;
+    if (softKeyboard && field !== null && document.activeElement === field) {
+      field.blur();
+      keyboardReleased.current = calm;
+    }
+    return calm;
+  }
+  /**
+   * The end of a box send that let go of the box (M104). `sent`: the line stays in Chat until the log has it.
+   * `handover`: the bridge held or queued it, and the line waits for that row. `failed`: every other end; the line
+   * goes now, in the frame the notice shows, and the text goes back (`writeBack`) or waits beside the notice.
+   */
+  function settleCalm(calm: CalmSend, end: "sent" | "handover" | "failed", requestId: string | null, intent?: IntentId): void {
+    if (calmRef.current === calm) {
+      calmRef.current = null;
+      setCalmHeld(false);
+    }
+    const released = keyboardReleased.current === calm;
+    if (released) keyboardReleased.current = null;
+    if (end === "failed") {
+      if (calm.row !== null) dropPending(calm.row.key, [calm.row.id]);
+      giveBack(intent === undefined ? calm : { ...calm, intent });
+      // The send did not go and its words are back: the keyboard we put away comes back, unless the person has
+      // moved on to another control since (focus on the page body only).
+      const field = inputRef.current;
+      const idle = document.activeElement === null || document.activeElement === document.body;
+      if (released && idle && field !== null && boxOf(calm)) field.focus({ preventScroll: true });
+      return;
+    }
+    if (calm.row !== null && end === "sent") setPendingState(calm.row.key, calm.row.id, "sent");
+    if (calm.row !== null && end === "handover") {
+      handOverPending(calm.row.key, calm.row.id);
+      if (requestId !== null) handoverRef.current = { key: calm.row.key, id: calm.row.id, requestId };
+    }
+    // The chips went out with the line: their previews go, and the stored draft is the box as it is now.
+    for (const chip of calm.chips) if (!attachmentsRef.current.includes(chip)) revokePreview(chip);
+    if (boxOf(calm)) persistDraft();
+  }
+  /**
+   * A text that did not go comes back (M104): into its box when that box is empty, else onto the Put back notice, never
+   * merged into a draft. A calm send that did not land and the queued card's text the composer refused (`keepLine`, the
+   * M102 review 3) both take this one road.
+   */
+  function giveBack(back: SentBack): void {
+    if (roomFor(back)) {
+      writeBack(back);
+      return;
+    }
+    // Appended to its pane's stored list, never in place of a text already there (the M102 review 3).
+    const item: PutBackItem = { draft: back.draft, chips: [...back.chips], line: back.line };
+    if (back.intent !== undefined) item.intent = back.intent;
+    const list = [...loadPutBack(back.scope, back.pane), item];
+    savePutBack(back.scope, back.pane, list);
+    // The store keeps no preview; a chip put back later draws its icon tile, as a restored draft's does.
+    for (const chip of back.chips) revokePreview(chip);
+    if (!boxOf(back)) return;
+    setPutBackList(list);
+    setHeldBackFull(false);
+  }
+  /**
+   * Put back, beside the notice: the newest kept text goes into its box once that box is empty, and the next one shows.
+   * Never merged, never over a text or an open Undo window.
+   */
+  function putBack(): void {
+    const list = loadPutBack(scope, paneId);
+    const newest = list[list.length - 1];
+    if (newest === undefined) return;
+    const back: SentBack = { draft: newest.draft, chips: newest.chips, pane: paneId, scope, line: newest.line, ...intentOf(newest) };
+    if (!roomFor(back)) {
+      setHeldBackFull(true);
+      return;
+    }
+    const rest = list.slice(0, -1);
+    savePutBack(scope, paneId, rest);
+    setPutBackList(rest);
+    setHeldBackFull(false);
+    writeBack(back);
   }
 
   // One Send Protocol request (lib/reply-action.ts). The id is kept for a retry of the same intent
@@ -1692,61 +2488,146 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
   // `sent`, `effective` or a `discarded` the bridge took.
   // `resend` is a resend of an ended held row: the request carries the old id and an empty text, the
   // bridge takes the row's own text, and `shown` (the row's text, maybe masked) is only for the preview.
-  async function sendThroughProtocol(t: string, isDraft: boolean, mode: SendMode, rowsHash: string | null, capAck = false, resend?: { oldId: string; shown: string }, when?: SendWhen): Promise<boolean> {
+  // `shown` is the text the person sees as sent when it is not `t`: a tap's words, whose request carries no text.
+  // `fromSecret` is true only for the code field's own send: it alone is sent as `secret`, and while the
+  // screen asks for a code it alone may go (the M102 review, B, here as the backstop for every caller).
+  async function sendThroughProtocol(t: string, isDraft: boolean, mode: SendMode, rowsHash: string | null, capAck = false, resend?: { oldId: string; shown: string }, when?: SendWhen, view?: SendRequestBody["view"], shown?: string, override = false, fromSecret = false): Promise<boolean> {
     if (starting) return false;
+    const notTheField = secretRefusal(fromSecret);
+    if (notTheField !== null) {
+      setSendRefusal(notTheField);
+      return false;
+    }
     setSending(true);
     setSendRefusal(null);
     setPendingUnknown(null); // a new send supersedes the last one's open question (#511)
+    setUnknownAnswer(null);
     // What an `unknown` answer would have to be settled against (#511): when this send started,
     // which journal turns already stood, and what the field held. Snapshotted before the request,
     // so a turn landing while it is in flight still counts as this send's.
     const sentAt = Date.now();
+    tapAtRef.current = sentAt;
     const seenUserUuids = new Set((chatEntriesRef.current ?? []).map((entry) => entry.uuid));
-    const draftAtSend = inputValueRef.current;
+    const sentFrom = draftNow();
+    const draftAtSend = sentFrom.text;
+    // The draft's own text when this send carries it, for the stored request id to follow the draft (lib/send-intent.ts).
+    const draftLine = isDraft && t === composeLine(draftAtSend, sentFrom.chips, isShell) ? t : null;
     // A send ends the belt X's Undo window: the operator has moved on, and an Undo landing after
     // the send would put back a draft the pane has since answered.
     endUndoWindow();
     // The operator has just acted on this pane, so the poller should watch it land, from the tap on.
     stampSend(paneId);
+    // The box send that let go of the box at the tap (M104), and how it ended: `failed` unless an answer says otherwise.
+    let calm: CalmSend | null = null;
+    let calmEnd: "sent" | "handover" | "failed" = "failed";
+    let calmRequest: string | null = null;
+    let calmIntent: IntentId | undefined;
     try {
-      const res = await sendText({ paneId, text: t, scope, mode, rowsHash, capAck, resendOf: resend?.oldId, when, held: protocolIntent.current });
+      // A text for a sign-in field says so (`secret`): the bridge writes no `line` of it, only its hash and length.
+      // Only the code field's own send is one, so a text from anywhere else is never typed into that field.
+      const secret = fromSecret && resend === undefined && view === undefined;
+      const where = paneScopeKey(scope, paneId);
+      const secretHeld = secret && secretIntentRef.current?.where === where ? secretIntentRef.current.intent : null;
+      const base: Parameters<typeof sendText>[0] = { paneId, text: t, scope, mode, rowsHash, capAck, resendOf: resend?.oldId, when, held: secret ? secretHeld : loadIntent(scope, paneId), secret, override };
+      // The box lets go here, after the stored intent of this text was read for the request (M104).
+      if (isDraft && !secret && resend === undefined && view === undefined && t.trim() !== "" && composeLine(draftAtSend, sentFrom.chips, isShell).trim() === t.trim() && !secretDraftRef.current && noEchoRef.current === null) {
+        calm = startCalm(sentFrom, t, mode, seenUserUuids, sentAt);
+      }
+      const res = await sendText(view === undefined ? base : { ...base, view });
       if (res.status === "noAnswer") {
-        // No answer: the id stays, so the next tap on the same text asks for the same request.
-        protocolIntent.current = res.intent;
-        setSendRefusal(phoneRefusal(translate("composer.protocol.retry", { error: res.error })));
+        calmIntent = res.intent;
+        // No answer: the id stays, so the next tap on the same text asks for the same request. A sign-in code's
+        // intent is never stored: it stays in memory, bound to the field's text until that changes (the M102 review 2, D).
+        if (secret) secretIntentRef.current = { where, intent: res.intent };
+        else saveIntent(scope, paneId, res.intent, draftLine);
+        // A code's notice still asks the person to look first: the field may have closed, or its text changed, since.
+        setSendRefusal(phoneRefusal(secret ? translate("composer.protocol.retrySecret") : translate("composer.protocol.retry", { error: res.error })));
         return false;
       }
-      protocolIntent.current = null;
+      // Any answer ends the intent. A refusal from the phone itself (offline) asked nothing, so an earlier id stays.
+      if (res.status !== "refused" || res.reason !== "offline") {
+        if (secret) secretIntentRef.current = null;
+        else clearIntent(scope, paneId);
+      }
       if (res.status === "refused") {
+        if (res.reason === "view") {
+          // A refusal of a send from a view, before the protocol: Collie's words for its code, never the code.
+          viewAnswerRef.current = { line: null, code: res.code };
+          setSendRefusal(phoneRefusal(translate(viewRefusalKey(res.code))));
+          return false;
+        }
         setSendRefusal(phoneRefusal(res.error));
         return false;
       }
       const { reply, reading } = res;
+      if (view !== undefined) viewAnswerRef.current = { line: reply.viewLine ?? null, code: null };
+      // A send from a view the protocol refused (over the person's draft, at a question, a pane with no
+      // profile, a turn, a screen that moved): one quiet line in Collie's words and no offer. The draft in
+      // the session's box and the text in this box stay as they are; nothing retries.
+      if (view !== undefined && reply.outcome === "refused") {
+        viewAnswerRef.current = { line: null, code: reply.reason };
+        setProtocolOffer(null);
+        const words = phoneRefusal(translate(viewRefusalKey(reply.reason, reply.detail)));
+        setSendRefusal(reply.reason === "draft_present" ? { ...words, tone: "neutral" } : words, reply.surface ?? shownSurface, false);
+        return false;
+      }
       // Report a problem (ADR 0123): the answer joins this pane's streak. Plain rules over the outcome and
       // reason (lib/report/trouble.ts); nothing is sent and nothing is retried. This machine's panes only.
       if (reportOn && reply.outcome !== null) {
         const settledAt = Date.now();
         noteSend(reportKey, paneId, { requestId: res.requestId, outcome: reply.outcome, reason: reply.reason, cap: reply.cap !== null, at: settledAt }, settledAt, scope);
       }
+      // A known answer, gone or not gone, ends the question about this text.
+      if (reading.note !== "unknown" && t !== "") forgetUnknownSend(scope, paneId, t, isShell);
       if (reading.clear) {
         setProtocolOffer(null);
-        afterVerifiedSend(resend?.shown ?? t, isDraft, verifiedNote(reading.note, when));
+        const note = verifiedNote(reading.note, when);
+        calmEnd = note === "held" || note === "queued" || note === "queuedInstead" ? "handover" : "sent";
+        calmRequest = res.requestId;
+        afterVerifiedSend(resend?.shown ?? shown ?? t, isDraft, note, sentFrom);
         return true;
       }
-      // A resend makes no offer: an offer would carry the row's text, which may be masked.
-      const offered = reading.offers.length > 0 && resend === undefined;
+      // Text the bridge typed and left in the box (`typed_not_submitted`) is this send's own, not a draft
+      // someone typed in the terminal (field case 2026-11-13): the "Draft in terminal" preview must not
+      // offer it back to Take over, which would put it into the field a second time. A Send of the same
+      // text again finishes it on the bridge (only the submit key goes out).
+      if (reading.note === "typed" && t !== "") {
+        setHandledKey(normalizeDraft(t));
+        setPreviewLatched(false);
+      }
+      // A resend makes no offer: an offer would carry the row's text, which may be masked. A sign-in code
+      // makes none either: an offer keeps the text for a later tap, and a code is never kept (the M102 review, A).
+      const offered = reading.offers.length > 0 && resend === undefined && !secret;
       setProtocolOffer(offered ? { text: t, isDraft, rowsHash: reply.rowsHash, offers: reading.offers, capAck: reading.cap !== null } : null);
-      const refusal = readingRefusal(reading);
-      setSendRefusal(
-        returnedDraft && reading.note === "draft" ? { ...refusal, sentence: translate("composer.protocol.draftIsReturned") } : refusal,
-        reply.surface ?? shownSurface,
-        offered,
-      );
+      // The revision the answer read: a Send again that waits for another send turns on once a later read differs.
+      const refusal = { ...readingRefusal(reading), atRevision: (reply.surface ?? shownSurface).revision };
+      // A screen Collie cannot read: the pane opens its card, with the person's Keys pad and "Type it
+      // anyway", instead of a sentence only (M102 spec 03).
+      // A not_free refusal now offers Send anyway (invariant I4), so its step is the offer; the card of a screen
+      // Collie cannot read opens for it all the same.
+      if (reading.step === "screen" || (reading.offers.includes("commit") && (reading.surface === "unknown" || reading.surface === "unreachable" || reading.surface === "unreadable"))) onScreenUnread?.();
+      // An override that met a menu, or whose text waits for the person's Enter (M102 spec 12): the Keys
+      // pad opens, unless the person has a drawer open. A refused override carries the screen now and
+      // its hash, so "Send past this screen" stays armed on the rows the card shows next.
+      if (reply.reason === "menu_open" || reading.note === "overrideTyped" || reply.textAlreadyTyped === true) {
+        if (drawerRef.current === null) requestDrawer("keys");
+      }
+      if (override && typeAnywaySendRef.current && reply.outcome === "refused" && reply.cap === null && reply.rowsHash !== null) setOverrideHash(reply.rowsHash);
+      const noticeOn = reply.surface ?? shownSurface;
+      const notice: SendRefusal = { ...refusal, sentence: refusalSentence(refusal.sentence, { returnedDraft, note: reading.note, draftSeen: reply.draftSeen === true, alreadyTyped: reply.textAlreadyTyped === true, overrideMoved: override && reply.outcome === "refused" && (reply.reason === "stale_surface" || reply.reason === "stale_view") && reply.rowsHash !== null }) };
+      setSendRefusal(notice, noticeOn, offered);
       // An `unknown` outcome is an open question the journal can still answer (#511): remember the
       // send, so its text landing as a user turn retires this notice and the kept draft. A resend
       // carries no text of its own to recognise, so it is never remembered.
       if (reading.note === "unknown" && resend === undefined) {
-        setPendingUnknown({ sentText: t, draftText: draftAtSend, isDraft, at: sentAt, seenUserUuids });
+        if (secret) secretSpentRef.current = true;
+        // A sign-in code is remembered by no text at all: nothing of it is kept for a resend (the M102 review, A).
+        setPendingUnknown({ sentText: secret ? "" : t, draftText: secret ? "" : draftAtSend, isDraft, at: sentAt, seenUserUuids });
+        // The next tap on this same text asks "Send it again?" first (lib/send-again.ts, memory only).
+        if (isDraft && t !== "") rememberUnknownSend(scope, paneId, t, Date.now(), isShell);
+        // The bridge took the text and could not see it land: the pane's card asks which it was (M102 spec 04). Only
+        // an `unknown` receipt has a request to mark; a sign-in code keeps no text, so it awaits nothing to send again.
+        if (reply.outcome === "unknown") setUnknownAnswer({ requestId: res.requestId, secret, awaitingUntil: awaitingOnPhone(reply.awaitingUntil), noticeKey: refusalKey(notice, noticeOn), interrupted: reply.reason === "interrupted" });
       }
       // A password prompt on the screen the composer already shows (#103): the bridge could not see
       // the text land, because the prompt never echoes it. Say so, drop the stored draft, offer Type.
@@ -1758,8 +2639,21 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
       // A discard the bridge took clears nothing of the draft, but the request went through: a held row's Discard dismisses on it.
       return reading.note === "discarded";
     } finally {
+      if (calm !== null) settleCalm(calm, calmEnd, calmRequest, calmIntent);
       setSending(false);
     }
+  }
+
+  // Cancel on a held send gives its words back: into this box when it is empty (text and chips), else into the
+  // stored draft of the pane they came from when that holds nothing. A box with words of its own is left alone.
+  function returnHeldWords(words: string, fromPane: string) {
+    if (draftPaneRef.current.paneId !== fromPane) {
+      const stored = loadDraftEntry(scope, fromPane);
+      if (stored === null || (stored.text.trim() === "" && stored.attachments.length === 0)) saveDraft(scope, fromPane, words);
+      return;
+    }
+    if (inputValueRef.current.trim() !== "" || attachmentsRef.current.length > 0) return;
+    updateInput(words);
   }
 
   // A tap on an ended held row. Resend: a NEW request (a new id) that names the old one in `resendOf`
@@ -1772,6 +2666,55 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
     if (starting || sending || locked) return Promise.resolve(false);
     if (action === "resend") return sendThroughProtocol("", false, row.mode, null, false, { oldId: row.requestId, shown: row.text });
     return sendThroughProtocol(row.text, false, action, null);
+  }
+
+  // Send it now on a held row that waited two minutes (M102 spec 12). The person looked at the screen and
+  // chose: the row is cancelled first (so the bridge never sends it too), then its text goes once with
+  // `override` and a rows hash read fresh. A read that gives no hash, or a cancel that finds the row gone
+  // out, sends nothing and leaves the row as it was. A send that fails gives the words back to the box.
+  // Only the tap runs this; nothing here sends by itself. True when the bridge took the send.
+  async function sendHeldNow(row: HeldRow): Promise<boolean> {
+    if (locked) {
+      sayTap(lockWords ?? unreachableWords);
+      return false;
+    }
+    const tapWords = refusedTapWords();
+    if (tapWords !== null) {
+      sayTap(tapWords);
+      return false;
+    }
+    const reading = translate("unreadDialog.reading");
+    setStatus(reading, "info", null);
+    let hash: string | null;
+    try {
+      hash = (await api.postSend({ id: mintRequestId(), pane: paneId, text: "", mode: "prepare" }, scope)).rowsHash;
+    } catch (e) {
+      setStatus(describeThrownError(e), "error");
+      return false;
+    } finally {
+      if (currentStatus()?.text === reading) clearStatus();
+    }
+    if (hash === null) {
+      setSendRefusal(phoneRefusal(translate("unreadDialog.typeAnywayFailed")));
+      return false;
+    }
+    try {
+      const answer = await api.cancelHeldSend(row.requestId, paneId, scope);
+      if (answer.result !== "cancelled") {
+        setStatus(translate(answer.receipt === undefined ? "composer.held.cancelLate" : "composer.held.wentOut"), "warn");
+        return false;
+      }
+    } catch (e) {
+      // An unknown id is a row another phone already took away.
+      if (!api.isApiErrorStatus(e, 404)) setStatus(describeThrownError(e), "error");
+      return false;
+    }
+    typeAnywaySendRef.current = true;
+    const sent = await sendThroughProtocol(row.text, false, row.mode, hash, false, undefined, undefined, undefined, row.text, true).finally(() => {
+      typeAnywaySendRef.current = false;
+    });
+    if (!sent) returnHeldWords(row.text, paneId);
+    return sent;
   }
 
   // A tap on an offer the last answer made: a new request with a new id, or nothing (`cancel`).
@@ -1789,7 +2732,8 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
     // ahead only while the screen still hashes the same. After the cap's notice the commit is the extra
     // confirm: it carries `capAck` (M56 spec 09).
     const seen = offer === "commit" || offer === "submit" || offer === "discard" ? held.rowsHash : null;
-    void sendThroughProtocol(words, held.isDraft, mode, seen, offer === "commit" && held.capAck);
+    // The commit is the person's tap through a screen Collie could not read: it says so (M102 spec 01).
+    void sendThroughProtocol(words, held.isDraft, mode, seen, offer === "commit" && held.capAck, undefined, undefined, undefined, undefined, offer === "commit");
   }
 
   // Gate the composer's Send through the destructive-input confirm: a matching command arms the
@@ -1799,7 +2743,10 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
   // turn. A destructive line arms "Really send?", and the confirming tap must send what was armed, so
   // `armedWhen` keeps the choice across the two taps (the confirm button calls this with it).
   function onSendClick(when?: SendWhen) {
-    if (starting) return;
+    if (starting) {
+      sayTap(translate("newPage.starting"));
+      return;
+    }
     // A reply in message mode goes to the other session through the bridge's walky route, and is not
     // typed into this pane by us, so the destructive-command guard (a shell concern) does not apply.
     if (walky.aim !== null) {
@@ -1809,8 +2756,23 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
     // The line the terminal gets: every chip's marker swapped for its path (ADR 0060). Both the
     // destructive check and the send read THIS, never the draft with its markers in it.
     const line = composeLine(input, attachments, isShell);
+    // THE "CANNOT TELL" CARD IS ON SCREEN (M102 spec 04): a tap on Send over the draft the unknown send left sends nothing.
+    // The card asks better than a guess does ("It arrived", "Send again"), so the tap puts a ring on it and brings it
+    // into view. A changed draft is a new message and goes as usual. Where no card shows (a dialog card or the
+    // unread card is up, or no pane hosts one), send-again.ts's second-tap question below still guards.
+    if (
+      cannotTellInScreen &&
+      pendingUnknown !== null &&
+      pendingUnknown.isDraft &&
+      unknownAnswer !== null &&
+      sentForm(line, isShell) === pendingUnknown.sentText
+    ) {
+      onCannotTellRing?.();
+      return;
+    }
     const reason = isDestructiveInput(line);
-    if (reason && !sendConfirm.confirm("send")) {
+    // The confirm is armed on this line, so a line edited after the first tap asks again.
+    if (reason && !sendConfirm.confirm(line)) {
       armedWhen.current = when;
       // On a crew the confirm names the machine as well as the pattern: "rm -r" is a different
       // sentence depending on whose disk it runs on, and this line is the last thing read before the
@@ -1822,18 +2784,42 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
       );
       return;
     }
+    // A second tap on the text of a send that ended unknown, moments ago, on this pane: ask once. A
+    // destructive line has had its own confirm by now; this one is about a message that may have gone.
+    // The memory holds the text as `send` types it, and both ends read it through `sentForm` (lib/send-again.ts).
+    if (asksSendAgain(scope, paneId, line, Date.now(), isShell)) {
+      // A tap on the armed word within SEND_AGAIN_CONFIRM_DELAY_MS of the arm (700 ms) is a double tap by habit: it does
+      // nothing, so the word stays and the shared confirm's 3 seconds keep running from the arm.
+      if (sendConfirm.pending === sendAgainId(line) && Date.now() - sendAgainArmedAt.current < SEND_AGAIN_CONFIRM_DELAY_MS) return;
+      if (!sendConfirm.confirm(sendAgainId(line))) {
+        sendAgainArmedAt.current = Date.now();
+        setSendAgainWaiting(true);
+        if (sendAgainWaitTimer.current !== null) clearTimeout(sendAgainWaitTimer.current);
+        sendAgainWaitTimer.current = setTimeout(() => setSendAgainWaiting(false), SEND_AGAIN_CONFIRM_DELAY_MS);
+        armedWhen.current = when;
+        setDestructiveNote(null);
+        return;
+      }
+    }
     sendConfirm.reset();
     setDestructiveNote(null);
     armedWhen.current = undefined;
+    forgetUnknownSend(scope, paneId, line, isShell); // the confirming tap ends it; an unknown answer arms it afresh
     void send(line, true, when);
   }
-  const confirmingSend = sendConfirm.pending === "send";
+  // Armed on the composed line: an edited line no longer stands armed, and the note goes with it.
+  const confirmLine = composeLine(input, attachments, isShell);
+  const confirmingDestructive = sendConfirm.pending !== null && sendConfirm.pending === confirmLine;
+  // The same slot and the same word-in-the-Send-button, asked of a line whose last send ended unknown.
+  const confirmingAgain = sendConfirm.pending !== null && sendConfirm.pending === sendAgainId(confirmLine);
+  const confirmingSend = confirmingDestructive || confirmingAgain;
   // A modal ask owns the agent's keyboard: the Send slot and the placeholder say so (spec 10).
   const askOwnsKeys = slot === "answer" && !direct.active;
   // The mic beside Attach, for a box that holds a draft or a chip (issue 573): the round button is Send
   // then, and a second clip is how a person adds to what is already written. Two mics never show at
   // once. It stays away while the round slot holds a word ("Answer the dialog" / "Really send?"), where
   // the row is already tight.
+  const confirmWord = translate(confirmingAgain ? "composer.send.sendAgain" : "composer.send.reallySend");
   const draftMicShown = micShown && !direct.active && hasDraft && !askOwnsKeys && !confirmingSend;
   const micAriaLabel = !micAvailable
     ? (stt?.reason ?? translate("composer.mic.unavailable"))
@@ -1844,12 +2830,26 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
     recorder.phase === "transcribing" ? (
       <Icon name="busy" className="size-4 animate-spin" />
     ) : recorder.phase === "recording" ? (
-      <Icon name="stop" className="size-4 fill-current" />
+      <Icon name="stop" className="size-4" />
     ) : (
       <Icon name="mic" className="size-4" />
     );
-  const micDisabled = !micAvailable || locked || offline || sending || recorder.phase === "transcribing";
+  // A mic that cannot record keeps the tap and says why (M102 spec 11): a phone shows no `title`, so a
+  // disabled button with its reason only there is a dead one. Only a running send or a clip on its way to
+  // the provider disables it, and the spinner beside it is that state's word.
+  const micBusy = sending || recorder.phase === "transcribing";
+  const micInert = !micAvailable || locked || startHeld || offline;
+  function micOffWords(): string {
+    if (!micAvailable) return stt?.reason ?? translate("composer.mic.unavailable");
+    if (locked) return lockWords ?? unreachableWords;
+    if (startHeld) return translate("newPage.starting");
+    return translate("composer.send.reconnect");
+  }
   function onMicClick(e: MouseEvent, opener: "primary" | "draft") {
+    if (micInert && recorder.phase !== "recording") {
+      setStatus(micOffWords(), "info");
+      return;
+    }
     // `detail` is 0 for a click the keyboard made: the takeover then shows its focus mark.
     openedByKeyboard.current = e.detail === 0;
     micOpener.current = opener;
@@ -1859,12 +2859,99 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
   // The refusal's reason at the thumb. Not in Type mode, and not beside the password notice, which
   // already says why at this spot. With an ask it stands beside the "Answer the dialog" word: a send
   // that came from a quick reply has no other place to be told.
-  const refusalShown = sendRefusal !== null && shownRefusalKey !== hiddenRefusalKey && !direct.active && noEcho === null;
+  // M102 spec 11: Type mode hides nothing (a Stop's receipt and a quick reply's refusal stand there too), and
+  // only the password notice keeps a refused SEND under it. A Stop's receipt shows under it as well.
+  const underPasswordNotice = noEcho !== null && sendRefusal?.isReceipt !== true;
+  // While the "cannot tell" card is on screen it carries the sentence of the unknown send, so that notice stays down
+  // (M102 spec 04). Only that one: a later refusal (a link that is down, a lock) has words the card does not.
+  const cannotTellInScreen = cannotTellFacts !== null && (cannotTellInView ?? true);
+  const cardStandsIn = cannotTellInScreen && unknownAnswer !== null && shownRefusalKey === unknownAnswer.noticeKey;
+  const refusalShown = sendRefusal !== null && shownRefusalKey !== hiddenRefusalKey && !underPasswordNotice && !cardStandsIn;
   // The way on, as buttons in the notice: the card, the screen, the Keys dock. Each only where it can do
   // something: the Screen when it is not showing, the Keys dock when it can open and is not open.
   const refusalCard = sendRefusal?.toCard === true && onAnswerDialog !== undefined && dialogCard;
   const refusalScreen = sendRefusal?.screen === true && screen !== undefined && !screen.on;
   const refusalKeys = way.keysOpen && drawer !== "keys";
+  // The sign-in field the person closed is one tap away again, from the notice that says it is closed.
+  const refusalSecret = secretField && secretClosed;
+  const secretOpen = secretField && !secretClosed && !direct.active;
+  // The offer of "Enter sends" shows only while nothing is chosen, and never in Type mode (its Enter is its own).
+  const enterOfferShown = enterOffer && enterChoice === null && !direct.active;
+  // THE STEP (M102 spec 02): the one button that changes the situation, first in the notice. The card (or,
+  // with no card, the Screen) and Open Keys follow it, so the notice holds at most two buttons plus the
+  // card. A step that cannot act here draws nothing: the card and the Keys pad still show.
+  const refusalStep = sendRefusal?.step ?? null;
+  // Send again after a refusal for another running send waits until a later read differs and the box
+  // holds no text (the other send went or was taken back). It never sends by itself.
+  const otherSendWaiting =
+    refusalStep === "sendAgain" &&
+    sendRefusal?.waits === true &&
+    sendRefusal.atRevision !== undefined &&
+    (shownSurface.revision === sendRefusal.atRevision || shownSurface.composer === "draft");
+  // A Send again of an `unknown` send also waits for the agent's own word, as the card's does (spec 13).
+  const stepWaiting = otherSendWaiting || (refusalStep === "sendAgain" && awaitingWord);
+  const stepButton =
+    refusalStep === "sendAgain"
+      ? !locked && lastSendRef.current !== null && (!lastSendRef.current.secret || secretField)
+      : refusalStep === "stop"
+        ? stopOffered
+        : refusalStep === "emptyBox"
+          ? way.keysSendable
+          : refusalStep === "screen" && screen !== undefined && !screen.on;
+  // A code's Send again is "Enter it again": nothing of it was kept to send (the M102 review, A).
+  const stepWord = refusalStep === "sendAgain" && lastSendRef.current?.secret === true ? translate("cannotTell.enterAgain") : stepLabel(refusalStep);
+  function onRefusalStep(): void {
+    if (refusalStep === "stop") {
+      void stopTurn();
+      return;
+    }
+    if (refusalStep === "emptyBox") {
+      void clearBox();
+      return;
+    }
+    if (refusalStep === "screen") {
+      screen?.onToggle();
+      return;
+    }
+    if (refusalStep !== "sendAgain" || stepWaiting) return;
+    sendAgainNow();
+  }
+  /** "Enter it again" for a sign-in code: the code field opens empty and takes the focus. Nothing is restored or sent. */
+  function enterSecretAgain(): void {
+    setSendRefusal(null);
+    setSecretClosed(false);
+    setSecretFresh((n) => n + 1);
+  }
+  /**
+   * The person's tap on a Send again (the notice's step, or the "cannot tell" card's button): the last send once more, as a
+   * new request through the whole Send Protocol. The tap is the decision, so the "Send it again?" second tap is not
+   * asked on top of it. A send that ended unknown is sent again by its OWN text (`pendingUnknown.sentText`), never by the
+   * field as it reads now: words typed or edited since are the next message (the M102 review, C). The field is left as
+   * it is, unless it still holds exactly that text, which then goes as the draft it is. Any other draft is sent from the
+   * field as it reads now.
+   */
+  function sendAgainNow(): void {
+    const last = lastSendRef.current;
+    if (last === null) return;
+    // The one wait guard for both buttons: while the agent's own word may still come, nothing goes (spec 13).
+    const until = unknownAnswerRef.current?.awaitingUntil ?? null;
+    if (until !== null && Date.now() < until) return;
+    // A code has no text kept to send again: the field opens empty, while the screen still asks for one.
+    if (last.secret) {
+      if (secretFieldRef.current) enterSecretAgain();
+      return;
+    }
+    const field = composeLine(input, attachments, isShell);
+    if (pendingUnknown !== null && pendingUnknown.sentText !== "") {
+      const kept = pendingUnknown.sentText;
+      forgetUnknownSend(scope, paneId, kept, isShell);
+      void send(kept, last.isDraft && sentForm(field, isShell) === kept);
+      return;
+    }
+    const line = last.isDraft ? field : last.value;
+    forgetUnknownSend(scope, paneId, line, isShell);
+    void send(line, last.isDraft);
+  }
   // What the field's placeholder says: the facts first (a pane that is gone, a device that may not
   // write, a box out of reach), then Type mode, then the shell line, then (M69) the Steer hint while a
   // turn runs on a harness that can steer, then the ordinary reply line. The placeholder names no other
@@ -1882,17 +2969,23 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
   // says so in the same place, before the Steer hint: a send probes the box first, so the person knows
   // why a send may come back refused.
   const staleWords = way.state !== "gone" && way.state !== "readOnly" && way.state !== "unreachable" && !direct.active && !isShell && surface.staleFrame === true;
+  // A box the read could not reach is not a lock any more (spec 03, I4): it stays typeable, and the
+  // placeholder still names it, from the way out rather than the slot.
   const placeholderWords =
-    way.state === "gone"
-      ? translate("composer.placeholder.gone")
-      : way.state === "readOnly"
-        ? translate("composer.placeholder.readOnly")
-        : way.state === "unreachable"
-          ? unreachableWords
-          : direct.active
-            ? translate("composer.placeholder.direct")
-            : isShell
-              ? translate("composer.placeholder.shell")
+    lockWords !== null
+      ? lockWords
+      : way.state === "unreachable"
+        ? unreachableWords
+        : startHeld
+        ? translate("newPage.starting")
+        : direct.active
+        ? translate("composer.placeholder.direct")
+        : isShell
+          ? translate("composer.placeholder.shell")
+          : secretField
+            ? translate("composer.secret.hint")
+            : overrideHash !== null
+              ? translate("unreadDialog.typeAnywayHint")
               : staleWords
                 ? translate("composer.stale.hint")
                 : steerWords
@@ -1929,7 +3022,10 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
   async function pressKeys(k: string[]): Promise<boolean> {
     // Only a pane that is gone, a device that may not write, or a multiplexer with no key to send stops
     // the pad (lib/way-out.ts): a box out of reach, a refused send and a stale read never do.
-    if (!way.keysOpen) return false;
+    if (!way.keysOpen) {
+      setStatus(lockWords ?? unreachableWords, "info");
+      return false;
+    }
     if (offlineRef.current) {
       setStatus(translate("composer.send.reconnect"), "error");
       return false;
@@ -2018,7 +3114,10 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
     const target = editTargetRef.current;
     if (target === null || target.epoch !== editEpoch.current) return;
     if (!sameEditTarget(target, draftPaneRef.current)) return;
-    if (lockedRef.current) return;
+    if (lockedRef.current) {
+      sayFileLocked();
+      return;
+    }
     if (editReplaceRef.current !== null && file === editReplaceRef.current) {
       finishEdit("cancel");
       return;
@@ -2054,7 +3153,9 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
   }, []);
 
   useEffect(() => {
-    if (editSession !== null && locked) abortEditRef.current();
+    if (editSession === null || !locked) return;
+    sayFileLocked();
+    abortEditRef.current();
   }, [editSession, locked]);
 
   // Upload an attachment. `targetPaneId` is the pane the file was accepted for: an edit confirmed
@@ -2066,7 +3167,10 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
     alreadyHeld = false,
     replaceN?: number,
   ) {
-    if (lockedRef.current) return;
+    if (lockedRef.current) {
+      sayFileLocked();
+      return;
+    }
     const refusal = rejectAttachment(file, limits);
     if (refusal === "tooLarge") {
       setStatus(translate("composer.upload.tooLarge", { max: limitMb(limits) }), "error");
@@ -2156,7 +3260,14 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
     if (edited === "cancel") return;
     try {
       if (!mountedRef.current || epoch !== editEpoch.current) return;
-      if (lockedRef.current || offlineRef.current) return;
+      if (lockedRef.current) {
+        sayFileLocked();
+        return;
+      }
+      if (offlineRef.current) {
+        setStatus(translate("composer.send.reconnect"), "error");
+        return;
+      }
       const target = draftPaneRef.current;
       await uploadFile(edited, target.paneId, target.scope, true, attachment.n);
     } finally {
@@ -2258,6 +3369,67 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
     setClearedDraft(held);
   }
 
+  /**
+   * "It arrived" on the "cannot tell" card (M102 spec 04): the person's word goes to the bridge, and only when it was
+   * recorded does anything here change. The kept draft then goes through the belt's own clear (`clearByHand`, so
+   * "Undo clear" is one tap away), and only while the field still holds what it held at the send: words typed since
+   * are the next message. A sign-in code keeps no draft, so only the question ends. Any answer but `recorded` leaves
+   * everything as it was: `failed` may be tapped again, and a 409 (`settled`) or a 404 (`unknownHere`) is final, for the
+   * card to say so and offer Close (the M102 review, K).
+   */
+  async function markUnknownArrived(): Promise<ArrivedAnswer> {
+    const answer = unknownAnswer;
+    const pending = pendingUnknown;
+    if (answer === null) return "failed";
+    try {
+      await api.postArrived(paneId, answer.requestId, scope);
+    } catch (e) {
+      if (api.isApiErrorStatus(e, 409)) return "settled";
+      if (api.isApiErrorStatus(e, 404)) return "unknownHere";
+      return "failed";
+    }
+    // A new send ended this question while the request ran: the word is on the old receipt, and the new one is untouched.
+    if (unknownAnswerRef.current?.requestId !== answer.requestId) return "recorded";
+    if (
+      pending !== null &&
+      pending.isDraft &&
+      inputValueRef.current === pending.draftText &&
+      composeLine(inputValueRef.current, attachmentsRef.current, isShell) === pending.sentText
+    ) {
+      clearByHand();
+    }
+    if (pending !== null) forgetUnknownSend(scope, paneId, pending.sentText, isShell);
+    setPendingUnknown(null);
+    setUnknownAnswer(null);
+    setProtocolOffer(null);
+    setSendRefusal(null);
+    return "recorded";
+  }
+
+  /** Close on the "cannot tell" card after a final answer: the question and its notice end. The draft stays as it is. */
+  function endCannotTell(): void {
+    if (pendingUnknown !== null) forgetUnknownSend(scope, paneId, pendingUnknown.sentText, isShell);
+    setPendingUnknown(null);
+    setUnknownAnswer(null);
+    setSendRefusal(null);
+  }
+
+  /**
+   * The card's second button (M102 spec 04). A sign-in code has no text to send again: the frame opens empty and takes
+   * the focus, and nothing is restored. Any other send goes again by the person's tap, as a new request.
+   */
+  function answerCannotTellAgain(): void {
+    const answer = unknownAnswer;
+    if (answer === null) return;
+    if (!answer.secret) {
+      sendAgainNow();
+      return;
+    }
+    setPendingUnknown(null);
+    setUnknownAnswer(null);
+    enterSecretAgain();
+  }
+
   /** Undo: the text, the chips with their previews, the chip numbering and the stored draft come
    *  back as they were, through the same write-through as a keystroke. Under a recognised password
    *  prompt that write-through stores nothing (ADR 0017), so Undo stores nothing either. */
@@ -2316,6 +3488,8 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
       label: translate("composer.controls.clear"),
       onClick: clearByHand,
       inert: sending || direct.active,
+      // The inert X says why (M102 spec 11): the spinner or the Type strip alone is no word for the tap.
+      onInert: () => setStatus(translate(sending ? "composer.tap.clearBusy" : "composer.tap.clearType"), "info"),
     };
   }
 
@@ -2340,7 +3514,10 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
     const epoch = editEpoch.current;
     for (const file of files) {
       if (!mountedRef.current || epoch !== editEpoch.current) return;
-      if (lockedRef.current) return;
+      if (lockedRef.current) {
+        sayFileLocked();
+        return;
+      }
       const refusal = rejectAttachment(file, limits);
       if (refusal === "tooLarge") {
         setStatus(translate("composer.upload.tooLarge", { max: limitMb(limits) }), "error");
@@ -2365,7 +3542,14 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
         if (edited === "cancel") continue;
         try {
           if (!mountedRef.current || epoch !== editEpoch.current) return;
-          if (lockedRef.current || offlineRef.current) return;
+          if (lockedRef.current) {
+            sayFileLocked();
+            return;
+          }
+          if (offlineRef.current) {
+            setStatus(translate("composer.send.reconnect"), "error");
+            return;
+          }
           const target = draftPaneRef.current;
           await uploadFile(edited, target.paneId, target.scope, true);
         } finally {
@@ -2391,19 +3575,34 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
   // pasted FILE becomes an upload. Copying a `.md` in a file manager produces the second; selecting
   // its contents in an editor produces the first, and neither has become the other.
   function onPasteFile(e: ClipboardEvent<HTMLTextAreaElement>) {
+    // Held for a start: a paste, of text or of a file, reaches neither the draft nor an upload.
+    if (startHeld) {
+      e.preventDefault();
+      return;
+    }
     if (locked || direct.active) return;
     const items = e.clipboardData?.items ?? [];
+    let refusedFile = false;
     for (let i = 0; i < items.length; i++) {
       const item = items[i];
       if (item.kind !== "file") continue;
       const file = item.getAsFile();
       if (!file) continue;
-      if (rejectAttachment(file, limits) === "badType") continue;
+      if (rejectAttachment(file, limits) === "badType") {
+        refusedFile = true;
+        continue;
+      }
       e.preventDefault();
       void presentFiles([file], false);
       return;
     }
     const pastedText = e.clipboardData?.getData?.("text/plain") ?? "";
+    // A file the box refuses and no text beside it: the paste would be lost with no word (M102 spec 11).
+    // With text on the clipboard the text paste still goes through, as it always did.
+    if (refusedFile && pastedText === "") {
+      setStatus(translate("composer.tap.fileType"), "warn");
+      return;
+    }
     if (!isCollapsiblePaste(pastedText)) return;
     e.preventDefault();
     addPasteAttachment(pastedText);
@@ -2421,29 +3620,71 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
     beltPills.current = pills;
     return pills;
   };
-  const beltTap = useRef({ locked, send, stop: stopOffered ? stopTurn : null, changesPill, agents: subagentList.length > 0, jobs: jobList.length > 0, pins: pinCount > 0 });
-  beltTap.current = { locked, send, stop: stopOffered ? stopTurn : null, changesPill, agents: subagentList.length > 0, jobs: jobList.length > 0, pins: pinCount > 0 };
+  const beltTap = useRef({ locked, lockWords, send, stop: stopOffered ? stopTurn : null, changesPill, agents: subagentList.length > 0, jobs: jobList.length > 0, pins: pinCount > 0 });
+  beltTap.current = { locked, lockWords, send, stop: stopOffered ? stopTurn : null, changesPill, agents: subagentList.length > 0, jobs: jobList.length > 0, pins: pinCount > 0 };
   // The tap moved the focus here and left its act, which runs once, through the same handler and gates
   // as a tap on this belt. A pill this belt does not draw, or draws disabled, does nothing.
   useEffect(() => {
     const intent = takeBeltIntent(paneScopeKey(scope, paneId));
     if (intent === null) return;
     const tap = beltTap.current;
-    if (intent.kind === "action") {
-      const pill = beltPills.current.find((a) => a.id === intent.id);
-      if (pill !== undefined && pill.disabled !== true) pill.onSelect();
-    } else if (intent.kind === "run") {
-      if (!tap.locked) void tap.send(intent.text, false);
-    } else if (intent.kind === "changes") {
-      tap.changesPill?.onClick();
-    } else if (intent.kind === "agents") {
-      if (tap.agents) setAgentsOpen(true);
-    } else if (intent.kind === "jobs") {
-      if (tap.jobs) setJobsOpen(true);
-    } else if (intent.kind === "pins") {
-      if (tap.pins) setPinsOpen(true);
-    } else if (tap.stop !== null) {
-      void tap.stop();
+    // An act the pane cannot take now says so (M102 spec 11): the tap already moved the focus here, so a
+    // silent drop would look like a belt that did nothing. The lock's own words where the lock is the reason.
+    const dropped = (): void => {
+      setStatus(tap.locked && tap.lockWords !== null ? tap.lockWords : translate("composer.tap.beltOff"), "info");
+    };
+    switch (intent.kind) {
+      case "action": {
+        const pill = beltPills.current.find((a) => a.id === intent.id);
+        if (pill === undefined || pill.disabled === true) {
+          dropped();
+          return;
+        }
+        pill.onSelect();
+        return;
+      }
+      case "run":
+        if (tap.locked) {
+          dropped();
+          return;
+        }
+        void tap.send(intent.text, false);
+        return;
+      case "changes":
+        if (tap.changesPill === undefined) {
+          dropped();
+          return;
+        }
+        tap.changesPill.onClick();
+        return;
+      case "agents":
+        if (!tap.agents) {
+          dropped();
+          return;
+        }
+        setAgentsOpen(true);
+        return;
+      case "jobs":
+        if (!tap.jobs) {
+          dropped();
+          return;
+        }
+        setJobsOpen(true);
+        return;
+      case "pins":
+        if (!tap.pins) {
+          dropped();
+          return;
+        }
+        setPinsOpen(true);
+        return;
+      case "stop":
+        if (tap.stop === null) {
+          dropped();
+          return;
+        }
+        void tap.stop();
+        return;
     }
   }, [scope, paneId]);
 
@@ -2541,11 +3782,17 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
   }
   function sendExpanded() {
     closeExpanded();
-    // A dialog that owns the agent's keys is answered first: the box's Send slot says so once the
-    // layer is gone, and nothing is sent from here.
-    if (askOwnsKeys) return;
+    // A dialog that owns the agent's keys is answered first: `send` refuses with the Send slot's own
+    // notice, the one the box's Send shows, and nothing is typed from here (M102 spec 11).
+    if (askOwnsKeys) {
+      void send(composeLine(input, attachments, isShell), true);
+      return;
+    }
     onSendClick();
   }
+
+  // The newest text waiting on Put back for this pane (M104; the M102 review 3), and how many wait.
+  const heldBackHere = putBackList[putBackList.length - 1] ?? null;
 
   // The change of shape is played (hooks/use-flip.ts): the box's height, with every row held still,
   // and a button that appears slides in sideways from its own edge, never from above (Altan,
@@ -2553,7 +3800,8 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
   // field layout has one shape, so there only the entrances play: Send taking the microphone's place
   // and the small microphone beside it.
   const flipKey = `${boxOpen ? "open" : "rest"}:${micIsPrimary ? "mic" : "send"}:${draftMicShown ? "draft-mic" : ""}:${expandShown ? "expand" : ""}`;
-  useFlip(boxRef, flipKey, { enabled: true, grows: box });
+  // A box that let go of a sent text at the tap takes its closed shape at once (M104): `instant` plays nothing for it.
+  useFlip(boxRef, flipKey, { enabled: true, grows: box, instant: flipInstantRef });
 
   // Attach's tap and its picker's two rows, drawn by the box and by the fullscreen editor's row alike:
   // one behaviour in two places, never two.
@@ -2596,7 +3844,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
           "size-9 shrink-0 rounded-full bg-secondary text-foreground",
           (pressed || picking) && "scale-95 bg-primary text-primary-foreground duration-0",
         )}
-        disabled={uploading || locked || direct.active}
+        disabled={uploading || locked || startHeld || direct.active}
         onPointerDown={(e) => e.preventDefault()}
         onClick={onAttachClick}
         aria-label={translate("composer.attach.aria")}
@@ -2622,8 +3870,9 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
       type="button"
       variant="ghost"
       size="icon"
-      className={cn(TOOLBAR_TAP_TARGET, "size-9 shrink-0 rounded-full bg-secondary text-foreground")}
-      disabled={micDisabled}
+      className={cn(TOOLBAR_TAP_TARGET, "size-9 shrink-0 rounded-full bg-secondary text-foreground", micInert && "opacity-50")}
+      disabled={micBusy}
+      aria-disabled={micInert ? true : undefined}
       aria-pressed={recorder.busy}
       aria-label={micAriaLabel}
       title={micAvailable ? undefined : stt?.reason}
@@ -2667,24 +3916,13 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
         )}
         inert={takeoverOpen}
       >
-        {/* Pending-send preview: visible from send until the mirror echoes back (or 6s). Shows the
-            user what landed so they don't double-tap while waiting for the terminal to update.
-            IT STAYS IN THE FOOTER, AND IT IS NOT A PILL. The "sent" ping already IS one — send()
-            publishes `composer.status.sent` on the same line, and the top pills carry it. What is
-            left here is the other half, and it is a VERIFICATION surface: the ✓ says the text was
-            seen in the input box before the submit key went out (see send()), and this holds the
-            words themselves on screen until the mirror echoes them back, so the operator can check
-            what landed instead of tapping Send a second time. That is a CONDITION with a real
-            duration — the echo gap — and the gap regularly outlives a pill's 2.5s. A pill would also
-            truncate to a line of chrome, which is the one thing this must not do. */}
-        <Collapse open={lastSent !== null}>
-          <div className="mb-2 flex items-center gap-1.5 rounded-md bg-muted/40 px-2.5 py-1.5 text-xs text-muted-foreground">
-            <Icon name="busy" className="size-3 shrink-0 animate-spin" />
-            <span className="truncate">
-              <span className="font-medium">{translate("composer.sentPreview.label")}</span> {lastSent}
-            </span>
-          </div>
-        </Collapse>
+        {/* Pending-send preview: "You sent: …", for a send the mirror has not echoed back `SEND_SLOW_MS` after the
+            tap (up to 6s). It floats (`SendToast`, in the floating column above) and is not a row of this
+            footer: as a row it moved the belt, the box and the mirror each time a send went out (DESIGN.md §2:
+            a notice that will not outlive the next interaction floats). A send the pane echoes at once shows
+            nothing. It is not a pill either: the "sent" ping already IS one (`composer.status.sent`, beside the
+            session's name), and this holds the words on screen so the operator can check what landed instead of
+            tapping Send a second time. */}
 
         {/* File input stays mounted here (not inside the keyboard-only key row) so the picker
             callback survives the keyboard collapsing. Attach fires it from the reply-input row
@@ -2722,8 +3960,11 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
               onSend={(keys) => direct.sendPaneKeys(keys)}
               presets={keyPresets}
               board={keyBoard}
-              clearBox={{ available: clearOffered, onClear: clearBox }}
+              // `unavailable` is the word a tap on a greyed Clear answers with (M102 spec 11): a dialog, else no draft.
+              clearBox={{ available: clearOffered, unavailable: shownSurface.modal === "none" || shownSurface.modal === "unknown" ? "empty" : "dialog", onClear: clearBox }}
               onQueueChange={setQueuedKeys}
+              // While the card of a screen Collie cannot read is open, Enter asks a second tap (M102 spec 03).
+              confirmEnter={unreadState !== null}
               disabled={!way.keysSendable}
             />
           </ComposerDock>
@@ -2867,18 +4108,20 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
                 word: translate("composer.controls.type"),
                 on: direct.active,
                 pressed: direct.active,
-                disabled: locked || sending,
+                disabled: locked,
+                // A running send dims the pill and keeps the tap: arming says why it cannot (M102 spec 11).
+                inert: sending,
                 onSelect: () => {
                   if (direct.active) {
                     direct.deactivate();
                     return;
                   }
-                  // Close whatever dock is open first: the mode needs the phone keyboard, and a
-                  // dock holding half the viewport is the thing in its way. Routed through
-                  // requestDrawer so a staged key queue still gets its discard confirm
-                  // (ADR 0005).
+                  // A refused arming has said why, and leaves the dock where it is.
+                  if (!direct.activate()) return;
+                  // Close whatever dock is open: the mode needs the phone keyboard, and a dock holding
+                  // half the viewport is the thing in its way. Routed through requestDrawer so a staged
+                  // key queue still gets its discard confirm (ADR 0005).
                   requestDrawer(null);
-                  direct.activate();
                 },
               },
               {
@@ -2999,6 +4242,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
           // The X on the pinned block while the box holds a draft, then Undo in its place until
           // the next act (M40 spec 04). See `clearSlot` for when it shows.
           clear={clearSlot()}
+          marks={beltMarks}
         />
         {/* ── THE FOOTER'S NOTICE STRIPS, SORTED BY KIND (DESIGN.md §1, §2) ─────────────────────
             Every strip below arrives and leaves through `Collapse`, which is the only sanctioned way
@@ -3019,11 +4263,9 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
             reason and shares that place, one notice at a time, and so does the held-send card
             (amended 2026-10-18), above the notice. See `floating` above; it renders here. */}
         {draftNoticeSlot ? createPortal(floating, draftNoticeSlot) : floating}
-        {/* A launch this phone started, before the bridge has read its first screen: Send waits, and
-            this says why for as long as it is true. */}
-        <Collapse open={starting && !locked && !direct.active}>
-          <Notice variant="box" tone="info" announce="status">{translate("newPage.starting")}</Notice>
-        </Collapse>
+        {/* A launch this phone started, before the bridge has read its first screen: Send stays inert
+            (`starting`). The reason is not said here: the header's title and mark say it (agent-chat's
+            `HeaderStatus` condition and `RouteHeader`'s `starting`), where it costs this footer no row. */}
         {/* The Send Protocol's offers (M56 spec 05), at the thumb: Add / Replace / Cancel on a draft,
             Submit / Discard on text that was typed and not sent, and the second tap on a screen
             Collie cannot read. Each is a new request; the ✕ drops the strip and sends nothing. */}
@@ -3033,8 +4275,8 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
               offers={protocolOffer.offers}
               disabled={starting || sending || locked}
               onOffer={onProtocolOffer}
-              // The ✕ drops the strip and hides the notice over it: a notice that still says "tap Type
-              // here" with no Type here to tap is a sentence about a button that is gone.
+              // The ✕ drops the strip and hides the notice over it: a notice that still says "tap Send
+              // anyway" with no Send anyway to tap is a sentence about a button that is gone.
               onDismiss={() => {
                 setProtocolOffer(null);
                 hideRefusal();
@@ -3045,7 +4287,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
         </Collapse>
         {/* The password-prompt notice (#103). Sits here, in the same in-flow slot as the other
             strips, because that is where the eye already is when a send is refused — and it is a
-            NOTICE beside the unchanged two-tap Send ("Type here"), never a replacement for it. */}
+            NOTICE beside the unchanged two-tap Send ("Send anyway"), never a replacement for it. */}
         <Collapse open={noEcho !== null && !direct.active}>
           {noEcho !== null && !direct.active && (
             <NoEchoNotice
@@ -3058,15 +4300,16 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
                 locked
                   ? null
                   : () => {
-                      // The draft is a password we know the pane never accepted, and it is already
-                      // in localStorage. Clear it BEFORE arming — both because leaving a secret in a
-                      // 48h store is the leak this issue asked about, and because `activate` refuses
-                      // while any draft is present, which would make the offered remedy fail on the
-                      // spot.
-                      clearComposedDraft();
-                      requestDrawer(null);
+                      // The draft is a password we know the pane never accepted, and its stored copy was
+                      // dropped when this notice rose. `activate` takes it away once the mode has armed,
+                      // and keeps it when the arming refuses (and says why), so a refused tap costs the
+                      // person no text (M102 spec 11).
                       setHandoffMask(true);
-                      direct.activate();
+                      if (!direct.activate({ discardDraft: clearComposedDraft })) {
+                        setHandoffMask(false);
+                        return;
+                      }
+                      requestDrawer(null);
                     }
               }
               onDismiss={() => noticeNoEcho(null)}
@@ -3093,8 +4336,17 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
         </Collapse>
         {/* MESSAGES HELD FOR THIS PANE (M62 spec 03): a draft in the box holds a message up to an hour, and
             the owner of the box should know. One line, a tap opens the Messages sheet with its Drop. */}
-        <Collapse open={walky.held > 0 && onOpenMessages !== undefined}>
-          {walky.held > 0 && onOpenMessages !== undefined && <WalkyHeldStrip count={walky.held} onOpen={onOpenMessages} />}
+        <Collapse open={walky.mark !== null && onOpenMessages !== undefined}>
+          {walky.mark !== null && onOpenMessages !== undefined && (
+            <WalkyHeldStrip
+              count={walky.mark.count}
+              kind={walky.mark.kind}
+              onOpen={onOpenMessages}
+              linked={walkyLinked}
+              deliverId={walky.mark.deliverId}
+              onDeliverNow={deliverNow}
+            />
+          )}
         </Collapse>
         {/* A draft too large for the disk tier (lib/drafts.ts). It survives a pane switch — the
             memory tier holds it whole — but not the app closing, and that difference is invisible
@@ -3122,33 +4374,68 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
               refusal={sendRefusal}
               onDismiss={hideRefusal}
               action={
-                refusalCard || refusalScreen || refusalKeys ? (
-                  <span className="flex flex-wrap justify-end gap-1">
-                    {refusalCard && (
-                      <Button variant="ghost" size="sm" className={NOTICE_ACTION} onClick={() => onAnswerDialog?.()}>
-                        {translate("composer.send.dialogFirst")}
-                      </Button>
-                    )}
-                    {refusalScreen && (
-                      <Button variant="ghost" size="sm" className={NOTICE_ACTION} onClick={() => screen?.onToggle()}>
-                        {translate("composer.controls.screen")}
-                      </Button>
-                    )}
-                    {refusalKeys && (
-                      <Button variant="ghost" size="sm" className={NOTICE_ACTION} onClick={() => requestDrawer("keys")}>
-                        {translate("composer.protocol.openKeys")}
-                      </Button>
-                    )}
-                  </span>
+                refusalSecret || (stepButton && stepWord !== null) || refusalCard || refusalScreen || refusalKeys ? (
+                  <RefusalActions
+                    step={
+                      refusalSecret
+                        ? {
+                            word: translate("composer.secret.reopen"),
+                            disabled: false,
+                            onPress: () => {
+                              setSecretClosed(false);
+                              setSendRefusal(null);
+                            },
+                          }
+                        : stepButton && stepWord !== null
+                          ? { word: stepWord, disabled: sending || stepWaiting, onPress: onRefusalStep }
+                          : null
+                    }
+                    wait={!refusalSecret && stepButton && refusalStep === "sendAgain" ? (awaitingWord ? "awaiting" : sendRefusal.waits === true ? (otherSendWaiting ? "waits" : "ready") : null) : null}
+                    onCard={refusalCard ? answerDialog : null}
+                    onScreen={refusalScreen && !refusalCard && refusalStep !== "screen" ? () => screen?.onToggle() : null}
+                    onKeys={refusalKeys ? () => requestDrawer("keys") : null}
+                  />
                 ) : undefined
               }
             />
           )}
         </Collapse>
+        {/* A SENT TEXT THAT COULD NOT GO BACK INTO THE BOX (M104): the send did not land and the person had typed a new
+            text meanwhile. The text waits here, never merged into the new one; Put back writes it into the box once
+            that box is empty, and says so when it is not. Under the notice that says what became of the send. */}
+        <Collapse open={heldBackHere !== null}>
+          {heldBackHere !== null && (
+            <Notice
+              tone="neutral"
+              variant="box"
+              className="mb-2"
+              icon={<Icon name="undo" />}
+              action={
+                <Button type="button" variant="outline" size="sm" data-slot="composer-put-back" className="h-6" onClick={putBack}>
+                  {translate("composer.heldBack.putBack")}
+                </Button>
+              }
+            >
+              <span data-slot="composer-held-back" className="line-clamp-2 whitespace-pre-wrap break-words">
+                {translate("composer.heldBack.kept", { text: heldBackHere.draft })}
+              </span>
+              {putBackList.length > 1 && (
+                <span data-slot="composer-held-back-count" className="text-muted-foreground">
+                  {translate("composer.heldBack.count", { count: putBackList.length })}
+                </span>
+              )}
+              {heldBackFull && (
+                <span data-slot="composer-held-back-full" role="status" className="text-muted-foreground">
+                  {translate("composer.heldBack.boxFull")}
+                </span>
+              )}
+            </Notice>
+          )}
+        </Collapse>
         {/* Why a destructive line waits for a second tap: said here, beside the "Really send?" word, and
             only while that word is armed. It was a header line, and the header holds nothing a person must
             act on (M56 spec 07). */}
-        <Collapse open={confirmingSend && destructiveNote !== null && !direct.active}>
+        <Collapse open={confirmingDestructive && destructiveNote !== null && !direct.active}>
           {destructiveNote !== null && (
             <Notice tone="danger" variant="box" className="mb-2" icon={<Icon name="error" />}>
               <span data-slot="composer-destructive">{destructiveNote}</span>
@@ -3170,6 +4457,28 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
           <p className="px-1 pb-1 text-xs leading-snug text-muted-foreground">
             {translate("composer.draft.holdsMask")}
           </p>
+        </Collapse>
+        {/* THE ONE-TIME OFFER OF "ENTER SENDS" (ADR 0157). A bare Enter that looks like a real keyboard's, with
+            nothing chosen yet, still adds its new line and brings this one line straight above the box. Turn on
+            stores the choice "on", the x stores "off"; either way it never shows again on this device. It
+            comes and goes through Collapse like the notices above it, so it moves the box by its own height. */}
+        <Collapse open={enterOfferShown}>
+          {enterOfferShown && (
+            <Notice
+              tone="neutral"
+              variant="box"
+              className="mb-2"
+              onDismiss={() => setEnterSends(false)}
+              dismissLabel={translate("composer.enterOffer.dismissAria")}
+              action={
+                <Button type="button" variant="outline" size="sm" data-slot="composer-enter-offer-on" className={NOTICE_ACTION} onClick={() => setEnterSends(true)}>
+                  {translate("composer.enterOffer.turnOn")}
+                </Button>
+              }
+            >
+              <span data-slot="composer-enter-offer">{translate("composer.enterOffer.text")}</span>
+            </Notice>
+          )}
         </Collapse>
         {/* ── ONE BOX, ONE ROW: THE FIELD, ATTACH, THE PRIMARY ACTION ──────────────────────
             The field, the attach control and Send used to be three shapes on one line: a
@@ -3237,6 +4546,27 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
             source={{ kind: "commands", commands: commandSuggestions, onPick: selectSuggestion }}
           />
         )}
+        {secretOpen ? (
+          <SecretField
+            key={secretFresh}
+            focusOnMount={secretFresh > 0}
+            disabled={starting || sending || locked}
+            sending={sending}
+            reason={secretReason()}
+            // A locked field says why in the composer's own words (the gone, read-only and out-of-reach
+            // placeholders): the frame's own "Not saved" line would leave a dead Send with no reason.
+            lockedWhy={locked ? placeholderWords : undefined}
+            onSend={sendSecret}
+            // The field's text changed, or the frame went: a code's lost request is not this text's any more.
+            onTextChange={() => {
+              secretIntentRef.current = null;
+            }}
+            onClose={() => {
+              setSecretClosed(true);
+              setSendRefusal(phoneRefusal(translate("composer.secret.closed")));
+            }}
+          />
+        ) : (
         <div
           data-slot="composer-box"
           data-layout={box ? "box" : undefined}
@@ -3277,7 +4607,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
             !box && attachments.length > 0 && "flex-wrap",
             // A composer nobody may write to says so as a surface, not just as a placeholder:
             // the fill recedes and both buttons in the box are disabled anyway.
-            locked && "bg-muted/40",
+            (locked || startHeld) && "bg-muted/40",
             // Armed "Type into terminal". The tint was on the field while the field wore the
             // frame; it follows the frame.
             direct.active && (box ? "border-primary focus-within:border-primary" : "border-primary focus-within:border-primary focus-within:ring-primary"),
@@ -3321,7 +4651,13 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
           <ChatInput
             ref={inputRef}
             value={direct.active ? direct.value : input}
-            onChange={direct.active ? direct.onChange : onDraftChange}
+            // The start hold is `readOnly`, not `disabled`: a disabled field drops focus, so the soft keyboard closed
+            // under a person who was typing and never came back. While held, no input reaches the draft: the
+            // browser's own readOnly stops keys, and these guards stop what some browsers let through (paste,
+            // cut, drop, IME composition), so the change handler never writes while held.
+            onChange={direct.active ? direct.onChange : startHeld ? undefined : onDraftChange}
+            onCut={startHeld ? (e) => e.preventDefault() : undefined}
+            onDrop={startHeld ? (e) => e.preventDefault() : undefined}
             onSelect={direct.active ? undefined : rememberCaret}
             onFocus={() => setBoxFocused(true)}
             onBlur={(e) => {
@@ -3334,10 +4670,36 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
               direct.active
                 ? direct.onKeyDown
                 : (e) => {
-                    if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+                    // Held: Enter, with or without a modifier, changes nothing and sends nothing.
+                    if (startHeld && e.key === "Enter") {
                       e.preventDefault();
-                      onSendClick();
+                      return;
                     }
+                    // Ctrl/Cmd+Enter always sends. A bare Enter sends only from a hardware key with the
+                    // device's setting on; the rule is lib/enter-key.ts (ADR 0157), and every other press
+                    // is left to the browser, a new line. The menus around the box take no keys, so
+                    // none of them has an Enter to lose, and the sign-in field is its own component.
+                    const answer = enterKeyAnswer(
+                      {
+                        key: e.key,
+                        code: e.code,
+                        shiftKey: e.shiftKey,
+                        altKey: e.altKey,
+                        ctrlKey: e.ctrlKey,
+                        metaKey: e.metaKey,
+                        isComposing: e.nativeEvent.isComposing,
+                        keyCode: e.keyCode,
+                        repeat: e.repeat,
+                      },
+                      softKeyboard,
+                      enterChoice,
+                    );
+                    // "hint": the Enter still adds its new line; the offer appears above the box.
+                    if (answer === "hint") setEnterOffer(true);
+                    if (answer === "default" || answer === "hint") return;
+                    e.preventDefault();
+                    if (answer === "send") onSendClick();
+                    // "swallow": a held Enter. The first press sent; a repeat adds no new line.
                   }
             }
             onPaste={onPasteFile}
@@ -3348,7 +4710,8 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
             // `autoCapitalize="none"` (issue 465). An agent pane keeps the keyboard's defaults.
             // The browser spellchecker is off on every pane: on Android Chrome a tap on a marked
             // word opens the browser's suggestion menu, which takes the focus and hides the keyboard.
-            autoCorrect={direct.active || isShell ? "off" : undefined}
+            // A sign-in code (a sign-in field, `secretField`) is case sensitive: no correction touches it either.
+            autoCorrect={direct.active || isShell || secretField ? "off" : undefined}
             spellCheck={false}
             className={cn(
               // `flex-1 min-w-0`: the field takes whatever width the two buttons beside it leave,
@@ -3388,7 +4751,20 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
               // does not change with it: `text-base` gives the field a unitless line-height, so the
               // placeholder's line box can only shrink (12px x 1.33 against 14-16px x 1.5), and the empty
               // field is already held at `min-h-9` above (at most 16px x 1.5 + 12px of padding = 36px).
-              (staleWords || steerWords) && "placeholder:text-xs",
+              //
+              // THE HINT SITS IN THE MIDDLE OF THE FIELD'S LINE, NOT AT ITS TOP (#758). `text-xs` sets the
+              // placeholder's own line-height too (12px x 1.33 = 16px), and Chromium lays a placeholder out
+              // from the top of the field's line, so a 16px line in a 21px one (the 14px draft size)
+              // left the words 3.5px above the centre of the box, level with neither the attach button
+              // nor Send. The hint takes the field's own line box instead: the field's line-height as a
+              // LENGTH (`leading-[1.5em]`, the same 1.5 x the draft size `text-base` gives it, so the field
+              // itself does not change), which `placeholder:leading-[inherit]` hands to the placeholder,
+              // where a unitless number would be multiplied by the placeholder's 12px again. The draft
+              // size is a setting, so no pixel is named here. The ordinary placeholder is at the
+              // field's own size and never needed it.
+              (staleWords || steerWords) && "leading-[1.5em] placeholder:text-xs placeholder:leading-[inherit]",
+              // The hold wears the look a disabled field has (`disabled:` in ui/chat/chat-input.tsx), since it is not disabled.
+              startHeld && "cursor-not-allowed opacity-50",
               // Mirrored, the field's right side stands against the box's border, so it takes the
               // inset the left used to take from Attach.
               !box && hand === "left" && "pr-2",
@@ -3417,6 +4793,8 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
             // Built above, where the two halves and their reasons sit together.
             style={draftStyle}
             disabled={locked}
+            readOnly={startHeld}
+            aria-disabled={startHeld ? true : undefined}
             rows={1}
           />
           <Button
@@ -3447,7 +4825,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
               // and a trigger that went dark under its own open menu would waste that.
               (pressed || picking) && "scale-95 bg-primary text-primary-foreground duration-0",
             )}
-            disabled={uploading || locked || direct.active}
+            disabled={uploading || locked || startHeld || direct.active}
             onPointerDown={(e) => e.preventDefault()}
             onClick={onAttachClick}
             aria-label={translate("composer.attach.aria")}
@@ -3475,7 +4853,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
                 "size-9 rounded-full bg-secondary text-foreground",
                 "col-start-3 row-start-3",
               )}
-              disabled={locked}
+              disabled={locked || startHeld}
               onPointerDown={(e) => e.preventDefault()}
               onClick={openExpanded}
               aria-label={translate("composer.expand")}
@@ -3499,6 +4877,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
               sendInert={sendInert || !hasDraft}
               onCollapse={closeExpanded}
               onSend={sendExpanded}
+              onInertSend={onInertSendTap}
               leading={expandedLeading}
               trailing={expandedTrailing}
               hidden={takeoverOpen}
@@ -3519,8 +4898,10 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
                 box && "bg-secondary text-foreground",
                 // Box layout: the small mic stands in the open shape's button row, beside Send.
                 box && (mirrored ? "col-start-2 row-start-3" : "col-start-4 row-start-3"),
+                micInert && "opacity-50",
               )}
-              disabled={micDisabled}
+              disabled={micBusy}
+              aria-disabled={micInert ? true : undefined}
               aria-pressed={recorder.busy}
               aria-label={micAriaLabel}
               title={micAvailable ? undefined : stt?.reason}
@@ -3599,27 +4980,71 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
                 box && (mirrored ? "col-start-1" : boxOpen ? "col-start-5" : "col-start-3"),
                 box && (boxOpen ? "row-start-3" : "row-start-1"),
               )}
-              onClick={() => onAnswerDialog?.()}
+              onClick={answerDialog}
               aria-label={translate("composer.send.dialogFirst")}
             >
               {translate("composer.send.dialogFirst")}
             </Button>
           ) : !direct.active && confirmingSend ? (
-            <Button
-              variant="destructive"
-              className={cn(
-                TOOLBAR_TAP_TARGET,
-                "h-9 shrink-0 rounded-md px-3 text-sm font-semibold",
-                box && (mirrored ? "col-start-1" : boxOpen ? "col-start-5" : "col-start-3"),
-                box && (boxOpen ? "row-start-3" : "row-start-1"),
-              )}
-              onClick={() => onSendClick(armedWhen.current)}
-              disabled={starting || locked || offline || !hasDraft || sending}
-              title={offline ? translate("composer.send.reconnect") : undefined}
-              aria-label={offline ? translate("composer.send.reconnect") : translate("composer.send.reallySend")}
-            >
-              {translate("composer.send.reallySend")}
-            </Button>
+            // ARMING MOVES NOTHING (Altan, 2026-11-13: "I don't like layout shifts close to buttons that are being used").
+            // The slot keeps exactly the footprint of the round Send button it stands in for: the wrapper is `size-9`
+            // and takes the Send button's grid cell, so the field's width, its wrapping and its height are the same
+            // before the tap, while the word shows, and after. The word button is drawn over the field, anchored to
+            // the slot's outer edge (the end edge, the start edge under `hand="left"`), at the Send button's height,
+            // above the field. It covers the last characters of the draft for the 3 seconds it stays armed, so it
+            // has a solid fill and a shadow. Anchored at the edge and wider than the circle, it always contains the
+            // point where Send was: the second tap lands without the thumb moving.
+            //
+            // THE COVER. A button-high word over a field of two lines always cuts one line in half. So, while the word is
+            // armed, one more element is drawn inside the box (this element's positioned parent is the box's own
+            // `relative` frame, in both layouts): the full inner height, on the Send side, solid in the box's fill under
+            // the word and fading to nothing over the last 24px toward the text, so whole line ends go clean. It is
+            // absolute and `aria-hidden`: nothing in flow moves. It takes pointer events and has no handler, so it absorbs
+            // a tap: what it hides (Attach, the small mic, Expand) cannot be hit for the 3 seconds. The word is above it. It is above the
+            // field and the small buttons it covers (z-5) and below the word (z-10), and it takes the box's corners.
+            <>
+              <div
+                aria-hidden="true"
+                data-slot="composer-confirm-cover"
+                className={cn(
+                  "absolute inset-y-0 z-[5] w-40",
+                  mirrored ? "left-0 rounded-l-xl" : "right-0 rounded-r-xl",
+                  // The box's own fill: `bg-card` in the box layout, `bg-background` in the field one.
+                  box
+                    ? mirrored
+                      ? "bg-[linear-gradient(to_right,var(--color-card)_calc(100%-24px),transparent)]"
+                      : "bg-[linear-gradient(to_left,var(--color-card)_calc(100%-24px),transparent)]"
+                    : mirrored
+                      ? "bg-[linear-gradient(to_right,var(--color-background)_calc(100%-24px),transparent)]"
+                      : "bg-[linear-gradient(to_left,var(--color-background)_calc(100%-24px),transparent)]",
+                )}
+              />
+              <div
+                data-slot="composer-send-slot"
+                className={cn(
+                  "relative size-9 shrink-0",
+                  box && (mirrored ? "col-start-1" : boxOpen ? "col-start-5" : "col-start-3"),
+                  box && (boxOpen ? "row-start-3" : "row-start-1"),
+                )}
+              >
+                <Button
+                  variant="destructive"
+                  className={cn(
+                    // `absolute`, not TOOLBAR_TAP_TARGET's `relative`: the same 4px reach around the button, kept as the pseudo-element.
+                    "absolute top-0 z-10 h-9 shrink-0 rounded-md px-3 text-sm font-semibold shadow-md before:absolute before:-inset-1 before:content-['']",
+                    // While "Send it again?" cannot confirm yet (its first 700 ms) it is drawn dimmed: no layout, no text, no movement.
+                    confirmingAgain && sendAgainWaiting && "opacity-60 motion-reduce:transition-none",
+                    mirrored ? "left-0" : "right-0",
+                  )}
+                  onClick={() => onSendClick(armedWhen.current)}
+                  disabled={starting || locked || offline || !hasDraft || sending}
+                  title={offline ? translate("composer.send.reconnect") : undefined}
+                  aria-label={offline ? translate("composer.send.reconnect") : confirmWord}
+                >
+                  {confirmWord}
+                </Button>
+              </div>
+            </>
           ) : micIsPrimary ? (
             // THE MICROPHONE IS THE PRIMARY ACTION WHILE THE BOX IS EMPTY, and becomes Send the
             // moment there is anything to send. It used to be a second, permanent control tucked
@@ -3639,8 +5064,10 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
                 "size-9 shrink-0 rounded-full",
                 box && (mirrored ? "col-start-1" : boxOpen ? "col-start-5" : "col-start-3"),
                 box && (boxOpen ? "row-start-3" : "row-start-1"),
+                micInert && "opacity-50",
               )}
-              disabled={micDisabled}
+              disabled={micBusy}
+              aria-disabled={micInert ? true : undefined}
               aria-pressed={recorder.busy}
               // The bridge's own words when it cannot serve — the operator's next move is on the
               // host, so the button says what is wrong rather than just refusing.
@@ -3674,7 +5101,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
               aria-disabled={sendInert ? true : undefined}
               onClick={
                 sendInert
-                  ? undefined
+                  ? onInertSendTap
                   : direct.active
                     ? () => direct.deactivate()
                     : () => onSendClick()
@@ -3703,6 +5130,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
             </Button>
           )}
         </div>
+        )}
       </div>
 
       {/* THE VOICE TAKEOVER (design 3.3): over the whole chrome block, in its own box, from the mic's

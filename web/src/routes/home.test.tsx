@@ -7,6 +7,8 @@ import { afterEach, beforeEach, vi } from "vitest";
 import { CrewProvider } from "@/components/crew-provider";
 import { ROOT_ROUTE_ID, type HomeData } from "@/lib/loaders";
 import { setPinned } from "@/lib/pins";
+import { __resetDashFilter } from "@/lib/dash-filter";
+import { recallScroll, rememberScroll } from "@/lib/scroll-memory";
 import { __resetBundleFocus, BUNDLE_FOCUS_TTL_MS, bundleFocusPending, requestBundleFocus } from "@/lib/bundle-apply";
 import {
   fixtureAgents,
@@ -25,6 +27,10 @@ import type { StartLaunchBody } from "@/lib/api";
 import type { SnapshotResponse } from "@/lib/types";
 import { withHeaderHost } from "@/test/header-host";
 import { server } from "@/test/setup";
+import { __resetHill, __settleHill, syncHill } from "@/lib/hill/store";
+import { hillDecision } from "@/test/hill-fixtures";
+import { partKey, type PlaceItem, type TricksReply, type WireTrickPart } from "@/lib/tricks/schema";
+import { tricksStore } from "@/lib/tricks/store";
 import { HomeRoute } from "./home";
 
 // The dashboard, one machine and several. The point of the pair is that the FIRST one is unchanged:
@@ -75,6 +81,7 @@ function renderHome(data: HomeData, initialPath?: string) {
       { path: "/pane/:paneId", element: <div data-testid="pane" /> },
       { path: "/space/:spaceId/changes", element: <div data-testid="space-changes" /> },
       { path: "/crew", element: <div data-testid="crew" /> },
+      { path: "/hill", element: <div data-testid="hill" /> },
     ],
     { initialEntries: [initialPath ?? (data.scope.host ? `/?h=${data.scope.host}` : "/")] },
   );
@@ -85,7 +92,7 @@ function renderHome(data: HomeData, initialPath?: string) {
 /** Wait for the herd list to be on screen. The workspace filter (components/agent-list.tsx) is the one
  *  control every render with at least one pane produces — there is no "Needs you" heading to wait
  *  on any more, since a pane no longer moves to a section of its own. */
-const settled = () => screen.findByRole("button", { name: /^Workspace / });
+const settled = () => screen.findByRole("button", { name: /^Space / });
 
 /** The `<section>` a workspace heading owns, scoped away from the workspace filter's own rows,
  *  which carry the same workspace name a heading does (agent-list.tsx). */
@@ -141,22 +148,22 @@ describe("the dashboard across machines", () => {
     // Three buttons now, not two — "All sessions" leads the list. It is not a session and does not
     // pretend to be one: it answers "do I have to choose at all", which is why it stands above the
     // rows rather than among them.
-    const sessionTrigger = screen.getByRole("button", { name: /switch session/i });
+    const sessionTrigger = screen.getByRole("button", { name: /switch space/i });
     await userEvent.click(sessionTrigger);
     const sheet = screen.getByRole("list");
     const rows = within(sheet).getAllByRole("button");
     expect(rows).toHaveLength(3);
-    expect(rows[0]).toHaveTextContent("All sessions");
+    expect(rows[0]).toHaveTextContent("All spaces");
   });
 
   it("labels each row with its machine — a label, never a split", async () => {
     renderHome(packed());
     await settled();
-    expect(screen.getAllByLabelText("Host: bluefin").length).toBeGreaterThan(0);
+    expect(screen.getAllByLabelText("Host: lodge").length).toBeGreaterThan(0);
     expect(screen.getAllByLabelText("Host: workshop").length).toBeGreaterThan(0);
     // No per-host heading anywhere: hosts do not carve the list up.
     const headings = screen.getAllByRole("heading").map((h) => h.textContent ?? "");
-    expect(headings.some((h) => /workshop|bluefin/i.test(h))).toBe(false);
+    expect(headings.some((h) => /workshop|lodge/i.test(h))).toBe(false);
   });
 
   it("opens a PEER's row addressed to the peer, not to the machine the URL points at", async () => {
@@ -330,9 +337,9 @@ describe("the dashboard across sessions", () => {
   it("marks the row that is NOT in the primary session, and only that one", async () => {
     renderHome(widened(), "/?all=1");
     await settled();
-    expect(screen.getByLabelText("In session: work")).toBeInTheDocument();
+    expect(screen.getByLabelText("In space: work")).toBeInTheDocument();
     // The primary needs no mark: an absent `?s=` already means it.
-    expect(screen.queryByLabelText("In session: default")).toBeNull();
+    expect(screen.queryByLabelText("In space: default")).toBeNull();
   });
 
   it("opens each row in its OWN session", async () => {
@@ -456,14 +463,14 @@ describe("the dashboard's footer (ADR 0066, ADR 0085)", () => {
     renderHome(data);
     await settled();
     // The Dashboard has all three, so the absence below is the tab's doing and not the fixture's.
-    expect(screen.getByRole("button", { name: /^Workspace / })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /^Space / })).toBeInTheDocument();
     expect(screen.getByRole("combobox", { name: "Pane order" })).toBeInTheDocument();
     expect(screen.getByRole("region", { name: "Pinned" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /need you/i })).toBeInTheDocument();
 
     await userEvent.click(tab(/^Crew$/));
     expect(screen.getByTestId("crew-tab")).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: /^Workspace / })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /^Space / })).not.toBeInTheDocument();
     expect(screen.queryByRole("combobox", { name: "Pane order" })).not.toBeInTheDocument();
     expect(screen.queryByRole("region", { name: "Pinned" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /need you/i })).not.toBeInTheDocument();
@@ -472,7 +479,7 @@ describe("the dashboard's footer (ADR 0066, ADR 0085)", () => {
 
     // Back on the Dashboard the chrome is as it was left.
     await userEvent.click(tab(/^Dashboard/));
-    expect(screen.getByRole("button", { name: /^Workspace / })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /^Space / })).toBeInTheDocument();
     expect(screen.getByRole("region", { name: "Pinned" })).toBeInTheDocument();
   });
 
@@ -568,8 +575,8 @@ describe("the dashboard's footer (ADR 0066, ADR 0085)", () => {
     expect(screen.queryByRole("heading", { name: "collie" })).not.toBeInTheDocument();
     // The filter still offers every workspace: the switch removes rows, never places.
     await userEvent.click(await settled());
-    expect(within(screen.getByRole("dialog", { name: "Workspaces" })).getByRole("checkbox", { name: /^collie/ })).toBeInTheDocument();
-    await userEvent.click(within(screen.getByRole("dialog", { name: "Workspaces" })).getByRole("button", { name: "Close" }));
+    expect(within(screen.getByRole("dialog", { name: "Spaces" })).getByRole("checkbox", { name: /^collie/ })).toBeInTheDocument();
+    await userEvent.click(within(screen.getByRole("dialog", { name: "Spaces" })).getByRole("button", { name: "Close" }));
     expect(stored().needsYouOnly).toBe(true);
     // A new mount reads it back.
     cleanup();
@@ -604,10 +611,10 @@ describe("the dashboard's footer (ADR 0066, ADR 0085)", () => {
   it("the workspace filter shows chosen workspaces alone, and the choice is remembered", async () => {
     renderHome(solo());
     await userEvent.click(await settled());
-    const sheet = () => screen.getByRole("dialog", { name: "Workspaces" });
-    expect(within(sheet()).getByRole("checkbox", { name: "All workspaces" })).toBeChecked();
+    const sheet = () => screen.getByRole("dialog", { name: "Spaces" });
+    expect(within(sheet()).getByRole("checkbox", { name: "All spaces" })).toBeChecked();
     expect(within(sheet()).getAllByRole("checkbox").map((o) => o.textContent)).toEqual([
-      "All workspaces",
+      "All spaces",
       expect.stringMatching(/^webapp/),
       expect.stringMatching(/^collie/),
     ]);
@@ -621,13 +628,13 @@ describe("the dashboard's footer (ADR 0066, ADR 0085)", () => {
     expect(screen.getByRole("heading", { name: "collie" })).toBeInTheDocument();
     expect(stored().isolatedSpaces).toHaveLength(2);
     await userEvent.click(within(sheet()).getByRole("checkbox", { name: /^webapp/ }));
-    // A new mount reads it back, and "All workspaces" clears it.
+    // A new mount reads it back, and "All spaces" clears it.
     cleanup();
     renderHome(solo());
     await userEvent.click(await settled());
     expect(within(sheet()).getByRole("checkbox", { name: /^collie/ })).toBeChecked();
     expect(screen.queryByRole("heading", { name: "webapp" })).not.toBeInTheDocument();
-    await userEvent.click(within(sheet()).getByRole("checkbox", { name: "All workspaces" }));
+    await userEvent.click(within(sheet()).getByRole("checkbox", { name: "All spaces" }));
     expect(screen.getByRole("heading", { name: "webapp" })).toBeInTheDocument();
     expect(stored().isolatedSpaces).toEqual([]);
   });
@@ -684,11 +691,11 @@ describe("the dashboard's footer (ADR 0066, ADR 0085)", () => {
     });
     renderHome(data);
     await userEvent.click(await settled());
-    const sheet = () => screen.getByRole("dialog", { name: "Workspaces" });
+    const sheet = () => screen.getByRole("dialog", { name: "Spaces" });
     // Only the root workspace and the unrelated workspace are listed in the filter sheet;
     // the root's state word reflects its blocked worktree pane.
     expect(within(sheet()).getAllByRole("checkbox").map((o) => o.textContent)).toEqual([
-      "All workspaces",
+      "All spaces",
       "membero · needs you",
       "collie",
     ]);
@@ -705,7 +712,7 @@ describe("the dashboard's footer (ADR 0066, ADR 0085)", () => {
     // On the Files tab, both the root checkout and its linked worktree keep their own change rows.
     await userEvent.click(within(sheet()).getByRole("button", { name: "Close" }));
     await userEvent.click(tab(/^Files$/));
-    const changesList = await screen.findByRole("list", { name: "Changes by workspace" });
+    const changesList = await screen.findByRole("list", { name: "Changes by space" });
     expect(within(changesList).getAllByRole("button").map((r) => r.textContent)).toEqual([
       expect.stringMatching(/^membero/),
       expect.stringMatching(/^lucky-meadow-d1ec/),
@@ -804,7 +811,7 @@ describe("the dashboard's footer (ADR 0066, ADR 0085)", () => {
     expect(rowsOf(section)[0]).toHaveTextContent("worktree-agent");
     // Clicking "+" on the root heading opens a tab in the root workspace (`w1`), not the worktree (`w2`).
     await userEvent.click(screen.getByRole("button", { name: "New tab in membero" }));
-    await waitFor(() => expect(createdTabBody).toBe(JSON.stringify({ workspaceId: "w1" })));
+    await waitFor(() => expect(JSON.parse(createdTabBody)).toEqual({ workspaceId: "w1", requestId: expect.any(String) }));
     // Spaces below also shows both membero and lucky-meadow-d1ec, not lucky-meadow-d1ec alone.
     expect(screen.getByRole("button", { name: /membero.*0 panes/i })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /lucky-meadow-d1ec.*1 pane/i })).toBeInTheDocument();
@@ -877,9 +884,9 @@ describe("the dashboard's footer (ADR 0066, ADR 0085)", () => {
     const data = await rootLoader({ request: new Request("http://localhost/") });
     renderHome(data);
     await userEvent.click(await settled());
-    const sheet = () => screen.getByRole("dialog", { name: "Workspaces" });
+    const sheet = () => screen.getByRole("dialog", { name: "Spaces" });
     expect(within(sheet()).getAllByRole("checkbox").map((o) => o.textContent)).toEqual([
-      "All workspaces",
+      "All spaces",
       "collie",
       "audiolink · working",
     ]);
@@ -890,7 +897,7 @@ describe("the dashboard's footer (ADR 0066, ADR 0085)", () => {
     // Learn the key the collie workspace is remembered by from a first visit.
     renderHome(solo());
     await userEvent.click(await settled());
-    await userEvent.click(within(screen.getByRole("dialog", { name: "Workspaces" })).getByRole("checkbox", { name: /^collie/ }));
+    await userEvent.click(within(screen.getByRole("dialog", { name: "Spaces" })).getByRole("checkbox", { name: /^collie/ }));
     const key: unknown = stored().isolatedSpaces[0];
     expect(key).toEqual(expect.stringContaining("collie"));
     cleanup();
@@ -900,7 +907,7 @@ describe("the dashboard's footer (ADR 0066, ADR 0085)", () => {
     await settled();
     expect(screen.queryByRole("heading", { name: "webapp" })).not.toBeInTheDocument();
     expect(screen.getByRole("heading", { name: "collie" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /^Workspace / })).toHaveAccessibleName("Workspace collie");
+    expect(screen.getByRole("button", { name: /^Space / })).toHaveAccessibleName("Space collie");
   });
 
   it("the order select changes the list to one ranked list, and the choice is remembered", async () => {
@@ -966,7 +973,7 @@ describe("the dashboard's footer (ADR 0066, ADR 0085)", () => {
     const router = renderHome(solo());
     await settled();
     await userEvent.click(tab(/^Files$/));
-    const list = await screen.findByRole("list", { name: "Changes by workspace" });
+    const list = await screen.findByRole("list", { name: "Changes by space" });
     // fixtureChanges: 3 files in webapp's root repo and 2 in packages/api, +10 −2 over all five.
     await within(list).findByText("5 files");
     await within(list).findByText("No folder");
@@ -1072,7 +1079,8 @@ describe("the dashboard heading's '+' and the New tab sheet", () => {
     const sheet = within(await screen.findByRole("dialog", { name: "New tab in webapp" }));
     await userEvent.click(sheet.getByRole("button", { name: "Just a shell" }));
     await waitFor(() => expect(url(router)).toBe("/pane/w1%3Ap8"));
-    expect(sent.tab).toEqual([JSON.stringify({ workspaceId: first.workspaceId })]);
+    // The same create as always, now with the request id every create carries (M100 spec 04).
+    expect(sent.tab.map((body) => JSON.parse(body))).toEqual([{ workspaceId: first.workspaceId, requestId: expect.any(String) }]);
     expect(sent.launch).toEqual([]);
   });
 
@@ -1169,5 +1177,222 @@ describe("the dashboard's update line after a tap on the updating mark", () => {
     expect(lineScrolls(spy)).toHaveLength(0);
     // And the stale request is gone, so a later plain visit cannot find it either.
     expect(bundleFocusPending()).toBe(false);
+  });
+});
+
+describe("the Hill in the Dashboard's bar (M96)", () => {
+  beforeEach(() => __resetHill());
+  afterEach(() => __resetHill());
+
+  async function openOnHill(count: number) {
+    const open = Array.from({ length: count }, (_, i) => hillDecision({ title: `Decision ${i + 1}`, priority: i === count - 1 ? "now" : "later" }));
+    server.use(http.get("/api/hill", () => HttpResponse.json({ v: 1, rev: 1, open, closed: [] })));
+    await act(async () => {
+      syncHill(1);
+      await __settleHill();
+    });
+  }
+
+  const bar = () => document.querySelector<HTMLElement>('[data-slot="tab-bar"]')!;
+  const hillItem = () => bar().querySelector<HTMLElement>('[data-slot="tab-link"][data-link="hill"]');
+
+  it("has no Hill item where the snapshot carries no hill, and no row above the list", async () => {
+    renderHome(solo());
+    await settled();
+    expect(hillItem()).toBeNull();
+    expect(document.querySelector('[data-slot="hill-entry"]')).toBeNull();
+  });
+
+  it("is the fourth item at the bar's right end, with no badge while nothing is open, and not selected on the Dashboard", async () => {
+    renderHome({ ...packed(), hill: true });
+    await settled();
+    const cells = [...bar().querySelectorAll<HTMLElement>('[data-slot="tab"], [data-slot="tab-link"]')];
+    expect(cells.map((cell) => cell.querySelector(".truncate")?.textContent)).toEqual(["Crew", "Dashboard", "Files", "Hill"]);
+    expect(hillItem()!.querySelector('[data-icon="hill"]')).not.toBeNull();
+    expect(hillItem()!.querySelector('[data-slot="tab-badge"]')).toBeNull();
+    expect(hillItem()).not.toHaveAttribute("aria-current");
+    // Today's bar otherwise: equal widths, nothing scrolls.
+    expect(bar().dataset.mode).toBe("equal");
+  });
+
+  it("a solo bridge with a hill and no tricks draws the bar: Dashboard, Files and the Hill, with nothing open", async () => {
+    renderHome({ ...solo(), hill: true });
+    await settled();
+    const cells = [...bar().querySelectorAll<HTMLElement>('[data-slot="tab"], [data-slot="tab-link"]')];
+    expect(cells.map((cell) => cell.querySelector(".truncate")?.textContent)).toEqual(["Dashboard", "Files", "Hill"]);
+    expect(hillItem()!.querySelector('[data-slot="tab-badge"]')).toBeNull();
+    expect(bar().dataset.mode).toBe("equal");
+  });
+
+  it("carries the open count in the bar's red badge, and a tap opens the Hill without selecting it", async () => {
+    await openOnHill(3);
+    const router = renderHome({ ...solo(), hill: true });
+    await settled();
+    const item = hillItem()!;
+    expect(item.querySelector('[data-slot="tab-badge"]')).toHaveTextContent("3");
+    expect(item).toHaveAccessibleName("Hill, 3 Decisions wait on you");
+    // One of them is `now`: the mountain wears its snow cap in the warm accent (A5).
+    expect(item.querySelector('[data-icon="hill-now"]')?.getAttribute("class")).toContain("text-status-working");
+    await userEvent.click(item);
+    await waitFor(() => expect(url(router)).toBe("/hill"));
+  });
+});
+
+describe("the tricks' places on the Dashboard (2026-11-10)", () => {
+  let rev = 100;
+  const item = (trick: string, at: "dashboard" | "tabbar", it: PlaceItem): WireTrickPart => ({
+    host: "lodge",
+    trick,
+    part: at,
+    rev: 1,
+    asOf: new Date().toISOString(),
+    value: { at, id: at, item: it },
+  });
+  async function seed(parts: WireTrickPart[]) {
+    rev += 1;
+    const tricks = [...new Set(parts.map((p) => p.trick))].map((id) => ({ host: "lodge", id, name: id, icon: "flask" as const, on: true, state: "ok" as const, places: ["dashboard" as const, "tabbar" as const] }));
+    const reply: TricksReply = { rev, tricks, parts, present: parts.map(partKey) };
+    server.use(http.get(/\/api\/tricks/, () => HttpResponse.json(reply)));
+    await act(() => tricksStore.syncTricks(rev));
+  }
+  afterEach(async () => seed([]));
+
+  const strip = () => document.querySelector<HTMLElement>('[data-slot="trick-dashboard-strip"]');
+  const bar = () => document.querySelector<HTMLElement>('[data-slot="tab-bar"]')!;
+
+  it("draws no strip and today's bar while no trick has a place there", async () => {
+    renderHome({ ...packed(), hill: true });
+    await settled();
+    expect(strip()).toBeNull();
+    expect(bar().dataset.mode).toBe("equal");
+    expect(bar().querySelector('[data-slot="tab-bar-divider"]')).toBeNull();
+  });
+
+  it("draws the tiles above the summary line on the Dashboard, in manifest order, and not on Crew", async () => {
+    await seed([item("legs", "dashboard", { label: "Legs", badge: 3 }), item("tracker", "dashboard", { label: "Tracker", tone: "accent" })]);
+    renderHome(packed());
+    await settled();
+    const tiles = [...strip()!.querySelectorAll<HTMLElement>('[data-slot="tile"]')];
+    expect(tiles.map((tile) => tile.dataset.trick)).toEqual(["legs", "tracker"]);
+    const summary = document.getElementById("dash-summary-line")!;
+    expect(strip()!.compareDocumentPosition(summary) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    await userEvent.click(within(bar()).getByRole("button", { name: /^Crew$/ }));
+    expect(strip()).toBeNull();
+    await userEvent.click(within(bar()).getByRole("button", { name: /^Files$/ }));
+    expect(strip()).toBeNull();
+  });
+
+  it("draws today's bar with the Hill when every trick is switched off: their bar items are not drawn", async () => {
+    rev += 1;
+    const parts = [item("legs", "tabbar", { label: "Legs" }), item("tracker", "tabbar", { label: "Tracker" })];
+    const tricks = ["legs", "tracker"].map((id) => ({ host: "lodge", id, name: id, icon: "flask" as const, on: false, state: "ok" as const, places: ["tabbar" as const] }));
+    const reply: TricksReply = { rev, tricks, parts, present: parts.map(partKey) };
+    server.use(http.get(/\/api\/tricks/, () => HttpResponse.json(reply)));
+    await act(() => tricksStore.syncTricks(rev));
+    renderHome({ ...solo(), hill: true });
+    await settled();
+    expect(bar().dataset.mode).toBe("equal");
+    expect(bar().querySelector('[data-slot="tab-extra"]')).toBeNull();
+    expect(bar().querySelector('[data-slot="tab-link"][data-link="hill"]')).not.toBeNull();
+  });
+
+  it("draws the bar, in its equal mode, for a trick with only a dashboard tile", async () => {
+    await seed([item("legs", "dashboard", { label: "Legs", badge: 3 })]);
+    renderHome({ ...solo(), hill: true });
+    await settled();
+    expect(strip()).not.toBeNull();
+    expect(bar().dataset.mode).toBe("equal");
+    expect(bar().querySelector('[data-slot="tab-extra"]')).toBeNull();
+    expect([...bar().querySelectorAll<HTMLElement>('[data-slot="tab"], [data-slot="tab-link"]')].map((cell) => cell.querySelector(".truncate")?.textContent)).toEqual(["Dashboard", "Files", "Hill"]);
+  });
+
+  it("puts the tabbar items after the Hill and a divider, and pins the tabs", async () => {
+    await seed([item("legs", "tabbar", { label: "Legs", badge: "23/34" })]);
+    renderHome({ ...packed(), hill: true });
+    await settled();
+    expect(bar().dataset.mode).toBe("scroll");
+    const order = [...bar().querySelectorAll<HTMLElement>('[data-slot="tab"], [data-slot="tab-link"], [data-slot="tab-bar-divider"], [data-slot="tab-extra"]')].map(
+      (el) => el.dataset.trick ?? el.dataset.link ?? el.dataset.slot,
+    );
+    expect(order).toEqual(["tab", "tab", "tab", "hill", "tab-bar-divider", "legs"]);
+  });
+});
+
+// THE SESSION FILTER on the Dashboard (M97 spec 04): its query lives in memory, per machine, while the app is open.
+describe("the dashboard's session filter", () => {
+  const extra = (n: number, workspaceLabel: string, sessionName: string) => ({
+    ...fixtureAgents[0]!,
+    paneId: `w${n}:p1`,
+    workspaceId: `w${n}`,
+    workspaceNumber: n,
+    workspaceLabel,
+    tabId: `w${n}:t1`,
+    sessionName,
+    status: "idle" as const,
+    cwd: `/home/you/${workspaceLabel}`,
+  });
+  const many = () =>
+    homeData({
+      agents: [...fixtureAgents, extra(5, "moonward", "api server"), extra(6, "moonward", "migrations"), extra(7, "scratch", "notes"), extra(8, "scratch", "ideas")],
+      shellPanes: [],
+      sessions: fixtureSessions,
+    });
+  const magnifier = () => screen.getByRole("button", { name: "Filter sessions" });
+  const field = () => screen.getByRole("textbox", { name: "Filter sessions" });
+  /** The session rows on screen, by DOM id: the Spaces overview below draws workspace names too, and the filter leaves it alone. */
+  const rows = () => document.querySelectorAll("button[id^='pane-row-']").length;
+
+  beforeEach(() => __resetDashFilter());
+
+  it("keeps the query, and the open field, across a visit to a session and back", async () => {
+    const router = renderHome(many());
+    await settled();
+    await userEvent.click(magnifier());
+    await userEvent.type(await screen.findByRole("textbox", { name: "Filter sessions" }), "moon");
+    expect(rows()).toBe(2);
+
+    await act(async () => {
+      await router.navigate("/pane/w5%3Ap1");
+    });
+    await screen.findByTestId("pane");
+    await act(async () => {
+      await router.navigate("/");
+    });
+    await settled();
+    expect(field()).toHaveValue("moon");
+    expect(magnifier()).toHaveAttribute("aria-pressed", "true");
+    expect(rows()).toBe(2);
+  });
+
+  it("starts empty on a fresh page: the query is never stored on the device", async () => {
+    renderHome(many());
+    await settled();
+    await userEvent.click(magnifier());
+    await userEvent.type(await screen.findByRole("textbox", { name: "Filter sessions" }), "moon");
+    expect(JSON.stringify({ ...localStorage, ...sessionStorage })).not.toContain("moon");
+    cleanup();
+    // A page load empties the module's store; the same reset stands in for it here.
+    __resetDashFilter();
+    renderHome(many());
+    await settled();
+    expect(screen.queryByRole("textbox", { name: "Filter sessions" })).toBeNull();
+    expect(magnifier()).toHaveAttribute("aria-pressed", "false");
+    expect(rows()).toBe(6);
+  });
+
+  it("restores the scroll position of the list when it comes back filtered", async () => {
+    const key = `home:${"\u0000"}`;
+    rememberScroll(key, 120);
+    renderHome(many());
+    await settled();
+    await userEvent.click(magnifier());
+    await userEvent.type(await screen.findByRole("textbox", { name: "Filter sessions" }), "moon");
+    expect(recallScroll(key)).toBe(120);
+  });
+
+  it("offers no magnifier on a Dashboard of five rows or fewer", async () => {
+    renderHome(solo());
+    await settled();
+    expect(screen.queryByRole("button", { name: "Filter sessions" })).toBeNull();
   });
 });

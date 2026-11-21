@@ -38,6 +38,7 @@ const EXEMPT = {
   // The launcher's statement about this process, not the operator's about this Collie.
   COLLIE_PLUGIN_ROOT: "the checkout this binary runs from, injected by the launcher",
   COLLIE_SUPERVISOR: "which service manager is in front of this process",
+  COLLIE_PARTS_DIR: "the linked parts folder the service pins so the bridge reads the CLI's folder (cli/unit.ts, M99)",
   // Template tokens and test switches, never read from an environment at all.
   COLLIE_VERSION: "a token `collie docs` substitutes into a page",
   COLLIE_DOCS_TABLE: "a token `collie docs` substitutes into a page",
@@ -55,6 +56,8 @@ const EXEMPT = {
     "the Windows off switch for the access-list repair (bridge/owner-only.ts), documented in docs/security.md only, never a settings card",
   COLLIE_PACK_SECRET:
     "named only in the update runner's redaction list, so it is a name to scrub and not a value read",
+  COLLIE_TOKEN:
+    "a developer script's own variable (scripts/capture-fixture.sh, scripts/crew-mux-probe.ts), named in the local key's refusal (bridge/error-codes.ts `local.no_text`); the bridge never reads it",
 } satisfies Record<string, string>;
 
 /** Just the names, so a lookup by a grepped string does not need an index signature. */

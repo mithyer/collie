@@ -25,6 +25,7 @@ import type { HomeData } from "@/lib/loaders";
 import { herd, homeSolo, sessionsSolo, shells, spaces, tabs, TS } from "../fixtures";
 import { PackedRootRouter } from "../harness";
 import { Card, Group, Section, type SectionDef } from "../layout";
+import { useCardFilter } from "./shared";
 
 export const DEF: SectionDef = {
   id: "dashboard-top",
@@ -82,10 +83,10 @@ const AGENTS: AgentView[] = [
 ];
 const SHELLS: AgentView[] = shells.map(renamed);
 
-/** The lead is called bluefin, as on Altan's phone; a second machine makes the machine chip appear. */
+/** The lead is called lodge, as on Altan's phone; a second machine makes the machine chip appear. */
 const ROSTER: ServerSummary[] = [
-  { id: "bluefin", name: "bluefin", isLead: true, reachable: true, protocol: "ok", lastSeenAt: TS - 2_000 },
-  { id: "minibuch", name: "minibuch", isLead: false, reachable: true, protocol: "ok", lastSeenAt: TS - 3_000 },
+  { id: "lodge", name: "lodge", isLead: true, reachable: true, protocol: "ok", lastSeenAt: TS - 2_000 },
+  { id: "workshop", name: "workshop", isLead: false, reachable: true, protocol: "ok", lastSeenAt: TS - 3_000 },
 ];
 
 const DATA: HomeData = {
@@ -163,11 +164,13 @@ function LiveDashboard({ data }: { data: HomeData }) {
   const [isolated, setIsolated] = useState<string[]>([]);
   const [hidden, setHidden] = useState<string[]>([]);
   const [needsYou, setNeedsYou] = useState(false);
+  const filter = useCardFilter();
   return (
     <AppHeaderHost bridge="connected" error={false}>
       <DashHeader data={data} />
       <div data-pg-scroll className="min-h-0 flex-1 overflow-y-auto">
         <AgentList
+          filter={filter}
           agents={data.agents}
           shellPanes={data.shellPanes}
           bridge="connected"

@@ -55,6 +55,9 @@ export const ICONOIR = {
   "copy": "copy", // copy · lucide Copy
   "copy-failed": "xmark", // the copy failed · lucide X
   "crew": "network", // the crew of machines · lucide Network
+  "decision-dismissed": "xmark", // a Decision that was dismissed · lucide X
+  "decision-superseded": "refresh-double", // a Decision a newer one replaced · lucide RefreshCw
+  "decision-withdrawn": "arrow-left", // a Decision its poster took back · lucide ArrowLeft
   "delete": "trash", // delete · lucide Trash2
   "detached-head": "git-commit", // HEAD is on a commit, not a branch · lucide GitCommitHorizontal
   "direct-typing": "dialpad", // keystrokes go straight to the terminal · lucide Keyboard
@@ -96,13 +99,19 @@ export const ICONOIR = {
   "harness-bar": "control-slider", // agent command bar setting · lucide SlidersHorizontal
   "harness-compact": "compress", // compact the context (agent command) · lucide Shrink
   "harness-effort": "dashboard-speed", // set effort (agent command) · lucide Gauge
+  "harness-history": "clock-rotate-right", // branch from an earlier prompt (agent command) · lucide History
   "harness-model": "cpu", // pick the model (agent command) · lucide Cpu
+  "harness-plan": "view-structure-down", // plan mode on, off or read (agent command) · lucide ListTree
   "harness-resume": "clock-rotate-right", // resume an earlier session (agent command) · lucide History
   "harness-tree": "view-structure-down", // session tree (agent command) · lucide ListTree
   "harnesses": "sparks", // harnesses · lucide Bot
   "hide-ignored": "eye-closed", // ignored files are hidden · lucide EyeOff
+  "hill": null, // the Hill, where Decisions wait · lucide Mountain
+  "hill-now": null, // the Hill while a `now` Decision is open · lucide MountainSnow
   "history-screen": "journal-page", // the scrollback history screen · lucide ScrollText
   "image": "media-image", // an image · lucide Image
+  "image-next": "nav-arrow-right", // the next picture in the picture sheet · lucide ChevronRight
+  "image-prev": "nav-arrow-left", // the previous picture in the picture sheet · lucide ChevronLeft
   "info": "info-circle", // information, or the facts of an option · lucide Info
   "install-app": "download-data-window", // install the app · lucide MonitorDown
   "jobs": "timer", // running jobs · lucide Timer
@@ -224,6 +233,7 @@ export const ICONOIR = {
   "prompt-user": "user", // the pinned prompt · lucide User
   "queued": "clock", // queued, not yet sent · lucide Clock
   "quick-actions": "flash", // quick actions · lucide Zap
+  "recommended": "star", // the option the poster recommends · lucide Star
   "refresh": "refresh", // refresh or reload · lucide RefreshCw
   "release-line": "git-branch", // release line (Stable or Edge) · lucide GitBranch
   "remove": "xmark", // remove one item from a list · lucide X
@@ -303,6 +313,7 @@ export const ICONOIR = {
   "tool-search": "search", // a search tool call · lucide Search
   "tool-task": "sparks", // a task or subagent tool call · lucide Bot
   "tour": "compass", // the guided tour · lucide Compass
+  "tricks": "puzzle", // Collie tricks, the small add-ons a person switches on · lucide Puzzle
   "type-into-terminal": "terminal", // type into the terminal · lucide Terminal
   "typeface": "text-size", // the typeface setting · lucide CaseSensitive
   "undo": "undo", // undo · lucide Undo2

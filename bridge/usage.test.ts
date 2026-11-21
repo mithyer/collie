@@ -3,7 +3,9 @@ import { describe, expect, it } from "bun:test";
 import { basename, dirname, join } from "node:path";
 
 import type { JsonObject } from "./json.ts";
+import { memoryAddedIo } from "./launchers-added.ts";
 import type { AgentView } from "./types.ts";
+import { UsageSeen } from "./usage-seen.ts";
 import {
   customClaudeConfigDir,
   parseUsageRecord,
@@ -23,7 +25,7 @@ function record(extra: JsonObject): string {
 }
 
 describe("parseUsageRecord", () => {
-  it("keeps the numbers, clamped, and the two known windows in their order", () => {
+  it("keeps the numbers, clamped, and every window in order: 5h, 7d, then the rest by label", () => {
     const parsed = parseUsageRecord(
       record({
         context: 142,
@@ -31,6 +33,8 @@ describe("parseUsageRecord", () => {
           { window: "7d", used: 36, resetsAt: NOW + 1000 },
           { window: "5h", used: -4 },
           { window: "spend", used: 50 },
+          { window: "7d:sonnet-4.6", used: 3, label: "Sonnet 4.6" },
+          { window: "7d:opus", used: 8, label: "Opus\u0007 " },
         ],
       }),
     );
@@ -42,8 +46,27 @@ describe("parseUsageRecord", () => {
       limits: [
         { window: "5h", used: 0 },
         { window: "7d", used: 36, resetsAt: NOW + 1000 },
+        { window: "7d:opus", used: 8, label: "Opus" },
+        { window: "7d:sonnet-4.6", used: 3, label: "Sonnet 4.6" },
+        { window: "spend", used: 50 },
       ],
     });
+  });
+
+  it("still parses a record an older CLI wrote: only 5h and 7d, no label", () => {
+    const parsed = parseUsageRecord(record({ limits: [{ window: "5h", used: 40, resetsAt: NOW + 5 }, { window: "7d", used: 10 }] }));
+    expect(parsed?.limits).toEqual([{ window: "5h", used: 40, resetsAt: NOW + 5 }, { window: "7d", used: 10 }]);
+  });
+
+  it("reads a plan that reports one window as one window", () => {
+    expect(parseUsageRecord(record({ limits: [{ window: "7d", used: 12 }] }))?.limits).toEqual([{ window: "7d", used: 12 }]);
+  });
+
+  it("keeps a window key once, drops one with no key, and holds at most eight", () => {
+    const many = Array.from({ length: 12 }, (_, i) => ({ window: `30d:${String(i)}`, used: i }));
+    const parsed = parseUsageRecord(record({ limits: [{ window: "5h", used: 1 }, { window: "5h", used: 2 }, { used: 3 }, { window: "", used: 4 }, ...many] }));
+    expect(parsed?.limits).toHaveLength(8);
+    expect(parsed?.limits?.[0]).toEqual({ window: "5h", used: 1 });
   });
 
   it("refuses junk, a newer schema, a missing time and an oversized file", () => {
@@ -60,17 +83,64 @@ describe("parseUsageRecord", () => {
   });
 });
 
+describe("who gave the window", () => {
+  it("keeps only a window the statusLine stated", () => {
+    expect(parseUsageRecord(record({ context: 22.2, window: 1_000_000, windowBy: "statusline" }))).toEqual({
+      schemaVersion: 1,
+      harness: "claude",
+      at: NOW,
+      context: 22.2,
+      window: 1_000_000,
+      windowBy: "statusline",
+    });
+    expect(usageAt({ schemaVersion: 1, harness: "claude", at: NOW, context: 4, window: 400_000, windowBy: "statusline" }, NOW)).toEqual({ context: 4 });
+  });
+
+  it("drops a window an older build took from its model table, and the context counted against it", () => {
+    // The record a 2026-11-12 build wrote for a 1M Fable session: 222,200 tokens over a table's 400k.
+    const fable = parseUsageRecord(record({ context: 55.5, window: 400_000, windowBy: "fable" }));
+    expect(fable).toEqual({ schemaVersion: 1, harness: "claude", at: NOW });
+    expect(usageAt(fable!, NOW)).toBeUndefined();
+    // And one from before `windowBy`, a flat 200k guess; and any other key.
+    const others: JsonObject[] = [{}, { windowBy: "opus" }, { windowBy: "other" }, { windowBy: "Statusline" }, { windowBy: 4 }];
+    for (const by of others) {
+      const parsed = parseUsageRecord(record({ context: 100, window: 200_000, ...by }));
+      expect(parsed?.context).toBeUndefined();
+      expect(parsed?.window).toBeUndefined();
+      expect(parsed?.windowBy).toBeUndefined();
+    }
+    // The limits and the cost of such a record stay: only the window's own number was a guess.
+    const limits = [{ window: "5h", used: 9 }];
+    expect(parseUsageRecord(record({ context: 55.5, window: 400_000, windowBy: "fable", cost: 1.5, limits }))).toMatchObject({ cost: 1.5, limits });
+  });
+
+  it("keeps a context with no window at all: the statusLine's own percent", () => {
+    expect(parseUsageRecord(record({ context: 22 }))?.context).toBe(22);
+  });
+
+  it("keeps the token count with or without a window, and the phone gets it; junk is dropped", () => {
+    expect(parseUsageRecord(record({ contextTokens: 222_200 }))?.contextTokens).toBe(222_200);
+    // An older build's guessed share goes, the count it never wrote is not invented, and a count beside it stays.
+    expect(parseUsageRecord(record({ context: 55.5, window: 400_000, windowBy: "fable", contextTokens: 222_200 }))).toEqual({ schemaVersion: 1, harness: "claude", at: NOW, contextTokens: 222_200 });
+    expect(usageAt(parseUsageRecord(record({ contextTokens: 222_200 }))!, NOW)).toEqual({ contextTokens: 222_200 });
+    expect(usageAt(parseUsageRecord(record({ contextTokens: 0 }))!, NOW)).toEqual({ contextTokens: 0 });
+    for (const bad of [-1, 1.5, "222200", null, 1e12]) expect(parseUsageRecord(record({ contextTokens: bad }))?.contextTokens).toBeUndefined();
+  });
+});
+
 describe("the window note", () => {
   it("round-trips as a positive integer, a record without it still parses, and junk is dropped", () => {
-    expect(parseUsageRecord(record({ context: 4, window: 1_000_000 }))).toEqual({ schemaVersion: 1, harness: "claude", at: NOW, context: 4, window: 1_000_000 });
+    expect(parseUsageRecord(record({ context: 4, window: 1_000_000, windowBy: "statusline" }))).toMatchObject({ context: 4, window: 1_000_000 });
     expect(parseUsageRecord(record({ context: 4 }))?.window).toBeUndefined();
-    for (const window of [0, -5, 1.5, "200000", null, 1e12]) expect(parseUsageRecord(record({ context: 4, window }))?.window).toBeUndefined();
+    for (const window of [0, -5, 1.5, "200000", null, 1e12]) {
+      expect(parseUsageRecord(record({ context: 4, window, windowBy: "statusline" }))?.window).toBeUndefined();
+    }
   });
 
   it("is never drawn: the phone gets the context and the limits only", () => {
-    const parsed = parseUsageRecord(record({ context: 4, window: 200_000 }));
+    const parsed = parseUsageRecord(record({ context: 4, window: 200_000, windowBy: "statusline" }));
     expect(usageAt(parsed!, NOW)).toEqual({ context: 4 });
-    expect(usageAt(parseUsageRecord(record({ window: 200_000 }))!, NOW)).toBeUndefined();
+    expect(usageAt(parseUsageRecord(record({ window: 200_000, windowBy: "statusline" }))!, NOW)).toBeUndefined();
   });
 });
 
@@ -216,6 +286,16 @@ describe("UsageTracker", () => {
     expect(tracker.get(pane("other"))).toEqual({ limits: [{ window: "5h", used: 99 }] });
   });
 
+  it("takes a scoped weekly window and a plan with one window from the sessions as they are, each key on its own", async () => {
+    const entries = new Map<string, [number, string]>([
+      [file("a"), [NOW, record({ at: NOW - 1000, context: 1, limits: [{ window: "7d", used: 10 }, { window: "7d:opus", used: 20, label: "Opus" }] })]],
+      [file("b"), [NOW, record({ at: NOW, context: 2, limits: [{ window: "7d", used: 15 }] })]],
+    ]);
+    const tracker = new UsageTracker(dir, memoryFiles(entries), () => NOW);
+    await tracker.refresh([pane("a"), pane("b")]);
+    expect(tracker.get(pane("b"))).toEqual({ context: 2, limits: [{ window: "7d", used: 15 }, { window: "7d:opus", used: 20, label: "Opus" }] });
+  });
+
   it("removes readings past their age, and leaves files that are not its own", async () => {
     const old = file("old");
     const fresh = file("fresh");
@@ -235,8 +315,8 @@ describe("UsageTracker with the account windows (ADR 0118)", () => {
   const dir = "/state/usage";
   const file = (session: string): string => join(dir, usageFileName(session));
   const ACCOUNT = [
-    { window: "5h" as const, used: 33, resetsAt: NOW + 60_000 },
-    { window: "7d" as const, used: 7, resetsAt: NOW + 120_000 },
+    { window: "5h", used: 33, resetsAt: NOW + 60_000 },
+    { window: "7d", used: 7, resetsAt: NOW + 120_000 },
   ];
   function claudePane(session: string | null, kind: "agent" | "shell" = "agent"): AgentView {
     // SAFETY: the tracker reads `agentSession`, `agent` and `kind` off a pane and nothing else.
@@ -253,6 +333,18 @@ describe("UsageTracker with the account windows (ADR 0118)", () => {
     const tracker = new UsageTracker(dir, memoryFiles(entries), () => NOW, account({ claude: ACCOUNT }));
     await tracker.refresh([claudePane("s1")]);
     expect(tracker.get(claudePane("s1"))).toEqual({ context: 42, limits: ACCOUNT });
+  });
+
+  it("hands each reading it draws to the last-seen store, with the folder it ran under", async () => {
+    const io = memoryAddedIo();
+    const seen = new UsageSeen(io, () => NOW, () => {});
+    const dirA = "/home/u/.claude-work";
+    const entries = new Map<string, [number, string]>([[file("w1"), [NOW, record({ context: 5, configDir: dirA })]]]);
+    const tracker = new UsageTracker(dir, memoryFiles(entries), () => NOW, { limits: (_h: string, configDir?: string) => (configDir === dirA ? ACCOUNT : undefined) }, undefined, seen);
+    await tracker.refresh([claudePane("w1")]);
+    tracker.get(claudePane("w1"));
+    expect(seen.reading("claude", dirA, NOW)?.windows.map((w) => [w.window, w.usedPct])).toEqual([["5h", 33], ["7d", 7]]);
+    expect(seen.reading("claude", undefined, NOW)).toBeNull();
   });
 
   it("a pane with no session record still gets the account windows", async () => {
@@ -343,17 +435,19 @@ describe("UsageTracker with the journal's context", () => {
   it("a reading with a window becomes the context, floored to one decimal", async () => {
     const tracker = new UsageTracker(dir, memoryFiles(new Map()), () => NOW, undefined, journal({ s1: { tokens: 17_345, window: 258_400 } }));
     await tracker.refresh([agentPane("codex", "s1")]);
-    expect(tracker.get(agentPane("codex", "s1"))).toEqual({ context: 6.7 });
+    expect(tracker.get(agentPane("codex", "s1"))).toEqual({ context: 6.7, contextTokens: 17_345 });
   });
 
-  it("a reading with no window is no context", async () => {
+  it("a reading with no window is no share, and the token count alone (2026-11-13)", async () => {
     const tracker = new UsageTracker(dir, memoryFiles(new Map()), () => NOW, undefined, journal({ s1: { tokens: 17_345 } }));
-    expect(tracker.get(agentPane("omp", "s1"))).toBeUndefined();
+    expect(tracker.get(agentPane("omp", "s1"))).toEqual({ contextTokens: 17_345 });
+    const odd = new UsageTracker(dir, memoryFiles(new Map()), () => NOW, undefined, journal({ s1: { tokens: 17_345.4, window: 0 } }));
+    expect(odd.get(agentPane("omp", "s1"))).toEqual({ contextTokens: 17_345 });
   });
 
   it("is clamped at 100 when the tokens overrun the window", async () => {
     const tracker = new UsageTracker(dir, memoryFiles(new Map()), () => NOW, undefined, journal({ s1: { tokens: 300_000, window: 200_000 } }));
-    expect(tracker.get(agentPane("pi", "s1"))).toEqual({ context: 100 });
+    expect(tracker.get(agentPane("pi", "s1"))).toEqual({ context: 100, contextTokens: 300_000 });
   });
 
   it("a session's usage file wins over the journal", async () => {
@@ -361,6 +455,11 @@ describe("UsageTracker with the journal's context", () => {
     const tracker = new UsageTracker(dir, memoryFiles(entries), () => NOW, undefined, journal({ s1: { tokens: 1, window: 2 } }));
     await tracker.refresh([agentPane("claude", "s1")]);
     expect(tracker.get(agentPane("claude", "s1"))).toEqual({ context: 42 });
+    // A file's count alone (no stated window) wins too: the journal's share is not mixed in under it.
+    const counted = new Map<string, [number, string]>([[file("s2"), [NOW, record({ contextTokens: 222_200 })]]]);
+    const second = new UsageTracker(dir, memoryFiles(counted), () => NOW, undefined, journal({ s2: { tokens: 1, window: 2 } }));
+    await second.refresh([agentPane("claude", "s2")]);
+    expect(second.get(agentPane("claude", "s2"))).toEqual({ contextTokens: 222_200 });
   });
 
   it("fills in a file that holds windows and no context, and rides beside the account windows", async () => {
@@ -369,14 +468,14 @@ describe("UsageTracker with the journal's context", () => {
     const readings = journal({ s1: { tokens: 50_000, window: 200_000 }, s2: { tokens: 100_000, window: 200_000 } });
     const tracker = new UsageTracker(dir, memoryFiles(entries), () => NOW, undefined, readings);
     await tracker.refresh([agentPane("codex", "s1")]);
-    expect(tracker.get(agentPane("codex", "s1"))).toEqual({ context: 25, limits: [{ window: "7d", used: 5 }] });
+    expect(tracker.get(agentPane("codex", "s1"))).toEqual({ context: 25, contextTokens: 50_000, limits: [{ window: "7d", used: 5 }] });
     const withAccount = new UsageTracker(dir, memoryFiles(new Map()), () => NOW, { limits: () => limits }, readings);
-    expect(withAccount.get(agentPane("codex", "s2"))).toEqual({ context: 50, limits });
+    expect(withAccount.get(agentPane("codex", "s2"))).toEqual({ context: 50, contextTokens: 100_000, limits });
   });
 
   it("is keyed by the session ref of either kind; a shell pane gets none", async () => {
     const tracker = new UsageTracker(dir, memoryFiles(new Map()), () => NOW, undefined, journal({ "/logs/a.jsonl": { tokens: 10, window: 100 } }));
-    expect(tracker.get(agentPane("pi", "/logs/a.jsonl", "agent", "path"))).toEqual({ context: 10 });
+    expect(tracker.get(agentPane("pi", "/logs/a.jsonl", "agent", "path"))).toEqual({ context: 10, contextTokens: 10 });
     expect(tracker.get(agentPane("pi", "/logs/a.jsonl", "shell", "path"))).toBeUndefined();
     expect(tracker.get(agentPane("pi", null))).toBeUndefined();
   });
@@ -431,5 +530,66 @@ describe("UsageTracker with the session cost", () => {
   it("parses a cost, and drops one that is not a non-negative number", () => {
     expect(parseUsageRecord(record({ cost: 1.5 }))?.cost).toBe(1.5);
     for (const bad of ["1", -2, null, true]) expect(parseUsageRecord(record({ cost: bad }))?.cost).toBeUndefined();
+  });
+});
+
+describe("UsageTracker: the folder of a pane's added account (M101)", () => {
+  const dir = "/state/usage";
+  const file = (session: string): string => join(dir, usageFileName(session));
+  const WORK = "/home/u/.codex-work";
+  const WINDOWS: UsageLimit[] = [{ window: "5h", used: 12 }];
+  function agentPane(agent: string, session: string | null, paneId: string): AgentView {
+    // SAFETY: the tracker reads `agentSession`, `agent`, `kind` and, through the seam, `paneId`.
+    const view = { agent, kind: "agent", paneId } as AgentView;
+    if (session !== null) view.agentSession = { kind: "id", value: session };
+    return view;
+  }
+  function recorder(limits: (harness: string, configDir?: string) => UsageLimit[] | undefined) {
+    const calls: [string, string[], string | undefined][] = [];
+    const asked: [string, string | undefined][] = [];
+    return {
+      calls,
+      asked,
+      limits: (harness: string, configDir?: string) => (asked.push([harness, configDir]), limits(harness, configDir)),
+      observeConfigDirs: (harness: string, dirs: ReadonlySet<string>, scope?: string) => void calls.push([harness, [...dirs], scope]),
+    };
+  }
+
+  it("a Codex pane started with an account is observed and read under that account's folder", async () => {
+    const io = memoryAddedIo();
+    const seen = new UsageSeen(io, () => NOW, () => {});
+    const account = recorder((_h, configDir) => (configDir === WORK ? WINDOWS : undefined));
+    const folders = (p: AgentView, scope: string) => (p.paneId === "w1:p2" && scope === "main" ? WORK : undefined);
+    const tracker = new UsageTracker(dir, memoryFiles(new Map()), () => NOW, account, undefined, seen, folders);
+    const work = agentPane("codex", null, "w1:p2");
+    const plain = agentPane("codex", null, "w1:p3");
+    await tracker.refresh([work, plain], "main");
+    expect(account.calls).toEqual([["codex", [WORK], "main"]]);
+    expect(tracker.get(work, "main")).toEqual({ limits: WINDOWS });
+    expect(tracker.get(plain, "main")).toBeUndefined();
+    expect(account.asked).toEqual([["codex", WORK], ["codex", undefined]]);
+    expect(seen.reading("codex", WORK, NOW)?.windows.map((w) => [w.window, w.usedPct])).toEqual([["5h", 12]]);
+    expect(seen.reading("codex", undefined, NOW)).toBeNull();
+  });
+
+  it("the folder a session reported wins over the account's, and a harness whose panes left is told so", async () => {
+    const reported = "/home/u/.claude-side";
+    const entries = new Map<string, [number, string]>([[file("c1"), [NOW, record({ context: 5, configDir: reported })]]]);
+    const account = recorder(() => undefined);
+    const tracker = new UsageTracker(dir, memoryFiles(entries), () => NOW, account, undefined, undefined, () => "/home/u/.claude-other");
+    await tracker.refresh([agentPane("claude", "c1", "w1:p1"), agentPane("codex", null, "w1:p2")], "main");
+    expect(account.calls).toEqual([
+      ["claude", [reported], "main"],
+      ["codex", ["/home/u/.claude-other"], "main"],
+    ]);
+    account.calls.length = 0;
+    await tracker.refresh([agentPane("claude", "c1", "w1:p1")], "main");
+    expect(account.calls).toEqual([
+      ["claude", [reported], "main"],
+      ["codex", [], "main"],
+    ]);
+    account.calls.length = 0;
+    await tracker.refresh([agentPane("claude", "c1", "w1:p1")], "main");
+    expect(account.calls).toEqual([["claude", [reported], "main"]]);
   });
 });

@@ -56,6 +56,15 @@ describe("rootLoader", () => {
     expect(data.agents).toHaveLength(2);
   });
 
+  it("says whether the bridge runs tricks, so a page can tell none from not yet", async () => {
+    const { rootLoader } = await import("./loaders");
+    expect((await rootLoader()).tricks).toBe(false);
+    server.use(http.get("/api/snapshot", () => HttpResponse.json({ ...fixtureSnapshot, tricksRev: 4 })));
+    vi.resetModules();
+    const again = await import("./loaders");
+    expect((await again.rootLoader()).tricks).toBe(true);
+  });
+
   it.each([401, 403] as const)("marks a %i response as an auth error", async (status) => {
     rejectSnapshot(status);
     const { rootLoader } = await import("./loaders");
@@ -221,6 +230,90 @@ describe("paneLoader and the read a row started (lib/pane-prefetch.ts)", () => {
     await prefetchPaneData("w1:p1", undefined);
     await paneLoader({ params: { paneId: "w2:p1" }, request: open("w2:p1") });
     expect(reads).toEqual([{ seen: false }, { seen: true }]);
+  });
+});
+
+describe("paneLoader reads the first page of Chat while a switch is pending (lib/chat-held.ts)", () => {
+  const open = (paneId: string) => new Request(`http://localhost/pane/${encodeURIComponent(paneId)}`);
+  const page = {
+    paneId: "w1:p1",
+    available: true,
+    page: "live",
+    gen: 1_759_000_000_000,
+    rev: 2,
+    head: 1,
+    oldest: 1,
+    hasOlder: false,
+    upserts: [{ uuid: "a", seq: 1, ts: "", role: "assistant", parts: [{ kind: "text", text: "hello" }] }],
+  };
+
+  /** A snapshot whose first agent holds a session, and the chat reads the page makes. */
+  function world(hasSession: boolean) {
+    const seen = { chats: 0 };
+    server.use(
+      http.get("/api/snapshot", () =>
+        HttpResponse.json({ ...fixtureSnapshot, agents: fixtureSnapshot.agents.map((a, i) => (i === 0 ? { ...a, hasSession } : a)) }),
+      ),
+      http.get(/\/api\/pane\/[^/]+\/chat/, () => {
+        seen.chats += 1;
+        return HttpResponse.json(page);
+      }),
+    );
+    return seen;
+  }
+
+  it("holds the page before the navigation lands, once, and not again on a poll", async () => {
+    const seen = world(true);
+    const { rootLoader, paneLoader } = await import("./loaders");
+    const { heldChat } = await import("./chat-held");
+    await rootLoader();
+    await paneLoader({ params: { paneId: "w1:p1" }, request: open("w1:p1") });
+    expect(heldChat(paneScopeKey(undefined, "w1:p1"), undefined)?.entries.map((e) => e.uuid)).toEqual(["a"]);
+    expect(seen.chats).toBe(1);
+    // The same URL again is a poll, which the Chat body's own read covers.
+    await paneLoader({ params: { paneId: "w1:p1" }, request: open("w1:p1") });
+    expect(seen.chats).toBe(1);
+  });
+
+  it("starts the Chat read with the mirror's and waits for it at most 600 ms from the tap, not from the mirror's answer", async () => {
+    world(true);
+    // The mirror answers in 400 ms and the page in 3 s. The switch costs the slower read up to the cap,
+    // counted from the start: 600 ms. A cap counted from the mirror's answer would cost 400 + 600 ms.
+    server.use(
+      http.get(/\/api\/pane\/[^/]+$/, async () => {
+        await delay(400);
+        return HttpResponse.json({ text: "$ ", truncated: false, revision: 1 });
+      }),
+      http.get(/\/api\/pane\/[^/]+\/chat/, async () => {
+        await delay(3000);
+        return HttpResponse.json(page);
+      }),
+    );
+    const { rootLoader, paneLoader, CHAT_WARM_WAIT_MS } = await import("./loaders");
+    await rootLoader();
+    const begun = performance.now();
+    await paneLoader({ params: { paneId: "w1:p1" }, request: open("w1:p1") });
+    const took = performance.now() - begun;
+    expect(took).toBeGreaterThanOrEqual(CHAT_WARM_WAIT_MS - 20);
+    expect(took).toBeLessThan(400 + CHAT_WARM_WAIT_MS - 100);
+  });
+
+  it("reads nothing for a pane that holds no session", async () => {
+    const seen = world(false);
+    const { rootLoader, paneLoader } = await import("./loaders");
+    await rootLoader();
+    await paneLoader({ params: { paneId: "w1:p1" }, request: open("w1:p1") });
+    expect(seen.chats).toBe(0);
+  });
+
+  it("reads nothing while the device shows the terminal", async () => {
+    const seen = world(true);
+    localStorage.setItem("collie:dash-prefs:v1", JSON.stringify({ paneView: "terminal" }));
+    const { rootLoader, paneLoader } = await import("./loaders");
+    await rootLoader();
+    await paneLoader({ params: { paneId: "w1:p1" }, request: open("w1:p1") });
+    expect(seen.chats).toBe(0);
+    localStorage.removeItem("collie:dash-prefs:v1");
   });
 });
 
@@ -1088,7 +1181,7 @@ describe("cold boot with no network", () => {
         http.get(/\/api\/pane\/[^/]+$/, () =>
           HttpResponse.json({
             paneId: "w1:p1",
-            text: "$ sudo -v\n[sudo] password for altan:",
+            text: "$ sudo -v\n[sudo] password for dev:",
             truncated: false,
             revision: 2,
           }),
@@ -1128,7 +1221,7 @@ describe("crewLoader", () => {
     const { crewLoader } = await import("./loaders");
     const data = await crewLoader();
     expect(data.error).toBe(false);
-    expect(data.status?.members.map((m) => m.id)).toEqual(["bluefin", "workshop", "attic"]);
+    expect(data.status?.members.map((m) => m.id)).toEqual(["lodge", "workshop", "attic"]);
   });
 
   // The default handler already refuses with 404, which is what a solo collie and a peer both do.
@@ -1158,8 +1251,8 @@ describe("rootLoader — spaces and tabs follow the host the url names", () => {
     crewSnapshot();
     const { rootLoader } = await import("./loaders");
     const data = await rootLoader();
-    expect(data.workspaces.map((w) => w.host)).toEqual(["bluefin", "bluefin"]);
-    expect(data.tabs.every((t) => t.host === "bluefin")).toBe(true);
+    expect(data.workspaces.map((w) => w.host)).toEqual(["lodge", "lodge"]);
+    expect(data.tabs.every((t) => t.host === "lodge")).toBe(true);
   });
 
   it("gives the peer's when the url names it — including its own `w1`", async () => {

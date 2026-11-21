@@ -24,8 +24,9 @@ import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync
 import { join } from "node:path";
 import { asJsonNumber, asJsonObject, asJsonString, type JsonValue } from "../../web/src/lib/json.ts";
 import { ASK_ID, ASK_OUTCOMES, ASK_REASONS, type AskReceipt } from "../../web/src/lib/surface/ask.ts";
+import { MENU_SIGN_KINDS, type MenuSign } from "../../web/src/lib/surface/menu-sign.ts";
 import { ASK_CHANNELS } from "../../web/src/lib/surface/surface.ts";
-import { readSendCap, readSurfaceWords, RECEIPT_DETAIL_MAX, REQUEST_ID, SEND_LATES, SEND_MODES, SEND_OUTCOMES, SEND_REASONS, type ReadMark, type SendMode, type SendReceipt, type SendStep } from "../../web/src/lib/surface/send.ts";
+import { readSendCap, readSurfaceWords, RECEIPT_DETAIL_MAX, REQUEST_ID, SEND_LATES, SEND_MODES, SEND_OUTCOMES, SEND_REASONS, SEND_WORDS, type ReadMark, type SendMode, type SendReceipt, type SendStep } from "../../web/src/lib/surface/send.ts";
 import { SENT_MAX_LINE, sentLineOf } from "../secret-line.ts";
 
 /** How long a settled request is kept, so a retry after a long network gap still finds its receipt. */
@@ -60,8 +61,20 @@ export interface SendRecord {
   readonly collie?: string;
   readonly phase: RequestPhase;
   readonly submitSentAt?: number;
+  /**
+   * When the first key of the request left (M102 spec 16): written before that key, so a restart can tell a
+   * request that may have typed (`interrupted`) from one that typed nothing (`crash`). Absent on records an
+   * older Collie wrote, and on a request that never reached a key.
+   */
+  readonly startedAt?: number;
   /** When a held request's release started (M56 spec 15): its run is bounded from here, not from accept. */
   readonly runAt?: number;
+  /**
+   * Which road ran the send (M99 spec 03): `data` when the pane's part took it over the inside wire,
+   * `screen` when a data try fell back to the Send Protocol's keys (nothing reached the part). Absent:
+   * the screen road, as on every record before 1.29 and every send with no data try.
+   */
+  readonly path?: "data" | "screen";
   readonly receipt?: SendReceipt;
 }
 
@@ -73,6 +86,8 @@ export interface AcceptInput {
   readonly surfaceRevision: number;
   readonly mode: SendMode;
   readonly text: string;
+  /** The text is for a sign-in field (`SendRequest.secret`): the record keeps no `line` of it, only the hash and length. */
+  readonly secret?: boolean;
 }
 
 export type AcceptResult =
@@ -210,10 +225,30 @@ function parseReceipt(value: JsonValue | undefined): SendReceipt | undefined {
   // `late` is lenient like `detail`: a word this module did not write is dropped, and the receipt stays.
   const late = node.late === undefined ? undefined : pick(node.late, SEND_LATES);
   if (late !== undefined) whole.late = late;
+  // `word` is lenient like `late`: a word this module did not write is dropped, and the receipt stays.
+  const word = node.word === undefined ? undefined : pick(node.word, SEND_WORDS);
+  if (word !== undefined) whole.word = word;
+  // `awaitingEventUntil` is lenient like `late`: a value that is not a time is dropped (M102 spec 13).
+  const awaiting = asJsonNumber(node.awaitingEventUntil);
+  if (awaiting !== undefined && Number.isSafeInteger(awaiting) && awaiting > 0) whole.awaitingEventUntil = awaiting;
+  if (node.draftSeen === true) whole.draftSeen = true;
+  // `menuSign` is lenient like `late`: a kind this module did not write, or a row that is no index, drops it.
+  const menu = menuSignOf(node.menuSign);
+  if (menu !== undefined) whole.menuSign = menu;
+  if (node.textAlreadyTyped === true) whole.textAlreadyTyped = true;
   if (acknowledged !== undefined) whole.acknowledged = acknowledged;
   if (detail !== undefined) whole.detail = detail;
   if (saw !== undefined) whole.saw = saw;
   return whole;
+}
+
+/** A stored `menuSign` ({@link SendReceipt.menuSign}): a known kind and a row index, else undefined. */
+function menuSignOf(value: JsonValue | undefined): MenuSign | undefined {
+  const node = value === undefined ? undefined : asJsonObject(value);
+  if (node === undefined) return undefined;
+  const kind = node.kind === undefined ? undefined : pick(node.kind, MENU_SIGN_KINDS);
+  const row = asJsonNumber(node.row);
+  return kind === undefined || row === undefined || !Number.isSafeInteger(row) || row < 0 ? undefined : { kind, row };
 }
 
 /**
@@ -245,8 +280,12 @@ export function parseSendRecord(raw: JsonValue | undefined): SendRecord | null {
   if (collie !== undefined && collie !== "") record = { ...record, collie };
   const submitSentAt = asJsonNumber(node.submitSentAt);
   if (submitSentAt !== undefined) record = { ...record, submitSentAt };
+  const startedAt = asJsonNumber(node.startedAt);
+  if (startedAt !== undefined) record = { ...record, startedAt };
   const runAt = asJsonNumber(node.runAt);
   if (runAt !== undefined) record = { ...record, runAt };
+  const path = asJsonString(node.path);
+  if (path === "data" || path === "screen") record = { ...record, path };
   if (node.receipt !== undefined) {
     const receipt = parseReceipt(node.receipt);
     if (receipt === undefined) return null;
@@ -392,11 +431,40 @@ export class RequestStore {
       acceptedAt: this.now(),
       phase: "accepted",
     };
-    const line = sentLineOf(input.text);
+    const line = input.secret === true ? null : sentLineOf(input.text);
     if (line !== null) record = { ...record, line };
     if (this.collie !== undefined) record = { ...record, collie: this.collie };
     this.write(record);
     return { kind: "new", record };
+  }
+
+  /**
+   * Drop the record's `line`: the send met a sign-in field (`idle.frame.secret`) its caller did not
+   * name, so the text is a secret after all. The hash and the length stay.
+   */
+  forgetLine(id: string): void {
+    const known = this.get(id);
+    if (known === null || known.line === undefined) return;
+    const { line: _secret, ...rest } = known;
+    this.write(rest);
+  }
+
+  /** The road the send took (see {@link SendRecord.path}). A settled record keeps the road it settled on. */
+  markPath(id: string, path: "data" | "screen"): void {
+    const known = this.get(id);
+    if (known === null || known.phase === "settled") return;
+    this.write({ ...known, path });
+  }
+
+  /**
+   * The write-ahead mark (M102 spec 16): written before the first key of a request (a probe, the text, a
+   * clear key or the submit), once per run. It adds a time only: the record keeps its hash and length and
+   * no more text than it had. A held request's release clears it with {@link rearm}.
+   */
+  markStarted(id: string): void {
+    const known = this.get(id);
+    if (known === null || known.phase === "settled" || known.startedAt !== undefined) return;
+    this.write({ ...known, startedAt: this.now() });
   }
 
   /** Written before the submit key goes out, so a crash after it reads as `unknown`, never as "not sent". */
@@ -408,15 +476,16 @@ export class RequestStore {
 
   /**
    * A settled `sent` or `unknown` that a matching prompt edge confirmed (M56 spec 11) becomes
-   * `effective`, its reason dropped. That and {@link markReturned} are the changes a settled record can
-   * take, each once. Returns the outcome it had, or null when the record is not one a prompt edge may close.
+   * `effective`, its reason dropped. That, {@link markReturned} and {@link markArrived} are the changes a
+   * settled record can take, each once. Returns the outcome it had, or null when the record is not one a prompt edge may close.
    */
   markEffective(id: string): "sent" | "unknown" | null {
     const known = this.get(id);
     const receipt = known?.receipt;
     if (known === null || known.phase !== "settled" || receipt === undefined) return null;
     if (receipt.outcome !== "sent" && receipt.outcome !== "unknown") return null;
-    const { reason: _dropped, ...rest } = receipt;
+    // The event settled it (M102 spec 13): the window it waited in is closed.
+    const { reason: _dropped, awaitingEventUntil: _closed, ...rest } = receipt;
     this.write({ ...known, receipt: { ...rest, outcome: "effective" } });
     return receipt.outcome;
   }
@@ -435,6 +504,24 @@ export class RequestStore {
     if (!waited || receipt.late !== undefined) return false;
     this.write({ ...known, receipt: { ...receipt, late: "returned" } });
     return true;
+  }
+
+  /**
+   * The person's "It arrived" on a settled `unknown` receipt of pane `paneId` (M102 spec 01): the receipt
+   * gets `word: "arrived"` beside its outcome, which stays `unknown`. `not_found` when no such record sits
+   * on that pane (an id of another pane is not told apart from an id nobody sent), `not_unknown` when it
+   * is not settled or did not end `unknown`, `already` on a second mark. A receipt whose word is `override`
+   * may be marked: `arrived` replaces it, since the override was counted when it was made and the newer
+   * word is what the person said last. The mark is never a proof, so nothing else reads it as one.
+   */
+  markArrived(id: string, paneId: string): "marked" | "not_found" | "not_unknown" | "already" {
+    const known = this.get(id);
+    if (known === null || known.paneId !== paneId) return "not_found";
+    const receipt = known.receipt;
+    if (known.phase !== "settled" || receipt === undefined || receipt.outcome !== "unknown") return "not_unknown";
+    if (receipt.word === "arrived") return "already";
+    this.write({ ...known, receipt: { ...receipt, word: "arrived" } });
+    return "marked";
   }
 
   /**
@@ -461,14 +548,14 @@ export class RequestStore {
   rearm(id: string, paneGeneration?: string): SendRecord | null {
     const known = this.get(id);
     if (known === null || known.phase !== "held") return null;
-    const { receipt: _held, ...rest } = known;
+    const { receipt: _held, startedAt: _ran, ...rest } = known;
     // The pane's generation now, when the caller read one: the release runs against the pane as it is.
     const armed: SendRecord = { ...rest, phase: "accepted", runAt: this.now(), paneGeneration: paneGeneration ?? known.paneGeneration };
     this.write(armed);
     return armed;
   }
 
-  /** The request's end: its receipt. A settled record changes once at most after this (`markEffective`, or `markReturned`). */
+  /** The request's end: its receipt. A settled record changes once at most after this (`markEffective`, `markReturned`, or `markArrived`). */
   settle(id: string, receipt: SendReceipt): SendRecord | null {
     const known = this.get(id);
     if (known === null) return null;

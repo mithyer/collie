@@ -268,6 +268,25 @@ const SNAPSHOT_KEYS = {
   // Not a crew dimension: present only while the mux is down for a refused durable token (M50 spec
   // 14), so a healthy solo body carries no such key and no golden byte moved.
   muxFault: true,
+  // Not a crew dimension: Collie tricks' rev (M94), present when a `<configDir>/tricks/` folder exists or
+  // the official list offers a trick (decided 2026-11-11: the card shows on a fresh install), and absent
+  // from these bodies, which run no tricks service, so no golden byte moved.
+  tricksRev: true,
+  // Not a crew dimension: the hill's revision (M96), absent until a session posts a decision on this
+  // bridge, so a solo body with no decisions carries no such key and no golden byte moved.
+  hillRev: true,
+  // Not a crew dimension: Morph's revision, absent until a session's Morph is switched on or a screen
+  // is shown on this bridge, so a solo body that never used Morph carries no such key.
+  trickViewsRev: true,
+  // Not a crew dimension: the Hill's switch, present only while it is off. The Hill is off by default
+  // (2026-11-13), so a body of a bridge built with the Hill carries it until the person switches the Hill on.
+  hillOff: true,
+  // Not a crew dimension: with the Hill off, the hill's revision while it holds a card of Collie's own about
+  // a trick (M96 spec 14), absent otherwise, so a body that never had such a card carries no such key.
+  trickCardsRev: true,
+  // Not a crew dimension: the switch for tricks as a whole, present only while it is off, which is the
+  // default (2026-11-17); a server built with no tricks runner (every solo test here) carries none.
+  tricksOff: true,
 } satisfies Record<keyof SnapshotResponse, true>;
 
 const SESSION_SUMMARY_KEYS = {
@@ -341,6 +360,10 @@ const PANE_WIRE_KEYS = {
   // its tab. Computed on the machine the pane lives on; an older peer omits both.
   soleTabName: true,
   tabPosition: true,
+  // Not a crew dimension: whether the space's label is a name of its own (MuxPane.spaceNamed, M98). Present
+  // only when the adapter's word differs from `workspaceLabel !== workspaceId`, and the fake mux here
+  // says nothing, so no golden byte moved. An older peer omits it.
+  workspaceNamed: true,
   // Not a crew dimension: what the checkout holding the pane's folder is on, read off that machine's
   // own disk. Attached at serialise time like `cache`, and absent here: this baseline builds its body
   // with no reader, so no golden byte moved.
@@ -376,6 +399,9 @@ const PANE_WIRE_KEYS = {
   // only, on a pane whose Surface shadow reads a harness Collie may steer, and this harness builds no
   // Send Protocol, so it is absent here and no golden byte moved.
   canSteer: true,
+  // Not a crew dimension: the ask route's mark (M102 spec 14). It rides with `sendProtocol` only, on a
+  // session with an ask book, and this harness builds none, so it is absent here and no golden byte moved.
+  askRoute: true,
   // Not a crew dimension: the pane's held sends (M56 spec 15). They ride with `sendProtocol` and only
   // when a send is held, and this harness builds no Send Protocol, so no golden byte moved.
   held: true,
@@ -389,6 +415,9 @@ const PANE_WIRE_KEYS = {
   // Not a crew dimension: a session turned its walky talky off (M89). Present only while it is off,
   // and this harness builds its body with no reader, so no golden byte moved.
   walkyOff: true,
+  // Not a crew dimension: the pane is linked (M99 spec 15, added 2026-11-13). Present only while a part of
+  // the pane declares what a send needs, and this harness builds its body with no reader, so no golden byte moved.
+  linked: true,
   // Not a crew dimension: how many pins the pane's session holds (M90). Present only above zero, and this
   // harness builds its body with no pin store, so no golden byte moved.
   pins: true,
@@ -396,6 +425,19 @@ const PANE_WIRE_KEYS = {
   // time from the statusLine wrapper's file, and this harness builds its body with no reader, so no
   // golden byte moved.
   usage: true,
+  // Not a crew dimension: the added account the pane runs under (M101). Present only for an added
+  // account, and this harness builds its body with no accounts service, so no golden byte moved.
+  account: true,
+  // Not a crew dimension: a trick session's part key (M94 slice 03). Present only on a pane of
+  // `kind: "trick"`, and this harness has no tricks folder, so no golden byte moved.
+  view: true,
+  // Not a crew dimension: the title the agent gave its session, from its journal (bridge/session-titles.ts,
+  // added 2026-11-13). Present only when the harness wrote one, and this harness builds its engine with no
+  // title tracker, so no golden byte moved.
+  agentTitle: true,
+  // Not a crew dimension: why a blocked pane needs a look (PR 787). Present only on a herdr-core pane whose
+  // program reported `error`, and this harness reports none, so no golden byte moved.
+  blockedBy: true,
 } satisfies Record<keyof PaneWire, true>;
 
 const DEVICE_AUTH_KEYS = {
@@ -492,12 +534,24 @@ describe("solo zero-tax — wire shapes carry no crew dimension", () => {
       "agents",
       "bridge",
       "device",
+      // The hill's revision (M96): present only on a bridge built with the hill, a number and nothing
+      // of the crew; the phone refetches `GET /api/hill` when it moves.
+      // The Hill's switch: present only while it is off, `true` and nothing of the crew.
+      "hillOff",
+      "hillRev",
       "muxFault",
       "notifications",
       "servers",
       "sessions",
       "shellPanes",
       "tabs",
+      // The agent views' revision: present only once a view was used on this bridge, a number and
+      // nothing of the crew; the phone refetches `GET /api/trick-views` when it moves.
+      // With the Hill off, the hill's revision while it holds a card of Collie's own about a trick.
+      "trickCardsRev",
+      "trickViewsRev",
+      "tricksOff",
+      "tricksRev",
       "ts",
       "update",
       "workspaces",
@@ -526,10 +580,14 @@ describe("solo zero-tax — wire shapes carry no crew dimension", () => {
   // bodies below prove; this list is the tripwire that a THIRD such field cannot be added quietly.
   test("PaneWire carries the two address dimensions and nothing else", () => {
     expect(Object.keys(PANE_WIRE_KEYS).toSorted()).toEqual([
+      "account",
       "actions",
       "agent",
+      "agentTitle",
+      "askRoute",
       "asks",
       "badge",
+      "blockedBy",
       "cache",
       "canSteer",
       "canStop",
@@ -548,6 +606,7 @@ describe("solo zero-tax — wire shapes carry no crew dimension", () => {
       "kind",
       "lastActiveAt",
       "lastSeenAt",
+      "linked",
       "model",
       "paneId",
       "paneLabel",
@@ -570,9 +629,11 @@ describe("solo zero-tax — wire shapes carry no crew dimension", () => {
       "todos",
       "turnId",
       "usage",
+      "view",
       "walkyOff",
       "workspaceId",
       "workspaceLabel",
+      "workspaceNamed",
       "workspaceNumber",
     ]);
   });
@@ -742,7 +803,7 @@ function declaredRoutes(): string[] {
   const src = readFileSync(join(import.meta.dir, "server.ts"), "utf8");
   const exact = [...src.matchAll(/pathname === "([^"]+)"/g)].map((m) => m[1]!);
   const prefixes = [...src.matchAll(/pathname\.startsWith\("([^"]+)"\)/g)].map((m) => `${m[1]}*`);
-  const patterns = [...src.matchAll(/^const \w*ROUTE = (\/\^.+\/);$/gm)].map((m) => m[1]!);
+  const patterns = [...src.matchAll(/^(?:export )?const \w*ROUTE = (\/\^.+\/);$/gm)].map((m) => m[1]!);
   return [...new Set([...exact, ...prefixes, ...patterns])].toSorted();
 }
 
@@ -767,10 +828,19 @@ describe("solo zero-tax — routes", () => {
       // call forwards to the member the program runs on.
       "/^\\/api\\/durable\\/conversation\\/([^/]+)\\/(items|reopen)$/",
       "/^\\/api\\/durable\\/conversations$/",
+      // One image of a decision on the hill (M96): a read, both ids checked against their patterns before
+      // any path is built, lead-local like the rest of the hill.
+      "/^\\/api\\/hill\\/media\\/([^/]+)\\/([^/]+)$/",
       // Machines (ADR 0084): one machine's day of minutes, and its alert rules. A lead and a solo
       // collie answer for every machine they keep watch over; a peer 404s (`crew.not_lead`), and none
       // is forwardable — `bridge/crew/router.test.ts` pins all three as 404 across a link.
       "/^\\/api\\/machines\\/([^/]+)\\/(history|alerts)$/",
+      // Pairing by a request a paired phone approves (ADR 0139): the approver's read and answer of one
+      // request, a paired device's write, and the asking browser's poll, open on its poll secret. SOLO
+      // routes that legitimately extend this list, named here rather than exempted; a crew member answers
+      // 404, because it serves no browser door, and no crew route is added.
+      "/^\\/api\\/pair\\/approve\\/([^/]+)$/",
+      "/^\\/api\\/pair\\/request\\/([^/]+)$/",
       // `changes` is the Changes view (ADR 0065): read-only git over the pane's folder, read-gated
       // like `history` beside it and forwarded to the member that owns the pane. `chat` is the live
       // half of `history` (journal/live.ts): the same log, asked "anything after this?" — a read, on
@@ -783,7 +853,7 @@ describe("solo zero-tax — routes", () => {
       // only a pane whose adapter takes guarded controls takes them; a Herdr pane gets the refusal.
       // `held` (issue 740) is the Cancel or Dismiss on a queued row, by pane, so it forwards to the member
       // whose hold queue keeps the row; on a solo collie it answers what `DELETE /api/send/<id>` does.
-      "/^\\/api\\/pane\\/([^/]+)(?:\\/(reply|keys|upload|close|rename|history|chat|changes|files|focus|answer|send|abort|clear|action|pins|held))?$/",
+      "/^\\/api\\/pane\\/([^/]+)(?:\\/(reply|keys|upload|close|rename|history|chat|changes|files|focus|answer|send|abort|clear|action|pins|held|arrived))?$/",
       // The slash commands Claude Code would load in the pane's cwd: a read of this machine's disk,
       // asked only when the palette opens, so a solo instance pays nothing per poll.
       "/^\\/api\\/pane\\/([^/]+)\\/claude-commands$/",
@@ -798,6 +868,9 @@ describe("solo zero-tax — routes", () => {
       // Walky talky's list for one pane (M62): the messages that reached it, newest first. A read, gated
       // like the pane read, this collie's own panes only until spec 03 makes it forwardable.
       "/^\\/api\\/pane\\/([^/]+)\\/walky$/",
+      // M99 spec 05, Deliver now: the pane owner hands one message held for their draft over by data. This
+      // machine's own panes only, like Drop; the lead answers 400 for a member's.
+      "/^\\/api\\/pane\\/([^/]+)\\/walky\\/([^/]+)\\/deliver$/",
       // The pane owner's Drop on a held walky talky message (M62 spec 03): a write, this collie's own
       // panes only. A message held on a crew member is dropped on that machine; the lead answers 400.
       "/^\\/api\\/pane\\/([^/]+)\\/walky\\/([^/]+)\\/drop$/",
@@ -808,6 +881,34 @@ describe("solo zero-tax — routes", () => {
       // with the held file's and never made into a path. Lead-local, not forwardable.
       "/^\\/api\\/stt\\/model\\/([^/]+)$/",
       "/^\\/api\\/tab\\/([^/]+)\\/(rename|close)$/",
+      // One picture of an agent view's screen: a read, both ids checked against their patterns before any
+      // path is built, lead-local like the hill's image route. A bridge that never kept a picture answers 404.
+      "/^\\/api\\/trick-views\\/media\\/([^/]+)\\/([^/]+)$/",
+      // Collie tricks (M94 slice 01): a tap on a trick's control. A SOLO route that legitimately extends
+      // this list, named here rather than exempted: this bridge's own host only (another host is 404
+      // until the crew merge), write-gated because it runs the program, and 404 with no runner.
+      // And its off switch (slice 04): the same file `collie trick on|off` writes, write-gated, this
+      // bridge's own host only, 404 with no runner.
+      // And a picture of the trick's own `media/` folder (M94 review 11): a read, gated like the list,
+      // the hill image's checks and headers, this bridge's own host and a trick that is on only.
+      "/^\\/api\\/tricks\\/([^/]+)\\/([^/]+)\\/(media\\/.+)$/",
+      "/^\\/api\\/tricks\\/([^/]+)\\/([^/]+)\\/auto$/",
+      // And a trick's code for the About sheet's folds (package F): a read, gated like the list, this
+      // bridge's own host only; the approved copy's bytes, masked.
+      "/^\\/api\\/tricks\\/([^/]+)\\/([^/]+)\\/code$/",
+      "/^\\/api\\/tricks\\/([^/]+)\\/([^/]+)\\/switch$/",
+      "/^\\/api\\/tricks\\/([^/]+)\\/([^/]+)\\/tap$/",
+      "/^\\/api\\/tricks\\/([^/]+)\\/([^/]+)\\/undo$/",
+      "/^\\/api\\/tricks\\/([^/]+)\\/([^/]+)\\/value$/",
+      // Official tricks (M94): add or update a trick on the list this release carries. A SOLO route that
+      // legitimately extends this list, named here rather than exempted: write-gated like the switch,
+      // this bridge's own tricks folder only, and a crew member answers `runs-on` and fetches nothing.
+      "/^\\/api\\/tricks\\/official\\/([^/]+)\\/(add|update)$/",
+      // A repository's trick list (package I): read the `collie-tricks.json` of a pasted https link, or add one
+      // trick it lists. A SOLO route that legitimately extends this list, named here rather than exempted:
+      // both verbs write-gated because the bridge fetches from the pasted host, this bridge's own tricks
+      // folder only, and 404 when no repository reader is wired.
+      "/^\\/api\\/tricks\\/repo\\/(list|add)$/",
       // The operator's Cancel on a held walky talky message it sent (M62 spec 03): a write, solo; a
       // record held on a member answers `elsewhere`, never a route of its own.
       "/^\\/api\\/walky\\/([^/]+)\\/cancel$/",
@@ -825,6 +926,11 @@ describe("solo zero-tax — routes", () => {
       // included, and then answers 404 instead of the SPA's app shell. Not a route of its own, and it
       // registers nothing on the crew link.
       "/api/*",
+      // Accounts (M101, ADR 0141): this machine's accounts, a read and two writes, each through the
+      // caller's gate and resolver. A bridge built with no service answers the read 404. Session-scoped,
+      // so a `?host=` call reaches the member whose folders they are.
+      "/api/accounts",
+      "/api/accounts/remove",
       // The prompt-cache rule catalog (M28/02). A process-scoped READ, gated exactly as `/api/config`
       // is, and the only route this feature adds. Not forwarded across the crew link.
       "/api/cache-rules",
@@ -839,6 +945,12 @@ describe("solo zero-tax — routes", () => {
       // It is named here, not exempted: the guard's job is that a route arrives on purpose.
       "/api/devices",
       "/api/devices/revoke",
+      // The composer diagnostic: a SOLO route that legitimately extends this list, named here rather
+      // than exempted. A paired phone whose reply box sits below its screen sends the heights it
+      // measured (numbers and enums only, a fixed key set); this bridge keeps them in
+      // `diag-composer.jsonl`. Read-gated like the notification preferences, never forwarded, nothing
+      // leaves the host. A bridge no phone reports to writes nothing through it.
+      "/api/diag/composer",
       // The new-space sheet's folder list (M40/02, #289) — two SOLO routes that legitimately extend
       // this list, named here rather than exempted. Session-scoped through the same closure
       // `/api/launchers` rides, the read gated as a read and the star as a write, so a `?host=` call
@@ -854,6 +966,20 @@ describe("solo zero-tax — routes", () => {
       // named here rather than exempted. It is the one ungated `/api/*` route: the prober is a local
       // updater holding no credential, and what it answers is `{ ok, version, deposed, mode }`.
       "/api/health",
+      // The hill (M96): the decisions an agent posted (a read) and the phone's answer to one (a write
+      // under the device gate, like `POST /api/walky`). Two SOLO routes, named here rather than
+      // exempted. A bridge that never took a post answers an empty list and writes nothing.
+      "/api/hill",
+      "/api/hill/answer",
+      // Clear (the Answered group's button): a SOLO write under the same device gate, named here.
+      "/api/hill/clear",
+      // The second Clear (1.29.0): the open cards answered in the session, a SOLO write under the same gate.
+      "/api/hill/clear/spoken",
+      // The crew state (1.29.0): a SOLO read and write under the same gates as the switch, and the
+      // "Tell all sessions now" tap, a write that types one operator line per waiting session.
+      "/api/hill/state",
+      "/api/hill/state/tell",
+      "/api/hill/switch",
       // The operator's own launcher rows (`launchers.toml`) — a SOLO route that legitimately
       // extends this list, named here rather than exempted. It is session-scoped and write-gated
       // through the same closure `/api/workspace` rides, and the configured rows are its allowlist:
@@ -898,6 +1024,11 @@ describe("solo zero-tax — routes", () => {
       "/api/notifications/cache-watch",
       "/api/notifications/cache-watch/forget",
       "/api/notifications/cache-watch/list",
+      // Clear all (ADR 0003, ADR 0042): a SOLO route in the notifications family that legitimately
+      // extends this list, named here rather than exempted. Read-gated like snooze and not forwardable:
+      // it opens every pane of the collie the phone talks to, which holds the subscriptions, and `bridge/crew/router.test.ts` pins it as 404 across a link. A bridge nobody asks writes
+      // nothing through it.
+      "/api/notifications/clear",
       "/api/notifications/prefs",
       // The Dogr build's per-phone rules (bridge/notify-rules.ts): a SOLO route like the two around it,
       // answered by the collie that holds the phone's subscription, never forwarded across a link.
@@ -909,6 +1040,8 @@ describe("solo zero-tax — routes", () => {
       // browser answering its own operator. A solo instance registers it and 404s
       // (`crew.not_lead`) — the same shape `/api/stt` has when no provider is configured.
       "/api/pair",
+      // And the request itself (ADR 0139): open like `/api/pair`, under the same Origin rule, capped.
+      "/api/pair/request",
       // "Look now" (ADR 0031) — a SOLO route that legitimately extends this list, named here rather
       // than exempted. It is session-scoped and read-gated, and it registers no crew route of its
       // own: a lead reaches a peer's through the peer's existing `/crew/v1/*` dispatch.
@@ -960,6 +1093,17 @@ describe("solo zero-tax — routes", () => {
       // named here rather than exempted. Lead-local like the math pack, and not forwardable. A bridge
       // whose operator never taps Refresh in the Theme card fetches nothing and writes nothing.
       "/api/themes/registry",
+      // Collie tricks (M94 slice 01): the tricks list and the parts changed since a rev. A read, gated like
+      // the snapshot, and its body is empty of tricks on an install with no `<configDir>/tricks/`.
+      // Agent views: the screens agents drew per (trick, session) (a read) and the person's per-session
+      // switch (a write that needs a paired device's own token). Two SOLO routes, named here rather than
+      // exempted, lead-local like the hill. A bridge that never used a view answers an empty list.
+      "/api/trick-views",
+      "/api/trick-views/switch",
+      "/api/tricks",
+      // Official tricks (M94): the list this release carries, each entry's state on this machine. A read, gated
+      // like the tricks list; it reads the list from the binary and the tricks folder, and fetches nothing.
+      "/api/tricks/official",
       // Starting an update from the phone (M15/05) — a SOLO route that legitimately extends this
       // list, named here rather than exempted. Write-gated through the same closure a send rides,
       // and it registers no crew sibling: a peer is levelled from the lead's terminal
@@ -995,6 +1139,8 @@ describe("solo zero-tax — routes", () => {
       // create. Two SOLO routes, named here rather than exempted. Session-scoped through the gate and
       // lead-local like the worktree create: neither is forwardable.
       "/api/worktree",
+      "/api/worktree/folder",
+      "/api/worktree/folder/set",
       "/api/worktree/plan",
       "/auth",
       "/auth/*",
@@ -1044,6 +1190,8 @@ const CONFIG_KEYS = {
   launchersFile: true,
   cacheRulesFile: true,
   spacesFile: true,
+  // Collie tricks (M94): the `tricks/` folder beside the operator files. A path, read only by the runner.
+  tricksDir: true,
   maxUploadBytes: true,
   port: true,
   host: true,
@@ -1070,12 +1218,14 @@ const CONFIG_KEYS = {
   stateDir: true,
   multiSession: true,
   surfaceShadow: true,
+  inside: true,
   sendProtocol: true,
   walky: true,
   walkyPairLimit: true,
   accountWindows: true,
   skipServe: true,
   basePath: true,
+  authReturn: true,
   uploadExtraTypes: true,
   cacheWarnSeconds: true,
   accessTeam: true,
@@ -1093,6 +1243,7 @@ describe("solo zero-tax — config", () => {
       "allowNonLoopbackBind",
       "allowedOrigins",
       "auditContent",
+      "authReturn",
       "basePath",
       "cacheRulesFile",
       "cacheWarnSeconds",
@@ -1102,6 +1253,7 @@ describe("solo zero-tax — config", () => {
       "dialMode",
       "fontsDir",
       "host",
+      "inside",
       "journalRoots",
       "keysFile",
       "launchersFile",
@@ -1133,6 +1285,7 @@ describe("solo zero-tax — config", () => {
       "themeFile",
       "tmuxBin",
       "transcript",
+      "tricksDir",
       "trustedUser",
       "trustedUserOptional",
       "uploadExtraTypes",
@@ -1141,7 +1294,7 @@ describe("solo zero-tax — config", () => {
       "vapidSubject",
       // Walky talky (M62): whether this machine takes messages for its panes. A solo switch, on by default.
       "walky",
-      // The walky talky pair cap, messages per ten minutes between two panes on this machine. Default 6.
+      // The walky talky pair cap, messages per ten minutes between two panes on this machine. Default 12.
       "walkyPairLimit",
       "zellijBin",
     ]);
@@ -1167,7 +1320,7 @@ describe("solo zero-tax — config", () => {
   // Read from `bridge/config-schema.ts` rather than by grepping `config.ts`'s source, because the
   // schema is now the single declaration of what every setting is (ADR 0040). The rows that carry a
   // `configField` are exactly the settings `loadConfig` resolves, which is the list §11 pins. A
-  // CONFIG FILE ADDS NO ENV KEY, so this list is the 38 names it has always been plus `COLLIE_BASE_PATH` (ADR 0052), `COLLIE_MUSE_ROOT`, `COLLIE_OPENCLAW_ROOT` (#401), `COLLIE_KIRO_ROOT`, `COLLIE_DSH_ROOT`, the two `COLLIE_ACCESS_*` keys (ADR 0081) `COLLIE_SENT` (ADR 0107) and `COLLIE_ACCOUNT_WINDOWS` (ADR 0118) — the two
+  // CONFIG FILE ADDS NO ENV KEY, so this list is the 38 names it has always been plus `COLLIE_BASE_PATH` (ADR 0052), `COLLIE_AUTH_RETURN`, `COLLIE_MUSE_ROOT`, `COLLIE_OPENCLAW_ROOT` (#401), `COLLIE_KIRO_ROOT`, `COLLIE_DSH_ROOT`, the two `COLLIE_ACCESS_*` keys (ADR 0081) `COLLIE_SENT` (ADR 0107) `COLLIE_ACCOUNT_WINDOWS` (ADR 0118) and `COLLIE_INSIDE` (M99) — the two
   // `COLLIE_MUX_ENDPOINT_<NAME>` rows collapse back to the prefix the old grep saw, because the env
   // name is built at the call site and the file key must not be.
   test("the schema names exactly today's COLLIE_* env keys — no crew enrollment key", () => {
@@ -1187,6 +1340,7 @@ describe("solo zero-tax — config", () => {
       "COLLIE_ALLOW_ANY_HOST",
       "COLLIE_ALLOW_NON_LOOPBACK_BIND",
       "COLLIE_AUDIT_CONTENT",
+      "COLLIE_AUTH_RETURN",
       "COLLIE_BASE_PATH",
       "COLLIE_CACHE_WARN_SECONDS",
       "COLLIE_CODEX_ROOT",
@@ -1197,8 +1351,10 @@ describe("solo zero-tax — config", () => {
       "COLLIE_HERDR_DIAL",
       "COLLIE_HERMES_ROOT",
       "COLLIE_HOST",
+      "COLLIE_INSIDE",
       "COLLIE_KIRO_ROOT",
       "COLLIE_MAX_UPLOAD_MB",
+      "COLLIE_MCODE_ROOT",
       "COLLIE_MULTI_SESSION",
       "COLLIE_MUSE_ROOT",
       "COLLIE_MUX",
@@ -1244,6 +1400,9 @@ describe("solo zero-tax — config", () => {
 
 /** Every `<stateDir>/…` path any bridge module names. `uploads` is a directory, the rest are files. */
 const STATE_DIR_ENTRIES = [
+  // The accounts a person added on this machine (M101, ADR 0141). Written by use and by nothing else:
+  // absent until the first add from Settings succeeds.
+  "accounts.json",
   // Windows only (M43 spec 04): the access lists Collie saved before it changed one, so the change can
   // be undone with `icacls /restore`. Absent until the bridge actually repaired a loose folder or file;
   // never on Linux or macOS, and never on a Windows install whose folders were private already.
@@ -1257,6 +1416,10 @@ const STATE_DIR_ENTRIES = [
   // READS it, and the emitter that fills it is a CLI verb the operator installs a hook for. An
   // instance whose operator never ran `collie hooks install` never has this directory at all.
   "beacons",
+  // This bridge's stable id (bridge/bridge-id.ts, M94 review row 11): the install id, minted once, and
+  // the id kept before a crew join. Written by use and by nothing else: boot only reads it, and the
+  // first trick run or hill post writes it, so a bridge that is merely started never has it.
+  "bridge-id.json",
   // The prompt-cache watch list (M28/03). Absent until the first watch toggle or the first warning sent
   // under the global switch — both are events, so a bridge that is merely started still writes the four
   // entries asserted below.
@@ -1270,6 +1433,10 @@ const STATE_DIR_ENTRIES = [
   // The bridge's own log of a durable program's panes (ADR 0099), one file per pane inside this folder.
   // Written only by a bridge that drives `COLLIE_MUX=durable`: the factory that builds the writer is
   // never called for Herdr, tmux or zellij, so every other instance never has this folder.
+  // The composer diagnostic (bridge/diag-composer.ts): the heights a phone measured when its reply box sat
+  // below its screen, one JSON line each, at most 500 lines. Written by use and by nothing else: absent
+  // until a phone reports an off-screen box. Numbers and enums only, no text.
+  "diag-composer.jsonl",
   "durable",
   // The push guard's memory for asks that travel as data (ADR 0100), keyed on (host, toolCallId).
   // Written only when a pane that carries asks opens or closes one: a bridge with no durable pane,
@@ -1288,6 +1455,10 @@ const STATE_DIR_ENTRIES = [
   // The hold queue (M56 spec 15): one file per send the harness could not take during its turn, kept
   // until the pane reads free, so a restart replays it. Created with the Send Protocol, like `sends`.
   "held",
+  // The hill (M96): the decisions agents posted and the receipts of the phone's answers, a folder with
+  // `decisions.json` and `receipts.json`. Written by use and by nothing else: absent until the first
+  // decision an agent posts, or the first answer from a phone.
+  "hill",
   // One receipt per launch the phone tagged with a request id (ADR 0091), so a retried Start never
   // opens a second pane. Written by use and by nothing else: absent until the first launch that
   // carries an id succeeds.
@@ -1334,6 +1505,13 @@ const STATE_DIR_ENTRIES = [
   // line. Written by use and by nothing else: absent until the first line sent to a shell pane, or the
   // first one-off run, that the skip rules keep. `COLLIE_SENT=off` never writes it.
   "sent.jsonl",
+  // The last names of each harness session (bridge/session-titles-store.ts), so a `/rename` name stays
+  // after a restart. Written by use and by nothing else: absent until a harness log first names a
+  // session. Transcripts off never builds the tracker, so it never writes it.
+  "session-titles.json",
+  // The folder a sign-in start runs in (bridge/account-folder.ts `signInFolder`): made empty, at 0700, by the
+  // first sign-in start from a phone, and never written into. Absent until then.
+  "sign-in",
   "snooze.json",
   // One receipt per starter a phone ran on a durable program (ADR 0102). Written by use and by nothing
   // else: absent until the first starter run, which only a peer on `COLLIE_MUX=durable` can offer.
@@ -1354,6 +1532,12 @@ const STATE_DIR_ENTRIES = [
   // The community theme registry (M59 spec 06): `<stateDir>/themes/registry.json`, the copy a tap on
   // Refresh in the Theme card fetched. Written by that tap and by nothing else.
   "themes",
+  // Agent views: `<stateDir>/trick-views/views/<key>.json`, one file per (trick, session), and
+  // `media/`. Written by use and by nothing else: absent until the first switch from a phone.
+  "trick-views",
+  // Collie tricks (M94, bridge/tricks/paths.ts): `switches.json` and one state folder per trick that ran.
+  // Written only by `collie trick on`/`off` and by a trick's run, so an install with no tricks has none.
+  "tricks",
   // The detached updater's own stdout and stderr (#283), with the run before it kept beside it as
   // `update-runner.log.1`. Absent until the first update started from the phone: the bridge opens it
   // only to hand the descriptor to the runner it spawns.
@@ -1372,6 +1556,10 @@ const STATE_DIR_ENTRIES = [
   // The usage readings, `usage/` (ADR 0115): one small file per Claude session, written by the
   // statusLine wrapper, read and pruned by the bridge. Absent until a wrapped statusLine runs.
   "usage",
+  // The last reading of each account's usage windows (bridge/usage-seen.ts, M101 spec 02): one 0600 file,
+  // written at most once a minute per key and only when a figure changed. Written by use and by nothing
+  // else: absent until the first reading of a window is held, and a bridge that is only started never has it.
+  "usage-seen.json",
   // The Whistle model's folder, `whistle/` (ADR 0096): the model, its manifest and a download's
   // part file. Absent until a write device taps "Download to host" or the operator runs
   // `collie stt whistle`; nothing else creates it.
@@ -1387,6 +1575,9 @@ const STATE_DIR_ENTRIES = [
   // The New sheet's last branch choices per repo (M48). Written by use and by nothing else: absent
   // until the first branch create from a folder succeeds.
   "worktree-choices.json",
+  // The machine's Worktree folder (ADR 0093 note): one parent directory, written only by the Settings
+  // card's save and absent until a person sets one.
+  "worktree-folder.json",
   // One receipt per worktree create the phone tagged with a request id (ADR 0089), so a retried
   // create replays instead of making a second worktree. Written by use and by nothing else: absent
   // until the first create that carries an id succeeds. Driven in "the worktree receipts appear only
@@ -1423,11 +1614,23 @@ const CREW_STATE_DIR_ENTRIES = [
   // state directory that never saw 1.8.x is named rather than adopted in silence. One `exists()` on
   // the boot path, no open, no rename; a solo instance finds nothing and says nothing.
   "pack-trust.json",
+  // The person's takeover tap, waiting for the next boot to adopt the two copies below (CREW_PROTOCOL
+  // §25). Written only by the takeover commit or `collie promote` on a deputy, which a solo instance
+  // never is.
+  "standby-adopt.json",
   "standby-devices.json",
+  // The lead's open Decisions, kept as an inert copy on the DEPUTY beside its tricks (CREW_PROTOCOL
+  // §25). Written only by the Hill half of the §25 routes from this collie's own lead while a warrant
+  // names this machine, which a solo instance cannot reach.
+  "standby-hill",
   // The lead's launcher rows, kept as a read-only copy on the DEPUTY (ADR 0127 point 5). The same
   // structural reason as the registry above: it is written only by a `POST /crew/v1/launchers-copy`
   // from this collie's own lead while a warrant names this machine, which a solo instance cannot reach.
   "standby-launchers.json",
+  // The lead's tricks, kept as an inert copy on the DEPUTY (CREW_PROTOCOL §25). The same structural
+  // reason: written only by the §25 routes from this collie's own lead while a warrant names this
+  // machine, which a solo instance cannot reach.
+  "standby-tricks",
 ];
 
 /** Every `.ts` module under `dir`, recursively, excluding tests. */

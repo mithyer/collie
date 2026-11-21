@@ -4,9 +4,10 @@ import net from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { toPipeName } from "../../dial.ts";
+import { SocketWriteFailed, toPipeName } from "../../dial.ts";
+import { bunWritesAnswer } from "../../dial.write-fails.ts";
 import type { JsonObject } from "../../json.ts";
-import { HerdrClient } from "./client.ts";
+import { HerdrClient, HerdrNoReply, HerdrTimeout } from "./client.ts";
 
 // The client's per-call budget. Proved against a real Unix socket (a named pipe on Windows) that
 // answers late: a call gives up at the budget the client was built with.
@@ -79,6 +80,100 @@ describe("HerdrClient per-call timeout", () => {
   });
 });
 
+/** A Herdr stand-in that reads one request line and closes the connection without a reply. */
+async function droppingHerdr(): Promise<string> {
+  dir = mkdtempSync(join(tmpdir(), "collie-herdr-client-"));
+  const path = join(dir, "herdr.sock");
+  server = net.createServer((conn) => {
+    let buf = "";
+    conn.on("error", () => {});
+    conn.on("data", (chunk) => {
+      buf += chunk.toString();
+      if (buf.includes("\n")) conn.destroy();
+    });
+  });
+  const listening = server;
+  await new Promise<void>((resolve, reject) => {
+    listening.once("error", reject);
+    listening.listen(path, resolve);
+  });
+  return path;
+}
+
+/** A stand-in that never reads: it closes with the request unread, which resets the connection. */
+async function resettingServer(name: string): Promise<string> {
+  dir = mkdtempSync(join(tmpdir(), "collie-herdr-client-"));
+  const path = join(dir, name);
+  server = net.createServer({ pauseOnConnect: true }, (conn) => {
+    conn.on("error", () => {});
+    setTimeout(() => conn.destroy(), 50);
+  });
+  const listening = server;
+  await new Promise<void>((resolve, reject) => {
+    listening.once("error", reject);
+    listening.listen(path, resolve);
+  });
+  return path;
+}
+
+/** What `call` rejects with, as an Error, or null when it resolves. */
+async function rejection(call: () => Promise<void>): Promise<Error | null> {
+  try {
+    await call();
+  } catch (err) {
+    return err instanceof Error ? err : new Error(String(err));
+  }
+  return null;
+}
+
+// M100 spec 03: a connection that closes after the request went out may follow a request Herdr acted
+// on, so it is its own class; a dial that never reached Herdr is not.
+describe.skipIf(process.platform === "win32")("HerdrClient, a connection closed before the reply", () => {
+  test("a close after the request went out rejects with HerdrNoReply and the old words", async () => {
+    const client = new HerdrClient(await droppingHerdr(), 2000);
+    const caught = await rejection(() => client.sendPaneText("w1:p1", "hello"));
+    expect(caught).toBeInstanceOf(HerdrNoReply);
+    expect(caught?.message).toBe("herdr pane.send_text: connection closed before reply");
+  });
+
+  test("a connection reset after the request went out rejects with HerdrNoReply", async () => {
+    const client = new HerdrClient(await resettingServer("herdr.sock"), 2000);
+    const caught = await rejection(() => client.sendPaneText("w1:p1", "hello"));
+    expect(caught).toBeInstanceOf(HerdrNoReply);
+  });
+
+  test("a write the socket refused after it took part of the request rejects with HerdrNoReply", async () => {
+    const restore = bunWritesAnswer([4, -1]);
+    try {
+      const caught = await rejection(() => new HerdrClient("/nowhere/herdr.sock", 2000).sendPaneText("w1:p1", "hello"));
+      expect(caught).toBeInstanceOf(HerdrNoReply);
+      expect(caught?.message).toBe("herdr pane.send_text: socket write failed");
+    } finally {
+      restore();
+    }
+  });
+
+  test("a write the socket refused before it took a byte rejects with the plain error", async () => {
+    const restore = bunWritesAnswer([-1]);
+    try {
+      const caught = await rejection(() => new HerdrClient("/nowhere/herdr.sock", 2000).sendPaneText("w1:p1", "hello"));
+      expect(caught).toBeInstanceOf(SocketWriteFailed);
+      expect(caught).not.toBeInstanceOf(HerdrNoReply);
+    } finally {
+      restore();
+    }
+  });
+
+  test("a socket with nobody behind it rejects with the dial's own error, not HerdrNoReply", async () => {
+    dir = mkdtempSync(join(tmpdir(), "collie-herdr-client-"));
+    const client = new HerdrClient(join(dir, "none.sock"), 2000);
+    const caught = await rejection(() => client.sendPaneText("w1:p1", "hello"));
+    expect(caught).not.toBeInstanceOf(HerdrNoReply);
+    expect(caught).not.toBeInstanceOf(HerdrTimeout);
+    expect(caught !== null && "code" in caught ? caught.code : null).toBe("ENOENT");
+  });
+});
+
 describe("HerdrClient processInfo", () => {
   const GROUP = {
     pane_id: "w9:p1",
@@ -98,5 +193,42 @@ describe("HerdrClient processInfo", () => {
   test("a pane with no foreground group answers without the key", async () => {
     const client = new HerdrClient(await lateHerdr({ process_info: { pane_id: "w9:p1" } }), 1_000);
     await expect(client.processInfo("w9:p1")).resolves.toEqual({ pane_id: "w9:p1" });
+  });
+});
+
+describe("HerdrClient openWorktree", () => {
+  // The shape of a real `worktree.open` answer, probed on herdr 0.9.5 (2026-11-13): the same
+  // `workspace` and `root_pane` a `workspace.create` gives, the worktree block on the workspace, and
+  // `already_open`.
+  const ANSWER = {
+    type: "worktree_opened",
+    already_open: false,
+    workspace: {
+      workspace_id: "w3",
+      label: "feat-x",
+      worktree: { checkout_path: "/srv/repo-wt/feat-x", is_linked_worktree: true, repo_key: "/srv/repo/.git" },
+    },
+    tab: { tab_id: "w3:t1", workspace_id: "w3" },
+    root_pane: { pane_id: "w3:p1", workspace_id: "w3", tab_id: "w3:t1", cwd: "/srv/repo-wt/feat-x" },
+  };
+
+  test("it sends worktree.open with the repo root as cwd, the checkout as path, and never focuses", async () => {
+    const client = new HerdrClient(await lateHerdr(ANSWER), 1_000);
+    const shell = await client.openWorktree({ cwd: "/srv/repo", path: "/srv/repo-wt/feat-x", label: "feat-x" });
+    expect(lastRequest?.method).toBe("worktree.open");
+    expect(lastRequest?.params).toEqual({ cwd: "/srv/repo", path: "/srv/repo-wt/feat-x", label: "feat-x", focus: false });
+    expect(shell).toEqual({
+      paneId: "w3:p1",
+      workspaceId: "w3",
+      workspaceLabel: "feat-x",
+      tabId: "w3:t1",
+      cwd: "/srv/repo-wt/feat-x",
+    });
+  });
+
+  test("an empty label is left off the wire", async () => {
+    const client = new HerdrClient(await lateHerdr(ANSWER), 1_000);
+    await client.openWorktree({ cwd: "/srv/repo", path: "/srv/repo-wt/feat-x", label: "" });
+    expect(lastRequest?.params).toEqual({ cwd: "/srv/repo", path: "/srv/repo-wt/feat-x", focus: false });
   });
 });

@@ -16,7 +16,8 @@ import { useWidthClass } from "@/hooks/use-width-class";
 import { cn } from "@/lib/utils";
 import { useTabLook, type TabLook } from "@/lib/tab-look";
 import { TRIAGE_STATUS, worstTriage, type TriageKey } from "@/lib/triage";
-import { hostKey } from "@/lib/hosts";
+import { CrossfadeText } from "@/components/ui/crossfade-text";
+import { hostKey, tabKey } from "@/lib/hosts";
 import { tabCellTitle, type TabTitle } from "@/lib/pane-name";
 import { statusLabel } from "@/lib/types";
 import type { AgentView, TabView } from "@/lib/types";
@@ -228,7 +229,9 @@ export function TabStrip({
   const scrollerRef = useRef<HTMLDivElement>(null);
   // Keyed on `selected` (not `workspaceId`): a many-tab strip must reveal the active tab on mount
   // AND every time the operator switches tabs, and `selected` is the value that changes on a switch.
-  useRevealActive(scrollerRef, selected);
+  // With `trailing` this is the pane screen's row, which remounts for every pane it opens; the memory
+  // key keeps the row where it stood, so a tapped tab stays under the finger.
+  useRevealActive(scrollerRef, selected, `tabs:${trailing ? "pane" : "space"}:${host ?? ""}:${workspaceId}`);
 
   // Tab status is computed over THIS machine's panes only: tab ids (`w1:t1`) collide across a crew
   // exactly as pane and workspace ids do, so an unfiltered merged list would paint a peer's blocked
@@ -284,7 +287,7 @@ export function TabStrip({
           // The pane row under this one (when the tab holds several panes) is a plain neighbour
           // now, not a rival: the two rows' hit boxes meet on their shared edge and never overlap.
           className={cn(
-            "flex items-center gap-3 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden",
+            "flex items-center gap-3 overflow-x-auto overscroll-x-contain [scrollbar-width:none] [&::-webkit-scrollbar]:hidden",
             // With a pinned control the right half of the edge-to-edge trick is spent on it: the
             // scroller becomes the flex row's growing child, keeps the LEFT gutter cancellation so
             // the first tab still starts on the route's 16px, and stops at the control instead of at
@@ -318,6 +321,7 @@ export function TabStrip({
                 step={step}
                 label={t.label}
                 title={tabCellTitle(t.label, inTab)}
+                fade={tabKey(host, t.tabId)}
                 active={selected === t.tabId}
                 // What's actually going on in there — blocked / ready / working / idle — instead of a
                 // dot that only ever appeared for blocked and left every other state unreadable.
@@ -395,6 +399,8 @@ interface TabProps {
   label: string;
   /** What the cell says ({@link tabCellTitle}); the "All" cell passes its word as a plain title. */
   title?: TabTitle | null;
+  /** The tab's identity ({@link tabKey}): a rename of this tab fades its words in ({@link CrossfadeText}). */
+  fade?: string;
   active: boolean;
   /**
    * The most urgent thing happening inside this tab ({@link worstTriage}) — drawn as a leading dot
@@ -415,6 +421,7 @@ function Tab({
   step,
   label,
   title: titleProp,
+  fade,
   active,
   status,
   onClick,
@@ -524,7 +531,7 @@ function Tab({
         // open one takes the full ink like any open tab, because ink is half of the only mark.
         <StableLabel className={active ? undefined : "text-muted-foreground/70"}>{title.text}</StableLabel>
       ) : (
-        <StableLabel>{title.text}</StableLabel>
+        <StableLabel fade={fade}>{title.text}</StableLabel>
       )}
     </button>
   );
@@ -534,13 +541,17 @@ function Tab({
 // E). Two copies share one grid cell: the invisible one is always semibold and sets the cell's
 // width, the visible one takes the tab's own weight and is centred over it. The copy is
 // `aria-hidden`, so the button's accessible name is the label once, not twice.
-function StableLabel({ children, className }: { children: string; className?: string }) {
+// `fade` is the tab's identity: given, a rename crossfades the visible copy (the invisible one takes
+// the new width at once).
+function StableLabel({ children, className, fade }: { children: string; className?: string; fade?: string }) {
   return (
     <span className={cn("grid justify-items-center", className)}>
       <span aria-hidden="true" className="invisible col-start-1 row-start-1 font-semibold">
         {children}
       </span>
-      <span className="col-start-1 row-start-1">{children}</span>
+      <span className="col-start-1 row-start-1">
+        {fade === undefined ? children : <CrossfadeText text={children} identity={fade} />}
+      </span>
     </span>
   );
 }

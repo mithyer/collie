@@ -87,6 +87,31 @@ describe("plurals", () => {
     expect(tn("space.overview.paneCount", 2)).toBe("2ペイン");
   });
 
+  // The fallback does not read `PENDING_TRANSLATION`: it fires for any plural set a bundle lacks. So the
+  // test builds that bundle itself, a Russian one without one set, and reads it through a fresh module.
+  it("reads a plural set in English, with English's rule, where a bundle lacks it", async () => {
+    vi.resetModules();
+    vi.doMock("./messages/ru", async (importOriginal) => {
+      const original = await importOriginal<typeof import("./messages/ru")>();
+      const kept = Object.fromEntries(
+        Object.entries(original.ru).filter(([key]) => !key.startsWith("home.tabs.hill.")),
+      );
+      return { ...original, ru: kept };
+    });
+    try {
+      const fresh = await import("./index");
+      fresh.setLocale("ru");
+      await fresh.whenLocaleReady("ru");
+      expect(fresh.tn("home.tabs.hill", 1)).toBe("1 Decision waits on you");
+      expect(fresh.tn("home.tabs.hill", 3)).toBe("3 Decisions wait on you");
+      // A set the bundle keeps still reads Russian, with Russian's rule.
+      expect(fresh.tn("home.changes.files", 2)).toBe("2 файла");
+    } finally {
+      vi.doUnmock("./messages/ru");
+      vi.resetModules();
+    }
+  });
+
   it("picks one/few/many for Russian", async () => {
     setLocale("ru");
     await whenLocaleReady("ru");
@@ -261,8 +286,11 @@ describe("every translated dictionary", () => {
         `${code} has keys English lacks`,
       ).toEqual([]);
       // Intl gives Russian `few` and `many` for whole numbers, so a plural base without both would
-      // quietly read `.other` for 2 and for 5.
-      const bases = englishKeys.filter((key) => key.endsWith(".one")).map((key) => key.slice(0, -4));
+      // quietly read `.other` for 2 and for 5. A set still pending translation reads English with
+      // English's rule (`tn`), so it carries no extra category until its translation pass.
+      const bases = englishKeys
+        .filter((key) => key.endsWith(".one") && !pending.has(key))
+        .map((key) => key.slice(0, -4));
       const extras = bases.flatMap((base) => EXTRA_PLURAL_CATEGORIES.map((category) => `${base}.${category}`));
       expect(
         extras.filter((key) => key in dictionary),

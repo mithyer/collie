@@ -32,6 +32,7 @@
 
 import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
+import { isQuestionPane } from "../../types.ts";
 import { declareCapabilities } from "../capabilities.ts";
 import type { ForegroundProcess } from "../../journal/types.ts";
 import { EXTENDED_ONLY_CHORDS } from "../keys.ts";
@@ -59,7 +60,7 @@ import {
   type MuxTabRequest,
   type MuxWatchOptions,
 } from "../types.ts";
-import { DEFAULT_HC_TIMEOUT_MS, defaultHcSocket, HC_GENERATION, HcClient, HcError, HcTimeout, type HcRpc, type WireForeground, type WireLayout, type WireRead, type WireTerminal } from "./client.ts";
+import { DEFAULT_HC_TIMEOUT_MS, defaultHcSocket, HC_GENERATION, HcClient, HcError, HcNoReply, HcTimeout, type HcRpc, type WireForeground, type WireLayout, type WireRead, type WireTerminal } from "./client.ts";
 import { routeEvent } from "./events.ts";
 import { herdrCoreMachineCandidates } from "./machine-list.ts";
 import { herdrCoreBeaconMatcher } from "./markers.ts";
@@ -124,6 +125,16 @@ const GONE_KINDS: ReadonlySet<string> = new Set(["not_found", "finished", "machi
 function refusalFor<T>(err: T): MuxRefusalOutcome {
   if (err instanceof HcError) return GONE_KINDS.has(err.kind) ? muxGone(err.message) : muxRefused(err.message);
   return muxUnreachable(err instanceof Error ? err.message : String(err));
+}
+
+/**
+ * The refusal for a failure of a CREATE call. A `runShell` the core did not answer in time, or whose
+ * connection closed after it carried the request, may still have started the shell, so it is
+ * `unconfirmed` and not `unreachable`: the route looks in the snapshot before it says anything
+ * (bridge/create-confirm.ts).
+ */
+function createRefusal<T>(err: T): MuxRefusalOutcome {
+  return err instanceof HcTimeout || err instanceof HcNoReply ? muxUnconfirmed(err.message) : refusalFor(err);
 }
 
 /** A pane id this adapter may address: a local terminal. Another machine's is `gone` here. */
@@ -222,7 +233,10 @@ export class HerdrCoreMux implements MuxAdapter {
 
   /** Per pane, the history read the core still runs, until it settles; Collie's budget does not end it. */
   private readonly historyPending = new Map<string, Promise<WireRead>>();
-  /** Panes whose program reported `blocked` in the last snapshot: a dialog is up. */
+  /**
+   * Panes whose program reported `blocked` in the last snapshot: a dialog is up. Not a pane that stopped
+   * on an error (`blockedBy: "error"`): no dialog is open there, so Load older reads its history.
+   */
   private readonly blockedPanes = new Set<string>();
   private readonly historyBudgetMs: number;
   private readonly log: (line: string) => void;
@@ -357,7 +371,10 @@ export class HerdrCoreMux implements MuxAdapter {
    *
    * At most one history read per pane runs on the core. While the program reports `blocked` or the
    * bridge's hint does (`hintBlocked`), none starts and the screen answers with
-   * {@link OLDER_NOTE_BLOCKED}. While one runs, a second `older` read waits for that one within the
+   * {@link OLDER_NOTE_BLOCKED}. A pane that stopped on an error is neither (`noteHistoryState`,
+   * server.ts `paneReadHint`), so its history is read. On a full-screen program the core may answer
+   * that read with the screen alone and `complete: false`; that answer carries no note, because
+   * neither note is true for it. While one runs, a second `older` read waits for that one within the
    * budget. Past the budget the screen answers with {@link OLDER_NOTE_READING}.
    */
   private async olderRows(paneId: string, lines: number, hintBlocked: boolean): Promise<{ read: WireRead; screen: WireRead; note?: string }> {
@@ -414,7 +431,20 @@ export class HerdrCoreMux implements MuxAdapter {
     const remote = remoteRefusal(paneId);
     if (remote !== null) return remote;
     if (text.length === 0) return muxAck();
-    return this.attempt(() => this.writeRaw(paneId, text));
+    // A write the core did not confirm, by a time-out or a closed connection after the text went out, may
+    // still land: `unconfirmed`, and the caller's next read decides, as for keys ({@link attemptKeys}).
+    try {
+      await this.writeRaw(paneId, text);
+      return muxAck();
+    } catch (err) {
+      if (err instanceof HcTimeout) {
+        return muxUnconfirmed(`herdr-core did not confirm the text written to ${paneId} in time (${err.message}). It may still arrive, so it was not written again.`);
+      }
+      if (err instanceof HcNoReply) {
+        return muxUnconfirmed(`herdr-core closed the connection before it confirmed the text written to ${paneId} (${err.message}). It may have arrived, so it was not written again.`);
+      }
+      return refusalFor(err);
+    }
   }
 
   /**
@@ -522,7 +552,7 @@ export class HerdrCoreMux implements MuxAdapter {
       this.foregrounds.set(created.address, created.foreground);
       return muxOk({ paneId: created.address, spaceId: space.spaceId, spaceLabel: space.label, tabId, cwd: created.cwd });
     } catch (err) {
-      return refusalFor(err);
+      return createRefusal(err);
     }
   }
 
@@ -546,7 +576,7 @@ export class HerdrCoreMux implements MuxAdapter {
       const spaceLabel = folderName(created.foreground?.cwd || created.cwd, this.home) || spaceId;
       return muxOk({ paneId: created.address, spaceId, spaceLabel, tabId, cwd: created.cwd });
     } catch (err) {
-      return refusalFor(err);
+      return createRefusal(err);
     }
   }
 
@@ -611,7 +641,8 @@ export class HerdrCoreMux implements MuxAdapter {
   }
 
   /**
-   * {@link attempt} for keys. A call the core did not answer in time is `unconfirmed`, not a failure:
+   * The ack-or-refusal of a key call. A call the core did not answer in time, or whose connection closed
+   * after it carried the keys, is `unconfirmed`, not a failure:
    * the core may still deliver the key (it did, M78 report 10 case 2). Nothing here sends it again;
    * the next read of the pane shows whether it landed.
    */
@@ -623,25 +654,18 @@ export class HerdrCoreMux implements MuxAdapter {
       if (err instanceof HcTimeout) {
         return muxUnconfirmed(`herdr-core did not confirm the keys on ${paneId} in time (${err.message}). They may still arrive, so they were not sent again.`);
       }
+      if (err instanceof HcNoReply) {
+        return muxUnconfirmed(`herdr-core closed the connection before it confirmed the keys on ${paneId} (${err.message}). They may have arrived, so they were not sent again.`);
+      }
       return refusalFor(err);
     }
   }
 
-  /** What the last snapshot says about history reads: which panes are blocked. */
+  /** What the last snapshot says about history reads: which panes are blocked on a question. */
   private noteHistoryState(snapshot: MuxSnapshot): void {
     this.blockedPanes.clear();
     for (const pane of snapshot.panes) {
-      if (pane.status === "blocked") this.blockedPanes.add(pane.paneId);
-    }
-  }
-
-  /** One verb that answers nothing but "it happened", as the contract's ack-or-refusal. */
-  private async attempt(call: () => Promise<void>): Promise<MuxAck> {
-    try {
-      await call();
-      return muxAck();
-    } catch (err) {
-      return refusalFor(err);
+      if (isQuestionPane(pane)) this.blockedPanes.add(pane.paneId);
     }
   }
 

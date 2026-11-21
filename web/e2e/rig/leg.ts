@@ -22,10 +22,11 @@ import { TOKEN_STORAGE_KEY } from "../../src/lib/pairing";
 import { readSendReceipts, readSurface } from "../../src/lib/send-protocol";
 import { askOf, isFree, type Surface } from "../../src/lib/surface/surface";
 import { TOUR_STORAGE_KEY, TOUR_VERSION } from "../../src/lib/tour";
+import { DESIGN_KEY, STILL_MARK } from "../fixtures/still-mark";
 import { BIN } from "./bins";
 import { SETUPS, harnessDirs, prepareHarness, type HarnessId } from "./harnesses";
 import type { ScenarioId } from "./scenarios";
-import { MEMBER_ID, P, STATE_ROOT, memGuard, readRun, readToken, sleep, startInPane, type Machine } from "./rig-lib";
+import { MEMBER_ID, P, STATE_ROOT, memGuard, readRun, readSecondToken, readToken, sleep, startInPane, type Machine } from "./rig-lib";
 import { STUB_HARNESSES, tiersFromEnv } from "./replay/tier";
 
 export { expect };
@@ -76,7 +77,7 @@ export function record(row: LedgerRow): void {
 // ── model turns ──────────────────────────────────────────────────────────────────────────────────
 
 /** Model turns one full run may spend on one harness. */
-export const TURN_CAP = 25;
+export const TURN_CAP = 26;
 
 /**
  * Count one model turn (a prompt the agent answers with the model). Throws when the harness has no
@@ -151,6 +152,8 @@ export interface RigPane {
   readonly agent: string;
   readonly status: string;
   readonly surface: Surface | null;
+  /** The pane read's `linked: true` (M99 spec 15): a part takes a plain message by data. */
+  readonly linked: boolean;
 }
 
 /** A pane's host on the crew rig: `undefined` for the lead's own panes, the member's id for the member's. */
@@ -168,12 +171,30 @@ export class Rig {
   /** The lead's member id on a crew rig; undefined on the solo rig. */
   readonly leadId: string | undefined;
 
-  constructor() {
+  /**
+   * The rig's bridge: the lead's, or with `which` = "second" the SECOND bridge of a rig started with
+   * `rig.ts up --second-bridge` (the chaos leg's case C3), which throws when this rig has none. The second
+   * bridge sees the same Herdr and the same panes, with its own state and its own paired device.
+   */
+  constructor(which: "lead" | "second" = "lead") {
     const run = readRun();
     if (run?.ready !== true) throw new Error("the rig is not up: the global setup starts it (bun e2e/rig/rig.ts up)");
-    this.base = `http://127.0.0.1:${run.port}`;
-    this.token = readToken();
-    this.leadId = run.leadId;
+    if (which === "lead") {
+      this.base = `http://127.0.0.1:${run.port}`;
+      this.token = readToken();
+      this.leadId = run.leadId;
+      return;
+    }
+    const token = readSecondToken();
+    if (run.second === undefined || token === null) throw new Error("this rig has no second bridge: start it with `bun e2e/rig/rig.ts up --second-bridge`");
+    this.base = `http://127.0.0.1:${run.second.port}`;
+    this.token = token;
+    this.leadId = undefined;
+  }
+
+  /** The rig's second bridge as a client, or null when the rig runs without one. */
+  static second(): Rig | null {
+    return readRun()?.second === undefined || readSecondToken() === null ? null : new Rig("second");
   }
 
   /** The device token the rig paired, for the phone's localStorage. */
@@ -209,7 +230,7 @@ export class Rig {
       if (row.paneId !== paneId) continue;
       const rowHost = asJsonString(row.host);
       if (host === undefined ? rowHost !== undefined && rowHost !== this.leadId : rowHost !== host) continue;
-      return { paneId, agent: String(row.agent ?? "shell"), status: String(row.status ?? "unknown"), surface: readSurface(row.surface) };
+      return { paneId, agent: String(row.agent ?? "shell"), status: String(row.status ?? "unknown"), surface: readSurface(row.surface), linked: row.linked === true };
     }
     return null;
   }
@@ -282,12 +303,14 @@ export async function phoneContext(browser: Browser, rig: Rig, device: Device): 
   memGuard("a browser context");
   const context = await browser.newContext({ ...device, baseURL: rig.base });
   await context.addInitScript(
-    ([localeKey, tokenKey, token, tourKey, tour]) => {
+    ([localeKey, tokenKey, token, tourKey, tour, designKey, design]) => {
       window.localStorage.setItem(localeKey, "en");
       window.localStorage.setItem(tokenKey, token);
       window.localStorage.setItem(tourKey, tour);
+      // The character holds still: a page that moves asks for a frame at every vsync (fixtures/still-mark.ts).
+      window.localStorage.setItem(designKey, design);
     },
-    [LOCALE_STORAGE_KEY, TOKEN_STORAGE_KEY, rig.deviceToken(), TOUR_STORAGE_KEY, String(TOUR_VERSION)],
+    [LOCALE_STORAGE_KEY, TOKEN_STORAGE_KEY, rig.deviceToken(), TOUR_STORAGE_KEY, String(TOUR_VERSION), DESIGN_KEY, JSON.stringify(STILL_MARK)],
   );
   return context;
 }
@@ -430,12 +453,25 @@ export function answerWords(answer: Answer): string {
  * Tap once and collect the bridge's answers: wait up to `answerMs` for the first answer, then until
  * no new answer came for `quietMs`. A tap that sends nothing (a local toggle) returns no answers.
  */
-export async function tap(recorder: TapRecorder, target: Locator, label: string, opts: { answerMs?: number; quietMs?: number; expectAnswer?: boolean; screenStillMs?: number | null } = {}): Promise<TapLog> {
+export async function tap(recorder: TapRecorder, target: Locator, label: string, opts: AnswerWait = {}): Promise<TapLog> {
   const t0 = Date.now();
   await target.tap();
+  return answered(recorder, t0, label, opts);
+}
+
+/** How long a tap or a hold waits for the bridge's answers. */
+export interface AnswerWait {
+  answerMs?: number;
+  quietMs?: number;
+  expectAnswer?: boolean;
+  screenStillMs?: number | null;
+}
+
+/** The answers the bridge gave since `t0`: up to `answerMs` for the first, then until none came for `quietMs`. */
+async function answered(recorder: TapRecorder, t0: number, label: string, opts: AnswerWait): Promise<TapLog> {
   const answerMs = opts.answerMs ?? (opts.expectAnswer === false ? 800 : 10_000);
   const quietMs = opts.quietMs ?? 900;
-  const end = t0 + answerMs;
+  const end = Date.now() + answerMs;
   while (recorder.since(t0).length === 0 && Date.now() < end) await sleep(100);
   let count = recorder.since(t0).length;
   let quietSince = Date.now();
@@ -509,6 +545,17 @@ export async function hold(page: Page, target: Locator, label: string, ms = 800)
   }
   const row: TapLog = { label, at: new Date(t0).toISOString(), answers: [], worked: true, screenStillMs: null };
   return settled ? row : { ...row, note: `the target still moved after ${String(SETTLE_CAP_MS)} ms; held at its last box` };
+}
+
+/**
+ * Press and hold for `ms`, then collect the bridge's answers as `tap()` does: the belt's Stop, which
+ * posts its abort at the end of a two-second hold (`STOP_HOLD_MS`, web/src/lib/arm.ts).
+ */
+export async function holdFor(page: Page, recorder: TapRecorder, target: Locator, label: string, ms: number, opts: AnswerWait = {}): Promise<TapLog> {
+  const t0 = Date.now();
+  const held = await hold(page, target, label, ms);
+  const row = await answered(recorder, t0, label, opts);
+  return held.note === undefined ? row : { ...row, note: held.note };
 }
 
 export function tapWords(log: TapLog): string {
@@ -723,8 +770,11 @@ export async function runScenario(harness: HarnessId, id: ScenarioId, session: S
 }
 
 /** A phone on the pane: a fresh context, the recorder on it, the pane open. Close it when done. */
-export async function phoneOn(browser: Browser, rig: Rig, paneId: string, device: Device, host?: Host): Promise<{ context: BrowserContext; page: Page; recorder: TapRecorder }> {
+export async function phoneOn(browser: Browser, rig: Rig, paneId: string, device: Device, host?: Host, options: { clock?: boolean } = {}): Promise<{ context: BrowserContext; page: Page; recorder: TapRecorder }> {
   const context = await phoneContext(browser, rig, device);
+  // A phone whose clock the case moves forward (`page.clock.fastForward`), so it never sleeps a grace in real
+  // time. Time flows as normal until the case moves it; only that context's page has the fake clock.
+  if (options.clock === true) await context.clock.install();
   const page = await context.newPage();
   const recorder = new TapRecorder(page);
   await openPane(page, paneId, host);
@@ -780,7 +830,7 @@ export async function waitIdle(rig: Rig, paneId: string, ms: number, host?: Host
 }
 
 /** The receipt row of one send request, once it settled. */
-export async function settledReceipt(rig: Rig, paneId: string, requestId: string, ms: number): Promise<{ outcome: string; reason?: string; detail?: string } | null> {
+export async function settledReceipt(rig: Rig, paneId: string, requestId: string, ms: number): Promise<{ outcome: string; reason?: string; detail?: string; keys: readonly string[] } | null> {
   return rig.until(
     async () => {
       const doc = readSendReceipts(await rig.get(`/api/send/receipts?pane=${encodeURIComponent(paneId)}`));

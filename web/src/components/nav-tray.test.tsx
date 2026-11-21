@@ -1,7 +1,8 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
 import { NavTray } from "./nav-tray";
+import { ARM_DWELL_MS, ENTER_ARM_MS } from "@/lib/arm";
 import { addRow, boardOf, chordKey, DEFAULT_BOARD, setCell } from "@/lib/key-board";
 
 describe("NavTray", () => {
@@ -854,6 +855,80 @@ describe("NavTray — operator preset rows", () => {
     expect(onSend).not.toHaveBeenCalled();
   });
 
+  it("unread card: while it is open, Enter asks a second tap, and only the second tap sends (M102 spec 03)", async () => {
+    const user = userEvent.setup();
+    const onSend = vi.fn();
+    const { rerender } = render(<NavTray onSend={onSend} confirmEnter />);
+    await user.click(screen.getByRole("button", { name: "Enter" }));
+    expect(onSend).not.toHaveBeenCalled();
+    // A second tap counts only ARM_DWELL_MS after the arm: wait it out, as a thumb does.
+    await new Promise<void>((resolve) => setTimeout(resolve, ARM_DWELL_MS));
+    await user.click(screen.getByRole("button", { name: "Enter, tap again to send" }));
+    expect(onSend).toHaveBeenCalledExactlyOnceWith(["Enter"]);
+    // The arrows stay one tap: only Enter can confirm a menu's default.
+    onSend.mockClear();
+    await user.click(screen.getByRole("button", { name: "Up" }));
+    expect(onSend).toHaveBeenCalledExactlyOnceWith(["Up"]);
+    // With no card, Enter is one tap again.
+    onSend.mockClear();
+    rerender(<NavTray onSend={onSend} />);
+    await user.click(screen.getByRole("button", { name: "Enter" }));
+    expect(onSend).toHaveBeenCalledExactlyOnceWith(["Enter"]);
+  });
+
+  it("unread card: a second Enter tap 100 ms after the first sends nothing and keeps the arm; one after 450 ms sends Enter once (the M102 review 3)", () => {
+    vi.useFakeTimers();
+    try {
+      const onSend = vi.fn();
+      render(<NavTray onSend={onSend} confirmEnter />);
+      fireEvent.click(screen.getByRole("button", { name: "Enter" }));
+      act(() => vi.advanceTimersByTime(100));
+      fireEvent.click(screen.getByRole("button", { name: "Enter, tap again to send" }));
+      expect(onSend).not.toHaveBeenCalled();
+      expect(screen.getByRole("button", { name: "Enter, tap again to send" })).toHaveTextContent("Sure?");
+      act(() => vi.advanceTimersByTime(350));
+      fireEvent.click(screen.getByRole("button", { name: "Enter, tap again to send" }));
+      expect(onSend).toHaveBeenCalledExactlyOnceWith(["Enter"]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("unread card: the pad's Enter arm lasts five seconds, as the card's Enter cap does (the M102 review 3)", () => {
+    vi.useFakeTimers();
+    try {
+      const onSend = vi.fn();
+      render(<NavTray onSend={onSend} confirmEnter />);
+      fireEvent.click(screen.getByRole("button", { name: "Enter" }));
+      act(() => vi.advanceTimersByTime(ENTER_ARM_MS - 1));
+      expect(screen.getByRole("button", { name: "Enter, tap again to send" })).toBeInTheDocument();
+      act(() => vi.advanceTimersByTime(2));
+      expect(screen.getByRole("button", { name: "Enter" })).toBeInTheDocument();
+      expect(onSend).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("unread card: a held hardware Enter key on the pad's Enter repeats nothing; its first press still counts (the M102 review 3)", () => {
+    render(<NavTray onSend={vi.fn()} confirmEnter />);
+    const enter = screen.getByRole("button", { name: "Enter" });
+    // fireEvent returns false when the handler prevented the default: a repeat keydown makes no click.
+    expect(fireEvent.keyDown(enter, { key: "Enter", repeat: true })).toBe(false);
+    expect(fireEvent.keyDown(enter, { key: "Enter", repeat: false })).toBe(true);
+  });
+
+  it("unread card: the pad's Enter arm drops when the pad is disabled, as the card's arm does (the M102 review 3)", () => {
+    const onSend = vi.fn();
+    const { rerender } = render(<NavTray onSend={onSend} confirmEnter />);
+    fireEvent.click(screen.getByRole("button", { name: "Enter" }));
+    expect(screen.getByRole("button", { name: "Enter, tap again to send" })).toBeInTheDocument();
+    rerender(<NavTray onSend={onSend} confirmEnter disabled />);
+    rerender(<NavTray onSend={onSend} confirmEnter />);
+    expect(screen.getByRole("button", { name: "Enter" })).toBeInTheDocument();
+    expect(onSend).not.toHaveBeenCalled();
+  });
+
   describe("a modifier key made in the editor", () => {
     // What the builder saves: a plain `{kind:"mod"}`, here two cells wide in a free spot of row 2.
     const withMod = boardOf(2, [
@@ -925,15 +1000,15 @@ describe("NavTray — operator preset rows", () => {
     expect(onSend).toHaveBeenCalledExactlyOnceWith(["ctrl+c"]);
   });
 
-  it("a key the multiplexer refuses is disabled, as on the fixed pad", () => {
+  it("a key the multiplexer refuses is greyed in its place and sends nothing", () => {
     render(<NavTray onSend={vi.fn()} board={custom} unsupportedKeys={["Home"]} />);
-    expect(screen.getByRole("button", { name: "Home" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Home" })).toHaveAttribute("aria-disabled", "true");
     expect(screen.getByRole("button", { name: "Ctrl+B, then C" })).toBeEnabled();
   });
 
   it("a refused key anywhere in a sequence greys the whole key", () => {
     render(<NavTray onSend={vi.fn()} board={boardOf(1, [[0, key("ctrl+b", "End")]])} unsupportedKeys={["End"]} />);
-    expect(screen.getByRole("button", { name: "Ctrl+B, then End" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Ctrl+B, then End" })).toHaveAttribute("aria-disabled", "true");
   });
 
   it("a sticky modifier key still composes onto the next chord key and stages it", async () => {
@@ -982,7 +1057,7 @@ describe("NavTray — operator preset rows", () => {
     const user = userEvent.setup();
     const onClear = vi.fn(() => Promise.resolve());
     const { rerender } = render(<NavTray onSend={vi.fn()} clearBox={{ available: false, onClear }} />);
-    expect(screen.getByRole("button", { name: "Clear the input box" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Clear the input box" })).toHaveAttribute("aria-disabled", "true");
     rerender(<NavTray onSend={vi.fn()} disabled clearBox={{ available: true, onClear }} />);
     await user.click(screen.getByRole("button", { name: "Clear the input box" }));
     expect(onClear).not.toHaveBeenCalled();

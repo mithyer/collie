@@ -2680,3 +2680,81 @@ describe("restart off Windows, golden", () => {
     expect(h.exec.spawned.map((x) => fold(x.command))).toEqual([["/opt/collie/bin/collie", "_exec-bridge"]]);
   });
 });
+
+// A macOS binary install runs its bridge from a copy whose path never changes, so the system's
+// privacy answers (the Documents folder dialog) survive an update. cli/stable-runner.ts has the
+// reasons; these pin how `start` uses it and how the pidfile guard still recognises that bridge.
+describe("start, on launchd, from a binary install", () => {
+  const JOB = "launchctl print gui/501/herdr.collie";
+  const RUNNING: NonNullable<Scripted["answers"]>[number] = [JOB, { stdout: "gui/501/herdr.collie = {\n\tpid = 4242\n}\n" }];
+  const DARWIN = hostFor("darwin");
+  const INSTALL = "/home/pat/.local/share/collie";
+  const VERSION_ROOT = `${INSTALL}/versions/1.2.3`;
+  const RUNNER = `${INSTALL}/runner/bin/collie`;
+
+  /** A darwin harness whose root is a version folder, with a `cp` that really copies in the fake file system. */
+  function installed(copyWorks = true): Harness {
+    const h = harness({
+      host: DARWIN,
+      answers: [...(NO_SYSTEMD ?? []), RUNNING],
+      files: { [collieBinary(VERSION_ROOT, DARWIN)]: "v1-bytes" },
+    });
+    h.deps.ctx = { ...h.deps.ctx, root: VERSION_ROOT };
+    const realCapture = h.exec.capture.bind(h.exec);
+    h.exec.capture = (tool, args, ...rest) => {
+      if (tool !== "cp") return realCapture(tool, args, ...rest);
+      if (!copyWorks) return { found: true, code: 1, stdout: "", stderr: "cp: failed" };
+      h.files.write(args.at(-1)!, h.files.read(args.at(-2)!) ?? "");
+      return { found: true, code: 0, stdout: "", stderr: "" };
+    };
+    return h;
+  }
+
+  const plistOf = (h: Harness): string =>
+    h.files.entries.get(`${HOME}/Library/LaunchAgents/herdr.collie.plist`)?.text ?? "";
+
+  test("the plist runs the stable copy, which holds this version's binary", async () => {
+    const h = installed();
+    expect(await cmdStart(h.deps)).toBe(EXIT.OK);
+    expect(h.files.read(RUNNER)).toBe("v1-bytes");
+    expect(plistOf(h)).toContain(`<string>${RUNNER}</string>`);
+    expect(plistOf(h)).not.toContain(`<string>${collieBinary(VERSION_ROOT, DARWIN)}</string>`);
+  });
+
+  test("the next version updates the copy and the plist keeps the same program path", async () => {
+    const h = installed();
+    await cmdStart(h.deps);
+    const before = plistOf(h);
+    // What `collie update` leaves: a new version folder, started through `current` by the new binary.
+    const next = `${INSTALL}/versions/1.2.4`;
+    h.files.write(collieBinary(next, DARWIN), "v2-bytes");
+    h.deps.ctx = { ...h.deps.ctx, root: next };
+    await cmdStart(h.deps);
+    expect(h.files.read(RUNNER)).toBe("v2-bytes");
+    // The program the system sees did not move; only the root handed to the bridge did.
+    expect(plistOf(h)).toContain(`<string>${RUNNER}</string>`);
+    expect(before).toContain(`<string>${RUNNER}</string>`);
+    expect(plistOf(h)).toContain(`<string>${next}</string>`);
+  });
+
+  test("a copy that cannot be made leaves the version folder's binary in the plist", async () => {
+    const h = installed(false);
+    expect(await cmdStart(h.deps)).toBe(EXIT.OK);
+    expect(plistOf(h)).toContain(`<string>${collieBinary(VERSION_ROOT, DARWIN)}</string>`);
+    expect(plistOf(h)).not.toContain(RUNNER);
+  });
+
+  test("a Linux or checkout install is not given a copy", async () => {
+    const h = harness({ host: hostFor("linux"), answers: [...(NO_SYSTEMD ?? [])] });
+    await cmdStart(h.deps);
+    expect(h.files.exists(RUNNER)).toBe(false);
+  });
+
+  test("the pidfile guard knows the copy's bridge as its own, and still no bystander", () => {
+    const names = [collieBinary(VERSION_ROOT, DARWIN), RUNNER];
+    expect(isOurBridge(`${RUNNER} _exec-bridge`, names)).toBe(true);
+    expect(isOurBridge(`${collieBinary(`${INSTALL}/versions/1.0.0`, DARWIN)} _exec-bridge`, names)).toBe(true);
+    expect(isOurBridge(`${RUNNER} status`, names)).toBe(false);
+    expect(isOurBridge("/other/runner/bin/collie _exec-bridge", names)).toBe(false);
+  });
+});

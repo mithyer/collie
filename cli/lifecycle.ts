@@ -19,6 +19,7 @@ import { crewDelta, deltaLines, type CrewDeltaDeps } from "./crew-delta.ts";
 import { cmdServeStatus, cmdUnserve, crewModeOnDisk, type ServeDeps } from "./serve.ts";
 import { phoneBlocked, SETUP_CLOSING, setupFindings, setupLines } from "./setup-findings.ts";
 import { pairedRegistryOf } from "./pairing.ts";
+import { refreshRunner, runnerPath } from "./stable-runner.ts";
 import { type Exec, type Files, PROCESS_QUERY_SLOW_START_MS, type ProcessLookup, type ProcessRow } from "./sys.ts";
 import {
   formatRestartMarker,
@@ -230,11 +231,16 @@ function collapseVersionDir(path: string): string {
  */
 export function isOurBridge(
   commandLine: string,
-  binary: string,
+  binary: string | readonly string[],
   instance: string | null = null,
 ): boolean {
+  // More than one name when this install also runs a stable copy of its binary (macOS,
+  // `cli/stable-runner.ts`): the launch agent's bridge then names the copy, not the version folder.
+  // `flat` takes the one-name and the many-name form alike, with no runtime type test.
+  const names = [binary].flat();
+  const line = collapseVersionDir(commandLine);
   if (
-    !collapseVersionDir(commandLine).includes(collapseVersionDir(binary)) ||
+    !names.some((name) => line.includes(collapseVersionDir(name))) ||
     !commandLine.includes("_exec-bridge")
   ) {
     return false;
@@ -259,7 +265,7 @@ export function stopPidfileProcess(deps: LifecycleDeps): void {
     const pid = Number(text);
     if (pid > 1) {
       const command = deps.exec.processCommand(pid);
-      if (command !== null && isOurBridge(command, collieBinary(deps.ctx.root, deps.host), deps.ctx.instance)) {
+      if (command !== null && isOurBridge(command, ownBinaries(deps), deps.ctx.instance)) {
         deps.exec.kill(pid);
       }
     }
@@ -279,6 +285,15 @@ function requireBinary(deps: LifecycleDeps): boolean {
   if (deps.files.exists(binary)) return true;
   deps.io.err(`error: no collie binary at ${binary} — build one with \`bun run build:cli\``);
   return false;
+}
+
+/**
+ * Every program path that counts as this install's own bridge: the version folder's binary, and the
+ * stable copy a macOS binary install runs under launchd (cli/stable-runner.ts).
+ */
+function ownBinaries(deps: LifecycleDeps): string[] {
+  const runner = runnerPath(deps.ctx.root, deps.host);
+  return [collieBinary(deps.ctx.root, deps.host), ...(runner === null ? [] : [runner])];
 }
 
 /**
@@ -332,7 +347,11 @@ export function writeUnit(deps: LifecycleDeps): boolean {
 
 export function writeAgent(deps: LifecycleDeps): boolean {
   if (!requireBinary(deps)) return false;
-  const spec = serviceSpec(deps.ctx, resolveTailscaleHosts(deps), deps.host);
+  // macOS binary install: run a copy whose path survives updates, so the system keeps the answer the
+  // person gave to its privacy dialogs. `null` (every other install, or a copy that failed) keeps the
+  // version folder's own binary. See cli/stable-runner.ts.
+  const launcher = refreshRunner(deps, deps.ctx.root);
+  const spec = { ...serviceSpec(deps.ctx, resolveTailscaleHosts(deps), deps.host), launcher };
   deps.files.mkdirp(deps.ctx.configDir);
   deps.files.write(
     agentFilePath(deps.ctx.home, deps.ctx.instance),

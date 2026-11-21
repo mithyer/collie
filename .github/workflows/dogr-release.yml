@@ -135,8 +135,18 @@ jobs:
           # a BROWSER download sets is documented in docs/install.md with its one-line removal.
           case "$PLATFORM" in
             macos-*)
-              codesign --force --sign - --timestamp=none "$stage/bin/collie"
+              # DOGR: a FIXED identifier and the requirement "identifier only". The default ad-hoc
+              # requirement names one exact file hash, so macOS treated every update as a new program and
+              # asked again for folder access. With this one the answer a person gave once keeps matching
+              # after each update (the launch agent runs a copy at a path that never changes:
+              # cli/stable-runner.ts). The identifier is RUNNER_IDENTIFIER there; a test pins them together.
+              codesign --force --sign - --timestamp=none \
+                --identifier dev.dogr.collie \
+                -r='designated => identifier "dev.dogr.collie"' "$stage/bin/collie"
               codesign -dv "$stage/bin/collie"
+              # A binary signed any other way would bring the dialog back after every update: refuse it.
+              codesign -d -r- "$stage/bin/collie" 2>&1 | grep -qF 'designated => identifier "dev.dogr.collie"'
+              codesign --verify --strict "$stage/bin/collie"
               ;;
           esac
 

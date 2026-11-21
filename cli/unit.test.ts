@@ -518,3 +518,40 @@ describe("the Task Scheduler task (Windows)", () => {
     expect(taskFilePath("C:\\cfg", "v1", win)).toBe("C:\\cfg\\herdr.collie-v1.task.xml");
   });
 });
+
+describe("the stable copy a macOS binary install runs", () => {
+  const INSTALLED: ServiceSpec = {
+    ...SPEC,
+    root: "/inst/versions/1.2.3",
+    binary: "/inst/versions/1.2.3/bin/collie",
+  };
+  const COPY = "/inst/runner/bin/collie";
+
+  test("the launch agent runs the stable copy when there is one", () => {
+    const spec = { ...INSTALLED, launcher: COPY };
+    expect(bridgeCommand(spec)).toEqual([COPY, "_exec-bridge"]);
+    const plist = launchAgentPlist(spec);
+    expect(plist).toContain(`<string>${COPY}</string>`);
+    // The program is the copy, but the root the bridge serves is still the version folder: the plist
+    // hands it over, and the copy has no web/dist or manifest beside it.
+    expect(plist).not.toContain("<string>/inst/versions/1.2.3/bin/collie</string>");
+    expect(plist).toContain("<key>COLLIE_PLUGIN_ROOT</key>\n        <string>/inst/versions/1.2.3</string>");
+  });
+
+  test("without one, or with none found, the version folder's binary runs as before", () => {
+    expect(bridgeCommand(INSTALLED)).toEqual(["/inst/versions/1.2.3/bin/collie", "_exec-bridge"]);
+    expect(bridgeCommand({ ...INSTALLED, launcher: null })).toEqual([
+      "/inst/versions/1.2.3/bin/collie",
+      "_exec-bridge",
+    ]);
+  });
+
+  test("the instance marker still follows the program", () => {
+    expect(bridgeCommand({ ...INSTALLED, launcher: COPY, instance: "v1" })).toEqual([
+      COPY,
+      "_exec-bridge",
+      "--instance",
+      "v1",
+    ]);
+  });
+});

@@ -63,6 +63,7 @@ import {
 } from "./reduce.ts";
 import { clamp, type Clamped, MAX_RESULT_CHARS, MAX_TEXT_CHARS, stripAnsi, summarizeToolInput } from "./text.ts";
 import { parseUnifiedDiff } from "./diff.ts";
+import { inlineBlobDir, inlineBlobRef } from "./inline-blobs.ts";
 import { answerLabels, classifyToolCall, type PlanTask, planTasks, questionKey, type ToolCall } from "./tool-call.ts";
 import type {
   AgentSessionRef,
@@ -176,8 +177,14 @@ export function resolveImage(data: string, mimeType?: string): InlineImage | nul
     return pictureLike ? { note: imageTooLargeNote(data.length) } : null;
   }
   // A `data:` value is taken as written, so only an image one is taken at all — `data:text/html`
-  // would be a document, not a picture.
-  if (data.startsWith("data:")) return data.startsWith("data:image/") ? { url: data } : null;
+  // would be a document, not a picture. A big raster one is kept in the store and named by the same
+  // short address pi's blobs use, so it is not carried in every page (journal/inline-blobs.ts); one
+  // the store does not take stays inline, as it always was.
+  if (data.startsWith("data:")) {
+    if (!data.startsWith("data:image/")) return null;
+    const ref = inlineBlobRef(data);
+    return { url: ref ?? data };
+  }
   // Anything left is bare base64, which the block's own `mimeType` names. An absent or non-image
   // mime type is not guessed at: png was a guess, and a guess here is a data URL nobody declared.
   if (mimeType === undefined || !mimeType.startsWith("image/")) return null;
@@ -185,7 +192,8 @@ export function resolveImage(data: string, mimeType?: string): InlineImage | nul
   // `http://evil.example/x.png` came back out as a data URL wrapping a remote address, which is the
   // http case sneaking through the branch that was meant to have dropped it.
   if (!BASE64_PAYLOAD_RE.test(data)) return null;
-  return { url: `data:${mimeType};base64,${data}` };
+  const ref = inlineBlobRef(data);
+  return { url: ref ?? `data:${mimeType};base64,${data}` };
 }
 
 /** What a tool result's picture blocks come to: the first renderable URL, and a note for each one left out for size. */
@@ -2209,6 +2217,10 @@ export async function resolveBlobPath(
 ): Promise<string | null> {
   if (!isBlobHash(hash)) return null;
   const blobRoots = sessionRoots.map((r) => join(dirname(r), "blobs"));
+  // The pictures the bridge itself moved out of inline text (journal/inline-blobs.ts) are searched
+  // last, with the same containment check as the agent's own blob folders.
+  const inline = inlineBlobDir();
+  if (inline !== null) blobRoots.push(inline);
   for (const blobDir of blobRoots) {
     const candidate = join(blobDir, hash);
     if (!(await exists(candidate))) continue;

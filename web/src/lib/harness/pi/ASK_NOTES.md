@@ -114,8 +114,30 @@ included: `⚠️ Dangerous command: chmod 777 gate-probe.txt Allow?`.
 the card read Yes, No and Cancel, and a tap through `POST /api/ask/<id>` sent `Enter` on Yes, and
 `Down`, a read-back with the pointer on No, then `Enter` on No. pi ran the command after Yes (the
 file went from 644 to 777) and printed `Blocked by user` after No.
-`ask_user_question` (`❯` rows, a tab strip) is read from source only and stays raw with the Escape
-card.
+`ask_user_question` from the rpiv package is read since 2026-11-21: see "rpiv-ask-user-question" below.
+
+## rpiv-ask-user-question 2.15.0 (pi 1.5.2, captured 2026-11-21)
+
+`@juicesharp/rpiv-ask-user-question` (the `ask_user_question` tool) was run in a real pi 1.5.2 inside herdr-core,
+200 columns, plain reads (`pi--v152-rpiv-*--w200.txt`, see the fixtures README). Its screen differs from pi's
+stock questionnaire in five ways, and each had been enough to leave the dialog raw:
+
+| Difference | Reader's answer |
+| --- | --- |
+| The footer stands **under** the bottom rule, then pi's status rows (a tabbed dialog leaves three blank rows between) | `footerBelowFrame` in `ask.ts`: status rows from the end, up to `MAX_FOOTER_GAP` blank rows, a footer that parses and names Escape, one optional blank row, then the bottom rule and a top rule of the same length |
+| The footer carries `Ctrl+] to collapse` | `keyKind` in `footer.ts` accepts `ctrl+<any one character>` as a chord that names no role (so a chord never claims a role: `Ctrl+Shift` is still refused) |
+| The pointer is `❯` (not `›`/`→`) | `BELOW_POINTERS`, used only for a frame whose footer is below, so no other pi screen starts to accept `❯` |
+| A one-question dialog has a `  Color` chip row (two-space indent) where a tabbed one has the strip | `CHIP_ROW`: read as the card's caption when no tab strip is there |
+| The review page has a mid rule, **no bottom rule**, and a `Ready to submit your answers?` select | `reviewPage`: the nearest rule above, a `❯ n. ` pointed row required; reads as a plain select (Submit answers, Cancel) |
+
+What stays raw, with the Escape card: a multi-select, and every state where one of rpiv's text editors has the
+keyboard (the `Type something.` row, the notes box). Their footer adds `Shift+Enter for newline`, and the row
+being typed draws the typed words in the option's place, so it would read as one more option. `detectPiQuestion`
+returns null when the footer is below and names `Shift+Enter`.
+
+Not captured, so not claimed: a painted read (herdr-core's pane read has no styling, so only the plain path was
+seen; the painted path goes through the same frame code and `paintedStatus`, but no capture proves it), rpiv's
+side-by-side preview layout, and a narrow pane.
 
 ## A dialog with no rules: the review-consent screen
 

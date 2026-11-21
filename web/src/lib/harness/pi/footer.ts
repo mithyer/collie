@@ -13,6 +13,8 @@
 //                                                                         OmO's built-in ask (pi--omo-v5130-*)
 //   ↑↓ choose · Enter confirm · Esc cancel · D details                    a frameless consent dialog
 //                                                                         (pi--v130-gentle-review-consent.txt)
+//   Enter to select · ↑/↓ to navigate · n to add notes · Esc to cancel · Ctrl+] to collapse
+//                                                                         rpiv-ask-user-question (pi--v152-rpiv-*)
 //
 // Two separators (` • ` and OmO's double space; ` · ` too, which pi's own modals print) and two hint
 // forms (`<key> to <verb>` and `<key> <verb>`). Every segment must be a hint whose key is in the
@@ -62,7 +64,9 @@ function keyKind(token: string): KeyKind | null {
   if (/^space$/i.test(token)) return "space";
   if (token === "1-9") return "digits";
   if (/^(?:tab|shift\+tab)$/i.test(token)) return "tab";
-  if (/^[a-z]$/i.test(token) || /^ctrl\+[a-z]$/i.test(token)) return "letter";
+  // A chord names no role, so any single character after `ctrl+` is read: rpiv's `Ctrl+] to collapse` is one. Its text
+  // editor (`Type something.`, notes) adds `Shift+Enter for newline`.
+  if (/^[a-z]$/i.test(token) || /^ctrl\+\S$/i.test(token) || /^shift\+enter$/i.test(token)) return "letter";
   return null;
 }
 

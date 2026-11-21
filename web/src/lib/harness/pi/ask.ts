@@ -26,8 +26,24 @@
 //   /tmp/project                               one to four styled status rows, no rule among them,
 //                                              or none at all (Gentle Shell, issue 455)
 //
+// A SECOND SHAPE, the footer BELOW the bottom rule (rpiv-ask-user-question, pi--v152-rpiv-*; ASK_NOTES.md):
+//
+//   ──────────────────────────────────────     top rule
+//     Color                                    a chip row (two spaces in) instead of a tab strip
+//    Which color do you like?
+//   ❯ 1. Red                                   the pointer is `❯`
+//   ──────────────────────────────────────     bottom rule
+//                                              one blank row
+//    Enter to select · ↑/↓ … · Esc to cancel   the footer, under the rule, naming Escape
+//   /tmp/project                               one to four status rows (`footerBelowFrame`)
+//
+// and its review page, which has no bottom rule at all: the options, the footer, the status rows
+// (`reviewPage`). The footer there is not a frame row, so the options are bounded by the rule above.
+// A footer that names Shift+Enter means a text editor has the keyboard: that screen stays raw.
+//
 // Two pointer columns are read: column 0 (`> 1.`, stock pi and the PR 397 extension) and column 1
-// (` → 1.`, OmO). The pointer glyph is `>` or `→`, the two the captures show; Claude's `❯` is not one.
+// (` → 1.`, OmO). The pointer glyph is `>` or `→`, the two the captures show; Claude's `❯` is one only
+// in a frame whose footer is below (`BELOW_POINTERS`).
 //
 // Unnumbered rows are read at column 1 only: ` → Label` and `   Label`, a description row one column
 // further in (`    Primeira opção`) and the rows a long description wraps onto, back at column 1
@@ -89,6 +105,9 @@ const MAX_BODY_ROWS = 200;
 /** OmO's status line under its options (`Submit (0/1 answered) — Enter advances`). */
 const MAX_TRAILER_ROWS = 2;
 const POINTERS = new Set([">", "→"]);
+/** The pointers of rpiv's dialog (`❯ 1. Red`): the same two, and the chevron it draws. Used only on a frame whose footer stands
+ *  under the bottom rule (`footerBelowFrame`), so a draft or a prose row that starts with `❯` is never an option row. */
+const BELOW_POINTERS = new Set([...POINTERS, "❯"]);
 /** The free-text row's label: `Type something.` (stock, PR 397), `Type your own answer...` (OmO). The
  *  `✎` follows it while its inline editor is open. */
 const FREE_TEXT = /^Type\b.*(?:\.|…)(?: ✎)?$/;
@@ -98,6 +117,8 @@ const OTHER = /^Other(?:…|\.\.\.)$/;
 const HEADER_ROW = /^ \S/;
 /** A row at column 0: the footer and the header block of a frameless dialog. */
 const NO_INDENT = /^\S/;
+/** rpiv's header chip: two spaces, then the header (`  Color`), a short label with no other mark. */
+const CHIP_ROW = /^ {2}\S(?:[^\s].{0,38})?$/;
 /** A frameless dialog's description paragraph, under the options, is at most this many rows. */
 const MAX_NOTE_ROWS = 3;
 /** An unnumbered option row at pointer column 1: the pointer or a space, a space, the label. */
@@ -139,6 +160,13 @@ export interface PiFrame {
   footerEnd: number;
   footer: PiFooter;
   texts: string[];
+  /** The footer stands UNDER the bottom rule (rpiv's dialog, see `footerBelowFrame`). The dialog's
+   *  body then ends at `bodyEnd` and its region, for the signature, at `regionEnd`. */
+  footerBelow?: true;
+  /** Exclusive end of the body rows when the footer is not the row that ends them (`footerStart` is). */
+  bodyEnd?: number;
+  /** Last row of the dialog's region when it is not the bottom rule (`bottom` is). */
+  regionEnd?: number;
 }
 
 function styledRow(line: StyledLine): boolean {
@@ -260,6 +288,13 @@ export function readPiFrame(lines: StyledLine[]): PiFrame | null {
   if (end < 0) return null;
 
   const plain = readIsUnstyled(lines);
+  // The footer inside the rules is the shape of every extension but one; rpiv's has it under them.
+  return footerInsideFrame(lines, texts, end, plain) ?? footerBelowFrame(lines, texts, end, plain);
+}
+
+/** `readPiFrame` for a dialog whose key-hint footer stands between its rules (or at the end of an open or
+ *  frameless frame): the shape the header draws. */
+function footerInsideFrame(lines: StyledLine[], texts: string[], end: number, plain: boolean): PiFrame | null {
   const bottom = statusTailBottom(lines, texts, end, plain);
   if (bottom === null) {
     // A frameless dialog is told from prose by its paint alone: none on a plain read.
@@ -290,6 +325,97 @@ export function readPiFrame(lines: StyledLine[]): PiFrame | null {
   }
   if (top < 0 || texts[top] !== texts[bottom] || ruleColor(lines[top]!) !== ruleColor(lines[bottom]!)) return null;
   return { top, bottom, open: false, footerStart: best.start, footerEnd, footer: best.footer, texts };
+}
+
+/** How many blank rows rpiv may leave between its key-hint row and pi's own status rows: none in the
+ *  capture of a one-question dialog, three in a tabbed one (pi--v152-rpiv-*). */
+const MAX_FOOTER_GAP = 4;
+
+/**
+ * The dialog of rpiv-ask-user-question (`ask_user_question`, pi--v152-rpiv-*): the same two rules round
+ * the question, but its key-hint footer stands UNDER the bottom rule, after one blank row, and pi's own
+ * status rows come after that (up to `MAX_FOOTER_GAP` blank rows between them):
+ *
+ *   ──────────────────────────────────────     top rule
+ *                                              blank rows
+ *     Color                                    one chip with the question's header (two spaces in), or
+ *    Which color do you like?                  a tab strip (` ←  □ Color   □ Size   ✓ Submit  →`), then
+ *                                              the question, one space in
+ *   ❯ 1. Red                                   options at column 0, the pointer `❯`
+ *        warm
+ *     2. Green
+ *     3. Type something.
+ *                                              one blank row
+ *   ──────────────────────────────────────     bottom rule
+ *                                              one blank row
+ *    Enter to select · ↑/↓ to navigate · …     the footer, one space in, up to three rows
+ *   /tmp/project                               pi's status rows
+ *
+ * The footer is the proof, as ever: it must parse and name an Escape key, and the status rows must be
+ * pi's own (`textStatus` on a plain read, `paintedStatus` on a styled one), so a rule above an editor
+ * (whose bottom rule has the status rows right under it) and prose that quotes the dialog decline.
+ * The frame's `bottom` is the bottom rule; the footer is outside it, so the body ends at the rule.
+ */
+function footerBelowFrame(lines: StyledLine[], texts: string[], end: number, plain: boolean): PiFrame | null {
+  for (let status = 1; status <= MAX_STATUS_ROWS; status++) {
+    const first = end - status + 1;
+    if (first < 1) break;
+    const statusRows = plain ? textStatus(texts.slice(first, end + 1)) : paintedStatus(lines.slice(first, end + 1));
+    if (!statusRows) continue;
+    // Blank rows may stand between the footer and the status rows, not a rule or text.
+    let footerEnd = first - 1;
+    while (footerEnd >= 0 && texts[footerEnd] === "" && first - 1 - footerEnd < MAX_FOOTER_GAP) footerEnd--;
+    if (footerEnd < 1) continue;
+    const best = footerAt(lines, texts, footerEnd, plain);
+    if (best === null || best.footer.escapeVerb === null) continue;
+    // One blank row, then the bottom rule, right above the footer.
+    let bottom = best.start - 1;
+    if (bottom >= 0 && texts[bottom] === "") bottom--;
+    if (bottom < 3 || !RULE.test(texts[bottom]!)) {
+      // The review page that ends a tabbed dialog has no bottom rule: the footer follows its `Submit answers` /
+      // `Cancel` options at once, under the rule that splits the answers from the question.
+      const review = reviewPage(lines, texts, best.start);
+      if (review === null) continue;
+      return {
+        top: review, bottom: best.start, open: false, footerStart: best.start, footerEnd, footer: best.footer, texts,
+        footerBelow: true, bodyEnd: best.start, regionEnd: footerEnd,
+      };
+    }
+    // The top rule: the first full rule above, of the bottom rule's length and colour.
+    let top = bottom - 1;
+    while (top >= 0 && !RULE.test(texts[top]!)) {
+      if (bottom - top > MAX_BODY_ROWS) break;
+      top--;
+    }
+    if (top < 0 || !RULE.test(texts[top]!) || texts[top] !== texts[bottom] || ruleColor(lines[top]!) !== ruleColor(lines[bottom]!)) {
+      continue;
+    }
+    return {
+      top, bottom, open: false, footerStart: best.start, footerEnd, footer: best.footer, texts,
+      footerBelow: true, bodyEnd: bottom, regionEnd: footerEnd,
+    };
+  }
+  return null;
+}
+
+/**
+ * The top rule of rpiv's review page, or null. The page lists the answers, then a rule, a blank row, the
+ * question `Ready to submit your answers?` and its two options, and the footer comes right under them
+ * (pi--v152-rpiv-submit--w200.txt). Only a rule with a pointed `❯ n.` row between it and the footer counts, and
+ * the nearest rule above the footer is taken so the answers listed above it stay out of the body.
+ */
+function reviewPage(lines: StyledLine[], texts: string[], footerStart: number): number | null {
+  let top = footerStart - 1;
+  while (top >= 0 && !RULE.test(texts[top]!)) {
+    if (footerStart - top > MAX_BODY_ROWS) return null;
+    top--;
+  }
+  if (top < 0) return null;
+  let pointed = false;
+  for (let r = top + 1; r < footerStart; r++) {
+    if (/^❯ \d+\. /.test(texts[r]!)) pointed = true;
+  }
+  return pointed && lines.length > footerStart ? top : null;
 }
 
 /**
@@ -538,12 +664,27 @@ export function detectPiQuestion(lines: StyledLine[]): PiQuestion | null {
   const frameless = frame.frameless === true;
   const headerRow = frameless ? NO_INDENT : HEADER_ROW;
   let at = frameless ? top : top + 1;
-  const bodyEnd = frame.footerStart; // exclusive
+  // Where the body ends: at the footer, or at the bottom rule when the footer stands under it (rpiv).
+  const bodyEnd = frame.bodyEnd ?? frame.footerStart; // exclusive
+  const below = frame.footerBelow === true;
+  const pointers = below ? BELOW_POINTERS : POINTERS;
+  // rpiv draws `Shift+Enter for newline` in its footer only while one of its text editors has the keyboard (the `Type something.`
+  // row or the notes box). The row then shows the typed words in place of `Type something.`, so it reads as one more option
+  // (pi--v152-rpiv-free-typed--w200.txt): no card is made, and the raw screen keeps the Escape card.
+  if (below && /shift\+enter/i.test(footer.text)) return null;
   let header: number[] = [];
+  // rpiv prints the question's header as one chip, two spaces in, before the question (`  Color`). It names the
+  // page, so it is read as the caption and kept out of the question's words.
+  let chipRow: number | null = null;
   let pointerCol: 0 | 1 | null = null;
   while (at < bodyEnd) {
-    pointerCol = optionStart(texts[at]!);
+    pointerCol = optionStart(texts[at]!, pointers);
     if (pointerCol !== null) break;
+    if (below && chipRow === null && header.every((r) => texts[r] === "") && CHIP_ROW.test(texts[at]!)) {
+      chipRow = at;
+      at++;
+      continue;
+    }
     if (texts[at] !== "" && !headerRow.test(texts[at]!)) break;
     header.push(at);
     at++;
@@ -570,7 +711,9 @@ export function detectPiQuestion(lines: StyledLine[]): PiQuestion | null {
   // Frameless: numbered rows with the pointer at column 0, no tab strip, nothing else.
   if (frameless && (pointerCol !== 0 || strip !== null)) return null;
 
-  const region = texts.slice(top, bottom + 1);
+  // The region the signature covers ends at the footer when the footer is outside the bottom rule.
+  const regionEnd = frame.regionEnd ?? bottom;
+  const region = texts.slice(top, regionEnd + 1);
   const signature = region.join("\n");
   if (signature.length > MAX_REGION_CHARS) return null;
 
@@ -579,7 +722,7 @@ export function detectPiQuestion(lines: StyledLine[]): PiQuestion | null {
     return strip === null ? null : readSubmitPage(frame, header, strip, signature, plain);
   }
 
-  const options = numbered ? readOptions(texts, at, bodyEnd, pointerCol) : readUnnumbered(texts, at, bodyEnd);
+  const options = numbered ? readOptions(texts, at, bodyEnd, pointerCol, pointers) : readUnnumbered(texts, at, bodyEnd);
   if (options === null) return null;
   // Trailer rows: blank, or at most two header-like rows that are not a rule or an editor. Only OmO's
   // numbered dialog prints one; under unnumbered rows a header-like row is a label wrapped back to
@@ -659,8 +802,10 @@ export function detectPiQuestion(lines: StyledLine[]): PiQuestion | null {
     options: options_,
     family: "select",
     signature,
-    coreSignature: coreSignatureOf(texts, top, bottom, rows[pointed]!.row, pointerCol, header, strip, frameless ? options.end : bodyEnd, bodyEnd),
+    coreSignature: coreSignatureOf(texts, top, regionEnd, rows[pointed]!.row, pointerCol, header, strip, frameless ? options.end : bodyEnd, bodyEnd),
   };
+  // A one-question dialog names its page by the chip row above the question.
+  if (caption === undefined && chipRow !== null) caption = texts[chipRow]!.trim();
   if (caption !== undefined) model.caption = caption;
   if (free !== null) {
     const feedback: PromptFeedback = {
@@ -705,12 +850,12 @@ function hangingIndent(row: string): number {
 }
 
 /** The pointer column (0 or 1) when `text` is the first option row, `1.`, else null. */
-function optionStart(text: string): 0 | 1 | null {
+function optionStart(text: string, pointers: ReadonlySet<string> = POINTERS): 0 | 1 | null {
   for (const col of [0, 1] as const) {
     const lead = text.slice(0, col);
     if (lead.trim() !== "") continue;
     const ptr = text[col];
-    if (ptr === undefined || (ptr !== " " && !POINTERS.has(ptr)) || text[col + 1] !== " ") continue;
+    if (ptr === undefined || (ptr !== " " && !pointers.has(ptr)) || text[col + 1] !== " ") continue;
     if (/^(?:\[[ x]\] )?1\. \S/.test(text.slice(col + 2))) return col;
   }
   return null;
@@ -725,6 +870,7 @@ function readOptions(
   start: number,
   end: number,
   col: 0 | 1,
+  pointers: ReadonlySet<string> = POINTERS,
 ): { rows: OptionRow[]; end: number } | null {
   const rows: OptionRow[] = [];
   let boxed: boolean | null = null;
@@ -735,7 +881,7 @@ function readOptions(
     if (t === "") break;
     const lead = t.slice(0, col);
     const ptr = t[col];
-    const isPrefix = lead.trim() === "" && ptr !== undefined && (ptr === " " || POINTERS.has(ptr)) && t[col + 1] === " ";
+    const isPrefix = lead.trim() === "" && ptr !== undefined && (ptr === " " || pointers.has(ptr)) && t[col + 1] === " ";
     const rest = isPrefix ? t.slice(col + 2) : "";
     const numbered = isPrefix ? /^(\[[ x]\] | {4})?([1-9])\. (\S.*)$/.exec(rest) : null;
     if (numbered !== null && (rows.length === 0 || !rows.at(-1)!.freeText)) {

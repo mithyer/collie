@@ -4025,3 +4025,27 @@ of the exact same length (`00000000-0000-0000-0000-000000000000/sample-lab`); no
 | `claude--v2322-macos-agents-panel-working--w80.txt` | Captured during the turn that started two background `Agent` calls (`tmux capture-pane -e -p`) | Running turn (`✽ Sprouting… (5s · ↓ 267 tokens)`), empty box, two status rows (`⏸ manual mode on · esc to interrupt · ← for agents · ↓ to manage`, `◐ medium · /effort`), blank row, `  ⏺ main`, two `◯ general-purpose` rows truncated with `…`. Reads `running` |
 | `claude--v2322-macos-agents-panel-focused--w80.txt` | Same tmux pane after the turn finished, after pressing `Down` (`tmux send-keys Down`) | `✻ Waiting for 2 background agents to finish`, empty box, `↑/↓ to select` + `◐ medium · /effort`, blank row, `❯ ⏺ main`, two `◯ general-purpose` rows. Reads `idle` |
 | `claude--v2322-macos-agents-panel-idle--w80.txt` | Second disposable 80 x 45 tmux lab run (`demo-project3`), captured idle after READY | `✻ Waiting for 2 background agents to finish`, empty box, two status rows, blank row, `  ⏺ main` (rendered as three bold spans) and two `◯ general-purpose` rows. Reads `idle` |
+
+## pi 1.5.2 with rpiv-ask-user-question 2.15.0 (captured 2026-11-21)
+
+`@juicesharp/rpiv-ask-user-question` 2.15.0 registers pi's `ask_user_question` tool. The captures are
+plain reads (`GET /api/pane/:id?lines=200` through herdr-core, which sends no styling) of a 200-column
+pane, cut from the dialog's top rule to the end of pi's status rows. The working directory was replaced
+with `/tmp/project`; no model text or private path remains. The dialog draws its key hints **under** the
+bottom rule, not between two rules as pi's stock questionnaire does, and its tab strip, option rows and
+review page differ in small ways (see `ASK_NOTES.md`, "rpiv-ask-user-question").
+
+| Fixture | State | Reads as |
+| --- | --- | --- |
+| `pi--v152-rpiv-single--w200.txt` | One question, `Color` chip row, the pointer (`❯`) on Red | question ask: Red, Green, Cancel, the caption `Color` |
+| `pi--v152-rpiv-single-moved--w200.txt` | Same, after one Down | question ask, the pointer on Green (Red is one Up away) |
+| `pi--v152-rpiv-tabs-first--w200.txt` | Two questions, the tab strip ` ←  ■ Color   □ Size   ✓ Submit  →`, page 1 | question ask: Red, Green, Cancel |
+| `pi--v152-rpiv-tabs-first-moved--w200.txt` | Same, after one Down | question ask, the pointer on Green |
+| `pi--v152-rpiv-tabs-second--w200.txt` | Page 2 after answering page 1 | question ask: Small, Large, Cancel |
+| `pi--v152-rpiv-tabs-second-moved--w200.txt` | Page 2, after one Down | question ask, the pointer on Large |
+| `pi--v152-rpiv-submit--w200.txt` | The review page: the answers, a rule, `Ready to submit your answers?`, `1. Submit answers`, `2. Cancel` and a footer with no bottom rule | question ask: Submit answers, Cancel, Cancel (Escape) |
+| `pi--v152-rpiv-submit-moved--w200.txt` | Same, after one Down | question ask, the pointer on Cancel |
+| `pi--v152-rpiv-multi--w200.txt` | A multi-select question (`Space to toggle`) | raw: the Escape card (multi-select stays raw, `.adr/0098`) |
+| `pi--v152-rpiv-free-focused--w200.txt` | The pointer on `Type something.`, the editor open and empty (`Shift+Enter for newline`) | raw |
+| `pi--v152-rpiv-free-typed--w200.txt` | The same editor with words typed, which draw in the option's place | raw: a typed row must never read as an option |
+| `pi--v152-rpiv-notes--w200.txt` | The notes box opened with `n` | raw |

@@ -133,6 +133,12 @@ export const WALK_PAIRS: readonly WalkPair[] = [
   ["pi", "pi--trust-prompt.txt", "pi--trust-prompt-moved.txt"],
   // gentle-pi 4.2.0's ask_user_choice (pi 1.3.0): unnumbered rows, the second capture after a real Down.
   ["pi", "pi--v130-gentle-choice.txt", "pi--v130-gentle-choice-moved.txt"],
+  // rpiv-ask-user-question 2.15.0 (pi 1.5.2) through herdr-core, plain reads: a one-question dialog, the first page of a
+  // tabbed one, its second page, and the review page that ends it, each with the pointer on option 1 and then on option 2.
+  ["pi", "pi--v152-rpiv-single--w200.txt", "pi--v152-rpiv-single-moved--w200.txt"],
+  ["pi", "pi--v152-rpiv-tabs-first--w200.txt", "pi--v152-rpiv-tabs-first-moved--w200.txt"],
+  ["pi", "pi--v152-rpiv-tabs-second--w200.txt", "pi--v152-rpiv-tabs-second-moved--w200.txt"],
+  ["pi", "pi--v152-rpiv-submit--w200.txt", "pi--v152-rpiv-submit-moved--w200.txt"],
   // pi's example permission-gate (pi 0.87.1), pi's own selector: Down at 120 columns, Up at 80.
   ["pi", "pi--v0871-permission-gate.txt", "pi--v0871-permission-gate-moved.txt"],
   ["pi", "pi--v0871-permission-gate-narrow.txt", "pi--v0871-permission-gate-narrow-moved.txt"],

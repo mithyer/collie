@@ -224,6 +224,7 @@ import { redactAnsi } from "./redact.ts";
 import { TranscriptStore } from "./journal/store.ts";
 import type { AgentSessionRef, DiscoverHints, ForegroundProcess, JournalAdapter, PaneScreen } from "./journal/types.ts";
 import { isBlobHash, resolveBlobPath } from "./journal/pi.ts";
+import { imageSizesOf } from "./journal/image-sizes.ts";
 import { realpathOf, statFile } from "./journal/files.ts";
 import { settleSharedRef } from "./journal/shared-ref.ts";
 import {
@@ -5645,7 +5646,11 @@ export async function paneHistory(
     // Secrets are masked here, after the store, so the cached parse stays the log's own words and a
     // `COLLIE_REDACT` change needs no cache flush (bridge/redact.ts).
     const page = cfg.redact ? maskHistoryPage(read) : read;
-    return json({ paneId, available: true, ...page } satisfies PaneHistoryResponse, accept);
+    // The size of each picture the bridge holds, from its header, so a page can shape its stand-in before it has the picture
+    // (bridge/journal/image-sizes.ts). It never fails the read, and a page with no sized picture carries no key.
+    const imageSizes = await imageSizesOf(page.entries, cfg.journalRoots.pi);
+    const sized = Object.keys(imageSizes).length > 0 ? { imageSizes } : {};
+    return json({ paneId, available: true, ...page, ...sized } satisfies PaneHistoryResponse, accept);
   } catch (err) {
     return text(`transcript read failed: ${errorText(err)}`, 502);
   }

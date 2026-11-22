@@ -1486,6 +1486,12 @@ export type PaneHistoryResponse =
       total: number;
       /** The log exceeded the read cap, so only its tail was parsed. */
       fileTruncated: boolean;
+      /**
+       * The pixel size of the pictures of `entries` whose bytes this bridge holds, keyed by the reference as the turn
+       * carries it (`/api/blobs/<hash>`), read off each picture's header (bridge/journal/image-sizes.ts). A picture with
+       * no size is left out, and a bridge without this field leaves it out altogether: a reader treats absent as "unknown".
+       */
+      imageSizes?: Record<string, { width: number; height: number }>;
     };
 
 /**

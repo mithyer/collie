@@ -2013,7 +2013,12 @@ export type PaneChatResponse =
        */
       detail?: "shared-folder";
     }
-  | ({ paneId: string; available: true } & ChatBody);
+  | ({
+      paneId: string;
+      available: true;
+      /** The pixel size of the pictures of `upserts` the bridge holds, keyed by their `/api/blobs/<hash>` reference (bridge/types.ts); absent from an older bridge. */
+      imageSizes?: Record<string, { width: number; height: number }>;
+    } & ChatBody);
 
 /** GET /api/pane/:id/subagent/:agentId — one Claude subagent's own JSONL transcript. */
 export type PaneSubagentResponse =

@@ -5942,7 +5942,12 @@ export async function paneChat(
     if (read === null) return unavailable("no-log");
     // Masked before the ETag is hashed, so the tag describes what was actually sent (bridge/redact.ts).
     const body = chatBodyForMux(cfg.redact ? maskChatBody(read) : read, mux.capabilities);
-    const data = { paneId, available: true, ...body } satisfies PaneChatResponse;
+    // The size of each picture the turns of this answer name, so a page can hold the picture's place before it has the picture
+    // (bridge/journal/image-sizes.ts, the same reading the history route does). Sizes are remembered by hash, so a poll that brings
+    // no new picture costs a map lookup; an answer with no sized picture carries no key, and its ETag is what it always was.
+    const imageSizes = await imageSizesOf(body.upserts, cfg.journalRoots.pi);
+    const sized = Object.keys(imageSizes).length > 0 ? { imageSizes } : {};
+    const data = { paneId, available: true, ...body, ...sized } satisfies PaneChatResponse;
     const etag = computeEtag(JSON.stringify(data));
     if (notModified(req.headers.get("if-none-match"), etag)) {
       // RFC 7232 §4.1: 304 MUST echo the ETag; body MUST be empty.

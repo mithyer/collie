@@ -280,8 +280,8 @@ does not bound the harnesses on the core.
 handled; none of them holds a case red:
 
 - **A styled poll adds an observer.** For every core pane, Collie validates one bounded read-only
-  observer paint against the independent plain screen. Unsupported forms and history stay plain,
-  so readers still need their text-only fallbacks (`HC_API.md`, "Styled screen reads").
+  observer paint against the independent plain screen. Load older does the same for the scrollback
+  it reads. Unsupported forms stay plain, so readers still need their text-only fallbacks (`HC_API.md`, "Styled screen reads").
 - **The key hold.** The core answers a named key about 3 s after a raw write. Collie types an unmodified
   Enter, Backspace and Tab as raw input, which the core takes at once, so a Claude send pays no hold.
   A pi or omp send pays one hold, about 3 s, for its `ctrl+q` submit, against well under a second on

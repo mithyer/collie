@@ -363,6 +363,25 @@ describe("HerdrCoreMux over a fake core", () => {
     expect(await read("preserve")).toBe(initial + 3);
   });
 
+  // The scrollback of Load older follows the styling of the request: colours for `preserve`, plain rows for `strip`.
+  // TEST:client.test.ts[a read with scrollback keeps its colours, and never fails because of them]
+  test("a Load older read keeps its colours for preserve and stays plain for strip", async () => {
+    const { fake, adapter } = build();
+    fake.setScreen("t1", ["\u001b[31mRed\u001b[0m"]);
+    const styled = await adapter.readGrid("t1", { scope: "recent", lines: 200, styling: "preserve", purpose: "older" });
+    const plain = await adapter.readGrid("t1", { scope: "recent", lines: 200, styling: "strip", purpose: "older" });
+    if (!styled.ok || !plain.ok) throw new Error("history read failed");
+    expect(styled.value.text).toContain("\u001b[31mRed\u001b[0m");
+    expect(plain.value.text.includes("\u001b")).toBe(false);
+    expect(styled.value.revision).toBe(plain.value.revision);
+    expect(fake.writes()).toEqual([]);
+    // A full-screen program's stitched history stays plain: the observer only paints the screen of the pane.
+    fake.fullScreenApp("t1", false);
+    const stitched = await adapter.readGrid("t1", { scope: "recent", lines: 200, styling: "preserve", purpose: "older" });
+    if (!stitched.ok) throw new Error("history read failed");
+    expect(stitched.value.text.includes("\u001b")).toBe(false);
+  });
+
   test("a changed trailing Unicode cell advances the revision", async () => {
     const { fake, adapter } = build();
     const read = async () => {

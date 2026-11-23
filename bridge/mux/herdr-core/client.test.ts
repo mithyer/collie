@@ -38,10 +38,12 @@ function reply(socket: Socket, id: JsonValue | undefined, result: JsonValue): vo
   socket.write(`${JSON.stringify({ jsonrpc: "2.0", id, result })}\n`);
 }
 
-function stand(onPlain: Handler, size = { cols: 70, rows: 30 }, paint: { data?: string | Buffer; chunkSize?: number; beforeReply?: boolean; live?: string; acknowledgeClose?: boolean; attachedCols?: number; declaredSize?: number; paced?: boolean } = {}): Stand {
+function stand(onPlain: Handler, size = { cols: 70, rows: 30 }, paint: { data?: string | Buffer; chunkSize?: number; beforeReply?: boolean; live?: string; acknowledgeClose?: boolean; attachedCols?: number; declaredSize?: number; paced?: boolean; reportless?: boolean } = {}): Stand {
   const dir = mkdtempSync(join(tmpdir(), "hc-client-"));
   const path = join(dir, "core.sock");
   const framesIn: { channel: number; kind: number; payload: Buffer }[] = [];
+  // The terminal record the core sends. `reportless` is hc 0.1.22's: no root status report, so the paint carries no OSC 7501.
+  const reported = paint.reportless === true ? {} : { status: { state: "working", app: "pi" } };
   const server: Server = createServer((socket) => {
     let framed = false;
     let text = "";
@@ -76,9 +78,9 @@ function stand(onPlain: Handler, size = { cols: 70, rows: 30 }, paint: { data?: 
         if (got.channel === 0) {
           const message = parseJsonObject(got.payload.toString("utf8")) ?? {};
           if (message.method === "terminal.get") {
-            socket.write(frame(0, 0, Buffer.from(JSON.stringify({ jsonrpc: "2.0", id: message.id, result: { address: "t1", state: "live", status: { state: "working", app: "pi" }, records: {}, ...size } }))));
+            socket.write(frame(0, 0, Buffer.from(JSON.stringify({ jsonrpc: "2.0", id: message.id, result: { address: "t1", state: "live", ...reported, records: {}, ...size } }))));
           } else if (message.method === "terminal.attach") {
-            const answer = frame(0, 0, Buffer.from(JSON.stringify({ jsonrpc: "2.0", id: message.id, result: { channel: 1, terminal: { address: "t1", state: "live", status: { state: "working", app: "pi" }, records: {}, ...size, cols: paint.attachedCols ?? size.cols } } })));
+            const answer = frame(0, 0, Buffer.from(JSON.stringify({ jsonrpc: "2.0", id: message.id, result: { channel: 1, terminal: { address: "t1", state: "live", ...reported, records: {}, ...size, cols: paint.attachedCols ?? size.cols } } })));
             const bytes = Buffer.isBuffer(paint.data) ? paint.data : Buffer.from(paint.data ?? "\u001b[2Jfirst paint");
             const chunks: Buffer[] = [];
             const step = paint.chunkSize ?? Math.max(1, bytes.length);
@@ -234,17 +236,74 @@ describe("HcClient over a unix socket", () => {
     }
   });
 
-  test("plain, history and incomplete reads never open an observer", async () => {
+  test("plain, strip and incomplete reads never open an observer", async () => {
     const core = stand((socket, message) => reply(socket, message.id, { text: "plain", complete: asJsonObject(message.params)?.lines !== 3 }));
     const client = new HcClient(core.path, 2000);
     expect((await client.readTerminal("t1", 0)).text).toBe("plain");
     expect((await client.readTerminal("t1", 0, "strip")).text).toBe("plain");
-    expect((await client.readTerminal("t1", 10, "preserve")).text).toBe("plain");
+    expect((await client.readTerminal("t1", 10, "strip")).text).toBe("plain");
     expect((await client.readTerminal("t1", 3, "preserve")).complete).toBe(false);
     expect(core.framesIn).toEqual([]);
     const partial = stand((socket, message) => reply(socket, message.id, { text: "part", complete: false }));
     expect((await new HcClient(partial.path, 2000).readTerminal("t1", 0, "preserve")).complete).toBe(false);
     expect(partial.framesIn).toEqual([]);
+  });
+
+  // The scrollback of Load older: the same observer, attached with `history: N`, a paint of the two-part form.
+  describe("a read with scrollback", () => {
+    const capture = join(import.meta.dirname, "fixtures/history-colors-v022");
+    const paint = readFileSync(`${capture}.paint.ansi`);
+    const plain = readFileSync(`${capture}.read.txt`, "utf8");
+    const rowsOf = (text: string) => text.split("\n").map((row) => row.trimEnd());
+    const answer = (socket: Socket, message: JsonObject) => reply(socket, message.id, { text: plain, complete: true, how: "history" });
+
+    test("a read with scrollback keeps its colours, and never fails because of them", async () => {
+      const frames = Math.ceil(paint.length / 512);
+      const core = stand(answer, { cols: 200, rows: 120 }, { data: paint, chunkSize: 512, paced: true, reportless: true });
+      const read = await new HcClient(core.path, 2000).readTerminal("t1", 50, "preserve");
+      expect(read.styled).toBe(true);
+      expect(read.how).toBe("history");
+      expect(rowsOf(stripSgr(read.text))).toEqual(rowsOf(plain));
+      expect(read.text).toContain("\u001b[38;5;208mrow 001"); // A row of the scrollback keeps its colour.
+      const rpc = core.framesIn.filter((f) => f.channel === 0).map((f) => parseJsonObject(f.payload.toString("utf8")) ?? {});
+      expect(rpc.find((m) => m.method === "terminal.attach")?.params).toEqual({ terminal: "t1", cols: 200, rows: 120, observe: true, history: 50 });
+      const stream = core.framesIn.filter((f) => f.channel !== 0);
+      expect(stream.filter((f) => f.kind === 1)).toHaveLength(frames);
+      expect(stream.filter((f) => f.kind === 2)).toHaveLength(1);
+      expect(stream.at(-1)?.kind).toBe(2);
+    });
+
+    test("a paint the proof does not recognise leaves the plain rows", async () => {
+      const core = stand(answer, { cols: 200, rows: 120 }, { data: "unsupported repaint" });
+      const read = await new HcClient(core.path, 2000).readTerminal("t1", 50, "preserve");
+      expect(read).toEqual({ text: plain, complete: true, how: "history" });
+    });
+
+    test("a pane that scrolled between the two reads leaves the plain rows", async () => {
+      const moved = plain.replace("row 003 plain text", "row 003 other text");
+      const core = stand((socket, message) => reply(socket, message.id, { text: moved, complete: true, how: "history" }), { cols: 200, rows: 120 }, { data: paint, reportless: true });
+      expect(await new HcClient(core.path, 2000).readTerminal("t1", 50, "preserve")).toEqual({ text: moved, complete: true, how: "history" });
+    });
+
+    test("an observer that fails or runs out of time never fails the read that already answered in plain text", async () => {
+      const oversized = stand(answer, { cols: 70, rows: 30 }, { data: "", declaredSize: 1024 * 1024 + 1 });
+      expect(await new HcClient(oversized.path, 2000).readTerminal("t1", 50, "preserve")).toEqual({ text: plain, complete: true, how: "history" });
+      const unacknowledged = stand(answer, { cols: 70, rows: 30 }, { acknowledgeClose: false });
+      expect(await new HcClient(unacknowledged.path, 100).readTerminal("t1", 50, "preserve")).toEqual({ text: plain, complete: true, how: "history" });
+    });
+
+    test("a paint with more scrollback than the bound stays plain, without an error", async () => {
+      const core = stand(answer, { cols: 200, rows: 120 }, { data: Buffer.alloc(4 * 1024 * 1024 + 1, 0x61), chunkSize: 16 * 1024 });
+      const started = Date.now();
+      expect(await new HcClient(core.path, 2000).readTerminal("t1", 5000, "preserve")).toEqual({ text: plain, complete: true, how: "history" });
+      expect(Date.now() - started).toBeLessThan(1500);
+    });
+
+    test("the screen read keeps its rule: a screen paint over the 1 MiB bound is still a transport failure", async () => {
+      const core = stand((socket, message) => reply(socket, message.id, { text: "plain", complete: true }),
+        { cols: 70, rows: 30 }, { data: Buffer.alloc(1024 * 1024 + 1, 0x61), chunkSize: 16 * 1024 });
+      await expect(new HcClient(core.path, 2000).readTerminal("t1", 0, "preserve")).rejects.toThrow("queued snapshot exceeds its limit");
+    });
   });
 
   test("an oversized paint is a transport failure, not a successful plain fallback", async () => {

@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { parseAnsi } from "../../../web/src/lib/ansi.ts";
 import { lineText, splitLines } from "../../../web/src/lib/blocks.ts";
 import { stripSgr } from "../../../web/src/lib/surface/plain.ts";
-import { styledSnapshot } from "./snapshot.ts";
+import { styledRead, styledSnapshot } from "./snapshot.ts";
 
 function capture(name = "preview") {
   const path = join(import.meta.dirname, "fixtures", `rpiv-${name}-v015`);
@@ -145,5 +145,79 @@ describe("a core observer snapshot as an already rendered SGR grid", () => {
     for (const bounds of [{ cols: 200.5, rows: 120 }, { cols: 199, rows: 120 }, { cols: 200, rows: 119 }, { cols: 0, rows: 120 }]) {
       expect(styledSnapshot(paint, screen, { ...bounds, reports: 1 })).toBeNull();
     }
+  });
+});
+
+// A paint made with `history: N` carries the scrollback in front of the screen part. The capture is a real hc 0.1.22
+// first paint of a 200 x 120 terminal that held 127 lines (8 of them scrolled into history), asked with history 50.
+describe("a first paint with scrollback from hc 0.1.22", () => {
+  const capturePath = join(import.meta.dirname, "fixtures", "history-colors-v022");
+  const paint = readFileSync(`${capturePath}.paint.ansi`, "utf8");
+  const read = { text: readFileSync(`${capturePath}.read.txt`, "utf8"), complete: true };
+  const historySize = { cols: 200, rows: 120, reports: 0 };
+  const plainRows = read.text.split("\n").map((row) => row.trimEnd());
+  const shownRows = (text: string) => stripSgr(text).split("\n").map((row) => row.trimEnd());
+
+  test("the real capture has the two-part shape this proof depends on", () => {
+    expect(paint.split("\x1b[H\x1b[2J")).toHaveLength(3); // The history part and the screen part.
+    expect(plainRows).toHaveLength(127);
+    expect(plainRows[0]).toBe("row 001 orange  slate");
+  });
+
+  test("styles the scrollback rows as well as the screen, with the plain read's rows", () => {
+    const styled = styledRead(paint, read, historySize);
+    expect(styled).not.toBeNull();
+    expect(shownRows(styled!)).toEqual(plainRows);
+    expect(stripSgr(styled!)).not.toContain("\x1b");
+    const spans = parseAnsi(styled!);
+    // `row 001` is in the history part, `row 013` in the screen part: both keep their colour.
+    expect(spans.find((span) => span.text === "row 001")).toMatchObject({ fg: "rgb(255,135,0)" });
+    expect(spans.find((span) => span.text === " slate ")).toMatchObject({ bg: "rgb(45,59,71)" });
+    expect(spans.find((span) => span.text === "row 013")).toMatchObject({ fg: "rgb(255,135,0)" });
+    expect(spans.find((span) => span.text === "inverse")).toMatchObject({ inverse: true });
+    expect(spans.find((span) => span.text === "struck")).toMatchObject({ strike: true });
+  });
+
+  test("a paint without scrollback still goes through the screen proof alone", () => {
+    const shellPath = join(import.meta.dirname, "fixtures", "shell-colors-v022");
+    const shellPaint = readFileSync(`${shellPath}.paint.ansi`, "utf8");
+    const shellScreen = { text: readFileSync(`${shellPath}.screen.txt`, "utf8"), complete: true };
+    const shellSize = { cols: 200, rows: 120, reports: 0 };
+    expect(styledRead(shellPaint, shellScreen, shellSize)).toBe(styledSnapshot(shellPaint, shellScreen, shellSize));
+    expect(styledRead(shellPaint, shellScreen, shellSize)).not.toBeNull();
+  });
+
+  test("a style left open at the end of the scrollback does not colour the first screen row", () => {
+    const leaky = paint.replace("inverse\x1b[0m\x1b[0m\r\n", "inverse\x1b[0m\x1b[41m\r\n");
+    expect(leaky).not.toBe(paint);
+    const styled = styledRead(leaky, read, historySize)!;
+    expect(styled).not.toBeNull();
+    const first = parseAnsi(styled).find((span) => span.text.startsWith("row 009"));
+    expect(first?.bg).toBeUndefined();
+  });
+
+  test.each([
+    ["a scrollback row that differs from the plain read", (text: string) => text.replace("row 003 plain text", "row 003 other text")],
+    ["a screen row that differs from the plain read", (text: string) => text.replace("row 100 ", "row 100 changed ")],
+    ["a plain read that has fewer rows than the paint", (text: string) => text.split("\n").slice(0, 9).join("\n")],
+  ])("refuses %s (the pane scrolled between the two reads)", (_name, change) => {
+    expect(styledRead(paint, { ...read, text: change(read.text) }, historySize)).toBeNull();
+  });
+
+  test.each([
+    ["a cursor movement in a scrollback row", (text: string) => text.replace("row 003 plain text", "\x1b[2Arow 003 plain text")],
+    ["an unproved colour in a scrollback row", (text: string) => text.replace("row 003 plain text", "\x1b[38;2;1;2mrow 003 plain text")],
+    ["text hidden below the scrollback rows", (text: string) => text.replace("\r\n\n\n", "\r\nhidden\n\n")],
+    ["a third home and clear", (text: string) => text.replace("row 100\x1b[0m", "\x1b[H\x1b[2Jrow 100\x1b[0m")],
+    ["too few rows to hold a scrollback", (text: string) => text.replace("\r\n\n\n", "\r\n\n")],
+  ])("refuses %s", (_name, change) => {
+    expect(styledRead(change(paint), read, historySize)).toBeNull();
+  });
+
+  test("refuses an incomplete read, changed bounds and a paint with no end marker", () => {
+    expect(styledRead(paint, { ...read, complete: false }, historySize)).toBeNull();
+    expect(styledRead(paint, read, { ...historySize, rows: 119 })).toBeNull();
+    expect(styledRead(paint, read, { ...historySize, cols: 10 })).toBeNull(); // Rows wider than the terminal.
+    expect(styledRead(paint.slice(0, -1), read, historySize)).toBeNull();
   });
 });

@@ -92,7 +92,7 @@ const HERDR_CORE_CAPABILITIES = declareCapabilities({
   // document changing, which is every structure change Collie shows. So no census and no number.
   topologyLatency: { kind: "push" },
   notes: {
-    paneGrid: "A styled screen poll validates one temporary read-only observer against the plain grid. Unsupported paint and history stay plain.",
+    paneGrid: "A styled read (the screen, and the scrollback of Load older) validates one temporary read-only observer against the plain read. Paint it cannot prove stays plain.",
     agentDetection:
       "herdr-core names the agent in a terminal from the agent's own status report. A program that sends no report is named from the process in the foreground, through the same table (omp sends none), and then has no status. A shell, or a process Collie has no harness for, reads as a shell.",
     agentSessionRef:
@@ -328,7 +328,8 @@ export class HerdrCoreMux implements MuxAdapter {
 
   /**
    * One pane's rendered screen: `preserve` validates a bounded read-only observer against the
-   * independent plain grid. Unsupported paint, `strip` and history retain the plain read.
+   * independent plain read, for the screen and for the scrollback of an `older` read. Unsupported paint
+   * and `strip` retain the plain read.
    *
    * A read the core calls incomplete (`complete: false`, HC_API.md § terminal.read: part of it may be
    * missing while a full-screen app works) is handed over with `partial` set, on any read: the mirror
@@ -360,7 +361,7 @@ export class HerdrCoreMux implements MuxAdapter {
         const screen = await this.rpc.readTerminal(paneId, 0, request.styling);
         return muxOk(this.gridOf(paneId, screen, screen, { keep: lines, truncated: true }));
       }
-      const answered = await this.olderRows(paneId, lines, request.hint?.blocked === true);
+      const answered = await this.olderRows(paneId, lines, request.hint?.blocked === true, request.styling);
       return muxOk(this.gridOf(paneId, answered.read, answered.screen, { keep: lines, truncated: answered.note !== undefined, note: answered.note }));
     } catch (err) {
       return refusalFor(err);
@@ -379,7 +380,7 @@ export class HerdrCoreMux implements MuxAdapter {
    * neither note is true for it. While one runs, a second `older` read waits for that one within the
    * budget. Past the budget the screen answers with {@link OLDER_NOTE_READING}.
    */
-  private async olderRows(paneId: string, lines: number, hintBlocked: boolean): Promise<{ read: WireRead; screen: WireRead; note?: string }> {
+  private async olderRows(paneId: string, lines: number, hintBlocked: boolean, styling: "preserve" | "strip"): Promise<{ read: WireRead; screen: WireRead; note?: string }> {
     const screen = this.rpc.readTerminal(paneId, 0);
     // Whichever is not used must not surface as an unhandled rejection.
     screen.catch(() => undefined);
@@ -387,7 +388,7 @@ export class HerdrCoreMux implements MuxAdapter {
       const shown = await screen;
       return { read: shown, screen: shown, note: OLDER_NOTE_BLOCKED };
     }
-    const history = this.historyPending.get(paneId) ?? this.startHistoryRead(paneId, lines);
+    const history = this.historyPending.get(paneId) ?? this.startHistoryRead(paneId, lines, styling);
     let timer: ReturnType<typeof setTimeout> | undefined;
     const late = new Promise<null>((resolve) => {
       timer = setTimeout(() => resolve(null), this.historyBudgetMs);
@@ -403,9 +404,13 @@ export class HerdrCoreMux implements MuxAdapter {
     return { read: shown, screen: shown, note: OLDER_NOTE_READING };
   }
 
-  /** One history read on the core, remembered as the pane's pending one until it settles, however late. */
-  private startHistoryRead(paneId: string, lines: number): Promise<WireRead> {
-    const history = this.rpc.readTerminal(paneId, lines);
+  /**
+   * One history read on the core, remembered as the pane's pending one until it settles, however late. With
+   * `styling: "preserve"` its rows keep their colours when the client can prove them (HcClient.readTerminal);
+   * otherwise, and whenever it cannot, they are the plain rows.
+   */
+  private startHistoryRead(paneId: string, lines: number, styling: "preserve" | "strip"): Promise<WireRead> {
+    const history = this.rpc.readTerminal(paneId, lines, styling);
     this.historyPending.set(paneId, history);
     const settled = () => {
       if (this.historyPending.get(paneId) === history) this.historyPending.delete(paneId);

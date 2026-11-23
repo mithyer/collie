@@ -562,16 +562,18 @@ export class FakeHcCore implements HcRpc {
     const history = lines > 0 ? terminal.history.slice(-lines) : [];
     const shown = terminal.screen.slice(-terminal.rows);
     while (shown.length < terminal.rows) shown.push("");
-    // This fake stands in for HcClient, including its validated styled screen observation.
-    // Native terminal.read/history and the default client call remain plain.
+    // This fake stands in for HcClient, including its validated styled observation of the screen and of the
+    // scrollback above it. Native terminal.read/history and the default client call remain plain. A full-screen
+    // program's stitched rows are not a paint the client can prove, so they stay plain.
+    const styledRows = styling === "preserve" && (lines === 0 || terminal.fullScreen === null);
     const rows = [...history, ...shown].map((row) => cropRawColumns(
-      styling === "preserve" && lines === 0 ? row : stripSgr(row), { start: 0, end: terminal.cols },
+      styledRows ? row : stripSgr(row), { start: 0, end: terminal.cols },
     ));
     const text = `${rows.join("\n")}\n`;
     if (lines === 0) return styling === "preserve"
       ? { text, complete: true, how: "screen", styled: true }
       : { text, complete: true, how: "screen" };
-    if (terminal.fullScreen === null) return { text, complete: true, how: "history" };
+    if (terminal.fullScreen === null) return styledRows ? { text, complete: true, how: "history", styled: true } : { text, complete: true, how: "history" };
     if (terminal.fullScreen.working) return { text, complete: false, how: "stitched", why: "working" };
     return { text, complete: true, how: "stitched" };
   }

@@ -52,6 +52,15 @@ export const HC_STREAM_SILENCE_MS = 40_000;
 /** How long a styled-read observer waits for more of the first paint, after the attach answer, before it closes with what it has. */
 const SNAPSHOT_QUIET_MS = 250;
 
+/**
+ * How many times one styled read tries before it keeps the plain rows. The plain read and the paint are two separate reads,
+ * so on a pane that is drawing (a working agent redraws every few hundred milliseconds) the screen can move between them and
+ * the text no longer matches: measured on a real busy pane, 3 to 7 of 30 polls came back plain. The next try reads both again
+ * and nearly always agrees, so a busy pane keeps its colours. A core whose paint form is not understood has never produced a
+ * styled read, so it only gets one extra try (see `HcClient.styledSeen`) and stays cheap.
+ */
+const STYLED_ATTEMPTS = 3;
+
 /** The largest DATA payload one frame carries here. The core takes up to 16 MiB. */
 const MAX_FRAME_PAYLOAD = 1024 * 1024;
 
@@ -434,6 +443,9 @@ export class HcClient {
     private readonly silenceMs = HC_STREAM_SILENCE_MS,
   ) {}
 
+  /** Whether this client has ever proved a styled read. Until then a failed one is retried once, afterwards twice (STYLED_ATTEMPTS). */
+  private styledSeen = false;
+
   /** One plain-mode call on its own connection. Rejects on an error answer, a timeout or a close. */
   private call(method: string, params: JsonObject = {}, timeoutMs = this.timeoutMs): Promise<JsonValue> {
     const id = nextId();
@@ -522,7 +534,8 @@ export class HcClient {
 
   /** The plain read, and for a `preserve` read of a complete answer one validated first paint beside it: the screen
    * alone for `lines` 0, the screen with `lines` rows of scrollback above it for `lines` above 0 (the phone's Load
-   * older). Old callers stay plain. Unsupported repaint forms retain that plain read. A transport error of the
+   * older). Old callers stay plain. Unsupported repaint forms retain that plain read. A paint that is whole but no longer
+   * agrees with the plain read (the screen moved between them) is tried again, up to {@link STYLED_ATTEMPTS} times. A transport error of the
    * screen read is thrown; styling the scrollback never fails a read that already succeeded in plain text.
    *
    * @param address The terminal.
@@ -534,13 +547,22 @@ export class HcClient {
   async readTerminal(address: string, lines: number, styling: "preserve" | "strip" = "strip"): Promise<WireRead> {
     const started = Date.now();
     const asked = Math.max(0, Math.floor(lines));
-    const result = asObject(await this.call("terminal.read", { terminal: address, lines: asked }));
-    const read: MutableRead = { text: str(result, "text"), complete: result.complete !== false };
-    const how = str(result, "how");
-    const why = str(result, "why");
-    if (how !== "") read.how = how;
-    if (why !== "") read.why = why;
-    if (styling === "preserve" && read.complete) {
+    let read = await this.plainRead(address, asked);
+    if (styling !== "preserve") return read;
+    // A try that fails because the screen moved between the two reads is made again with a fresh plain read, so the text
+    // the paint is proved against is as new as the paint (see STYLED_ATTEMPTS). Errors and a read without time are not retried.
+    const attempts = this.styledSeen ? STYLED_ATTEMPTS : 2;
+    for (let attempt = 0; attempt < attempts && read.complete; attempt++) {
+      if (attempt > 0) {
+        // The earlier plain read is still a good answer for a scrollback read, so a failure of this one does not fail it.
+        try {
+          read = await this.plainRead(address, asked);
+        } catch (err) {
+          if (asked > 0) return read;
+          throw err;
+        }
+      }
+      if (!read.complete) break;
       const remaining = this.timeoutMs - (Date.now() - started);
       // Colour on scrollback is a nicety on top of an answer already in hand: out of time or any failure of the
       // observer returns the plain rows. The screen read keeps its rule (a transport error is not hidden).
@@ -548,32 +570,63 @@ export class HcClient {
         if (asked > 0) return read;
         throw new HcTimeout("terminal.attach", this.timeoutMs);
       }
-      let snapshot: { paint: Buffer; size: SnapshotSize | null };
+      let pass: { styled: string | null; retry: boolean };
       try {
-        snapshot = await this.observeSnapshot(address, remaining, asked);
+        pass = await this.styledPass(address, asked, read, remaining);
       } catch (err) {
         if (asked > 0) return read;
         throw err;
       }
-      if (snapshot.size !== null) {
-        // Frame boundaries do not delimit first_paint: the outbox can split it or merge live bytes.
-        // Find the known metadata end in bytes, so invalid/split UTF-8 in later live output is ignored.
-        const end = firstPaintEnd(snapshot.paint.toString("latin1"), snapshot.size.reports);
-        if (end === null) return read;
-        let paint: string;
-        try {
-          paint = new TextDecoder("utf-8", { fatal: true }).decode(snapshot.paint.subarray(0, end));
-        } catch {
-          return read; // a split/invalid UTF-8 paint is not a complete styled snapshot
-        }
-        const styled = styledRead(paint, read, snapshot.size);
-        if (styled !== null) {
-          read.text = styled;
-          read.styled = true;
-        }
+      if (pass.styled !== null) {
+        read.text = pass.styled;
+        read.styled = true;
+        this.styledSeen = true;
+        break;
       }
+      if (!pass.retry) break;
     }
     return read;
+  }
+
+  /** One plain `terminal.read`, shaped as a {@link WireRead}.
+   * @param address The terminal.
+   * @param asked How many rows of scrollback to read above the screen (0 reads the screen alone).
+   * @returns The core's text and completeness, with `how` and `why` when it gave them.
+   */
+  private async plainRead(address: string, asked: number): Promise<MutableRead> {
+    const result = asObject(await this.call("terminal.read", { terminal: address, lines: asked }));
+    const read: MutableRead = { text: str(result, "text"), complete: result.complete !== false };
+    const how = str(result, "how");
+    const why = str(result, "why");
+    if (how !== "") read.how = how;
+    if (why !== "") read.why = why;
+    return read;
+  }
+
+  /** One styled try: an observer's first paint, proved against the plain read it is handed.
+   * @param address The terminal.
+   * @param asked The scrollback rows the plain read and the paint both carry.
+   * @param read The plain read the paint must agree with, row by row.
+   * @param remaining What is left of the read's time.
+   * @returns The styled text, or `null` when the paint could not be proved; `retry` says whether another try can help: it
+   *   can when the paint was whole but the screen had moved (or the size changed), it cannot when the paint form is not
+   *   known (no end marker, split UTF-8), which a second try would meet again and only make slower.
+   * TEST:client.test.ts[a screen that moved between the two reads is read again]
+   */
+  private async styledPass(address: string, asked: number, read: WireRead, remaining: number): Promise<{ styled: string | null; retry: boolean }> {
+    const snapshot = await this.observeSnapshot(address, remaining, asked);
+    if (snapshot.size === null) return { styled: null, retry: true };
+    // Frame boundaries do not delimit first_paint: the outbox can split it or merge live bytes.
+    // Find the known metadata end in bytes, so invalid/split UTF-8 in later live output is ignored.
+    const end = firstPaintEnd(snapshot.paint.toString("latin1"), snapshot.size.reports);
+    if (end === null) return { styled: null, retry: false };
+    let paint: string;
+    try {
+      paint = new TextDecoder("utf-8", { fatal: true }).decode(snapshot.paint.subarray(0, end));
+    } catch {
+      return { styled: null, retry: false }; // a split/invalid UTF-8 paint is not a complete styled snapshot
+    }
+    return { styled: styledRead(paint, read, snapshot.size), retry: true };
   }
 
   /** One short-lived observer. CLOSE detaches it once the first paint is whole. Drain the

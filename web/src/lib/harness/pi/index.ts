@@ -31,7 +31,9 @@ export function piBuildBlocks(lines: StyledLine[]): Block[] {
     blocks.push(
       question.kind === "prompt-select"
         ? { kind: "prompt-select", prompt: question.model, lines: region }
-        : { kind: "wizard", wizard: question.model, lines: region },
+        : question.kind === "multi-select"
+          ? { kind: "multi-select", multi: question.model, lines: region }
+          : { kind: "wizard", wizard: question.model, lines: region },
     );
     return blocks;
   }

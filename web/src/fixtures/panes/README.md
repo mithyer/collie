@@ -4202,7 +4202,27 @@ review page differ in small ways (see `ASK_NOTES.md`, "rpiv-ask-user-question").
 | `pi--v152-rpiv-tabs-second-moved--w200.txt` | Page 2, after one Down | question ask, the pointer on Large |
 | `pi--v152-rpiv-submit--w200.txt` | The review page: the answers, a rule, `Ready to submit your answers?`, `1. Submit answers`, `2. Cancel` and a footer with no bottom rule | question ask: Submit answers, Cancel, Cancel (Escape) |
 | `pi--v152-rpiv-submit-moved--w200.txt` | Same, after one Down | question ask, the pointer on Cancel |
-| `pi--v152-rpiv-multi--w200.txt` | A multi-select question (`Space to toggle`) | raw: the Escape card (multi-select stays raw, `.adr/0098`) |
+| `pi--v152-rpiv-multi--w200.txt` | A multi-select question (`Space to toggle`), a plain read | multi-select card: Cheese, Ham, Olives and the `Submit` row |
 | `pi--v152-rpiv-free-focused--w200.txt` | The pointer on `Type something.`, the editor open and empty (`Shift+Enter for newline`) | raw |
 | `pi--v152-rpiv-free-typed--w200.txt` | The same editor with words typed, which draw in the option's place | raw: a typed row must never read as an option |
 | `pi--v152-rpiv-notes--w200.txt` | The notes box opened with `n` | raw |
+
+### The multi-select page (pi 1.6.0, captured 2026-11-23)
+
+Captured from a real pi 1.6.0 with rpiv-ask-user-question 2.15.0 through a scratch Collie on herdr-core 0.1.22,
+as **styled** reads (`styling: preserve`, so the pointer chip and the dim hints keep their SGR bytes), 200
+columns, cut and cleaned the same way as above. The page prints `[ ]` / `[✔]` after the number, a last numbered
+row that is always the free-text input (`Type something.`) and, below it, an unnumbered advance row: `Submit`
+on the last question, `Next` on an earlier one of a questionnaire. A digit toggles its row and leaves the
+pointer; Up from the first row wraps to the advance row; Down onto the input row focuses its editor.
+
+| Fixture | State | Reads as |
+| --- | --- | --- |
+| `pi--v160-rpiv-multi--w200.txt` | One multi-select question, the pointer on option 1, nothing ticked | multi-select card: three options with their descriptions, advance `Submit` |
+| `pi--v160-rpiv-multi-checked--w200.txt` | Options 1 and 3 ticked, the pointer on option 1 | same card with two ticks; the identity text equals the unticked page's |
+| `pi--v160-rpiv-multi-third--w200.txt` | Option 1 ticked, the pointer on option 3 | advance plan `Up Up Up Enter` |
+| `pi--v160-rpiv-multi-submit-row--w200.txt` | The pointer on the `Submit` row | advance plan `Enter` |
+| `pi--v160-rpiv-multi-typed--w200.txt` | Words typed in the input, the editor left, the pointer on option 3 | the typed row (`4. [✔] pepperoni`) is the input, never an option |
+| `pi--v160-rpiv-multi-free-focused--w200.txt` | The input focused with words in it (`Shift+Enter for newline`) | raw: an open editor stays with the terminal |
+| `pi--v160-rpiv-tabs-multi--w200.txt` | Two questions, the tab strip ` ←  □ Toppings   □ Size   ✓ Submit  →`, page 1 is the multi-select | multi-select card with the advance row `Next` |
+| `pi--v160-rpiv-tabs-multi-checked--w200.txt` | Same, option 2 ticked: the strip's chip turns `■` | same card; the identity text ignores the chip's mark |

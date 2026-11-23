@@ -56,7 +56,7 @@ ADR 0080 (walk, read back, confirm) and ADR 0113 (the AskUserQuestion field) sta
    The omp plan review declines while a row may be disabled, because the arrows would skip it.
 8. **A card types only into a field it modelled:** AskUserQuestion's answer, Claude's plan feedback
    row and the preview note. Search boxes, note keys and footer actions with no field on the model stay
-   on the Keys pad. A multi-select with no measured toggle recipe (omp, pi) stays raw.
+   on the Keys pad. A multi-select with no measured toggle recipe (omp, pi) stays raw. (Dogr fork, 2026-11-23: pi's rpiv checkbox page has one now, a digit toggles and `Up` wraps onto the advance row, and is lifted; see `web/src/lib/harness/pi/ASK_NOTES.md`.)
 9. **Every card tap is bound; a multi-select macro binds its first write.** The phone sends the
    region as `expected_prompt`, and the bridge refuses the keys unless that region ends in the last
    six non-blank rows of a fresh read. A grammar may widen that to twelve when it read every row

@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { parseAnsi } from "../../ansi";
 import { lineText, splitLines, type StyledLine } from "../../blocks";
+import { multiSelectEquals, multiSelectIdentity, type MultiSelectModel } from "../multi-select-model";
 import { promptsEqual, promptsSameIdentity, type PromptModel } from "../prompt-model";
 import { detectPiQuestion, piModalOnScreen, piQuestionBanner, readPiFrame } from "./ask";
 import { ruleAbove, tailRule } from "./composer";
@@ -37,9 +38,10 @@ function prompt(lines: StyledLine[]): PromptModel {
 const PI_FIXTURES = readdirSync(PANES).filter((name) => name.startsWith("pi--") && name.endsWith(".txt")).toSorted();
 
 // What every pi screen in the corpus reads as. `walk` is plan (a), arrows then Enter; `digit` is plan
-// (b), the digit OmO's footer names; `review` is a Submit page lifted as a wizard review. Everything
-// else is `raw`, and `modal` says whether the unread-dialog card may offer Escape.
-type Expect = "walk" | "digit" | "review" | "raw";
+// (b), the digit OmO's footer names; `review` is a Submit page lifted as a wizard review; `multi` is
+// rpiv's checkbox page lifted as a multi-select card. Everything else is `raw`, and `modal` says
+// whether the unread-dialog card may offer Escape.
+type Expect = "walk" | "digit" | "review" | "multi" | "raw";
 const LIFTS = new Map<string, Expect>([
   // pi's stock `question` example, pi 0.87.1 and 1.1.0 (live captures 2026-10-12).
   ["question-single", "walk"],
@@ -132,6 +134,15 @@ const LIFTS_397 = new Map<string, Expect>([
   ["pi--v152-rpiv-tabs-second-moved--w200.txt", "walk"],
   ["pi--v152-rpiv-submit--w200.txt", "walk"],
   ["pi--v152-rpiv-submit-moved--w200.txt", "walk"],
+  // The checkbox page (a plain read on pi 1.5.2, styled reads on pi 1.6.0): a multi-select card. The focused editor stays raw.
+  ["pi--v152-rpiv-multi--w200.txt", "multi"],
+  ["pi--v160-rpiv-multi--w200.txt", "multi"],
+  ["pi--v160-rpiv-multi-checked--w200.txt", "multi"],
+  ["pi--v160-rpiv-multi-third--w200.txt", "multi"],
+  ["pi--v160-rpiv-multi-submit-row--w200.txt", "multi"],
+  ["pi--v160-rpiv-multi-typed--w200.txt", "multi"],
+  ["pi--v160-rpiv-tabs-multi--w200.txt", "multi"],
+  ["pi--v160-rpiv-tabs-multi-checked--w200.txt", "multi"],
   // pi 1.3.0 `/login` (2026-11-15): the method list and the Anthropic method list, each with its pointer moved.
   ["pi--v130-login-methods--w61.txt", "walk"],
   ["pi--v130-login-methods-moved--w61.txt", "walk"],
@@ -175,10 +186,10 @@ const RAW_MODALS = new Set([
   // The model selector under pi-powerline-footer, which replaces pi's editor with its own (issue 544,
   // live 2026-10-20): pi's selector still takes the editor's place in column zero.
   "pi--v130-powerline-model-selector--w120.txt",
-  // rpiv-ask-user-question 2.15.0: a multi-select, a text editor with the keyboard (empty and typed) and its notes box stay raw,
+  // rpiv-ask-user-question 2.15.0: a text editor with the keyboard (empty and typed) and its notes box stay raw,
   // and the footer still names Esc, so the Escape card is offered.
-  "pi--v152-rpiv-multi--w200.txt",
   "pi--v152-rpiv-free-focused--w200.txt",
+  "pi--v160-rpiv-multi-free-focused--w200.txt",
   "pi--v152-rpiv-free-typed--w200.txt",
   "pi--v152-rpiv-notes--w200.txt",
   ...["v0871", "v110"].flatMap((v) => [
@@ -202,6 +213,7 @@ function actual(lines: StyledLine[]): Expect {
   const block = piAdapter.buildBlocks(lines).find((b) => b.kind !== "raw" && b.kind !== "box-text");
   if (block === undefined) return "raw";
   if (block.kind === "wizard") return "review";
+  if (block.kind === "multi-select") return "multi";
   if (block.kind !== "prompt-select") throw new Error(`unexpected ${block.kind}`);
   return block.prompt.options[0]!.keys.every((k) => /^[1-9]$/.test(k)) ? "digit" : "walk";
 }
@@ -768,6 +780,136 @@ describe("the Submit page", () => {
   });
 });
 
+describe("rpiv-ask-user-question: the multi-select page (pi 1.5.2 plain read, pi 1.6.0 styled reads)", () => {
+  // TEST: pi--v160-rpiv-multi*.txt and pi--v160-rpiv-tabs-multi*.txt are styled reads of a real dialog; pi--v152-rpiv-multi--w200.txt is the plain read the mutations below start from.
+  const PLAIN = "pi--v152-rpiv-multi--w200.txt";
+  const multi = (lines: StyledLine[]): MultiSelectModel => {
+    const question = detectPiQuestion(lines);
+    if (question?.kind !== "multi-select") throw new Error("no multi-select lifted");
+    return question.model;
+  };
+  const rowsOf = (name: string) => raw(name).replace(/\n$/, "").split("\n");
+  /** The plain page with one row replaced, found by its text, so a mutation names what it breaks. */
+  const without = (find: string, to: string | null) =>
+    rowsOf(PLAIN).flatMap((row) => (row.includes(find) ? (to === null ? [] : [row.replace(find, to)]) : [row]));
+  const read = (rows: string[]) => detectPiQuestion(linesOf(rows.join("\n")));
+
+  it("lifts the checkbox page: the choices with their descriptions, the input row left out, the advance row named", () => {
+    const model = multi(load("pi--v160-rpiv-multi--w200.txt"));
+    expect(model.phase).toBe("checkbox");
+    if (model.phase !== "checkbox") return;
+    expect(model.question).toBe("Which toppings do you want?");
+    expect(model.options).toEqual([
+      { n: 1, label: "Cheese", description: "melted cheese", checked: false },
+      { n: 2, label: "Ham", description: "smoked ham", checked: false },
+      { n: 3, label: "Olives", description: "green olives", checked: false },
+    ]);
+    expect(model.toggle).toBe("digit");
+    expect(model.advanceLabel).toBe("Submit");
+    expect(model.pointer).toBe("option");
+    // rpiv's Escape cancels the whole dialog and a card key is a digit, so there is no escape row and no field.
+    expect(model.escape).toBeNull();
+    expect(model.field).toBeUndefined();
+  });
+
+  it("reads the ticks, and a plain read of the same dialog reads the same", () => {
+    const ticked = multi(load("pi--v160-rpiv-multi-checked--w200.txt"));
+    if (ticked.phase !== "checkbox") throw new Error("not a checkbox page");
+    expect(ticked.options.map((o) => o.checked)).toEqual([true, false, true]);
+    const plain = multi(load(PLAIN));
+    if (plain.phase !== "checkbox") throw new Error("not a checkbox page");
+    expect(plain.options.map((o) => o.label)).toEqual(["Cheese", "Ham", "Olives"]);
+  });
+
+  it("advances by the keys that wrap past the first row, so the pointer never crosses the input row", () => {
+    const keys = (name: string) => {
+      const model = multi(load(name));
+      return model.phase === "checkbox" ? model.advanceKeys : undefined;
+    };
+    expect(keys("pi--v160-rpiv-multi--w200.txt")).toEqual(["Up", "Enter"]);
+    expect(keys("pi--v160-rpiv-multi-third--w200.txt")).toEqual(["Up", "Up", "Up", "Enter"]);
+    expect(keys("pi--v160-rpiv-multi-typed--w200.txt")).toEqual(["Up", "Up", "Up", "Enter"]);
+    expect(keys("pi--v160-rpiv-multi-submit-row--w200.txt")).toEqual(["Enter"]);
+  });
+
+  it("names the advance row as the screen printed it: Next on a page of a questionnaire", () => {
+    const model = multi(load("pi--v160-rpiv-tabs-multi--w200.txt"));
+    expect(model.phase === "checkbox" && model.advanceLabel).toBe("Next");
+    expect(model.phase === "checkbox" && model.question).toBe("Which toppings do you want?");
+  });
+
+  it("never takes the typed row for a choice", () => {
+    const model = multi(load("pi--v160-rpiv-multi-typed--w200.txt"));
+    expect(model.phase === "checkbox" && model.options.map((o) => o.label)).toEqual(["Cheese", "Ham", "Olives"]);
+  });
+
+  it("keeps one identity while boxes flip and the pointer moves, and breaks it on a different page", () => {
+    const sig = (name: string) => multi(load(name)).signature;
+    const region = (name: string) => multi(load(name)).regionSignature;
+    const first = sig("pi--v160-rpiv-multi--w200.txt");
+    expect(sig("pi--v160-rpiv-multi-checked--w200.txt")).toBe(first);
+    expect(sig("pi--v160-rpiv-multi-third--w200.txt")).toBe(first);
+    expect(sig("pi--v160-rpiv-multi-submit-row--w200.txt")).toBe(first);
+    // The literal text a write binds to does change with a tick: a stale tap is refused.
+    expect(region("pi--v160-rpiv-multi-checked--w200.txt")).not.toBe(region("pi--v160-rpiv-multi--w200.txt"));
+    // The questionnaire's chip turns from □ to ■ when its page gets a tick: still the same page.
+    expect(sig("pi--v160-rpiv-tabs-multi-checked--w200.txt")).toBe(sig("pi--v160-rpiv-tabs-multi--w200.txt"));
+    expect(sig("pi--v160-rpiv-tabs-multi--w200.txt")).not.toBe(first);
+    // Typed words change what the page says.
+    expect(sig("pi--v160-rpiv-multi-typed--w200.txt")).not.toBe(first);
+  });
+
+  it("makes models that differ only by a tick unequal, and equal on a re-read", () => {
+    const a = multi(load("pi--v160-rpiv-multi--w200.txt"));
+    const again = multi(load("pi--v160-rpiv-multi--w200.txt"));
+    const ticked = multi(load("pi--v160-rpiv-multi-checked--w200.txt"));
+    expect(multiSelectEquals(a, again)).toBe(true);
+    expect(multiSelectEquals(a, ticked)).toBe(false);
+    expect(multiSelectIdentity(a, ticked)).toBe(false);
+  });
+
+  it("lifts through the adapter as a multi-select block", () => {
+    const blocks = piAdapter.buildBlocks(load("pi--v160-rpiv-multi--w200.txt"));
+    expect(blocks.some((b) => b.kind === "multi-select")).toBe(true);
+  });
+
+  it("stays raw while an editor holds the keyboard, and when the pointer stands on the input row", () => {
+    expect(detectPiQuestion(load("pi--v160-rpiv-multi-free-focused--w200.txt"))).toBeNull();
+    const onInput = without("❯ 1. [ ] Cheese", "  1. [ ] Cheese").map((row) => row.replace("  4. [ ] Type something.", "❯ 4. [ ] Type something."));
+    expect(read(onInput)).toBeNull();
+  });
+
+  it("declines a page whose footer does not say the boxes toggle, or that has no advance row", () => {
+    expect(read(without("Space to toggle · ", ""))).toBeNull();
+    expect(read(without("  Submit", null))).toBeNull();
+    // Without the pointer anywhere the page cannot say where an advance would start.
+    expect(read(without("❯ 1. [ ] Cheese", "  1. [ ] Cheese"))).toBeNull();
+  });
+
+  it("declines rows it does not know: a stray row between the choices, a gap in the numbers, too many choices", () => {
+    expect(read(without("  smoked", "     a stray row"))).toBeNull();
+    expect(read(without("  2. [ ] Ham", "  3. [ ] Ham"))).toBeNull();
+    const many = rowsOf(PLAIN);
+    const at = many.findIndex((r) => r.includes("Type something."));
+    const extra = Array.from({ length: 8 }, (_, i) => `  ${i + 4}. [ ] Extra ${i + 1}`);
+    many.splice(at, 0, ...extra);
+    many[at + extra.length] = "  12. [ ] Type something.";
+    expect(read(many)).toBeNull();
+  });
+
+  it("reads the typed words that wrapped under the input row, and keeps the choices' own rows apart from them", () => {
+    const rows = rowsOf(PLAIN).map((row) => (row.includes("Type something.") ? "  4. [✔] a long answer that the dialog wrapped" : row));
+    const at = rows.findIndex((r) => r.includes("a long answer"));
+    rows.splice(at + 1, 0, "         onto a second row");
+    const model = read(rows);
+    expect(model?.kind).toBe("multi-select");
+    // A wrapped row under a choice, not under the input, is a row the page does not have.
+    const under = rowsOf(PLAIN);
+    under.splice(under.findIndex((r) => r.includes("1. [ ] Cheese")) + 1, 0, "         wrapped under a choice");
+    expect(read(under)).toBeNull();
+  });
+});
+
 describe("rpiv-ask-user-question: the footer under the bottom rule (pi 1.5.2 through herdr-core)", () => {
   // TEST: the fixtures pi--v152-rpiv-*--w200.txt are plain reads, so the rows carry no colour and the frame is found by its rules.
   const SINGLE = "pi--v152-rpiv-single--w200.txt";
@@ -823,10 +965,10 @@ describe("rpiv-ask-user-question: the footer under the bottom rule (pi 1.5.2 thr
     expect(askOf(read.surface.modal)?.options.map((o) => o.label)).toEqual(["Red", "Green", "Cancel"]);
   });
 
-  it("keeps a multi-select and both text editors raw, so a typed row is never taken for an option", () => {
+  it("keeps both text editors and the notes box raw, so a typed row is never taken for an option", () => {
     for (const name of [
-      "pi--v152-rpiv-multi--w200.txt",
       "pi--v152-rpiv-free-focused--w200.txt",
+      "pi--v160-rpiv-multi-free-focused--w200.txt",
       "pi--v152-rpiv-free-typed--w200.txt",
       "pi--v152-rpiv-notes--w200.txt",
     ]) {

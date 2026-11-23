@@ -64,8 +64,9 @@
 //   e. A tab strip with several questions: a question page lifts by (a) only, captioned with the
 //      current chip's label, and the Submit page lifts as a wizard review only when the screen names
 //      Enter as submit and every question has an answer row.
-// Multi-select (checkbox rows) is not lifted here; it stays raw (see the ADR). The footer's Esc hint
-// becomes the last row, sending Escape, in the footer's own words.
+// Multi-select (checkbox rows) is lifted only in rpiv's own grammar (a box after the number, the footer
+// under the bottom rule), as a multi-select card: see rpiv-multi.ts. Any other checkbox page stays raw
+// (see the ADR). The footer's Esc hint becomes the last row, sending Escape, in the footer's own words.
 //
 // The free-text row is never a button. It is the `free-text` field of the model, read so the walk
 // knows the row is there; a screen whose pointer stands on it stays raw, and nothing here types.
@@ -89,10 +90,12 @@ import { lineText, type StyledLine } from "../../blocks";
 import { readIsUnstyled } from "../../surface/frame";
 import { MAX_REGION_CHARS } from "../bound-region";
 import { pointerWalk } from "../menu-hints";
+import type { MultiSelectModel } from "../multi-select-model";
 import type { PromptFeedback, PromptModel, PromptOption } from "../prompt-model";
 import type { WizardAnswer, WizardModel, WizardStepChip } from "../wizard-model";
 import { locateComposer, MAX_PICKER_HEADER_ROWS, paintedStatus, ruleAbove, tailRule } from "./composer";
 import { keyHintPairs, listDialogHint, parsePiFooter, type PiFooter } from "./footer";
+import { readRpivMulti, rpivMultiModel, rpivMultiSignature } from "./rpiv-multi";
 
 /** A full-width rule: pi's editor rules and every question extension's own top and bottom rule. */
 const RULE = /^─{8,}$/;
@@ -647,6 +650,7 @@ interface Strip {
 
 export type PiQuestion =
   | { kind: "prompt-select"; model: PromptModel; startLine: number }
+  | { kind: "multi-select"; model: MultiSelectModel; startLine: number }
   | { kind: "wizard"; model: WizardModel; startLine: number };
 
 /**
@@ -722,6 +726,20 @@ export function detectPiQuestion(lines: StyledLine[]): PiQuestion | null {
     return strip === null ? null : readSubmitPage(frame, header, strip, signature, plain);
   }
 
+  // rpiv's checkbox page has its own grammar (a box after the number, the input row always last, an unnumbered
+  // advance row): see rpiv-multi.ts. The footer must say it is one (`Space to toggle`) before the rows are read.
+  if (below && numbered && pointerCol === 0 && footer.spaceToggles && footer.arrowsMove && footer.enter === "select") {
+    const page = readRpivMulti(texts, at, bodyEnd);
+    if (page !== null) {
+      const words = (strip === null ? header : header.filter((r) => r > strip.row))
+        .map((r) => texts[r]!.trim())
+        .filter((t) => t.length > 0)
+        .join(" ");
+      if (words.length === 0) return null;
+      const identity = rpivMultiSignature(texts, top, regionEnd, page, strip === null ? null : strip.row);
+      return { kind: "multi-select", model: rpivMultiModel(page, words, identity, signature), startLine: top };
+    }
+  }
   const options = numbered ? readOptions(texts, at, bodyEnd, pointerCol, pointers) : readUnnumbered(texts, at, bodyEnd);
   if (options === null) return null;
   // Trailer rows: blank, or at most two header-like rows that are not a rule or an editor. Only OmO's
@@ -744,7 +762,7 @@ export function detectPiQuestion(lines: StyledLine[]): PiQuestion | null {
   }
   const rows = options.rows;
   // Checkbox rows, or a footer that gives Space a tick or a toggle, are a multi-select question,
-  // which this reader leaves raw (.adr/0098). OmO's multi-select prints no checkbox at all and says
+  // which this reader leaves raw (.adr/0098) once rpiv's page is out. OmO's multi-select prints no checkbox at all and says
   // so only in its footer (`space toggle  enter toggle`, pi--omo-v5130-multi.txt).
   if (rows.some((r) => r.checkbox) || footer.spaceToggles) return null;
 

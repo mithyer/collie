@@ -185,12 +185,13 @@ async function dispatchIntent(
 
 /**
  * Whether digit `n` toggles a row the card offers: an option, or the answer field while it holds text
- * and is not focused (its digit toggles its tick, measured; a focused field would type the digit).
+ * and is not focused (its digit toggles its tick, measured; a focused field would type the digit). A field
+ * whose digit opens the editor (rpiv, `digitOpens`) is never a toggle: its box follows its words.
  */
 function isToggleable(multi: Extract<MultiSelectModel, { phase: "checkbox" }>, n: number): boolean {
   if (multi.options.some((o) => o.n === n)) return true;
   const field = multi.field;
-  return field !== undefined && field.n === n && field.text !== "" && !field.focused;
+  return field !== undefined && field.digitOpens !== true && field.n === n && field.text !== "" && !field.focused;
 }
 
 /** Entry guard, then send exactly `keys` (one keystroke against the dialog). */
@@ -334,8 +335,9 @@ type Proved = { ok: true; proof: MultiSelectModel } | { ok: false; result: Actio
 
 const fieldOn = (m: MultiSelectModel) => (m.phase === "checkbox" ? m.field : undefined);
 
-/** How the answer recipe reads a multi-select question: its `field`, against the dialog tapped. The
- *  field's digit toggles its tick and never focuses it, so the recipe always walks onto the row. */
+/** How the answer recipe reads a multi-select question: its `field`, against the dialog tapped. Claude's
+ *  field digit toggles its tick and never focuses it, so the recipe always walks onto the row; rpiv's digit
+ *  gives the empty field the keyboard (`digitOpens`), like a single question's. */
 function multiFieldAccess(tapped: Checkbox): FieldAccess<"multi-select"> {
   return {
     fieldOf: (m) => {
@@ -345,7 +347,7 @@ function multiFieldAccess(tapped: Checkbox): FieldAccess<"multi-select"> {
       return { key: String(n), focused, text, pointer };
     },
     sameDialog: (m) => multiSelectIdentity(m, tapped),
-    digitFocuses: false,
+    digitFocuses: tapped.field?.digitOpens === true,
   };
 }
 
@@ -375,6 +377,11 @@ async function runTypeAnswer(args: GuardArgs, text: string): Promise<ActionResul
  */
 async function tickField(args: GuardArgs, proof: MultiSelectModel, ours: string, sleep: Sleep): Promise<Proved> {
   if (fieldOn(proof)?.checked) return { ok: true, proof };
+  // Where `Enter` commits the whole answer (rpiv) there is no key that ticks: the box follows the words, and a
+  // read that shows it unticked is a screen this recipe does not know. Nothing is sent.
+  if (fieldOn(proof)?.commitsOnEnter === true) {
+    return { ok: false, result: { status: "error", error: t("promptAction.answer.notTicked") } };
+  }
   const sent = await sendBoundKeys(args, ["Enter"], proof.regionSignature);
   if (sent.status !== "sent") return { ok: false, result: sent };
   const polled = await pollDialog({ ...target(args), sleep }, (m) => {

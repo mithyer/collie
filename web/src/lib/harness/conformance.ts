@@ -737,8 +737,11 @@ export const UNPRINTED_KEY_EXCEPTIONS: readonly UnprintedKeyException[] = [
   },
   {
     letter: "g",
-    harnesses: ["claude"],
-    dialog: "a field Collie types into is cleared with edit keys: AskUserQuestion's ctrl+u ctrl+k, the preview note's ctrl+k and Backspace sweep",
+    harnesses: ["claude", "pi"],
+    // Pi's rpiv input prints `Ctrl+U to clear` only while it holds the keyboard, and never ctrl+k (which the
+    // recipe sends after it, as for Claude's field): both are declared here on its own measurement (real pi
+    // 1.6.0, rpiv 2.15.0, 2026-11-23: the pair empties a wrapped value and leaves the row as `❯ 3.  `).
+    dialog: "a field Collie types into is cleared with edit keys: AskUserQuestion's and rpiv's ctrl+u ctrl+k, the preview note's ctrl+k and Backspace sweep",
     steps: ["clear"],
     keys: ["ctrl+u", "ctrl+k", "Backspace"],
     files: ["web/src/lib/answer-field.ts", "web/src/lib/preview-action.ts"],

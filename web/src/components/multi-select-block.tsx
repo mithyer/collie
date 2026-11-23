@@ -243,7 +243,8 @@ function CheckboxPhase({
             label={field.text}
             checked={field.checked}
             busy={sending === `opt-${field.n}`}
-            disabled={locked || field.focused}
+            // An rpiv field's box follows its words and its digit opens the editor, so the row is no toggle.
+            disabled={locked || field.focused || field.digitOpens === true}
             typed
             onToggle={() => onPress(`opt-${field.n}`, { kind: "toggle", n: field.n })}
           />

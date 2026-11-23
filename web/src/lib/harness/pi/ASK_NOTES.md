@@ -150,10 +150,9 @@ stock questionnaire in five ways, and each had been enough to leave the dialog r
 | A one-question dialog has a `  Color` chip row (two-space indent) where a tabbed one has the strip | `CHIP_ROW`: read as the card's caption when no tab strip is there |
 | The review page has a mid rule, **no bottom rule**, and a `Ready to submit your answers?` select | `reviewPage`: the nearest rule above, a `❯ n. ` pointed row required; reads as a plain select (Submit answers, Cancel) |
 
-What stays raw, with the Escape card: every state where one of rpiv's text editors has the keyboard (the
-`Type something.` row, the notes box). Their footer adds `Shift+Enter for newline`, and the row being typed draws
-the typed words in the option's place, so it would read as one more option. `detectPiQuestion` returns null
-when the footer is below and names `Shift+Enter`.
+What stays raw, with the Escape card: the notes box. Its footer adds `Shift+Enter for newline` like the
+`Type something.` row's does, and `detectPiQuestion` returns null for it, because no card types notes. The input row
+is lifted since 2026-11-23: see "rpiv's input row" below.
 
 Not captured, so not claimed: rpiv's side-by-side preview layout, and a narrow pane. Styled reads of the single
 and tabbed pages were not captured either; the multi-select page was (see the next section).
@@ -167,19 +166,53 @@ herdr-core 0.1.22, plus the old plain capture `pi--v152-rpiv-multi--w200.txt`). 
 | Part | What it prints | What the reader does |
 | --- | --- | --- |
 | Choice rows | `❯ 1. [ ] Cheese` / `  2. [✔] Ham`, a description at column 2 | the card's options, the digit toggles (one key, the pointer stays) |
-| The last numbered row | always the free-text input: `  4. [ ] Type something.`; with words typed in it `  4. [✔] pepperoni`, wrapped under it at nine spaces | **never an option**: the card cannot type, and a digit on it would open the editor |
+| The last numbered row | always the free-text input: `  4. [ ] Type something.`; with words typed in it `  4. [✔] pepperoni`, wrapped under it at nine spaces | **never an option**: it is the card's answer field (see "rpiv's input row") |
 | The advance row | one unnumbered row last: `  Submit` on the last question, `  Next` on an earlier one of a questionnaire | the card's advance button, labelled as printed |
 | The footer | under the bottom rule: `Enter to select · ↑/↓ to navigate · Space to toggle · … · Esc to cancel` | must say `Space to toggle`, or the page stays raw |
 
 Why the advance plan is `Up` x (i + 1) then `Enter` (`rpivAdvanceKeys`): rpiv's pointer wraps, so one `Up` from the
 first choice lands on the advance row, and the pointer never crosses the input row (a `Down` onto it focuses the
 editor, whose Enter commits the typed text and whose Esc cancels the whole dialog). The plan is sent once, bound
-to the region it was read from. A page whose pointer stands on the input row stays raw.
+to the region it was read from. While the input row has the keyboard there is no plan (`advanceKeys` is absent), so
+the closed-loop walk of `lib/multi-select-action.ts` runs after the field recipe has parked the pointer above it.
 
-The card has no "chat about this" row (rpiv's Esc cancels the whole dialog and a card key is a digit), no
-field, and no step strip: moving between the questions of a questionnaire, typing a custom answer and notes
-stay with the terminal. A tick turns the tab strip's chip from `□` to `■`, so the page's identity ignores the
-chip marks (`rpivMultiSignature`).
+The card has no "chat about this" row (rpiv's Esc cancels the whole dialog and a card key is a digit) and no step
+strip: moving between the questions of a questionnaire and notes stay with the terminal. A tick turns the tab strip's
+chip from `□` to `■`, so the page's identity ignores the chip marks (`rpivMultiSignature`).
+
+## rpiv's input row: a typed answer from the card (pi 1.6.0, captured and lifted 2026-11-23)
+
+The last numbered row of a single or a multi-select page is rpiv's free-text input. It is lifted as the card's
+**answer field** (`readRpivInput` in `rpiv-field.ts`), so the phone can type into it with the shared recipe of
+`lib/answer-field.ts`. Measured on real pi 1.6.0 + rpiv 2.15.0, herdr-core 0.1.22 (fixtures
+`pi--v160-rpiv-single-free-*` and `pi--v160-rpiv-multi-free-*`):
+
+| What happens | Measured |
+| --- | --- |
+| A digit (or a walk) onto the row | opens the editor: `❯ 3. ` plus a cursor cell (a no-break space, which the read strips), the footer gains `Shift+Enter for newline · Ctrl+U to clear` and loses `n to add notes` |
+| A digit on a row that holds words | opens the editor again with the words in it (it does not answer, unlike Claude's field) |
+| Pasted words (the reply path, no Enter) | single: `❯ 3. purple`; multi: the box ticks by itself, `❯ 4. [✔] purple` |
+| `ctrl+u` then `ctrl+k` | clears the whole value (the multi box unticks) |
+| `Up` | leaves the editor and keeps the words (`  3. purple`, multi `  4. [✔] purple`) |
+| `Enter` in the editor | single: answers with the words; **multi: commits the whole answer**, ticks and all |
+| `Esc` in the editor | cancels the whole dialog |
+| A long value | wraps under the row, 5 spaces in a single page and 9 in a multi page; a word wrap leaves no visible space, a CJK wrap breaks anywhere |
+
+What the reader and the flows do with it:
+
+- Single page: `model.feedback = {key: <the digit>, focused, text, purpose: "answer"}`. The card's `Send answer` runs
+  `submitPromptAnswer`: reach the field, clear it, paste, prove the words, then one `Enter` bound to that read.
+- Multi-select page: `model.field` carries `digitOpens` (a digit opens the editor, so the card shows no toggle for the row)
+  and `commitsOnEnter` (the field recipe must never send `Enter` to tick the box, as it does for Claude: rpiv ticks by
+  itself, and `tickField` refuses instead when the box reads unticked). After typing, the pointer is parked above the field
+  with `Up`, which is also where the words stay for the next `Submit`.
+- The identity of the page ignores the input row (shown as `~`) and the footer words that change with the editor, so
+  focusing or typing never reads as another dialog; the entry guard still compares the field's words exactly.
+- The words are joined from their rows with one space, except between two wide (CJK) letters. A mid-word break of a long
+  latin word leaves a seam this cannot see: the read-back then differs from what was typed and the flow stops with the
+  words unsent in the box.
+- Declined (stays raw with the Escape card): the notes box, an editor whose footer is not in English
+  (the `Shift+Enter` hint is the sign; other languages were not measured), an input row holding a confirmed answer (`4. Hello ✔`), and the review page.
 
 ## A dialog with no rules: the review-consent screen
 

@@ -1,0 +1,3 @@
+red bold green orange truecolor under ital inverse
+plain line
+%

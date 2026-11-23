@@ -11,6 +11,7 @@ The questionnaire and all input are synthetic.
 | `rpiv-answer-v015` | 200 × 120 | Multiline custom answer, leading spaces, emoji and reverse-video software caret. |
 | `rpiv-startup-bell-v015` | 59 × 40 | Pi startup during the fixture launch, before the question arrived; a live bell follows the complete first paint in the same DATA payload. |
 | `rpiv-coalesced-cursor-v015` | 59 × 40 | Focused custom answer `Known answer.`; live cursor commands follow the complete first paint in the same DATA payload. |
+| `shell-colors-v022` | 200 × 120 | **hc 0.1.22**, captured 2026-11-23 from a plain zsh with a neutral prompt: red, bold green, 256-colour, truecolor, underline, italic and inverse text. The paint begins with CAN and, like the screen, ends at the last non-blank row (no root status report, `reports: 0`). |
 
 Each `.screen.txt` is the independent `terminal.read { lines: 0 }` result for the same screen.
 Files preserve trailing spaces and contain no added final newline. They are expected text, not

@@ -60,6 +60,41 @@ describe("a core observer snapshot as an already rendered SGR grid", () => {
     expect(caret).toMatchObject({ text: "\u00a0", bold: true, inverse: true, bg: "rgb(181,152,189)" });
   });
 
+  // hc 0.1.22 differs from 0.1.15 in two measured ways: its first paint begins with CAN, and both the
+  // paint and the plain read stop at the last non-blank row instead of keeping every blank row.
+  describe("a first paint from hc 0.1.22", () => {
+    const shell = () => {
+      const path = join(import.meta.dirname, "fixtures", "shell-colors-v022");
+      return { paint: readFileSync(`${path}.paint.ansi`, "utf8"), screen: { text: readFileSync(`${path}.screen.txt`, "utf8"), complete: true } };
+    };
+    const shellSize = { cols: 200, rows: 120, reports: 0 };
+
+    test("keeps colour, bold, italic, underline and inverse although the screen is shorter than the terminal", () => {
+      const { paint, screen } = shell();
+      expect(paint.startsWith("\x18\x1b[!p")).toBe(true); // The real leading CAN this regression covers.
+      expect(screen.text.split("\n").length).toBeLessThan(shellSize.rows);
+      const grid = styledSnapshot(paint, screen, shellSize);
+      expect(grid).not.toBeNull();
+      expect(visibleRows(grid!)).toEqual(screen.text.split("\n").map((row) => row.trimEnd()));
+      expect(stripSgr(grid!)).not.toContain("\x1b");
+      const spans = parseAnsi(grid!);
+      expect(spans.find((span) => span.text === "red")).toMatchObject({ fg: "var(--ansi-1)" });
+      expect(spans.find((span) => span.text === "bold green")).toMatchObject({ fg: "var(--ansi-2)", bold: true });
+      expect(spans.find((span) => span.text === "orange")).toMatchObject({ fg: "rgb(255,135,0)" });
+      expect(spans.find((span) => span.text === "truecolor")).toMatchObject({ fg: "rgb(255,220,0)", bg: "rgb(30,60,120)" });
+      expect(spans.find((span) => span.text === "ital")).toMatchObject({ italic: true });
+      expect(spans.find((span) => span.text === "under")).toMatchObject({ underline: true });
+      expect(spans.find((span) => span.text === "inverse")).toMatchObject({ inverse: true });
+    });
+
+    test("still refuses a CAN anywhere but in the prologue, and a screen that differs from the paint", () => {
+      const { paint, screen } = shell();
+      expect(styledSnapshot(paint.replace("plain line", "plain \x18line"), screen, shellSize)).toBeNull();
+      expect(styledSnapshot(paint, { ...screen, text: screen.text.replace("plain line", "other line") }, shellSize)).toBeNull();
+      expect(styledSnapshot(paint, screen, { ...shellSize, rows: 2 })).toBeNull(); // The paint is taller than the terminal.
+    });
+  });
+
   test("unsupported SGR cannot manufacture style facts from subparameters or incomplete colours", () => {
     const { paint, screen } = capture();
     for (const sgr of ["4:3", "1;;31", "5", "38;2;255;0", "48;5;256"]) {

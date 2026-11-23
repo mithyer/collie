@@ -167,6 +167,12 @@ and its hello/get/attach/close exchange after the plain read. This cost applies 
 not only Pi. Strip, history and incomplete reads open no observer. A direct styled read upstream
 would remove this extra connection and validation work.
 
+**hc 0.1.22 differs in two measured ways** (captured 2026-11-23, `fixtures/shell-colors-v022`).
+The first paint starts with CAN (0x18) before `ESC [ ! p`, and both `terminal.read { lines: 0 }`
+and the paint stop at the last non-blank row (3 rows on a 200 × 120 terminal), where 0.1.15 kept
+every blank row. Before Collie accepted both, every styled read on 0.1.22 fell back to plain
+text. `snapshot.ts` now allows the CAN in the prologue and compares the rows up to the last
+non-blank one; a read taller than the terminal is still refused.
 **The paint is not a `MuxGrid`.** It contains cursor and mode commands. One real pending-wrap
 restoration printed the final status `f` twice; passing it straight to `parseAnsi` produced
 `thinking offf`. Nor is a DATA frame a paint boundary: the core's outbox joins queued bytes and

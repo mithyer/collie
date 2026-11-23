@@ -8,10 +8,13 @@ import { stripSgr } from "../../../web/src/lib/surface/plain.ts";
 
 const ESC = String.fromCodePoint(0x1b);
 const BEL = String.fromCodePoint(0x07);
+// hc 0.1.22 starts its first paint with CAN (0x18) before the soft reset. CAN only cancels a
+// half-received escape sequence in the viewer's parser; it draws nothing and moves nothing.
+const CAN = String.fromCodePoint(0x18);
 // Measured input/reporting and screen-selection modes only. Unknown modes can change the
 // meaning of the grid (for example origin or screen reverse); never silently discard those.
 const PREFIX_MODE = "(?:1|7|9|25|47|66|100[0-6]|101[56]|104[79]|2004|2026|2031|2048)";
-const PREFIX_CONTROL = new RegExp(`${ESC}\\[(?:!p|\\?${PREFIX_MODE}[hl]|=[0-9;]+u|[0-9]*[GgHJ])|${ESC}H`, "g");
+const PREFIX_CONTROL = new RegExp(`${ESC}\\[(?:!p|\\?${PREFIX_MODE}[hl]|=[0-9;]+u|[0-9]*[GgHJ])|${ESC}H|${CAN}`, "g");
 const CURSOR = new RegExp(`${ESC}\\[(\\d+);(\\d+)H`);
 const METADATA = new RegExp(`${ESC}\\[=[0-9;]+u|${ESC}\\[\\?9001[hl]|${ESC}\\](?:2|7501);[^${ESC}${BEL}]*(?:${BEL}|${ESC}\\\\)`, "g");
 const WIN32_MODE = new RegExp(`${ESC}\\[\\?9001[hl]`);
@@ -72,6 +75,13 @@ function containsControl(text: string, allowNewline = false): boolean {
   return false;
 }
 
+/** The rows up to the last one that holds anything; rows are already right-trimmed of ASCII spaces. */
+function withoutBlankTail(rows: readonly string[]): readonly string[] {
+  let end = rows.length;
+  while (end > 0 && rows[end - 1] === "") end -= 1;
+  return rows.slice(0, end);
+}
+
 /** Rendered text + SGR only, or null when the snapshot cannot prove the plain read's whole grid.
  * The separate reads are not atomic: mismatched text or dimensions must not produce styled facts.
  */
@@ -99,8 +109,13 @@ export function styledSnapshot(
   const rows = splitLines(parseAnsi(grid));
   const textRows = rows.map(lineText);
   const plainRows = screen.text.split("\n").map((row) => row.replace(/ +$/u, ""));
-  if (textRows.length !== size.rows || plainRows.length !== size.rows ||
-      textRows.some((row, i) => row.replace(/ +$/u, "") !== plainRows[i] || displayWidth(row) > size.cols)) return null;
+  // hc 0.1.15 kept every blank row below the content in both reads (rows === size.rows); hc 0.1.22
+  // drops them from both. Compare the rows up to the last non-blank one, so either form proves the
+  // whole grid, and still refuse a read that is taller than the terminal.
+  const textTrimmed = withoutBlankTail(textRows.map((row) => row.replace(/ +$/u, "")));
+  const plainTrimmed = withoutBlankTail(plainRows);
+  if (textRows.length > size.rows || plainRows.length > size.rows || textTrimmed.length !== plainTrimmed.length ||
+      textTrimmed.some((row, i) => row !== plainTrimmed[i]) || textRows.some((row) => displayWidth(row) > size.cols)) return null;
   const y = Number(cursor[1]), x = Number(cursor[2]);
   if (y < 1 || y > size.rows || x < 1 || x > size.cols) return null;
   const tail = body.slice(cursor.index + cursor[0].length).replace(METADATA, "");

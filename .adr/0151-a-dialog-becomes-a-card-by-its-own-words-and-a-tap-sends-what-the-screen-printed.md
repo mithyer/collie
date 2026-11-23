@@ -38,7 +38,8 @@ ADR 0080 (walk, read back, confirm) and ADR 0113 (the AskUserQuestion field) sta
    f. The unread-dialog card offers its adapter's declared cancel key, only on the adapter's own
       modal evidence (omp: its key-hint footer, `omp/modal.ts`; ADR 0053, changed by 0142).
    g. A field Collie types into is cleared with edit keys the screen does not print: AskUserQuestion's
-      `ctrl+u ctrl+k` (ADR 0113) and the preview note's `ctrl+k` and Backspace sweep.
+      `ctrl+u ctrl+k` (ADR 0113), pi's rpiv input (Dogr fork, 2026-11-23: it prints `Ctrl+U to clear` only while
+      focused, never `ctrl+k`) and the preview note's `ctrl+k` and Backspace sweep.
 4. **A printed scale is chips.** When the screen prints the whole scale an `←/→` row moves along, each
    value is a chip, and a tap sends the footer's arrow, repeated by the distance. The scale is part of
    the menu's identity. Fewer than two values, or a value not among them, keeps the plain arrows.

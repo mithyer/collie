@@ -6405,6 +6405,51 @@
    "version": "1.6.0",
    "state": "dialog"
   },
+  "pi--v160-rpiv-multi-free-focused-empty--w200.txt": {
+   "harness": "pi",
+   "version": "1.6.0",
+   "state": "dialog"
+  },
+  "pi--v160-rpiv-multi-free-focused-typed--w200.txt": {
+   "harness": "pi",
+   "version": "1.6.0",
+   "state": "dialog"
+  },
+  "pi--v160-rpiv-multi-free-left-typed--w200.txt": {
+   "harness": "pi",
+   "version": "1.6.0",
+   "state": "dialog"
+  },
+  "pi--v160-rpiv-single-free-focused-empty--w200.txt": {
+   "harness": "pi",
+   "version": "1.6.0",
+   "state": "dialog"
+  },
+  "pi--v160-rpiv-single-free-focused-typed--w200.txt": {
+   "harness": "pi",
+   "version": "1.6.0",
+   "state": "dialog"
+  },
+  "pi--v160-rpiv-single-free-left-empty--w200.txt": {
+   "harness": "pi",
+   "version": "1.6.0",
+   "state": "dialog"
+  },
+  "pi--v160-rpiv-single-free-left-typed--w200.txt": {
+   "harness": "pi",
+   "version": "1.6.0",
+   "state": "dialog"
+  },
+  "pi--v160-rpiv-single-free-wrapped--w200.txt": {
+   "harness": "pi",
+   "version": "1.6.0",
+   "state": "dialog"
+  },
+  "pi--v160-rpiv-single-free-wrapped-words--w200.txt": {
+   "harness": "pi",
+   "version": "1.6.0",
+   "state": "dialog"
+  },
   "pi--v160-rpiv-tabs-multi--w200.txt": {
    "harness": "pi",
    "version": "1.6.0",

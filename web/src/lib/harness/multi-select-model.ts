@@ -33,6 +33,12 @@ export interface MultiSelectAnswerField {
   pointer: AnswerFieldPointer;
   /** Visual lines the field covers: its row plus the lines its value wrapped onto. */
   lines: number;
+  /** The row's digit gives the field the keyboard instead of toggling its tick (rpiv), so it is never a
+   *  toggle: the box ticks by itself once the field holds words and clears with them. */
+  digitOpens?: boolean;
+  /** `Enter` inside the field commits the whole answer (rpiv) instead of toggling the tick (Claude), so no
+   *  recipe may send it there, not even to tick a box that reads unticked. */
+  commitsOnEnter?: boolean;
 }
 
 /** One checkable option of the current checkbox question. */
@@ -249,11 +255,22 @@ function ownMarkOf(a: MultiSelectCheckbox, b: MultiSelectCheckbox): "compare" | 
   return a.field !== undefined && b.field !== undefined ? "skip" : "compare";
 }
 
+/**
+ * Whether the mid-flight identity may leave the advance plan out. A plan that is counted from where the
+ * pointer stands (rpiv: `Up` as many times as the pointer is from the first row) changes with every pointer
+ * move, and the answer recipe and the advance walk move the pointer on purpose. Only when BOTH models carry
+ * a field whose `Enter` commits, which is the page that counts that way; the entry guard
+ * ({@link multiSelectEquals}) still compares the plan exactly.
+ */
+function ownPlanOf(a: MultiSelectCheckbox, b: MultiSelectCheckbox): "compare" | "skip" {
+  return a.field?.commitsOnEnter === true && b.field?.commitsOnEnter === true ? "skip" : "compare";
+}
+
 /** The checkbox screen's subject, recipe and options, shared by both comparators' checkbox legs. */
-function sameCheckboxCore(a: MultiSelectCheckbox, b: MultiSelectCheckbox): boolean {
+function sameCheckboxCore(a: MultiSelectCheckbox, b: MultiSelectCheckbox, plan: "compare" | "skip" = "compare"): boolean {
   return (
     a.advanceLabel === b.advanceLabel &&
-    sameOptionalKeys(a.advanceKeys, b.advanceKeys) &&
+    (plan === "skip" || sameOptionalKeys(a.advanceKeys, b.advanceKeys)) &&
     a.question === b.question &&
     a.toggle === b.toggle &&
     a.options.length === b.options.length &&
@@ -341,7 +358,7 @@ export function multiSelectIdentity(a: MultiSelectModel, b: MultiSelectModel): b
     // its text and tick would read its own keystrokes as drift.
     return (
       sameSteps(a, b, ownMarkOf(a, b)) &&
-      sameCheckboxCore(a, b) &&
+      sameCheckboxCore(a, b, ownPlanOf(a, b)) &&
       a.field?.n === b.field?.n &&
       (a.field === undefined) === (b.field === undefined)
     );

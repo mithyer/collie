@@ -95,6 +95,7 @@ import type { PromptFeedback, PromptModel, PromptOption } from "../prompt-model"
 import type { WizardAnswer, WizardModel, WizardStepChip } from "../wizard-model";
 import { locateComposer, MAX_PICKER_HEADER_ROWS, paintedStatus, ruleAbove, tailRule } from "./composer";
 import { keyHintPairs, listDialogHint, parsePiFooter, type PiFooter } from "./footer";
+import { footerIdentity, readRpivInput, type RpivInput } from "./rpiv-field";
 import { readRpivMulti, rpivMultiModel, rpivMultiSignature } from "./rpiv-multi";
 
 /** A full-width rule: pi's editor rules and every question extension's own top and bottom rule. */
@@ -672,10 +673,10 @@ export function detectPiQuestion(lines: StyledLine[]): PiQuestion | null {
   const bodyEnd = frame.bodyEnd ?? frame.footerStart; // exclusive
   const below = frame.footerBelow === true;
   const pointers = below ? BELOW_POINTERS : POINTERS;
-  // rpiv draws `Shift+Enter for newline` in its footer only while one of its text editors has the keyboard (the `Type something.`
-  // row or the notes box). The row then shows the typed words in place of `Type something.`, so it reads as one more option
-  // (pi--v152-rpiv-free-typed--w200.txt): no card is made, and the raw screen keeps the Escape card.
-  if (below && /shift\+enter/i.test(footer.text)) return null;
+  // rpiv draws `Shift+Enter for newline` in its footer only while one of its text editors has the keyboard: the `Type something.`
+  // row, read below as an answer field (rpiv-field.ts), or the notes box, which is never lifted (the raw screen keeps
+  // the Escape card). Every page that reaches a lift with an editor open must show it on the input row.
+  const editorOpen = below && /shift\+enter/i.test(footer.text);
   let header: number[] = [];
   // rpiv prints the question's header as one chip, two spaces in, before the question (`  Color`). It names the
   // page, so it is read as the caption and kept out of the question's words.
@@ -729,18 +730,38 @@ export function detectPiQuestion(lines: StyledLine[]): PiQuestion | null {
   // rpiv's checkbox page has its own grammar (a box after the number, the input row always last, an unnumbered
   // advance row): see rpiv-multi.ts. The footer must say it is one (`Space to toggle`) before the rows are read.
   if (below && numbered && pointerCol === 0 && footer.spaceToggles && footer.arrowsMove && footer.enter === "select") {
-    const page = readRpivMulti(texts, at, bodyEnd);
+    const page = readRpivMulti(texts, at, bodyEnd, editorOpen);
     if (page !== null) {
       const words = (strip === null ? header : header.filter((r) => r > strip.row))
         .map((r) => texts[r]!.trim())
         .filter((t) => t.length > 0)
         .join(" ");
       if (words.length === 0) return null;
-      const identity = rpivMultiSignature(texts, top, regionEnd, page, strip === null ? null : strip.row);
+      const identity = rpivMultiSignature(texts, top, regionEnd, page, strip === null ? null : strip.row, frame.footerStart);
       return { kind: "multi-select", model: rpivMultiModel(page, words, identity, signature), startLine: top };
     }
   }
-  const options = numbered ? readOptions(texts, at, bodyEnd, pointerCol, pointers) : readUnnumbered(texts, at, bodyEnd);
+  // rpiv's single page ends in its text input, whatever the row says: the typed words stand in place of the label,
+  // and the draft stays after the pointer left, so only its place tells it from an option. Read it out of the rows
+  // here, and let the option reader see the placeholder form, so that typing never changes what the dialog is.
+  let input: RpivInput | null = null;
+  let rowTexts = texts;
+  const hung = new Set<number>();
+  if (below && numbered && !footer.spaceToggles) {
+    input = readRpivInput(texts, at, bodyEnd, false);
+    // The pointer is on the input exactly while its editor has the keyboard; any other editor is the notes box.
+    if (input !== null && input.focused !== editorOpen) return null;
+    if (input !== null) {
+      rowTexts = texts.slice();
+      rowTexts[input.row] = `${texts[input.row]![0]!} ${input.n}. Type something.`;
+      for (const r of input.wrapped) {
+        rowTexts[r] = "";
+        hung.add(r);
+      }
+    }
+  }
+  if (editorOpen && input === null) return null;
+  const options = numbered ? readOptions(rowTexts, at, bodyEnd, pointerCol, pointers) : readUnnumbered(texts, at, bodyEnd);
   if (options === null) return null;
   // Trailer rows: blank, or at most two header-like rows that are not a rule or an editor. Only OmO's
   // numbered dialog prints one; under unnumbered rows a header-like row is a label wrapped back to
@@ -749,7 +770,7 @@ export function detectPiQuestion(lines: StyledLine[]): PiQuestion | null {
   let counter: { answered: number; total: number } | null = null;
   if (frameless && !framelessNote(lines, texts, options.end, bodyEnd)) return null;
   for (let i = frameless ? bodyEnd : options.end; i < bodyEnd; i++) {
-    const t = texts[i]!;
+    const t = rowTexts[i]!;
     if (t === "") continue;
     if (!numbered || !HEADER_ROW.test(t) || /^ [─>]/.test(t) || ++trailers > MAX_TRAILER_ROWS) return null;
     // An answered counter (`Submit (0/1 answered)`, pi--omo-v5130-single-described.txt) is a second
@@ -780,7 +801,7 @@ export function detectPiQuestion(lines: StyledLine[]): PiQuestion | null {
   // A pointer on the free-text row stays raw: one keystroke there (Enter) opens the extension's own
   // editor, and the phone never types into it (pi--v0871-question-other-focused.txt,
   // pi--omo-v5130-single-other-focused.txt).
-  if (free?.pointed === true) return null;
+  if (free?.pointed === true && input === null) return null;
   const choices = free === null ? rows : rows.slice(0, -1);
   if (choices.length < 1) return null;
 
@@ -820,12 +841,34 @@ export function detectPiQuestion(lines: StyledLine[]): PiQuestion | null {
     options: options_,
     family: "select",
     signature,
-    coreSignature: coreSignatureOf(texts, top, regionEnd, rows[pointed]!.row, pointerCol, header, strip, frameless ? options.end : bodyEnd, bodyEnd),
+    coreSignature: coreSignatureOf(
+      rowTexts,
+      top,
+      regionEnd,
+      rows[pointed]!.row,
+      pointerCol,
+      header,
+      strip,
+      frameless ? options.end : bodyEnd,
+      bodyEnd,
+      hung,
+      below ? { from: frame.footerStart, to: frame.footerEnd, text: footerIdentity(texts, frame.footerStart, frame.footerEnd) } : null,
+    ),
   };
   // A one-question dialog names its page by the chip row above the question.
   if (caption === undefined && chipRow !== null) caption = texts[chipRow]!.trim();
   if (caption !== undefined) model.caption = caption;
-  if (free !== null) {
+  if (free !== null && input !== null) {
+    // rpiv's input is an answer field (ADR 0113): its digit gives it the keyboard, a walk onto it does too, and
+    // `Enter` in it answers with the words. The recipe (lib/answer-field.ts) types and proves them first.
+    model.feedback = {
+      key: String(input.n),
+      focused: input.focused,
+      text: input.text,
+      purpose: "answer",
+      pointer: input.focused ? "on" : "above",
+    };
+  } else if (free !== null) {
     const feedback: PromptFeedback = {
       // No key: nothing is ever sent for this row (prompt-action refuses the `free-text` purpose), and
       // its printed number is not a key the footer names (ADR 0009).
@@ -1171,10 +1214,19 @@ function coreSignatureOf(
   strip: Strip | null,
   noteFrom: number,
   noteTo: number,
+  drop: ReadonlySet<number> = new Set(),
+  footer: { from: number; to: number; text: string } | null = null,
 ): string {
   const titleRows = new Set(strip === null ? [] : header.filter((r) => r < strip.row));
   const out: string[] = [];
   for (let r = top; r <= bottom; r++) {
+    // The rows a typed value wrapped onto are no part of what the dialog is; its footer is one row of words
+    // that do not change when an editor opens.
+    if (drop.has(r)) continue;
+    if (footer !== null && r >= footer.from && r <= footer.to) {
+      if (r === footer.from) out.push(footer.text);
+      continue;
+    }
     let t = texts[r]!;
     if (r === pointedRow) t = `${t.slice(0, col)} ${t.slice(col + 1)}`;
     // A frameless dialog's description paragraph describes the pointed option, so it moves with the

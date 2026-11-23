@@ -134,15 +134,30 @@ const LIFTS_397 = new Map<string, Expect>([
   ["pi--v152-rpiv-tabs-second-moved--w200.txt", "walk"],
   ["pi--v152-rpiv-submit--w200.txt", "walk"],
   ["pi--v152-rpiv-submit-moved--w200.txt", "walk"],
-  // The checkbox page (a plain read on pi 1.5.2, styled reads on pi 1.6.0): a multi-select card. The focused editor stays raw.
+  // The checkbox page (a plain read on pi 1.5.2, styled reads on pi 1.6.0): a multi-select card. rpiv's input row is
+  // an answer field in every state it has: empty, with a draft the pointer left, and with the keyboard.
   ["pi--v152-rpiv-multi--w200.txt", "multi"],
   ["pi--v160-rpiv-multi--w200.txt", "multi"],
   ["pi--v160-rpiv-multi-checked--w200.txt", "multi"],
   ["pi--v160-rpiv-multi-third--w200.txt", "multi"],
   ["pi--v160-rpiv-multi-submit-row--w200.txt", "multi"],
   ["pi--v160-rpiv-multi-typed--w200.txt", "multi"],
+  ["pi--v160-rpiv-multi-free-focused--w200.txt", "multi"],
+  ["pi--v160-rpiv-multi-free-focused-empty--w200.txt", "multi"],
+  ["pi--v160-rpiv-multi-free-focused-typed--w200.txt", "multi"],
+  ["pi--v160-rpiv-multi-free-left-typed--w200.txt", "multi"],
   ["pi--v160-rpiv-tabs-multi--w200.txt", "multi"],
   ["pi--v160-rpiv-tabs-multi-checked--w200.txt", "multi"],
+  // The single page's input row, in every state (real pi 1.6.0, 2026-11-23): the pointer on it with the editor open
+  // (empty, typed, wrapped by words and by Chinese letters), and left with its draft or empty. A select with an answer field.
+  ["pi--v152-rpiv-free-focused--w200.txt", "walk"],
+  ["pi--v152-rpiv-free-typed--w200.txt", "walk"],
+  ["pi--v160-rpiv-single-free-focused-empty--w200.txt", "walk"],
+  ["pi--v160-rpiv-single-free-focused-typed--w200.txt", "walk"],
+  ["pi--v160-rpiv-single-free-left-empty--w200.txt", "walk"],
+  ["pi--v160-rpiv-single-free-left-typed--w200.txt", "walk"],
+  ["pi--v160-rpiv-single-free-wrapped--w200.txt", "walk"],
+  ["pi--v160-rpiv-single-free-wrapped-words--w200.txt", "walk"],
   // pi 1.3.0 `/login` (2026-11-15): the method list and the Anthropic method list, each with its pointer moved.
   ["pi--v130-login-methods--w61.txt", "walk"],
   ["pi--v130-login-methods-moved--w61.txt", "walk"],
@@ -186,11 +201,8 @@ const RAW_MODALS = new Set([
   // The model selector under pi-powerline-footer, which replaces pi's editor with its own (issue 544,
   // live 2026-10-20): pi's selector still takes the editor's place in column zero.
   "pi--v130-powerline-model-selector--w120.txt",
-  // rpiv-ask-user-question 2.15.0: a text editor with the keyboard (empty and typed) and its notes box stay raw,
-  // and the footer still names Esc, so the Escape card is offered.
-  "pi--v152-rpiv-free-focused--w200.txt",
-  "pi--v160-rpiv-multi-free-focused--w200.txt",
-  "pi--v152-rpiv-free-typed--w200.txt",
+  // rpiv-ask-user-question 2.15.0: its notes box stays raw (the input row's editor is an answer field now), and the
+  // footer still names Esc, so the Escape card is offered.
   "pi--v152-rpiv-notes--w200.txt",
   ...["v0871", "v110"].flatMap((v) => [
     `pi--${v}-question-other-focused.txt`,
@@ -807,9 +819,19 @@ describe("rpiv-ask-user-question: the multi-select page (pi 1.5.2 plain read, pi
     expect(model.toggle).toBe("digit");
     expect(model.advanceLabel).toBe("Submit");
     expect(model.pointer).toBe("option");
-    // rpiv's Escape cancels the whole dialog and a card key is a digit, so there is no escape row and no field.
+    // rpiv's Escape cancels the whole dialog and a card key is a digit, so there is no escape row. The input row is
+    // the card's answer field: its digit opens the editor, and its Enter commits the whole answer.
     expect(model.escape).toBeNull();
-    expect(model.field).toBeUndefined();
+    expect(model.field).toEqual({
+      n: 4,
+      focused: false,
+      text: "",
+      checked: false,
+      pointer: "above",
+      lines: 1,
+      digitOpens: true,
+      commitsOnEnter: true,
+    });
   });
 
   it("reads the ticks, and a plain read of the same dialog reads the same", () => {
@@ -855,8 +877,11 @@ describe("rpiv-ask-user-question: the multi-select page (pi 1.5.2 plain read, pi
     // The questionnaire's chip turns from □ to ■ when its page gets a tick: still the same page.
     expect(sig("pi--v160-rpiv-tabs-multi-checked--w200.txt")).toBe(sig("pi--v160-rpiv-tabs-multi--w200.txt"));
     expect(sig("pi--v160-rpiv-tabs-multi--w200.txt")).not.toBe(first);
-    // Typed words change what the page says.
-    expect(sig("pi--v160-rpiv-multi-typed--w200.txt")).not.toBe(first);
+    // Typed words, the box they tick and the keyboard they hold are the field's state, not the page's identity.
+    expect(sig("pi--v160-rpiv-multi-typed--w200.txt")).toBe(first);
+    const empty = sig("pi--v160-rpiv-multi-free-focused-empty--w200.txt");
+    expect(sig("pi--v160-rpiv-multi-free-focused-typed--w200.txt")).toBe(empty);
+    expect(sig("pi--v160-rpiv-multi-free-left-typed--w200.txt")).toBe(empty);
   });
 
   it("makes models that differ only by a tick unequal, and equal on a re-read", () => {
@@ -873,8 +898,26 @@ describe("rpiv-ask-user-question: the multi-select page (pi 1.5.2 plain read, pi
     expect(blocks.some((b) => b.kind === "multi-select")).toBe(true);
   });
 
-  it("stays raw while an editor holds the keyboard, and when the pointer stands on the input row", () => {
-    expect(detectPiQuestion(load("pi--v160-rpiv-multi-free-focused--w200.txt"))).toBeNull();
+  it("reads the input row with the keyboard as the focused field, with no advance plan from there", () => {
+    const empty = multi(load("pi--v160-rpiv-multi-free-focused-empty--w200.txt"));
+    const typed = multi(load("pi--v160-rpiv-multi-free-focused-typed--w200.txt"));
+    for (const model of [empty, typed]) {
+      expect(model.phase === "checkbox" && model.pointer).toBe("field");
+      expect(model.phase === "checkbox" && model.advanceKeys).toBeUndefined();
+    }
+    expect(empty.phase === "checkbox" && empty.field).toMatchObject({ n: 4, focused: true, text: "", checked: false, pointer: "on" });
+    expect(typed.phase === "checkbox" && typed.field).toMatchObject({ n: 4, focused: true, text: "extra anchovies", checked: true, pointer: "on" });
+  });
+
+  it("reads the draft the pointer left: its words and its tick, the pointer on an option", () => {
+    const left = multi(load("pi--v160-rpiv-multi-free-left-typed--w200.txt"));
+    expect(left.phase === "checkbox" && left.field).toMatchObject({ focused: false, text: "extra anchovies", checked: true, pointer: "above" });
+    expect(left.phase === "checkbox" && left.pointer).toBe("option");
+    // The draft's tick is the field's: the three choices stay unticked.
+    expect(left.phase === "checkbox" && left.options.map((o) => o.checked)).toEqual([false, false, false]);
+  });
+
+  it("stays raw when the pointer stands on the input row without the editor open", () => {
     const onInput = without("❯ 1. [ ] Cheese", "  1. [ ] Cheese").map((row) => row.replace("  4. [ ] Type something.", "❯ 4. [ ] Type something."));
     expect(read(onInput)).toBeNull();
   });
@@ -908,6 +951,84 @@ describe("rpiv-ask-user-question: the multi-select page (pi 1.5.2 plain read, pi
     under.splice(under.findIndex((r) => r.includes("1. [ ] Cheese")) + 1, 0, "         wrapped under a choice");
     expect(read(under)).toBeNull();
   });
+});
+
+describe("rpiv-ask-user-question: the input row as an answer field (pi 1.5.2 plain, pi 1.6.0 styled reads)", () => {
+  // TEST: pi--v160-rpiv-single-free-*.txt and pi--v160-rpiv-multi-free-*.txt are styled reads of a real dialog (2026-11-23); pi--v152-rpiv-free-*.txt are plain reads of an older one.
+  const SINGLE = {
+    focusedEmpty: "pi--v160-rpiv-single-free-focused-empty--w200.txt",
+    focusedTyped: "pi--v160-rpiv-single-free-focused-typed--w200.txt",
+    leftEmpty: "pi--v160-rpiv-single-free-left-empty--w200.txt",
+    leftTyped: "pi--v160-rpiv-single-free-left-typed--w200.txt",
+    wrapped: "pi--v160-rpiv-single-free-wrapped--w200.txt",
+    wrappedWords: "pi--v160-rpiv-single-free-wrapped-words--w200.txt",
+  };
+  const feedback = (name: string) => prompt(load(name)).feedback;
+
+  it("reads the input row in each state it has: focused or left, empty or with words", () => {
+    expect(feedback(SINGLE.focusedEmpty)).toEqual({ key: "3", focused: true, text: "", purpose: "answer", pointer: "on" });
+    expect(feedback(SINGLE.focusedTyped)).toEqual({ key: "3", focused: true, text: "purple", purpose: "answer", pointer: "on" });
+    expect(feedback(SINGLE.leftEmpty)).toEqual({ key: "3", focused: false, text: "", purpose: "answer", pointer: "above" });
+    expect(feedback(SINGLE.leftTyped)).toEqual({ key: "3", focused: false, text: "purple", purpose: "answer", pointer: "above" });
+  });
+
+  it("reads the plain captures of pi 1.5.2 too, and takes the typed row for no option", () => {
+    expect(feedback("pi--v152-rpiv-free-focused--w200.txt")).toMatchObject({ focused: true, text: "" });
+    expect(feedback("pi--v152-rpiv-free-typed--w200.txt")).toMatchObject({ focused: true, text: "purp" });
+    for (const name of Object.values(SINGLE)) {
+      expect(prompt(load(name)).options.map((o) => o.label).filter((l) => l !== "Cancel"), name).toEqual(["Red", "Green"]);
+    }
+  });
+
+  it("keeps one identity through the keyboard, the typing and the pointer's walk", () => {
+    const models = [SINGLE.focusedEmpty, SINGLE.focusedTyped, SINGLE.leftEmpty, SINGLE.leftTyped].map((n) => prompt(load(n)));
+    for (const model of models) expect(promptsSameIdentity(model, models[0]!)).toBe(true);
+    // The question is another one: the identity breaks.
+    const other = rowsFor(SINGLE.leftEmpty).map((row) => row.replace("Which color do you like?", "Which size do you want?"));
+    expect(promptsSameIdentity(prompt(linesOf(other.join("\n"))), models[0]!)).toBe(false);
+  });
+
+  it("joins a wrapped value: a space where a Latin word wrapped, none between two wide letters", () => {
+    const alphabet = "alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima mike november oscar papa quebec romeo sierra tango uniform victor whiskey xray yankee zulu";
+    expect(feedback(SINGLE.wrappedWords)?.text).toBe(`${alphabet} ${alphabet}`);
+    const mixed = feedback(SINGLE.wrapped)?.text ?? "";
+    expect(mixed.startsWith("I would like purple because it matches the sky at dusk")).toBe(true);
+    // The Chinese letters came out as typed: no space was put between them where their row wrapped.
+    expect(mixed.endsWith("更多的字更多的字更多的字更多的字更多的字更多的字更多的字")).toBe(true);
+    expect(mixed).not.toMatch(/[\u4e00-\u9fff] [\u4e00-\u9fff]/u);
+  });
+
+  it("leaves the review page alone: its last row is an option, even with the pointer on it", () => {
+    for (const name of ["pi--v152-rpiv-submit--w200.txt", "pi--v152-rpiv-submit-moved--w200.txt"]) {
+      const model = prompt(load(name));
+      expect(model.feedback, name).toBeUndefined();
+      expect(model.options.map((o) => o.label).slice(0, 2), name).toEqual(["Submit answers", "Cancel"]);
+    }
+  });
+
+  it("declines a row it cannot place: words under the input that are not its wrapped text", () => {
+    const rows = rowsFor(SINGLE.leftTyped);
+    const at = rows.findIndex((r) => r.includes("3. purple"));
+    rows.splice(at + 1, 0, "   a stray row");
+    expect(detectPiQuestion(linesOf(rows.join("\n")))).toBeNull();
+  });
+
+  it("declines an editor that is the notes box's, and a focused row whose footer has no editor hint", () => {
+    expect(detectPiQuestion(load("pi--v152-rpiv-notes--w200.txt"))).toBeNull();
+    const noHint = rowsFor(SINGLE.focusedTyped).map((row) => row.replace(/ · Shift\+Enter for newline · Ctrl\+U to clear/, ""));
+    expect(detectPiQuestion(linesOf(noHint.join("\n")))).toBeNull();
+  });
+
+  it("reads the same input row in the localised placeholder, as empty", () => {
+    for (const placeholder of ["Schreibe etwas.", "输入内容", "Escribe algo."]) {
+      const rows = rowsFor(SINGLE.leftEmpty).map((row) => row.replace("Type something.", placeholder));
+      expect(prompt(linesOf(rows.join("\n"))).feedback, placeholder).toMatchObject({ focused: false, text: "" });
+    }
+  });
+
+  function rowsFor(name: string): string[] {
+    return raw(name).replace(/\n$/, "").split("\n");
+  }
 });
 
 describe("rpiv-ask-user-question: the footer under the bottom rule (pi 1.5.2 through herdr-core)", () => {
@@ -965,15 +1086,8 @@ describe("rpiv-ask-user-question: the footer under the bottom rule (pi 1.5.2 thr
     expect(askOf(read.surface.modal)?.options.map((o) => o.label)).toEqual(["Red", "Green", "Cancel"]);
   });
 
-  it("keeps both text editors and the notes box raw, so a typed row is never taken for an option", () => {
-    for (const name of [
-      "pi--v152-rpiv-free-focused--w200.txt",
-      "pi--v160-rpiv-multi-free-focused--w200.txt",
-      "pi--v152-rpiv-free-typed--w200.txt",
-      "pi--v152-rpiv-notes--w200.txt",
-    ]) {
-      expect(detectPiQuestion(load(name)), name).toBeNull();
-    }
+  it("keeps the notes box raw: the editor that has the keyboard is not the input row's", () => {
+    expect(detectPiQuestion(load("pi--v152-rpiv-notes--w200.txt"))).toBeNull();
   });
 
   it("declines a dialog whose footer does not name Escape, or that has prose between the options and the rule", () => {

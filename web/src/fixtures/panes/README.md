@@ -4203,8 +4203,8 @@ review page differ in small ways (see `ASK_NOTES.md`, "rpiv-ask-user-question").
 | `pi--v152-rpiv-submit--w200.txt` | The review page: the answers, a rule, `Ready to submit your answers?`, `1. Submit answers`, `2. Cancel` and a footer with no bottom rule | question ask: Submit answers, Cancel, Cancel (Escape) |
 | `pi--v152-rpiv-submit-moved--w200.txt` | Same, after one Down | question ask, the pointer on Cancel |
 | `pi--v152-rpiv-multi--w200.txt` | A multi-select question (`Space to toggle`), a plain read | multi-select card: Cheese, Ham, Olives and the `Submit` row |
-| `pi--v152-rpiv-free-focused--w200.txt` | The pointer on `Type something.`, the editor open and empty (`Shift+Enter for newline`) | raw |
-| `pi--v152-rpiv-free-typed--w200.txt` | The same editor with words typed, which draw in the option's place | raw: a typed row must never read as an option |
+| `pi--v152-rpiv-free-focused--w200.txt` | The pointer on `Type something.`, the editor open and empty (`Shift+Enter for newline`) | question ask with an answer field: focused, empty |
+| `pi--v152-rpiv-free-typed--w200.txt` | The same editor with words typed, which draw in the option's place | the field focused with `purp`; the typed row is never an option |
 | `pi--v152-rpiv-notes--w200.txt` | The notes box opened with `n` | raw |
 
 ### The multi-select page (pi 1.6.0, captured 2026-11-23)
@@ -4223,6 +4223,25 @@ pointer; Up from the first row wraps to the advance row; Down onto the input row
 | `pi--v160-rpiv-multi-third--w200.txt` | Option 1 ticked, the pointer on option 3 | advance plan `Up Up Up Enter` |
 | `pi--v160-rpiv-multi-submit-row--w200.txt` | The pointer on the `Submit` row | advance plan `Enter` |
 | `pi--v160-rpiv-multi-typed--w200.txt` | Words typed in the input, the editor left, the pointer on option 3 | the typed row (`4. [✔] pepperoni`) is the input, never an option |
-| `pi--v160-rpiv-multi-free-focused--w200.txt` | The input focused with words in it (`Shift+Enter for newline`) | raw: an open editor stays with the terminal |
+| `pi--v160-rpiv-multi-free-focused--w200.txt` | The input focused with words in it (`Shift+Enter for newline`) | multi-select card, the field focused with `pepperoni`, no advance plan |
+| `pi--v160-rpiv-multi-free-focused-empty--w200.txt` | The input focused, nothing typed (`❯ 4. [ ]`, a no-break cursor cell) | the field focused and empty; the page's identity equals the other two below |
+| `pi--v160-rpiv-multi-free-focused-typed--w200.txt` | The input focused with `extra anchovies`; the box ticked itself | the field focused, text `extra anchovies`, ticked |
+| `pi--v160-rpiv-multi-free-left-typed--w200.txt` | The editor left with `Up`, the draft and its tick kept, the pointer on option 3 | the field unfocused with its words; advance plan `Up Up Up Enter` |
 | `pi--v160-rpiv-tabs-multi--w200.txt` | Two questions, the tab strip ` ←  □ Toppings   □ Size   ✓ Submit  →`, page 1 is the multi-select | multi-select card with the advance row `Next` |
 | `pi--v160-rpiv-tabs-multi-checked--w200.txt` | Same, option 2 ticked: the strip's chip turns `■` | same card; the identity text ignores the chip's mark |
+
+### The single page's input row (pi 1.6.0, captured 2026-11-23)
+
+Same rig as above (real pi 1.6.0, rpiv-ask-user-question 2.15.0, herdr-core 0.1.22, 200 columns, styled reads, the last 20 rows).
+One question `Which color do you like?` with Red and Green and rpiv's own last row `Type something.`; the person typed `purple` or
+longer texts. The cursor cell of a focused row is a no-break space, which the row's trimmed text loses.
+
+| File | Screen | Reads as |
+|---|---|---|
+| `pi--v160-rpiv-single-free-focused-empty--w200.txt` | The pointer on the input row, the editor open and empty (`❯ 3.`, footer `Shift+Enter for newline · Ctrl+U to clear`) | question ask, the answer field focused and empty; the options give way (a tap is refused while the editor has the keyboard) |
+| `pi--v160-rpiv-single-free-focused-typed--w200.txt` | The editor open with `purple` | the field focused, text `purple` |
+| `pi--v160-rpiv-single-free-left-empty--w200.txt` | The editor left with `Up`, nothing typed (`  3. Type something.` again) | the field unfocused and empty, the pointer on Green |
+| `pi--v160-rpiv-single-free-left-typed--w200.txt` | The editor left with `Up`, the draft kept (`  3. purple`) | the field unfocused with `purple`; the page's identity equals the empty page's |
+| `pi--v160-rpiv-single-free-wrapped--w200.txt` | A long text that wrapped inside Latin words and then inside a run of Chinese letters (hung rows five columns in) | the field's text with a space where a Latin word wrapped and none between two Chinese letters |
+| `pi--v160-rpiv-single-free-wrapped-words--w200.txt` | A text of short words wrapped at word boundaries (the space is on neither side of the break) | the field's text with single spaces |
+

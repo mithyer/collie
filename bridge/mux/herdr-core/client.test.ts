@@ -236,6 +236,56 @@ describe("HcClient over a unix socket", () => {
     }
   });
 
+  // A pane that is drawing moves between the plain read and the observer's paint; the next try reads both again.
+  describe("a screen that moved between the two reads is read again", () => {
+    const screen = readFileSync(join(import.meta.dirname, "fixtures/rpiv-preview-v015.screen.txt"), "utf8");
+    const paint = readFileSync(join(import.meta.dirname, "fixtures/rpiv-preview-v015.paint.ansi"), "utf8");
+    // The text of an earlier moment: its first row is not the row the paint draws.
+    const stale = `an earlier moment\n${screen.split("\n").slice(1).join("\n")}`;
+    const plainAnswers = (texts: string[]) => {
+      const asked: JsonObject[] = [];
+      const core = stand((socket, message) => {
+        asked.push(asJsonObject(message.params) ?? {});
+        reply(socket, message.id, { text: texts[Math.min(asked.length - 1, texts.length - 1)]!, complete: true, how: "screen" });
+      }, { cols: 200, rows: 120 }, { data: paint });
+      return { core, asked };
+    };
+
+    test("the second try proves the paint against a fresh plain read", async () => {
+      const { core, asked } = plainAnswers([stale, screen]);
+      const read = await new HcClient(core.path, 2000).readTerminal("t1", 0, "preserve");
+      expect(read.styled).toBe(true);
+      expect(asked).toHaveLength(2);
+      expect(stripSgr(read.text).split("\n").map((row) => row.trimEnd())).toEqual(screen.split("\n").map((row) => row.trimEnd()));
+    });
+
+    test("a screen that never agrees stays plain, with the newest plain read, after a bounded number of tries", async () => {
+      const { core, asked } = plainAnswers([stale]);
+      const client = new HcClient(core.path, 2000);
+      expect(await client.readTerminal("t1", 0, "preserve")).toEqual({ text: stale, complete: true, how: "screen" });
+      // Nothing has been proved yet on this client: one extra try, not more.
+      expect(asked).toHaveLength(2);
+      // After one proved read the client knows its core can be styled, so a pane that is moving gets the full number of tries.
+      const { core: other, asked: otherAsked } = plainAnswers([screen]);
+      const proven = new HcClient(other.path, 2000);
+      expect((await proven.readTerminal("t1", 0, "preserve")).styled).toBe(true);
+      otherAsked.length = 0;
+      const moving = stand((socket, message) => {
+        otherAsked.push(asJsonObject(message.params) ?? {});
+        reply(socket, message.id, { text: stale, complete: true });
+      }, { cols: 200, rows: 120 }, { data: paint });
+      Reflect.set(proven, "socketPath", moving.path);
+      expect((await proven.readTerminal("t1", 0, "preserve")).styled).toBeUndefined();
+      expect(otherAsked).toHaveLength(3);
+    });
+
+    test("a read that is not styled is never repeated", async () => {
+      const { core, asked } = plainAnswers([stale]);
+      await new HcClient(core.path, 2000).readTerminal("t1", 0, "strip");
+      expect(asked).toHaveLength(1);
+    });
+  });
+
   test("plain, strip and incomplete reads never open an observer", async () => {
     const core = stand((socket, message) => reply(socket, message.id, { text: "plain", complete: asJsonObject(message.params)?.lines !== 3 }));
     const client = new HcClient(core.path, 2000);

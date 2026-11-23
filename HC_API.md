@@ -167,6 +167,12 @@ share the existing read deadline (5 s by default); frame payloads are bounded to
 screen-only paint, so is the total queued paint (a paint with scrollback is bounded to 4 MiB; a bigger
 one is not an error, that read stays plain).
 
+The plain read and the observer's paint are two reads, so a pane that is drawing can move between them; a whole
+paint that no longer agrees with the plain read is then tried again with a fresh plain read, up to 3 times once this
+client has proved one paint (2 before that). Measured on a busy pane of the real session (the screen changed in 29 of
+30 polls): 23% of the reads came back plain with one try, none of 300 with retries (median 7 ms, p95 13 ms). A paint
+of an unknown form (no end marker, split UTF-8) is not retried: a second try would meet it again.
+
 Each complete read requesting `styling: "preserve"` adds one temporary observer connection and its
 hello/get/attach/close exchange after the plain read. This cost applies to every core pane, not only
 Pi. Strip and incomplete reads open no observer. A direct styled read upstream would remove this

@@ -49,6 +49,9 @@ export const HC_GENERATION = 1;
  */
 export const HC_STREAM_SILENCE_MS = 40_000;
 
+/** How long a styled-read observer waits for more of the first paint, after the attach answer, before it closes with what it has. */
+const SNAPSHOT_QUIET_MS = 250;
+
 /** The largest DATA payload one frame carries here. The core takes up to 16 MiB. */
 const MAX_FRAME_PAYLOAD = 1024 * 1024;
 
@@ -564,11 +567,14 @@ export class HcClient {
       const paint: Buffer[] = [];
       let paintBytes = 0;
       let closing = false;
+      // Armed while the attach answer is in and the first paint is not whole yet; see closeWhenPainted.
+      let quiet: ReturnType<typeof setTimeout> | undefined;
       const getId = nextId(), attachId = nextId();
       const finish = (fn: () => void) => {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
+        clearTimeout(quiet);
         socket.destroy();
         fn();
       };
@@ -579,7 +585,26 @@ export class HcClient {
         if (channel < 0 || closing) return;
         if (paintChannel >= 0 && channel !== paintChannel) throw new Error("herdr-core terminal.attach: unexpected snapshot channel");
         closing = true;
+        clearTimeout(quiet);
         socket.write(frame(channel, FRAME_CLOSE, Buffer.alloc(0)));
+      };
+      // The core sends the first paint in DATA frames of at most 16 KiB and gives the next one only after our
+      // read credit, and a CLOSE ends whatever is still queued. A screen as big as a real window (279x76 with
+      // colours is well over 16 KiB) therefore arrives cut short if CLOSE goes out with the attach answer, and
+      // the cut paint has no end marker, so every such read fell back to plain text. Close only when the marker
+      // (win32 mode plus the status reports) is in, when the dimensions already changed (the read stays plain
+      // anyway), or when nothing new came for SNAPSHOT_QUIET_MS (a core with another paint form).
+      // TEST:client.test.ts[a first paint larger than one DATA frame is read whole before CLOSE]
+      const closeWhenPainted = () => {
+        if (channel < 0 || closing) return;
+        if (size === null || (paintBytes > 0 && firstPaintEnd(Buffer.concat(paint, paintBytes).toString("latin1"), size.reports) !== null)) {
+          closeObserver();
+          return;
+        }
+        clearTimeout(quiet);
+        quiet = setTimeout(() => {
+          try { closeObserver(); } catch (err) { finish(() => reject(err)); }
+        }, SNAPSHOT_QUIET_MS);
       };
       const onRpc = (message: JsonObject) => {
         if (message.id === getId) {
@@ -597,7 +622,7 @@ export class HcClient {
           if (before !== null && after.address === address && after.cols === before.cols && after.rows === before.rows && reports === beforeReports) {
             size = { cols: after.cols, rows: after.rows, reports };
           }
-          closeObserver();
+          closeWhenPainted();
         }
       };
       const onFrames = (chunk: Buffer) => {
@@ -622,6 +647,7 @@ export class HcClient {
             const credit = Buffer.alloc(4);
             credit.writeUInt32LE(incoming.payload.length, 0);
             socket.write(frame(incoming.channel, FRAME_CREDIT, credit));
+            closeWhenPainted();
           } else if (incoming.channel === channel && incoming.kind === FRAME_CLOSE) {
             if (!closing || paintBytes === 0) throw new Error("herdr-core terminal.attach: closed before a snapshot");
             finish(() => resolve({ paint: Buffer.concat(paint, paintBytes), size }));

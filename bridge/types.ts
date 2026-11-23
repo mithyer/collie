@@ -1566,7 +1566,16 @@ export type PaneChatResponse =
        */
       detail?: "shared-folder";
     }
-  | ({ paneId: string; available: true } & ChatBody);
+  | ({
+      paneId: string;
+      available: true;
+      /**
+       * The pixel size of the pictures of `upserts` whose bytes this bridge holds, keyed by the reference as the turn carries it
+       * (`/api/blobs/<hash>`), as {@link PaneHistoryResponse} gives it (bridge/journal/image-sizes.ts). A picture with no size is
+       * left out and a bridge without this field leaves it out altogether: a reader treats absent as "unknown".
+       */
+      imageSizes?: Record<string, { width: number; height: number }>;
+    } & ChatBody);
 
 /**
  * One changed file in a Changes list (ADR 0065). `status` is the file's state against HEAD, staged

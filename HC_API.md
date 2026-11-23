@@ -157,8 +157,12 @@ Every core pane can supply styling through a framed observer, even though `termi
 ```
 
 An observer cannot type or resize. Collie uses the terminal's own dimensions and sends no input,
-RESIZE, FOCUS or FACTS. It requests CLOSE immediately after the attach reply, then drains queued
-output through the CLOSE acknowledgement. CREDIT consumes output only. The plain read and observer
+RESIZE, FOCUS or FACTS. It requests CLOSE once the first paint is whole (its end marker is in), not
+at the attach reply, then drains through the CLOSE acknowledgement. The core sends DATA frames of at
+most 16 KiB and releases the next only after our CREDIT, and CLOSE drops what is still queued: a
+real 279 × 76 window with colours is larger than one frame, so an early CLOSE cut the paint short
+and every such read came back plain (found on the real session, 2026-11-23). An observer that sees
+no end marker for 250 ms closes anyway and the read stays plain. CREDIT consumes output only. The plain read and observer
 share the existing read deadline (5 s by default); frame payloads and total queued paint are each
 bounded to 1 MiB. History reads remain plain.
 

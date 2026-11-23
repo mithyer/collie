@@ -38,7 +38,7 @@ function reply(socket: Socket, id: JsonValue | undefined, result: JsonValue): vo
   socket.write(`${JSON.stringify({ jsonrpc: "2.0", id, result })}\n`);
 }
 
-function stand(onPlain: Handler, size = { cols: 70, rows: 30 }, paint: { data?: string | Buffer; chunkSize?: number; beforeReply?: boolean; live?: string; acknowledgeClose?: boolean; attachedCols?: number; declaredSize?: number } = {}): Stand {
+function stand(onPlain: Handler, size = { cols: 70, rows: 30 }, paint: { data?: string | Buffer; chunkSize?: number; beforeReply?: boolean; live?: string; acknowledgeClose?: boolean; attachedCols?: number; declaredSize?: number; paced?: boolean } = {}): Stand {
   const dir = mkdtempSync(join(tmpdir(), "hc-client-"));
   const path = join(dir, "core.sock");
   const framesIn: { channel: number; kind: number; payload: Buffer }[] = [];
@@ -46,6 +46,8 @@ function stand(onPlain: Handler, size = { cols: 70, rows: 30 }, paint: { data?: 
     let framed = false;
     let text = "";
     let bin: Buffer = Buffer.alloc(0);
+    // The DATA frames the core still holds back in `paced` mode: it sends the next one only after a read credit, and a CLOSE drops the rest.
+    let held: Buffer[] = [];
     socket.on("data", (chunk: Buffer) => {
       if (!framed) {
         text += chunk.toString("utf8");
@@ -81,12 +83,20 @@ function stand(onPlain: Handler, size = { cols: 70, rows: 30 }, paint: { data?: 
             const chunks: Buffer[] = [];
             const step = paint.chunkSize ?? Math.max(1, bytes.length);
             for (let i = 0; i < bytes.length; i += step) chunks.push(frame(1, 0, bytes.subarray(i, i + step)));
+            if (paint.paced === true && chunks.length > 0) {
+              held = chunks.slice(1);
+              socket.write(Buffer.concat([answer, chunks[0]!]));
+              return;
+            }
             const first = chunks.length ? Buffer.concat(chunks) : frame(1, 0, Buffer.alloc(0));
             if (paint.declaredSize !== undefined) first.writeUInt32LE(paint.declaredSize, 5);
             socket.write(Buffer.concat(paint.beforeReply ? [first, answer] : [answer, first]));
             if (paint.live !== undefined) socket.write(frame(1, 0, Buffer.from(paint.live)));
           }
+        } else if (got.kind === 1 && held.length > 0) {
+          socket.write(held.shift()!);
         } else if (got.kind === 2 && paint.acknowledgeClose !== false) {
+          held = [];
           socket.write(frame(got.channel, 2, Buffer.alloc(0)));
         }
       }
@@ -175,6 +185,37 @@ describe("HcClient over a unix socket", () => {
     expect(stream.some(f => f.kind === 1)).toBe(true);
     expect(stream.filter(f => f.kind === 2)).toHaveLength(1);
     expect(stream.every(f => f.kind === 1 || f.kind === 2)).toBe(true);
+  });
+
+  test("a first paint larger than one DATA frame is read whole before CLOSE", async () => {
+    const screen = readFileSync(join(import.meta.dirname, "fixtures/rpiv-preview-v015.screen.txt"), "utf8");
+    const paint = readFileSync(join(import.meta.dirname, "fixtures/rpiv-preview-v015.paint.ansi"));
+    // Real hc 0.1.22 on a 279x76 window: one 16 KiB frame with the attach answer, the rest only after our credits.
+    // Closing on the attach answer used to cut the paint before its end marker, so every big screen came back plain.
+    const frames = Math.ceil(paint.length / 512);
+    expect(frames).toBeGreaterThan(3);
+    const core = stand((socket, message) => reply(socket, message.id, { text: screen, complete: true }),
+      { cols: 200, rows: 120 }, { data: paint, chunkSize: 512, paced: true });
+    const read = await new HcClient(core.path, 2000).readTerminal("t1", 0, "preserve");
+    expect(read.styled).toBe(true);
+    expect(read.text).toContain("\u001b[48;2;45;59;71m");
+    expect(stripSgr(read.text).split("\n").map(row => row.trimEnd())).toEqual(screen.split("\n").map(row => row.trimEnd()));
+    const stream = core.framesIn.filter(f => f.channel !== 0);
+    // One credit per received frame, and the single CLOSE comes after the last credit, never before the paint is whole.
+    expect(stream.filter(f => f.kind === 1)).toHaveLength(frames);
+    expect(stream.filter(f => f.kind === 2)).toHaveLength(1);
+    expect(stream.at(-1)?.kind).toBe(2);
+    expect(stream.every(f => f.kind === 1 || f.kind === 2)).toBe(true);
+  });
+
+  test("a paced paint that never ends is closed after a short silence and the plain reading is kept", async () => {
+    const screen = readFileSync(join(import.meta.dirname, "fixtures/rpiv-preview-v015.screen.txt"), "utf8");
+    const core = stand((socket, message) => reply(socket, message.id, { text: screen, complete: true, how: "screen" }),
+      { cols: 200, rows: 120 }, { data: "unsupported repaint".repeat(40), chunkSize: 100, paced: true });
+    const started = Date.now();
+    expect(await new HcClient(core.path, 2000).readTerminal("t1", 0, "preserve")).toEqual({ text: screen, complete: true, how: "screen" });
+    expect(Date.now() - started).toBeLessThan(1500);
+    expect(core.framesIn.filter(f => f.channel !== 0 && f.kind === 2)).toHaveLength(1);
   });
 
   test("queued bytes have a total snapshot bound even when every DATA frame is small", async () => {

@@ -141,3 +141,69 @@ export function styledSnapshot(
   }
   return grid;
 }
+
+/** Home plus clear screen: how hc 0.1.22 opens the screen part of a first paint, and, when it has scrollback to
+ * show, the history part before it as well. */
+const CLEAR_SCREEN = `${ESC}[H${ESC}[2J`;
+
+/** Whether a piece of a paint is blank: nothing but spaces once the SGR is gone. */
+const blankPiece = (piece: string): boolean => /^ *$/u.test(stripSgr(piece));
+
+/**
+ * A styled read of what the plain read returned, for the screen alone or with the scrollback above it.
+ *
+ * A first paint made with `history: 0` is the screen part only, and {@link styledSnapshot} proves it. A paint made
+ * with `history: N` (hc 0.1.22, measured 2026-11-23) holds a history part in front of that screen part:
+ * `prologue, home+clear, the K history rows, home+clear, setup, home, screen grid, cursor, metadata`. The history
+ * rows are separated by CR LF and followed by `size.rows` bare line feeds, which push them off the viewer's screen
+ * into its scrollback (so `K = pieces - 1 - size.rows`). Dropping the history part and the second home+clear
+ * leaves exactly the screen-only form, so the screen part goes through {@link styledSnapshot} unchanged and the
+ * history rows go through the same SGR and text proof. Both parts are proved against the plain read, row by row,
+ * and the result has the plain read's rows (K styled history rows, then the screen grid).
+ *
+ * Anything this does not recognise (no pair, a third pair, no history rows, a row that differs from the plain
+ * read, an unproved escape) answers `null` and the caller keeps the plain text.
+ *
+ * TEST:snapshot.test.ts[a first paint with scrollback from hc 0.1.22]
+ *
+ * @param paint The first paint as decoded UTF-8 text; whatever follows its end marker is cut off here.
+ * @param read The plain read of the same terminal (`terminal.read` with the same `lines`).
+ * @param size The terminal's size and status report count, as the attach reply and `terminal.get` agree on them.
+ * @returns The styled text with the plain read's rows, or `null` when it cannot be proved.
+ */
+export function styledRead(
+  paint: string,
+  read: { readonly text: string; readonly complete: boolean },
+  size: SnapshotSize,
+): string | null {
+  const paintEnd = firstPaintEnd(paint, size.reports);
+  if (paintEnd === null) return null;
+  paint = paint.slice(0, paintEnd);
+  const first = paint.indexOf(CLEAR_SCREEN);
+  const second = first < 0 ? -1 : paint.indexOf(CLEAR_SCREEN, first + CLEAR_SCREEN.length);
+  // No pair, or one: the screen part alone (this is also every paint made without history).
+  if (second < 0) return styledSnapshot(paint, read, size);
+  if (paint.indexOf(CLEAR_SCREEN, second + CLEAR_SCREEN.length) >= 0 || !read.complete) return null;
+  if (!Number.isInteger(size.cols) || !Number.isInteger(size.rows) || size.cols <= 0 || size.rows <= 0) return null;
+  const history = paint.slice(first + CLEAR_SCREEN.length, second).replace(/\r\n/g, "\n");
+  // The same rule as the screen grid: every escape that crosses MuxGrid is SGR, and nothing else draws.
+  if (!provedSgr(history) || containsControl(stripSgr(history), true)) return null;
+  const pieces = history.split("\n");
+  const count = pieces.length - 1 - size.rows;
+  if (count < 1 || !pieces.slice(count).every(blankPiece)) return null;
+  const historyPaint = pieces.slice(0, count).join("\n");
+  const historyRows = splitLines(parseAnsi(historyPaint)).map(lineText);
+  const plainRows = read.text.split("\n").map((row) => row.replace(/ +$/u, ""));
+  if (historyRows.length !== count || plainRows.length <= count ||
+      historyRows.some((row, i) => row.replace(/ +$/u, "") !== plainRows[i] || displayWidth(row) > size.cols)) return null;
+  // The screen part, as a screen-only paint, against the rest of the plain read.
+  const screenPaint = paint.slice(0, first + CLEAR_SCREEN.length) + paint.slice(second + CLEAR_SCREEN.length);
+  const screen = styledSnapshot(screenPaint, { text: plainRows.slice(count).join("\n"), complete: true }, size);
+  if (screen === null) return null;
+  // The reset keeps a style left open at the end of the history rows from leaking into the first screen row.
+  const styled = `${historyPaint}${ESC}[0m\n${screen}`;
+  const shown = withoutBlankTail(stripSgr(styled).split("\n").map((row) => row.replace(/ +$/u, "")));
+  const proved = withoutBlankTail(plainRows);
+  if (shown.length !== proved.length || shown.some((row, i) => row !== proved[i])) return null;
+  return styled;
+}

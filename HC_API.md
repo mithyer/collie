@@ -163,13 +163,29 @@ most 16 KiB and releases the next only after our CREDIT, and CLOSE drops what is
 real 279 × 76 window with colours is larger than one frame, so an early CLOSE cut the paint short
 and every such read came back plain (found on the real session, 2026-11-23). An observer that sees
 no end marker for 250 ms closes anyway and the read stays plain. CREDIT consumes output only. The plain read and observer
-share the existing read deadline (5 s by default); frame payloads and total queued paint are each
-bounded to 1 MiB. History reads remain plain.
+share the existing read deadline (5 s by default); frame payloads are bounded to 1 MiB and, for a
+screen-only paint, so is the total queued paint (a paint with scrollback is bounded to 4 MiB; a bigger
+one is not an error, that read stays plain).
 
-Each complete screen poll requesting `styling: "preserve"` adds one temporary observer connection
-and its hello/get/attach/close exchange after the plain read. This cost applies to every core pane,
-not only Pi. Strip, history and incomplete reads open no observer. A direct styled read upstream
-would remove this extra connection and validation work.
+Each complete read requesting `styling: "preserve"` adds one temporary observer connection and its
+hello/get/attach/close exchange after the plain read. This cost applies to every core pane, not only
+Pi. Strip and incomplete reads open no observer. A direct styled read upstream would remove this
+extra connection and validation work.
+
+**Scrollback (Load older, `terminal.read { lines: N }`).** The same observer styles the history rows:
+attach with `history: N` instead of 0. Measured on hc 0.1.22 (2026-11-23, `fixtures/history-colors-v022`):
+the first paint is `prologue, ESC[H ESC[2J, the K history rows, ESC[H ESC[2J, setup, ESC[H, screen grid,
+cursor, metadata`, where K is `min(N, rows the core keeps)`. The history rows are separated by CR LF and
+followed by one bare LF per terminal row, which pushes them off the viewer's screen into its scrollback
+(so `K = pieces - 1 - rows`). A pane with no scrollback gets the screen-only form with a single
+`ESC[H ESC[2J`. The K rows equal the first K rows of the plain `terminal.read { lines: N }`, and the rest
+of that read equals the screen grid. `styledRead` in `snapshot.ts` checks both parts against the plain
+read, row by row, and feeds the screen part (the paint with the history part and the second
+`ESC[H ESC[2J` cut out) to `styledSnapshot` unchanged. Anything else (a third pair, no history rows, a
+row that differs because the pane scrolled between the two reads, an unproved escape) leaves the plain
+read. A failure of the observer on a history read never fails the read. Size: 50 rows ~ 45 KB, 500 ~
+194 KB, 5000 ~ 642 KB, about 25 ms. Not measured: hc 0.1.15 (its paint form is not known to carry
+scrollback; the proof refuses what it does not recognise) and full-screen programs.
 
 **hc 0.1.22 differs in two measured ways** (captured 2026-11-23, `fixtures/shell-colors-v022`).
 The first paint starts with CAN (0x18) before `ESC [ ! p`, and both `terminal.read { lines: 0 }`

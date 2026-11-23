@@ -2,7 +2,7 @@ import { existsSync } from "node:fs";
 import { createConnection, type Socket } from "node:net";
 import { homedir } from "node:os";
 import type { JsonObject, JsonValue } from "../../json.ts";
-import { firstPaintEnd, styledSnapshot, type SnapshotSize } from "./snapshot.ts";
+import { firstPaintEnd, styledRead, type SnapshotSize } from "./snapshot.ts";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // The herdr-core socket, the TRANSPORT. This is the only file that knows the core's method names
@@ -54,6 +54,14 @@ const SNAPSHOT_QUIET_MS = 250;
 
 /** The largest DATA payload one frame carries here. The core takes up to 16 MiB. */
 const MAX_FRAME_PAYLOAD = 1024 * 1024;
+
+/**
+ * The most first-paint bytes a styled read that carries scrollback queues. Colour roughly doubles the size of the
+ * plain rows (about 130 bytes a row against 60), and 5000 coloured history rows measured 642 KB, so 4 MiB covers the
+ * longest Load older the bridge allows without holding an unbounded buffer. A bigger paint is not an error: that
+ * read simply stays plain.
+ */
+const MAX_HISTORY_PAINT = 4 * 1024 * 1024;
 
 /** Frame kinds (HC_API.md § Transport, framed mode). */
 const FRAME_DATA = 0;
@@ -512,21 +520,41 @@ export class HcClient {
     return parseTerminal(await this.call("terminal.get", { terminal: address }));
   }
 
-  /** Plain history; a screen-only `preserve` read additionally observes one validated first paint.
-   * Old callers stay plain. Unsupported repaint forms retain that plain read; transport errors do not.
+  /** The plain read, and for a `preserve` read of a complete answer one validated first paint beside it: the screen
+   * alone for `lines` 0, the screen with `lines` rows of scrollback above it for `lines` above 0 (the phone's Load
+   * older). Old callers stay plain. Unsupported repaint forms retain that plain read. A transport error of the
+   * screen read is thrown; styling the scrollback never fails a read that already succeeded in plain text.
+   *
+   * @param address The terminal.
+   * @param lines How many rows of scrollback to read above the screen; 0 reads the screen alone.
+   * @param styling `preserve` asks for colour and text attributes when the paint can be proved; `strip` is plain.
+   * @returns The plain read, with `styled: true` and SGR in its text when the styled form was proved.
+   * TEST:client.test.ts[a read with scrollback keeps its colours, and never fails because of them]
    */
   async readTerminal(address: string, lines: number, styling: "preserve" | "strip" = "strip"): Promise<WireRead> {
     const started = Date.now();
-    const result = asObject(await this.call("terminal.read", { terminal: address, lines: Math.max(0, Math.floor(lines)) }));
+    const asked = Math.max(0, Math.floor(lines));
+    const result = asObject(await this.call("terminal.read", { terminal: address, lines: asked }));
     const read: MutableRead = { text: str(result, "text"), complete: result.complete !== false };
     const how = str(result, "how");
     const why = str(result, "why");
     if (how !== "") read.how = how;
     if (why !== "") read.why = why;
-    if (styling === "preserve" && lines === 0 && read.complete) {
+    if (styling === "preserve" && read.complete) {
       const remaining = this.timeoutMs - (Date.now() - started);
-      if (remaining <= 0) throw new HcTimeout("terminal.attach", this.timeoutMs);
-      const snapshot = await this.observeSnapshot(address, remaining);
+      // Colour on scrollback is a nicety on top of an answer already in hand: out of time or any failure of the
+      // observer returns the plain rows. The screen read keeps its rule (a transport error is not hidden).
+      if (remaining <= 0) {
+        if (asked > 0) return read;
+        throw new HcTimeout("terminal.attach", this.timeoutMs);
+      }
+      let snapshot: { paint: Buffer; size: SnapshotSize | null };
+      try {
+        snapshot = await this.observeSnapshot(address, remaining, asked);
+      } catch (err) {
+        if (asked > 0) return read;
+        throw err;
+      }
       if (snapshot.size !== null) {
         // Frame boundaries do not delimit first_paint: the outbox can split it or merge live bytes.
         // Find the known metadata end in bytes, so invalid/split UTF-8 in later live output is ignored.
@@ -538,7 +566,7 @@ export class HcClient {
         } catch {
           return read; // a split/invalid UTF-8 paint is not a complete styled snapshot
         }
-        const styled = styledSnapshot(paint, read, snapshot.size);
+        const styled = styledRead(paint, read, snapshot.size);
         if (styled !== null) {
           read.text = styled;
           read.styled = true;
@@ -548,11 +576,17 @@ export class HcClient {
     return read;
   }
 
-  /** One short-lived observer. CLOSE detaches it as soon as its attach reply arrives. Drain the
+  /** One short-lived observer. CLOSE detaches it once the first paint is whole. Drain the
    * bounded queued bytes through CLOSE acknowledgement, with read credits only: never input,
    * resize, focus or display facts. The remaining budget includes the preceding plain read.
+   *
+   * @param address The terminal.
+   * @param budgetMs What is left of the read's time, the preceding plain read included.
+   * @param history How many rows of scrollback the core puts in front of the screen in the paint (0: none).
+   * @returns The queued paint bytes and the terminal's size, or `size: null` (and no bytes) when the dimensions
+   *   moved during the read, or when a paint with scrollback outgrew {@link MAX_HISTORY_PAINT}: the caller stays plain.
    */
-  private observeSnapshot(address: string, budgetMs: number): Promise<{ paint: Buffer; size: SnapshotSize | null }> {
+  private observeSnapshot(address: string, budgetMs: number, history = 0): Promise<{ paint: Buffer; size: SnapshotSize | null }> {
     return new Promise((resolve, reject) => {
       const socket: Socket = createConnection(this.socketPath);
       let settled = false;
@@ -566,6 +600,12 @@ export class HcClient {
       let paintChannel = -1;
       const paint: Buffer[] = [];
       let paintBytes = 0;
+      // Whether the win32-mode marker that starts the end of the paint has been seen, and the last bytes before
+      // the newest frame so a marker split across two frames is still found. The full end check (which joins the
+      // whole paint) only runs once the marker is in: with scrollback the paint is hundreds of frames long and
+      // joining it on every frame would be quadratic.
+      let sawMarker = false;
+      let carry = "";
       let closing = false;
       // Armed while the attach answer is in and the first paint is not whole yet; see closeWhenPainted.
       let quiet: ReturnType<typeof setTimeout> | undefined;
@@ -597,7 +637,7 @@ export class HcClient {
       // TEST:client.test.ts[a first paint larger than one DATA frame is read whole before CLOSE]
       const closeWhenPainted = () => {
         if (channel < 0 || closing) return;
-        if (size === null || (paintBytes > 0 && firstPaintEnd(Buffer.concat(paint, paintBytes).toString("latin1"), size.reports) !== null)) {
+        if (size === null || (paintBytes > 0 && sawMarker && firstPaintEnd(Buffer.concat(paint, paintBytes).toString("latin1"), size.reports) !== null)) {
           closeObserver();
           return;
         }
@@ -612,7 +652,7 @@ export class HcClient {
           before = parseTerminal(record);
           beforeReports = statusReportCount(record);
           if (before.address !== address) throw new Error("herdr-core terminal.get: snapshot names another terminal");
-          sendRpc(attachId, "terminal.attach", { terminal: address, cols: before.cols, rows: before.rows, observe: true, history: 0 });
+          sendRpc(attachId, "terminal.attach", { terminal: address, cols: before.cols, rows: before.rows, observe: true, history });
         } else if (message.id === attachId) {
           const result = asObject(decodeAnswer(message, "terminal.attach"));
           channel = num(result, "channel");
@@ -640,8 +680,16 @@ export class HcClient {
               throw new Error("herdr-core terminal.attach: unexpected snapshot stream");
             }
             paintBytes += incoming.payload.length;
-            if (paintBytes > MAX_FRAME_PAYLOAD) throw new Error("herdr-core terminal.attach: queued snapshot exceeds its limit");
+            if (paintBytes > (history > 0 ? MAX_HISTORY_PAINT : MAX_FRAME_PAYLOAD)) {
+              if (history === 0) throw new Error("herdr-core terminal.attach: queued snapshot exceeds its limit");
+              // Too much scrollback to style: not a failure, the read stays plain. Dropping the connection ends the observer.
+              finish(() => resolve({ paint: Buffer.alloc(0), size: null }));
+              return;
+            }
             paint.push(incoming.payload);
+            const frameText = incoming.payload.toString("latin1");
+            if (!sawMarker && `${carry}${frameText}`.includes("\x1b[?9001")) sawMarker = true;
+            carry = frameText.slice(-8);
             // Credits consume output only. They let a multi-frame paint drain before CLOSE without
             // holding an observer open or granting input, resize, focus or display facts.
             const credit = Buffer.alloc(4);

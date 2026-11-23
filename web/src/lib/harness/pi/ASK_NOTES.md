@@ -150,14 +150,36 @@ stock questionnaire in five ways, and each had been enough to leave the dialog r
 | A one-question dialog has a `  Color` chip row (two-space indent) where a tabbed one has the strip | `CHIP_ROW`: read as the card's caption when no tab strip is there |
 | The review page has a mid rule, **no bottom rule**, and a `Ready to submit your answers?` select | `reviewPage`: the nearest rule above, a `❯ n. ` pointed row required; reads as a plain select (Submit answers, Cancel) |
 
-What stays raw, with the Escape card: a multi-select, and every state where one of rpiv's text editors has the
-keyboard (the `Type something.` row, the notes box). Their footer adds `Shift+Enter for newline`, and the row
-being typed draws the typed words in the option's place, so it would read as one more option. `detectPiQuestion`
-returns null when the footer is below and names `Shift+Enter`.
+What stays raw, with the Escape card: every state where one of rpiv's text editors has the keyboard (the
+`Type something.` row, the notes box). Their footer adds `Shift+Enter for newline`, and the row being typed draws
+the typed words in the option's place, so it would read as one more option. `detectPiQuestion` returns null
+when the footer is below and names `Shift+Enter`.
 
-Not captured, so not claimed: a painted read (herdr-core's pane read has no styling, so only the plain path was
-seen; the painted path goes through the same frame code and `paintedStatus`, but no capture proves it), rpiv's
-side-by-side preview layout, and a narrow pane.
+Not captured, so not claimed: rpiv's side-by-side preview layout, and a narrow pane. Styled reads of the single
+and tabbed pages were not captured either; the multi-select page was (see the next section).
+
+## rpiv's multi-select page (pi 1.6.0, captured and lifted 2026-11-23)
+
+A multi-select question is lifted as a **multi-select card** (`readRpivMulti` in `rpiv-multi.ts`; the screens are
+`pi--v160-rpiv-multi*--w200.txt` and `pi--v160-rpiv-tabs-multi*--w200.txt`, styled reads of a real pi 1.6.0 on
+herdr-core 0.1.22, plus the old plain capture `pi--v152-rpiv-multi--w200.txt`). The page's grammar:
+
+| Part | What it prints | What the reader does |
+| --- | --- | --- |
+| Choice rows | `❯ 1. [ ] Cheese` / `  2. [✔] Ham`, a description at column 2 | the card's options, the digit toggles (one key, the pointer stays) |
+| The last numbered row | always the free-text input: `  4. [ ] Type something.`; with words typed in it `  4. [✔] pepperoni`, wrapped under it at nine spaces | **never an option**: the card cannot type, and a digit on it would open the editor |
+| The advance row | one unnumbered row last: `  Submit` on the last question, `  Next` on an earlier one of a questionnaire | the card's advance button, labelled as printed |
+| The footer | under the bottom rule: `Enter to select · ↑/↓ to navigate · Space to toggle · … · Esc to cancel` | must say `Space to toggle`, or the page stays raw |
+
+Why the advance plan is `Up` x (i + 1) then `Enter` (`rpivAdvanceKeys`): rpiv's pointer wraps, so one `Up` from the
+first choice lands on the advance row, and the pointer never crosses the input row (a `Down` onto it focuses the
+editor, whose Enter commits the typed text and whose Esc cancels the whole dialog). The plan is sent once, bound
+to the region it was read from. A page whose pointer stands on the input row stays raw.
+
+The card has no "chat about this" row (rpiv's Esc cancels the whole dialog and a card key is a digit), no
+field, and no step strip: moving between the questions of a questionnaire, typing a custom answer and notes
+stay with the terminal. A tick turns the tab strip's chip from `□` to `■`, so the page's identity ignores the
+chip marks (`rpivMultiSignature`).
 
 ## A dialog with no rules: the review-consent screen
 

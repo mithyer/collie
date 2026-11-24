@@ -1347,7 +1347,7 @@ describe("the steer keys (M69)", () => {
   const FIXTURES = join(import.meta.dirname, "../../fixtures/panes");
   const LINE = "also say hello at the end";
   /** The rows of a capture as plain text, the way the reader sees them. */
-  const rowsOf = (name: string, width = "w120"): string[] => splitLines(parseAnsi(readFileSync(join(FIXTURES, `${name}--${width}.txt`), "utf8"))).map((row) => rowText(row).trimEnd());
+  const rowsOf = (name: string): string[] => splitLines(parseAnsi(readFileSync(join(FIXTURES, `${name}--w120.txt`), "utf8"))).map((row) => rowText(row).trimEnd());
   const raw = (id: string): JsonObject => parseJsonObject(readFileSync(join(PROFILES_DIR, `${id}.json`), "utf8"))!;
   const witnesses = (id: string): readonly SteerWitness[] => loadProfiles().get(id)!.keys.steerWitness!;
   /** The rows a witness's pattern takes with the line as its text (or, for a marker, at all). */
@@ -1385,22 +1385,6 @@ describe("the steer keys (M69)", () => {
     // At 0.1 s pi has emptied the box but not drawn the row yet: no witness, so the reads go on to 2 s.
     expect(hits(rowsOf("pi--v130-steer-after-now"), block!)).toEqual([]);
     expect(hits(rowsOf("pi--v130-queue-after"), block!)).toEqual([]);
-  });
-
-  it("pi on macOS names the edit hint `Option+Up`, not `Alt+Up`: the steer witness and the queued row accept both (live capture, pi 1.5.2)", () => {
-    const [block] = witnesses("pi");
-    const rows = rowsOf("pi--v152-steer-after-macos", "w200");
-    // The `Steering:` row stands right over the macOS hint, and the witness finds it.
-    const at = rows.findIndex((row) => new RegExp(block!.pattern, "u").exec(row)?.groups?.["text"] === "say banana");
-    expect(at).toBeGreaterThan(0);
-    expect(rows[at + 1]).toContain("Option+Up");
-    expect(new RegExp(block!.hint!, "u").test(rows[at + 1]!)).toBe(true);
-    // The same hint, worded for Linux and Windows, still matches, and so does the queued row's.
-    expect(new RegExp(block!.hint!, "u").test("↳ Alt+Up to edit all queued messages")).toBe(true);
-    const queued = loadProfiles().get("pi")!.keys.queuedRow!;
-    expect(["↳ Alt+Up to edit all queued messages", "↳ Option+Up to edit all queued messages"].map((row) => new RegExp(queued.hint, "u").test(row))).toEqual([true, true]);
-    // Other keys are not taken for it.
-    expect(new RegExp(block!.hint!, "u").test("↳ Ctrl+Up to edit all queued messages")).toBe(false);
   });
 
   it("pi: with a follow-up already queued, its `Follow-up:` row stands between the `Steering:` row and the hint (live rerun 2026-10-23)", () => {

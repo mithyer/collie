@@ -124,6 +124,30 @@ describe("TranscriptView", () => {
     expect(screen.getByText(/abc1234 the commit body/)).toBeInTheDocument();
   });
 
+  it("draws a tool call's glyph from its kind, and the wrench when it has none", () => {
+    showToolCalls();
+    const { container } = render(
+      <TranscriptView
+        entries={[
+          turn({
+            role: "assistant",
+            parts: [
+              { kind: "tool", name: "Bash", summary: "ls", call: { kind: "execute", command: "ls" } },
+              { kind: "tool", name: "Read", summary: "a.ts", call: { kind: "read", path: "a.ts" } },
+              { kind: "tool", name: "Mystery", summary: "x" },
+            ],
+          }),
+        ]}
+      />,
+    );
+    const glyph = (name: string) =>
+      screen.getByText(name).closest("button")?.querySelector("svg.icon")?.getAttribute("data-icon");
+    expect(glyph("Bash")).toBe("tool-execute");
+    expect(glyph("Read")).toBe("tool-read");
+    expect(glyph("Mystery")).toBe("tool");
+    expect(container.querySelector('[data-icon="tool-edit"]')).toBeNull();
+  });
+
   it("a tool call with no result isn't expandable (nothing to reveal)", () => {
     showToolCalls();
     render(

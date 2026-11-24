@@ -9,7 +9,7 @@
   rpiv-ask-user-question
 
 
- <file name="/home/wlucas/Development/collie/web/e2e/rig/editor-questions.json">
+ <file name="/home/tester/Development/collie/web/e2e/rig/editor-questions.json">
  {"questions":[{"question":"Which implementation should the Collie probe use?","header":"Plan","options":[{"label":"Sequential","description":"Keep the steps ordered.","preview":"Plan A\nRead ->
  Write\nKeep ordering"},{"label":"Parallel","description":"Run independent work together.","preview":"Plan B\nRead + Check\nThen write"}]},{"question":"Which checks should the Collie probe
  run?","header":"Checks","multiSelect":true,"options":[{"label":"Unit tests","description":"Verify local behavior."},{"label":"Integration tests","description":"Verify the real

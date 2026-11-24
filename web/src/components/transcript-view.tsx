@@ -6,6 +6,7 @@ import { DividedLine } from "@/components/ui/divided-line";
 import { JournalImage } from "@/components/journal-image";
 import { MarkdownText } from "@/components/markdown-text";
 import { cn } from "@/lib/utils";
+import { toolIconOf } from "@/lib/tool-icon";
 import { splitHighlight } from "@/lib/transcript-search";
 import type { Scope } from "@/lib/scope";
 import type { TranscriptEntry, TranscriptPart } from "@/lib/types";
@@ -116,7 +117,7 @@ function ToolPart({
         {isError ? (
           <Icon name="error" className="size-3.5 shrink-0 text-destructive" />
         ) : (
-          <Icon name="tool" className="size-3.5 shrink-0 text-muted-foreground" />
+          <Icon name={toolIconOf(part.call)} className="size-3.5 shrink-0 text-muted-foreground" />
         )}
         <span className="shrink-0 font-mono text-xs font-semibold">{part.name}</span>
         {part.summary && (

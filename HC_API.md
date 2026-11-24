@@ -193,6 +193,25 @@ read. A failure of the observer on a history read never fails the read. Size: 50
 194 KB, 5000 ~ 642 KB, about 25 ms. Not measured: hc 0.1.15 (its paint form is not known to carry
 scrollback; the proof refuses what it does not recognise) and full-screen programs.
 
+**The two reads are not cut at the same row (hc 0.1.22, measured 2026-11-24 on a real session and a
+throw-away one; `fixtures/history-trailing-empty-v022`, `fixtures/history-cursor-row-v022`).** Before
+this was known, a Load older read of a pane with a blank row at the bottom of its screen, or with empty
+rows at the end of its scrollback, was never styled (the proof saw rows that differ), and a read of
+more rows than the pane holds stayed plain too. Three facts:
+1. The paint with `history: N` **leaves out the empty rows at the end of the scrollback**; the plain
+   read keeps them.
+2. The plain read counts its rows back **from the last non-empty row of the document**, the paint from
+   the end of the terminal's screen. When the screen ends in empty rows (an agent's input box with room
+   below it, the cursor line) the plain read's screen part starts higher, and its scrollback ends earlier,
+   so the paint starts later than the plain read. HcClient therefore asks the paint for `N + rows`, one
+   screen more, and `styledRead` finds the plain read's rows at the end of the paint's rows
+   (`alignedRows`): the same text row by row, only empty rows missing from the paint (put back as empty
+   lines), the paint's earlier rows cut away, nothing left over at either end.
+3. A `terminal.read { lines: N }` for more rows than the pane holds is not an error: the core answers
+   all it has with `complete: false, how: "history"` (about 1900-2000 rows with the default scrollback).
+   HcClient treats that read as styleable (`styleable`), because the proof checks every row; any other
+   incomplete read (`how: "screen"`, a full-screen program) stays plain, and so does a screen read.
+
 **hc 0.1.22 differs in two measured ways** (captured 2026-11-23, `fixtures/shell-colors-v022`).
 The first paint starts with CAN (0x18) before `ESC [ ! p`, and both `terminal.read { lines: 0 }`
 and the paint stop at the last non-blank row (3 rows on a 200 × 120 terminal), where 0.1.15 kept

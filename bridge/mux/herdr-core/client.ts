@@ -436,6 +436,20 @@ export type HcRpc = Pick<
   | "subscribe"
 >;
 
+/**
+ * Whether a plain read can be given its colours: a complete one, or a history read the core calls incomplete because the pane holds
+ * fewer rows of scrollback than were asked for (`how: history`, measured 2026-11-24: asking for 3000 rows of a pane that holds
+ * about 1900 answers all of them with `complete: false`). The paint is proved against the rows either way, so a read that really
+ * lacks rows (a full-screen program answering with its screen alone, `how: screen`) still fails the proof and stays plain.
+ * @param read The plain read.
+ * @param asked How many rows of scrollback were asked for (0 for the screen alone, which must be complete).
+ * @returns True when the paint may be tried against this read.
+ * TEST:client.test.ts[a read of more rows than the pane holds keeps its colours]
+ */
+function styleable(read: WireRead, asked: number): boolean {
+  return read.complete || (asked > 0 && read.how === "history");
+}
+
 export class HcClient {
   constructor(
     private readonly socketPath: string,
@@ -552,7 +566,7 @@ export class HcClient {
     // A try that fails because the screen moved between the two reads is made again with a fresh plain read, so the text
     // the paint is proved against is as new as the paint (see STYLED_ATTEMPTS). Errors and a read without time are not retried.
     const attempts = this.styledSeen ? STYLED_ATTEMPTS : 2;
-    for (let attempt = 0; attempt < attempts && read.complete; attempt++) {
+    for (let attempt = 0; attempt < attempts && styleable(read, asked); attempt++) {
       if (attempt > 0) {
         // The earlier plain read is still a good answer for a scrollback read, so a failure of this one does not fail it.
         try {
@@ -562,7 +576,7 @@ export class HcClient {
           throw err;
         }
       }
-      if (!read.complete) break;
+      if (!styleable(read, asked)) break;
       const remaining = this.timeoutMs - (Date.now() - started);
       // Colour on scrollback is a nicety on top of an answer already in hand: out of time or any failure of the
       // observer returns the plain rows. The screen read keeps its rule (a transport error is not hidden).
@@ -626,7 +640,9 @@ export class HcClient {
     } catch {
       return { styled: null, retry: false }; // a split/invalid UTF-8 paint is not a complete styled snapshot
     }
-    return { styled: styledRead(paint, read, snapshot.size), retry: true };
+    // An incomplete history read is the whole scrollback (the pane holds fewer rows than were asked for): the paint is proved
+    // against it row by row like any other, so it is offered to the proof as a whole read.
+    return { styled: styledRead(paint, { text: read.text, complete: styleable(read, asked) }, snapshot.size), retry: true };
   }
 
   /** One short-lived observer. CLOSE detaches it once the first paint is whole. Drain the
@@ -705,7 +721,16 @@ export class HcClient {
           before = parseTerminal(record);
           beforeReports = statusReportCount(record);
           if (before.address !== address) throw new Error("herdr-core terminal.get: snapshot names another terminal");
-          sendRpc(attachId, "terminal.attach", { terminal: address, cols: before.cols, rows: before.rows, observe: true, history });
+          // The paint is asked for one screen more scrollback than the plain read has: the two reads are not cut at the same row (the
+          // plain read counts back from the last non-empty row, so it can reach into what the paint calls scrollback), and the proof
+          // (styledRead) needs the paint to start no later than the plain read does. The surplus rows are cut away there.
+          sendRpc(attachId, "terminal.attach", {
+            terminal: address,
+            cols: before.cols,
+            rows: before.rows,
+            observe: true,
+            history: history > 0 ? history + before.rows : 0,
+          });
         } else if (message.id === attachId) {
           const result = asObject(decodeAnswer(message, "terminal.attach"));
           channel = num(result, "channel");

@@ -82,14 +82,13 @@ function withoutBlankTail(rows: readonly string[]): readonly string[] {
   return rows.slice(0, end);
 }
 
-/** Rendered text + SGR only, or null when the snapshot cannot prove the plain read's whole grid.
- * The separate reads are not atomic: mismatched text or dimensions must not produce styled facts.
+/** The screen part of a first paint, checked in its own right: the form of the paint and of every escape in it, with no plain read
+ * beside it. What it returns is only as good as the proof the caller makes against a plain read (styledSnapshot, styledRead).
+ * @param paint The first paint as decoded UTF-8 text, in the screen-only form (whatever follows its end marker is cut off here).
+ * @param size The terminal's size and status report count.
+ * @returns The styled grid and its rows as text (right-trimmed of spaces), or null when the form or an escape is not known.
  */
-export function styledSnapshot(
-  paint: string,
-  screen: { readonly text: string; readonly complete: boolean },
-  size: SnapshotSize,
-): string | null {
+function readScreenPart(paint: string, size: SnapshotSize): { readonly grid: string; readonly textRows: readonly string[] } | null {
   if (!Number.isInteger(size.cols) || !Number.isInteger(size.rows) || size.cols <= 0 || size.rows <= 0) return null;
   const paintEnd = firstPaintEnd(paint, size.reports);
   if (paintEnd === null) return null;
@@ -102,20 +101,13 @@ export function styledSnapshot(
   if (prefix !== "") return null;
   const body = paint.slice(home + 3);
   const cursor = CURSOR.exec(body);
-  if (cursor === null || !screen.complete) return null;
+  if (cursor === null) return null;
   const grid = body.slice(0, cursor.index).replace(/\r\n/g, "\n");
   // Every escape that crosses MuxGrid must be SGR. A cursor command hidden by parseAnsi is not safe.
   if (!provedSgr(grid) || containsControl(stripSgr(grid), true)) return null;
   const rows = splitLines(parseAnsi(grid));
   const textRows = rows.map(lineText);
-  const plainRows = screen.text.split("\n").map((row) => row.replace(/ +$/u, ""));
-  // hc 0.1.15 kept every blank row below the content in both reads (rows === size.rows); hc 0.1.22
-  // drops them from both. Compare the rows up to the last non-blank one, so either form proves the
-  // whole grid, and still refuse a read that is taller than the terminal.
-  const textTrimmed = withoutBlankTail(textRows.map((row) => row.replace(/ +$/u, "")));
-  const plainTrimmed = withoutBlankTail(plainRows);
-  if (textRows.length > size.rows || plainRows.length > size.rows || textTrimmed.length !== plainTrimmed.length ||
-      textTrimmed.some((row, i) => row !== plainTrimmed[i]) || textRows.some((row) => displayWidth(row) > size.cols)) return null;
+  if (textRows.length > size.rows || textRows.some((row) => displayWidth(row) > size.cols)) return null;
   const y = Number(cursor[1]), x = Number(cursor[2]);
   if (y < 1 || y > size.rows || x < 1 || x > size.cols) return null;
   const tail = body.slice(cursor.index + cursor[0].length).replace(METADATA, "");
@@ -139,7 +131,29 @@ export function styledSnapshot(
     if (original === undefined || restored === undefined ||
         fields.some((key) => (original[key] || undefined) !== (restored[key] || undefined))) return null;
   }
-  return grid;
+  return { grid, textRows: textRows.map((row) => row.replace(/ +$/u, "")) };
+}
+
+/** Rendered text + SGR only, or null when the snapshot cannot prove the plain read's whole grid.
+ * The separate reads are not atomic: mismatched text or dimensions must not produce styled facts.
+ */
+export function styledSnapshot(
+  paint: string,
+  screen: { readonly text: string; readonly complete: boolean },
+  size: SnapshotSize,
+): string | null {
+  if (!screen.complete) return null;
+  const part = readScreenPart(paint, size);
+  if (part === null) return null;
+  const plainRows = screen.text.split("\n").map((row) => row.replace(/ +$/u, ""));
+  // hc 0.1.15 kept every blank row below the content in both reads (rows === size.rows); hc 0.1.22
+  // drops them from both. Compare the rows up to the last non-blank one, so either form proves the
+  // whole grid, and still refuse a read that is taller than the terminal.
+  const textTrimmed = withoutBlankTail(part.textRows);
+  const plainTrimmed = withoutBlankTail(plainRows);
+  if (plainRows.length > size.rows || textTrimmed.length !== plainTrimmed.length ||
+      textTrimmed.some((row, i) => row !== plainTrimmed[i])) return null;
+  return part.grid;
 }
 
 /** Home plus clear screen: how hc 0.1.22 opens the screen part of a first paint, and, when it has scrollback to
@@ -157,9 +171,17 @@ const blankPiece = (piece: string): boolean => /^ *$/u.test(stripSgr(piece));
  * `prologue, home+clear, the K history rows, home+clear, setup, home, screen grid, cursor, metadata`. The history
  * rows are separated by CR LF and followed by `size.rows` bare line feeds, which push them off the viewer's screen
  * into its scrollback (so `K = pieces - 1 - size.rows`). Dropping the history part and the second home+clear
- * leaves exactly the screen-only form, so the screen part goes through {@link styledSnapshot} unchanged and the
- * history rows go through the same SGR and text proof. Both parts are proved against the plain read, row by row,
- * and the result has the plain read's rows (K styled history rows, then the screen grid).
+ * leaves exactly the screen-only form, which goes through the same checks as a screen on its own
+ * ({@link readScreenPart}); the history rows go through the same SGR and text proof.
+ *
+ * The two reads are made apart and do not draw the same rows (hc 0.1.22, measured 2026-11-24 against a real
+ * session): the plain read counts its rows back from the last non-empty row of the document, so when the screen ends in
+ * empty rows (the cursor line, a program that leaves room) it starts its screen part higher than the paint does and holds
+ * rows the paint holds as history; and the paint leaves the empty rows at the end of the scrollback out, which the plain
+ * read keeps. So the paint is not cut at the same row as the plain read. The caller asks the paint for more scrollback than
+ * the plain read has, and here the plain read's rows are proved to be the end of the paint's rows: row by row the same
+ * text, the plain read's extra empty rows put back as empty lines, the paint's earlier rows dropped. A paint that does not
+ * contain the plain read this way (the pane moved between the reads, or a row differs) answers `null`.
  *
  * Anything this does not recognise (no pair, a third pair, no history rows, a row that differs from the plain
  * read, an unproved escape) answers `null` and the caller keeps the plain text.
@@ -193,17 +215,69 @@ export function styledRead(
   if (count < 1 || !pieces.slice(count).every(blankPiece)) return null;
   const historyPaint = pieces.slice(0, count).join("\n");
   const historyRows = splitLines(parseAnsi(historyPaint)).map(lineText);
-  const plainRows = read.text.split("\n").map((row) => row.replace(/ +$/u, ""));
-  if (historyRows.length !== count || plainRows.length <= count ||
-      historyRows.some((row, i) => row.replace(/ +$/u, "") !== plainRows[i] || displayWidth(row) > size.cols)) return null;
-  // The screen part, as a screen-only paint, against the rest of the plain read.
+  if (historyRows.length !== count || historyRows.some((row) => displayWidth(row) > size.cols)) return null;
+  // The screen part, as a screen-only paint, checked in its own right (the plain read is proved against the whole below).
   const screenPaint = paint.slice(0, first + CLEAR_SCREEN.length) + paint.slice(second + CLEAR_SCREEN.length);
-  const screen = styledSnapshot(screenPaint, { text: plainRows.slice(count).join("\n"), complete: true }, size);
+  const screen = readScreenPart(screenPaint, size);
   if (screen === null) return null;
   // The reset keeps a style left open at the end of the history rows from leaking into the first screen row.
-  const styled = `${historyPaint}${ESC}[0m\n${screen}`;
-  const shown = withoutBlankTail(stripSgr(styled).split("\n").map((row) => row.replace(/ +$/u, "")));
-  const proved = withoutBlankTail(plainRows);
-  if (shown.length !== proved.length || shown.some((row, i) => row !== proved[i])) return null;
-  return styled;
+  const drawn = `${historyPaint}${ESC}[0m\n${screen.grid}`.split("\n");
+  const drawnText = [...historyRows.map((row) => row.replace(/ +$/u, "")), ...screen.textRows];
+  const plainRows = read.text.split("\n").map((row) => row.replace(/ +$/u, ""));
+  const rows = alignedRows(drawn, drawnText, plainRows);
+  return rows === null ? null : rows.join("\n");
+}
+
+/**
+ * Whether the rows before `at` leave every style off, so that the rows from `at` on draw the same whether or not those rows are
+ * there: the last SGR in them (if any) is a plain reset.
+ * @param rows The paint's rows, styled.
+ * @param at The row the kept rows would start with.
+ * @returns True when nothing set before `at` is still on at `at`.
+ */
+function styleClosedBefore(rows: readonly string[], at: number): boolean {
+  for (let i = at - 1; i >= 0; i--) {
+    const sgr = [...rows[i]!.matchAll(new RegExp(`${ESC}\\[([0-9;]*)m`, "g"))];
+    if (sgr.length > 0) return sgr[sgr.length - 1]![1] === "" || sgr[sgr.length - 1]![1] === "0";
+  }
+  return true;
+}
+
+/**
+ * Finds the plain read's rows at the end of the paint's rows and hands back those rows, styled.
+ *
+ * Both are the end of the same document, so the plain read is the paint's rows from some row on, with these differences
+ * and no others: the paint may start earlier (its first rows are cut away), and the plain read may have empty rows the
+ * paint does not (they are put back as empty lines). Everything else must be the same text, row by row, and nothing may be
+ * left over at the end of either. The first row of the plain read that the paint cannot place is where this gives up.
+ *
+ * @param drawn The paint's rows, styled, one per row of the document.
+ * @param drawnText The same rows as plain text, right-trimmed of spaces.
+ * @param plain The plain read's rows, right-trimmed of spaces.
+ * @returns One styled row for each plain row, or null when the plain read is not the end of the paint.
+ * TEST:snapshot.test.ts[a first paint with scrollback from hc 0.1.22]
+ */
+function alignedRows(drawn: readonly string[], drawnText: readonly string[], plain: readonly string[]): string[] | null {
+  const drawnEnd = withoutBlankTail(drawnText).length;
+  const plainEnd = withoutBlankTail(plain).length;
+  for (let from = 0; from < drawnEnd; from++) {
+    // The rows kept must not depend on a style set in the rows that are cut away (measured: hc ends a row with the reset, or
+    // with default-styled text after one).
+    if (plain[0] !== undefined && plain[0] !== "" && drawnText[from] !== plain[0]) continue;
+    if (from > 0 && !styleClosedBefore(drawn, from)) continue;
+    const placed: string[] = [];
+    let at = from;
+    let ok = true;
+    for (let i = 0; i < plainEnd && ok; i++) {
+      if (at < drawnEnd && plain[i] === drawnText[at]) placed.push(drawn[at++]!);
+      else if (plain[i] === "") placed.push("");
+      else ok = false;
+    }
+    if (ok && at === drawnEnd) {
+      // The empty rows after the last non-empty row stay as the plain read has them.
+      for (let i = plainEnd; i < plain.length; i++) placed.push("");
+      return placed;
+    }
+  }
+  return null;
 }

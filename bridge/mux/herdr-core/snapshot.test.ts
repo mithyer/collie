@@ -221,3 +221,60 @@ describe("a first paint with scrollback from hc 0.1.22", () => {
     expect(styledRead(paint.slice(0, -1), read, historySize)).toBeNull();
   });
 });
+
+// hc 0.1.22 cuts the paint with scrollback and the plain read at different rows (measured 2026-11-24 against a real session and a
+// throw-away one): both captures are neutral, made with a throw-away script, and the paint was asked for one screen more scrollback
+// than the plain read (as HcClient does), which is why the paint holds more rows than the plain read.
+describe("a paint and a plain read that are not cut at the same row (hc 0.1.22)", () => {
+  const dir = join(import.meta.dirname, "fixtures");
+  const bounds = { cols: 200, rows: 120, reports: 0 };
+  const shown = (text: string) => stripSgr(text).split("\n").map((row) => row.trimEnd());
+  const rowsOf = (text: string) => text.split("\n").map((row) => row.trimEnd());
+
+  test("scrollback that ends in empty rows: the paint leaves them out, the plain read keeps them", () => {
+    const paint = readFileSync(join(dir, "history-trailing-empty-v022.paint.ansi"), "utf8");
+    const plain = readFileSync(join(dir, "history-trailing-empty-v022.read.txt"), "utf8");
+    // The shape this relies on: 40 rows of text in the scrollback, then the empty rows the plain read keeps.
+    expect(rowsOf(plain)).toHaveLength(170);
+    expect(rowsOf(plain)[0]).toBe("row 022 truecolor blue  slate");
+    const styled = styledRead(paint, { text: plain, complete: true }, bounds);
+    expect(styled).not.toBeNull();
+    expect(shown(styled!)).toEqual(rowsOf(plain));
+    // Rows keep their colour at both ends: the first row of the plain read, and the last row of the screen.
+    const spans = parseAnsi(styled!);
+    expect(spans.find((span) => span.text === "row 040 orange")).toMatchObject({ fg: "rgb(255,135,0)" });
+    expect(spans.find((span) => span.text === " slate ")).toMatchObject({ bg: "rgb(45,59,71)" });
+  });
+
+  test("the plain read starts higher than the paint's boundary: the screen ends in an empty cursor row", () => {
+    const paint = readFileSync(join(dir, "history-cursor-row-v022.paint.ansi"), "utf8");
+    const plain = readFileSync(join(dir, "history-cursor-row-v022.read.txt"), "utf8");
+    expect(rowsOf(plain)).toHaveLength(130);
+    expect(rowsOf(plain)[0]).toBe("row 132 orange plain text");
+    const styled = styledRead(paint, { text: plain, complete: true }, bounds);
+    expect(styled).not.toBeNull();
+    // The paint holds rows from `row 001`; the answer starts where the plain read does, and nothing is left over.
+    expect(shown(styled!)).toEqual(rowsOf(plain));
+    expect(parseAnsi(styled!).find((span) => span.text === "row 132 orange")).toMatchObject({ fg: "rgb(255,135,0)" });
+  });
+
+  test.each([
+    ["trailing-empty", "row 040 orange plain text", "row 040 other plain text"],
+    ["cursor-row", "row 150 orange plain text", "row 150 other plain text"],
+  ])("refuses a row of the plain read that the paint does not have (%s)", (name, from, to) => {
+    const paint = readFileSync(join(dir, `history-${name === "cursor-row" ? "cursor-row" : "trailing-empty"}-v022.paint.ansi`), "utf8");
+    const plain = readFileSync(join(dir, `history-${name === "cursor-row" ? "cursor-row" : "trailing-empty"}-v022.read.txt`), "utf8");
+    expect(plain).toContain(from);
+    expect(styledRead(paint, { text: plain.replace(from, to), complete: true }, bounds)).toBeNull();
+  });
+
+  test("refuses a plain read that goes on after the paint's last row, or lacks a text row the paint has", () => {
+    const paint = readFileSync(join(dir, "history-cursor-row-v022.paint.ansi"), "utf8");
+    const plain = readFileSync(join(dir, "history-cursor-row-v022.read.txt"), "utf8");
+    expect(styledRead(paint, { text: `${plain.trimEnd()}\nrow 261 orange plain text`, complete: true }, bounds)).toBeNull();
+    // Only empty rows may be missing from the paint; a text row missing from the plain read is a pane that moved.
+    const lacking = plain.replace("row 140 orange plain text\n", "");
+    expect(lacking).not.toBe(plain);
+    expect(styledRead(paint, { text: lacking, complete: true }, bounds)).toBeNull();
+  });
+});

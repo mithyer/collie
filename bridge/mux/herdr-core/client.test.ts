@@ -316,11 +316,30 @@ describe("HcClient over a unix socket", () => {
       expect(rowsOf(stripSgr(read.text))).toEqual(rowsOf(plain));
       expect(read.text).toContain("\u001b[38;5;208mrow 001"); // A row of the scrollback keeps its colour.
       const rpc = core.framesIn.filter((f) => f.channel === 0).map((f) => parseJsonObject(f.payload.toString("utf8")) ?? {});
-      expect(rpc.find((m) => m.method === "terminal.attach")?.params).toEqual({ terminal: "t1", cols: 200, rows: 120, observe: true, history: 50 });
+      // One screen more scrollback than the plain read: the two reads are not cut at the same row (see styledRead).
+      expect(rpc.find((m) => m.method === "terminal.attach")?.params).toEqual({ terminal: "t1", cols: 200, rows: 120, observe: true, history: 50 + 120 });
       const stream = core.framesIn.filter((f) => f.channel !== 0);
       expect(stream.filter((f) => f.kind === 1)).toHaveLength(frames);
       expect(stream.filter((f) => f.kind === 2)).toHaveLength(1);
       expect(stream.at(-1)?.kind).toBe(2);
+    });
+
+    // TEST target of styleable() in client.ts.
+    test("a read of more rows than the pane holds keeps its colours (the core calls it incomplete)", async () => {
+      const everything = readFileSync(join(import.meta.dirname, "fixtures/history-cursor-row-v022.read.txt"), "utf8");
+      const whole = readFileSync(join(import.meta.dirname, "fixtures/history-cursor-row-v022.paint.ansi"));
+      // The pane holds fewer rows than were asked for: the core answers all of them, but says `complete: false, how: history`.
+      const core = stand((socket, message) => reply(socket, message.id, { text: everything, complete: false, how: "history" }), { cols: 200, rows: 120 }, { data: whole, reportless: true });
+      const read = await new HcClient(core.path, 2000).readTerminal("t1", 3000, "preserve");
+      expect(read.styled).toBe(true);
+      expect(read.complete).toBe(false);
+      expect(rowsOf(stripSgr(read.text))).toEqual(rowsOf(everything));
+      // A read that is incomplete for another reason (a full-screen program answering with its screen alone) stays plain.
+      const screenOnly = stand((socket, message) => reply(socket, message.id, { text: everything, complete: false, how: "screen" }), { cols: 200, rows: 120 }, { data: whole, reportless: true });
+      expect(await new HcClient(screenOnly.path, 2000).readTerminal("t1", 3000, "preserve")).toEqual({ text: everything, complete: false, how: "screen" });
+      // The screen alone must be complete to be styled, whatever `how` says.
+      const screenRead = stand((socket, message) => reply(socket, message.id, { text: everything, complete: false, how: "history" }), { cols: 200, rows: 120 }, { data: whole, reportless: true });
+      expect(await new HcClient(screenRead.path, 2000).readTerminal("t1", 0, "preserve")).toEqual({ text: everything, complete: false, how: "history" });
     });
 
     test("a paint the proof does not recognise leaves the plain rows", async () => {

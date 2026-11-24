@@ -367,6 +367,9 @@ function enrichCall(
     // `[{ questionIndex, question, kind, answer }]` (gentle-pi 4.6.0, from the issue #714 report; not
     // read off a local log). An entry lands on the question at its `questionIndex`, else the one
     // whose text it names, else its own place in the list. `answer` is a label or a list of labels.
+    // rpiv-ask-user-question 2.15.0 (read off a real session, 2026-11-24) writes the same list, and for
+    // a multi-select question (`kind: "multi"`) the ticked labels are `selected` while `answer` holds
+    // only the words typed into its "Type something" row, or null.
     const entries = Array.isArray(answers) ? answers.map(asRecord) : [];
     if (entries.length > 0 && entries.every((entry) => entry !== null)) {
       const lists: string[][] = call.questions.map(() => []);
@@ -375,7 +378,11 @@ function enrichCall(
         const named = questionKey(entry?.question);
         const byText = named === undefined ? -1 : call.questions.findIndex((q) => q.question === named);
         const slot = typeof index === "number" && Number.isInteger(index) && index >= 0 ? index : byText >= 0 ? byText : at;
-        if (slot < lists.length) lists[slot] = answerLabels(entry?.answer);
+        if (slot < lists.length) {
+          const ticked = answerLabels(entry?.selected);
+          const typed = answerLabels(entry?.answer).filter((label) => !ticked.includes(label));
+          lists[slot] = [...ticked, ...typed];
+        }
       });
       if (lists.some((list) => list.length > 0)) call.answers = lists;
       return;

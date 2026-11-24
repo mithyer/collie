@@ -1,7 +1,7 @@
 @import "tailwindcss";
 @import "tw-animate-css";
 
-/* Math (Settings → Appearance; lib/math/). Each engine's own stylesheet ships in its lazy chunk,
+/* Math (Settings → Look and feel; lib/math/). Each engine's own stylesheet ships in its lazy chunk,
    never here, so a device on Off downloads none of it. These two rules are the engine-neutral box.
    Each formula pans within the reading column, including a long inline formula. */
 .math-inline {
@@ -364,14 +364,17 @@
      7.3:1 light, 9.2:1 dark. */
   --control-on: light-dark(oklch(0.88 0.06 235), oklch(0.34 0.06 240));
   --control-on-foreground: light-dark(oklch(0.32 0.12 245), oklch(0.92 0.06 235));
-  /* The frame of the pane you are working in on a large screen (ADR 0120): a sky-200 in the dark
-     half; a stronger blue in the light half, where a pale frame would vanish on white. */
-  --pane-active: light-dark(oklch(0.14 0 0), oklch(0.985 0 0));
+  /* The frame of the pane you are working in on a large screen (ADR 0120, ADR 0174): a 1px hairline in the
+     "on" ink mixed into the page in OKLab, 70% in light and 60% in dark, so a quiet blue line and not a grey
+     ring beside the focus ring. A DERIVED token (schema.ts DERIVED_THEME_TOKENS): the file for `collie` holds no
+     value, and `deriveTokens` (lib/theme/derive.ts) holds every other theme's at 3:1 on the recess, the page and
+     the paper; a theme that sets its own `pane-active` has it mixed the same way, in place of the "on" ink. */
+  --pane-active: light-dark(color-mix(in oklab, var(--control-on-foreground) 70%, var(--background)), color-mix(in oklab, var(--control-on-foreground) 60%, var(--background)));
   /* The open folder tab's top edge and the open pane's ring (theme surface word `tabs: folder`,
      lib/tab-look.ts). Drawn only under that word. The default is the foreground ink of each half
      (the same two values as --foreground above), so a theme that sets the word and not the colour
-     draws its folder edge in ink. A pair and not var(--foreground), like --pane-active: the theme
-     file for `collie` holds every optional token, and a theme that sets one half is filled from it. */
+     draws its folder edge in ink. A pair and not var(--foreground): the theme file for `collie` holds
+     every optional token but the derived ones, and a theme that sets one half is filled from it. */
   --tab-active: light-dark(oklch(0.14 0 0), oklch(0.985 0 0));
   /* The ground of a found or matched piece of text: Find in Chat, and the letters a list filter matches
      (ui/match-text.tsx). A ground with alpha, laid over whatever the text sits on, so the ink on top
@@ -379,7 +382,7 @@
      The default is the amber the app drew as a literal before it had this token: Tailwind 4.3.1's
      amber-300 at 70% in the light half (oklch(87.9% 0.169 91.605 / 0.7)) and amber-500 at 40% in the
      dark half (oklch(76.9% 0.188 70.08 / 0.4)), written here as the same oklch with alpha, so the pixel
-     is the one it replaced. A pair, like --pane-active: the theme file for `collie` holds every optional
+     is the one it replaced. A pair, like --tab-active: the theme file for `collie` holds every optional
      token, and a theme that sets one half is filled from it. */
   --find: light-dark(oklch(0.879 0.169 91.605 / 0.7), oklch(0.769 0.188 70.08 / 0.4));
   --secondary: light-dark(oklch(0.915 0.004 80), oklch(0.28 0.003 80));
@@ -422,12 +425,56 @@
      rgb(214) on rgb(245) light; white 24% over rgb(10) = rgb(69) dark. At 3x DPR on a phone that
      is a crisp 1px cut, which is the mark's own vocabulary — a cut, not a wash. */
   --rule: light-dark(oklch(0.72 0.004 80), oklch(0.52 0.003 80));
+  /* THE FIRM EDGE (DESIGN.md §4, "Three line tokens"): the cut a person must SEE between the large screen's
+     tab bar and the work, and under a pane's header. --rule is a region's cut at 1.3:1 to 2:1, which is right
+     for a list and too faint for the line the selected tab stands on: on a theme whose page is black or
+     near-white the recess clamps to the page and --rule was the only thing left, at 1.0 to 1.3:1. This one is
+     the theme's own ink mixed into its own page, so it holds 3:1 or more against the recess, the page and the
+     paper in both halves of every bundled theme (e2e/strip-head.spec.ts measures the painted pixels).
+     DERIVED ONLY, never a theme token: a theme reaches it through `foreground` and `background`. For a theme
+     that is applied, lib/theme/derive.ts makes it from the same mix with a 3:1 floor (EDGE_SHARE there is this
+     58%); derive.test.ts holds this line and that share together. No component may restate the mix. */
+  --edge-firm: color-mix(in oklch, var(--foreground) 58%, var(--background));
+  /* THE WIDE LAYOUT'S THREE PLANES (DESIGN.md §4, "The large screen's three planes"). On a large screen
+     the navigation (the sidebar, the tab strip of the space, the strip's own ground) stands on the RECESS,
+     a column without focus on the page (--background), and the focused column, whole, on the PAPER: the
+     lightest surface on the screen in both halves, so the eye lands on the work. Both are DERIVED from the
+     theme's own tokens, so every theme gets the three planes without naming them; a theme may set either
+     one (optional, schema version 3) and need not.
+       recess: the page's own lightness minus 0.05. A page that is already black clamps at the page; then
+               the paper and the focus frame carry the order alone.
+       paper:  in light, the card 0.05 lighter, at most white (the card is white already). In dark,
+               halfway between the page and the card 0.05 lighter (L 0.23 on a 0.17 page on Collie): the
+               full step (0.29) read as too bright a sheet on a desktop (2026-11-21), and the focus frame,
+               not the lift, is what marks the focus.
+     Relative colour, not color-mix: no token is darker than the page in dark, so no mix can reach the
+     recess. */
+  --surface-recess: oklch(from var(--background) calc(l - 0.05) c h);
+  --surface-paper: light-dark(oklch(from var(--card) min(1, calc(l + 0.05)) c h), color-mix(in oklch, var(--background), oklch(from var(--card) calc(l + 0.05) c h)));
   /* Light is darkened off stock shadcn (0.708 → 0.62): at 0.708 the focus ring measures 2.58:1 on
      white, under the 3:1 WCAG 1.4.11 floor for a non-text indicator — and components draw it at
      `ring-ring/50`, which halves that again. On an app whose buttons type into a live shell, a focus
      ring you can't locate is a real problem. Still worth an on-device look: even at 0.62 the /50
      variant is marginal. */
   --ring: light-dark(oklch(0.5 0 0), oklch(0.76 0 0));
+  /* THE STATE FILLS, per plane (DESIGN.md §14, ADR 0172). A hover, a selected item and an open trigger read
+     `--state-hover`, `--state-on` and `--state-open`; each plane class points the three at its own triple
+     (`RECESS_ACCENT`, `PAPER_PLANE`, `PAGE_PLANE`), and here they hold the page's. These are Collie's relations,
+     the colours Altan approved on 2026-11-21: the accent on the page and the paper, the paper on the recess, the
+     on-colour for an open trigger. A theme that is applied gets the same relations with a floor under each
+     (lib/theme/derive.ts, set inline by applyTheme); derive.test.ts holds the two together within 0.005. */
+  --state-hover-page: var(--accent);
+  --state-hover-recess: var(--surface-paper);
+  --state-hover-paper: var(--accent);
+  --state-on-page: var(--accent);
+  --state-on-recess: var(--surface-paper);
+  --state-on-paper: var(--accent);
+  --state-open-page: var(--control-on);
+  --state-open-recess: var(--control-on);
+  --state-open-paper: var(--control-on);
+  --state-hover: var(--state-hover-page);
+  --state-on: var(--state-on-page);
+  --state-open: var(--state-open-page);
 
   /* Agent lifecycle status palette — the app's primary at-a-glance signal, so both halves are
      tuned against their own ground rather than one set being reused. The dark values glow on
@@ -707,6 +754,9 @@
   --color-border: var(--border);
   --color-input: var(--input);
   --color-rule: var(--rule);
+  --color-edge-firm: var(--edge-firm);
+  --color-surface-recess: var(--surface-recess);
+  --color-surface-paper: var(--surface-paper);
   --color-ring: var(--ring);
   --color-band-ground: var(--band-ground);
   --color-band-rule: var(--band-rule);
@@ -1794,6 +1844,15 @@ svg[data-mark].mark-steps .ct-tw {
   }
 }
 
+/* THE KEYBOARD'S RING over the sidebar (M108, lib/shortcuts/sidebar-focus.ts). Navigate mode marks the row
+   it stands on with `data-shortcut-focus`. DESIGN.md's focus channel, set apart from the row's own state
+   border: a 2px outline in the focus ring ink, 2px out, so it never moves the row and shows on the current
+   row's fill too. The list's 8px inset leaves room for it inside the scroller. */
+[data-shortcut-focus] {
+  outline: 2px solid var(--color-ring);
+  outline-offset: 2px;
+}
+
 /* THE FILL OF A HOLD (components/harness-bar.tsx `ScreenStop`, components/hold-to-approve.tsx). While a
    finger holds the belt's Stop, or the yes to a trick's code, a tinted layer opens from the start edge to
    the end edge over the time left to the act (the hook sets `animation-duration` inline), so the button is
@@ -2135,4 +2194,12 @@ svg[data-mark].mark-steps .ct-tw {
 }
 [data-fold="book"] .fold-left-full {
   width: var(--fold-a);
+}
+
+/* A MOUSE DRAG ON THE ACTIONS BELT (components/ui/overflow-edges.tsx, `drag`). While the pointer drags the
+   scrolling part, the whole of it shows the closed hand, the pills' own hand cursor included. At rest the
+   pills keep theirs. */
+[data-belt-dragging],
+[data-belt-dragging] * {
+  cursor: grabbing !important;
 }

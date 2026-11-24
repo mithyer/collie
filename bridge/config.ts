@@ -215,6 +215,12 @@ export interface Config {
    * (`bridge/mux/tern/exec.ts`). Set via `COLLIE_TERN_BIN`. Inert unless {@link mux} is `tern`.
    */
   ternBin: string;
+  /**
+   * Absolute path to the `rex` binary, when the operator has one somewhere unusual. Empty (the
+   * default) probes fixed paths — `~/.local/bin`, `/usr/local/bin`, `/usr/bin` and Homebrew's — and
+   * never `PATH` (`bridge/mux/rex/exec.ts`). Set via `COLLIE_REX_BIN`. Inert unless {@link mux} is `rex`.
+   */
+  rexBin: string;
   /** Path to Herdr's control socket. A non-Herdr-launched daemon must discover this itself. */
   socketPath: string;
   /**
@@ -314,6 +320,11 @@ export interface Config {
    * in the same dir, read the same way (bridge/operator-keys.ts) and likewise never read here.
    */
   keysFile: string;
+  /**
+   * Where the operator's keyboard shortcuts live, `shortcuts.toml`, the sibling of `keys.toml` in the
+   * same dir, read the same way (bridge/operator-shortcuts.ts) and likewise never read here.
+   */
+  shortcutsFile: string;
   /**
    * Where the operator's Quick-dock groups live — `quick-replies.toml`, the third sibling in the
    * same dir, read the same way (bridge/operator-quick-replies.ts) and likewise never read here.
@@ -479,6 +490,12 @@ export interface Config {
    * every message with `refused: off`; the CLI on this machine still sends. On by default.
    */
   walky: boolean;
+  /**
+   * Project files (`COLLIE_PROJECT_FILES`, ADR 0160): whether this machine reads a repository's own
+   * `collie.toml` at all. On by default; off reads none and serves no project picture. The operator's
+   * own config wins over every repository's file.
+   */
+  projectFiles: boolean;
   /**
    * The walky talky pair cap (`COLLIE_WALKY_PAIR_LIMIT`): messages in ten minutes between the same two
    * panes, either direction, counted by this bridge alone. 12 by default, 1 to 100; a value outside that
@@ -853,6 +870,7 @@ export function loadConfig(
     tmuxBin: (env.COLLIE_TMUX_BIN ?? "").trim(),
     zellijBin: (env.COLLIE_ZELLIJ_BIN ?? "").trim(),
     ternBin: (env.COLLIE_TERN_BIN ?? "").trim(),
+    rexBin: (env.COLLIE_REX_BIN ?? "").trim(),
     socketPath,
     dialMode: envEnum("COLLIE_HERDR_DIAL", ["auto", "net", "bun"] as const, "auto", env),
     port: envInt("COLLIE_PORT", DEFAULT_PORT, { min: 1, max: 65535 }, env),
@@ -879,6 +897,7 @@ export function loadConfig(
     submitKeys: submitKeys.length ? submitKeys : ["Enter"],
     commandsFile: join(configDir, "commands.toml"),
     keysFile: join(configDir, "keys.toml"),
+    shortcutsFile: join(configDir, "shortcuts.toml"),
     quickRepliesFile: join(configDir, "quick-replies.toml"),
     themeFile: join(configDir, "theme.toml"),
     fontsDir: join(configDir, "fonts"),
@@ -908,6 +927,7 @@ export function loadConfig(
     inside: env.COLLIE_INSIDE === undefined || env.COLLIE_INSIDE.trim() === "" ? null : envBool("COLLIE_INSIDE", false, env),
     sendProtocol: envBool("COLLIE_SEND_PROTOCOL", true, env),
     walky: envBool("COLLIE_WALKY", true, env),
+    projectFiles: envBool("COLLIE_PROJECT_FILES", true, env),
     walkyPairLimit: envInt("COLLIE_WALKY_PAIR_LIMIT", PAIR_LIMIT, { min: 1, max: 100 }, env),
     skipServe: envBool("COLLIE_SKIP_SERVE", false, env),
     basePath: normaliseBasePath(env.COLLIE_BASE_PATH),

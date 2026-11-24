@@ -5,6 +5,7 @@ import type { RefObject } from "react";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { __resetBeltIntents, takeBeltIntent } from "@/lib/belt-intent";
+import { __reloadProjectPictures, __resetProjectPictures, setProjectPictures } from "@/lib/project-picture";
 import { paneRowKey } from "@/lib/hosts";
 import { asJsonObject, asJsonString, parseJsonObject } from "@/lib/json";
 import { ROOT_ROUTE_ID, type HomeData, type PaneData } from "@/lib/loaders";
@@ -12,8 +13,12 @@ import { panePath } from "@/lib/nav";
 import { readAgentLaunch } from "@/lib/agent-startup";
 import { __resetOpenBeside } from "@/lib/open-beside";
 import { paneScopeKey } from "@/lib/scope";
+import type { ActionId } from "@/lib/shortcuts/actions";
+import { __resetShortcutRegistry, runShortcutAction } from "@/lib/shortcuts/registry";
 import { statusLabel, type AgentView, type DeviceAuth, type TabView } from "@/lib/types";
 import { __resetWideLayoutStore, setWideLayoutMode } from "@/lib/wide-layout-store";
+import { FOCUS_FRAME, PAGE_PLANE, PAPER_PLANE } from "@/components/strip-column";
+import { NAV_EDGE } from "@/components/ui/nav-edge";
 import { DetailRoute } from "@/routes/detail";
 import { withHeaderHost } from "@/test/header-host";
 import { server } from "@/test/setup";
@@ -243,11 +248,17 @@ describe("the page under the layout", () => {
 });
 
 describe("the sidebar", () => {
-  it("is a raised panel with the mark, the word and an open toggle, and the header docks in the focused column", async () => {
+  it("stands on the recess with the mark, the word and an open toggle, and the header docks in the focused column", async () => {
     const { container } = await mount("w1:p1", 1200);
     const aside = q(container, "aside")!;
     expect(aside.dataset.slot).toBe("wide-sidebar");
-    expect(aside.className).toContain("bg-card");
+    expect(aside.className).toContain("bg-surface-recess");
+    // The phone's switcher list inside it stands on a card and marks its row with the accent: here both
+    // are re-pointed, so the list takes the recess and the selected row the paper.
+    expect(aside.className).toContain("[--card:var(--surface-recess)]");
+    expect(aside.className).toContain("[--accent:var(--state-on-recess)]");
+    expect(aside.className).toContain(NAV_EDGE);
+    expect(aside.className).not.toContain("border-rule");
     expect(aside.style.width).toBe("320px");
     // One image: Collie in the text colour, then three inked letters (components/collie-wordmark.tsx).
     expect(q(aside, '[data-slot="sidebar-word"] svg')?.getAttribute("aria-label")).toBe("ColliePWA");
@@ -300,8 +311,10 @@ describe("the sidebar", () => {
     const block = q(container, 'aside[data-slot="wide-sidebar"] [data-slot="session-filter"]')!;
     expect(block).not.toBeNull();
     expect(block.getAttribute("role")).toBe("search");
-    expect(block.className).toEqual(expect.stringContaining("sticky"));
-    expect(block.className).toEqual(expect.stringContaining("top-0 -mx-2 px-2"));
+    // The head block around it sticks, across the sidebar.
+    const head = block.closest('[data-slot="sidebar-head-block"]')!;
+    expect(head.className).toEqual(expect.stringContaining("sticky"));
+    expect(head.className).toMatch(/\btop-0\b.*\s-mx-2\b/);
     expect(within(block).getByRole("textbox", { name: "Filter sessions" })).not.toHaveFocus();
 
     // Typed into, it narrows the list; closed to the rail, the field and its query are gone.
@@ -328,6 +341,21 @@ describe("the sidebar", () => {
   it("is 264 px wide at medium", async () => {
     const { container } = await mount("w1:p1", 700);
     expect(q(container, "aside")?.style.width).toBe("264px");
+  });
+
+  // THE COLLAPSE BUTTON IS A TOGGLE, NOT A TRIGGER (ui/button.tsx `TRIGGER_OPEN`): `aria-expanded` says whether the
+  // sidebar is open, and it takes no open fill, because an open sidebar is the resting state. The ghost Button already
+  // brings the house focus ring and the hover fill, so it misses neither.
+  it("says whether the sidebar is open, wears no open fill, and keeps the house focus ring and hover", async () => {
+    const { container } = await mount("w1:p1", 1200);
+    const toggle = q(container, '[data-slot="sidebar-toggle"]')!;
+    expect(toggle.getAttribute("aria-expanded")).toBe("true");
+    expect(toggle.className).not.toContain("aria-expanded:bg-(--state-open)");
+    expect(toggle.className).toContain("focus-visible:outline-2");
+    expect(toggle.className).toContain("hover:bg-(--state-hover)");
+    fireEvent.click(toggle);
+    await waitFor(() => expect(q(container, '[data-slot="sidebar-toggle"]')?.getAttribute("aria-expanded")).toBe("false"));
+    expect(q(container, '[data-slot="sidebar-toggle"]')?.className).not.toContain("aria-expanded:bg-(--state-open)");
   });
 
   it("closes to a rail of icons with status marks, remembered on this device", async () => {
@@ -403,19 +431,58 @@ describe("the strip", () => {
     await waitFor(() => expect(columns(container).map((c) => c.dataset.colKey)).toEqual([key(A1), key(A3)]));
   });
 
-  it("frames the focused column on all four sides, and reserves the frame on every column", async () => {
+  it("puts the focused column on the paper inside the frame, one column too, and reserves the frame on every column", async () => {
     const { container } = await mount("w1:p1", 1200);
     const lone = q(columns(container)[0]!, '[data-slot="column-frame"]')!;
-    // One column: the frame stays off, its width still reserved.
-    expect(lone.className).toContain("border-2");
-    expect(lone.className).toContain("border-transparent");
+    // One column: it has the focus, so it is the paper inside the frame (Altan's screenshot was this state).
+    expect(lone.className.split(" ")).toContain("border-[1px]");
+    expect(lone.className).toContain(FOCUS_FRAME);
+    expect(lone.className).toContain("bg-surface-paper");
 
     await openBesideFromSidebar(container, A2);
     const [other, focused] = columns(container).map((c) => q(c, '[data-slot="column-frame"]')!);
-    expect(focused!.className).toContain("border-2");
-    expect(focused!.className).toContain("border-pane-active");
-    expect(other!.className).toContain("border-2");
+    expect(focused!.className.split(" ")).toContain("border-[1px]");
+    expect(focused!.className).toContain(FOCUS_FRAME);
+    expect(focused!.className).toContain(PAPER_PLANE);
+    expect(other!.className.split(" ")).toContain("border-[1px]");
     expect(other!.className).toContain("border-transparent");
+    expect(other!.className).toContain(PAGE_PLANE);
+    expect(other!.className).not.toContain("bg-surface-paper");
+  });
+
+  it("puts the navigation on the recess: the tab strip and the strip's own ground, the tab bar on the firm edge and a page band", async () => {
+    const { container } = await mount("w1:p1", 1200);
+    const header = q(container, '[data-slot="space-header"]')!;
+    expect(header.className).toContain("bg-surface-recess");
+    // The open tab stands on this line in both looks, so it is the firm edge (ADR 0171), not the faint `NAV_EDGE`
+    // that measured 1.0:1 where a theme's recess clamps to its page.
+    expect(header.className).toContain("border-edge-firm");
+    expect(header.className).not.toContain(NAV_EDGE);
+    expect(header.className).not.toContain("border-rule");
+    // The 6px page band under the bar, the bar's height and not the columns'.
+    const band = header.nextElementSibling!;
+    expect(band).toHaveAttribute("data-slot", "space-band");
+    expect(band.className).toContain("h-1.5");
+    expect(band.className).toContain("bg-background");
+    expect(header.className).not.toContain("bg-band-ground");
+    expect(q(container, '[data-slot="strip"]')!.className).toContain("bg-surface-recess");
+    // The seam between two columns is a component edge, quieter than a region's rule.
+    expect(columns(container)[0]!.className).toContain("border-border");
+    expect(columns(container)[0]!.className).not.toContain("border-rule");
+  });
+
+  it("draws the seam under a column header once: the body under it opens with no rule", async () => {
+    const { container } = await mount("w1:p1", 1200);
+    await openBesideFromSidebar(container, A2);
+    const other = columns(container).find((c) => !c.hasAttribute("data-focused"))!;
+    expect(q(other, '[data-slot="column-header"]')!.className).toContain("border-b");
+    expect(q(other, '[data-slot="column-body"]')!.className).toContain("border-transparent");
+    // The focused column's reading area loses its own top rule under the pane header, in both planes.
+    for (const frame of columns(container).map((c) => q(c, '[data-slot="column-frame"]')!)) {
+      expect(frame.className).toContain("[&_[data-slot=pane-reading]]:border-t-transparent");
+      expect(frame.className).toContain("[&_[data-slot=composer-actions]]:bg-muted/20");
+      expect(frame.className).toContain("[&_[data-slot=belt-track]]:bg-transparent");
+    }
   });
 
   it("a tap on the pins mark in a column without focus leaves a pins intent for that pane (M90)", async () => {
@@ -471,6 +538,28 @@ describe("the strip", () => {
     fireEvent.pointerDown(body, { clientX: 10, clientY: 10 });
     fireEvent.pointerUp(body, { clientX: 12, clientY: 11 });
     await waitFor(() => expect(router.state.location.pathname).toBe(panePath("w1:p1")));
+  });
+
+  it("the 1px frame follows the focus, the other column keeps a transparent 1px border, and no border width changes", async () => {
+    const { container } = await mount("w1:p1", 1200);
+    await openBesideFromSidebar(container, A2);
+    const frames = () => columns(container).map((c) => q(c, '[data-slot="column-frame"]')!);
+    // The border widths a class string sets: a focus change may recolour them and never change them (DESIGN.md §2).
+    const widths = (el: HTMLElement) => el.className.split(/\s+/u).filter((c) => /^border(-[xytrbl])?(-([0-9]+|\[1px\]))?$/u.test(c));
+    const [a, b] = frames();
+    expect(b!.className).toContain(FOCUS_FRAME);
+    expect(a!.className).toContain("border-transparent");
+    expect(widths(a!)).toEqual(["border-[1px]"]);
+    expect(widths(b!)).toEqual(["border-[1px]"]);
+    const body = q(columns(container)[0]!, '[data-slot="column-body"]')!;
+    fireEvent.pointerDown(body, { clientX: 10, clientY: 10 });
+    fireEvent.pointerUp(body, { clientX: 12, clientY: 11 });
+    await waitFor(() => expect(frames()[0]!.className).toContain(FOCUS_FRAME));
+    const [a2, b2] = frames();
+    expect(b2!.className).toContain("border-transparent");
+    expect(b2!.className).not.toContain(FOCUS_FRAME);
+    expect(widths(a2!)).toEqual(widths(a!));
+    expect(widths(b2!)).toEqual(widths(b!));
   });
 
   it("Remove from view drops a column, and the last column cannot leave", async () => {
@@ -547,7 +636,7 @@ describe("width", () => {
 });
 
 describe("the sidebar's structure", () => {
-  it("one 16px inset, 44px icon buttons with 20px glyphs, a hairline between rows, more air above a heading", async () => {
+  it("one 16px inset, a hairline between rows, more air above a heading", async () => {
     const { container } = await mount("w1:p1", 1200);
     const aside = q(container, "aside")!;
     const list = q(aside, "[data-pane-key]")!.closest("section")!.parentElement!;
@@ -556,11 +645,7 @@ describe("the sidebar's structure", () => {
     expect(list.className).toContain("gap-6");
     const heading = within(aside).getByRole("heading", { name: "alpha" }).parentElement!;
     expect(heading.className).toContain("px-2");
-    // The summary row: a 44px row, its order glyphs 20px like every icon button around them.
-    const radios = within(aside).getAllByRole("radio");
-    expect(radios[0]?.closest("div.min-h-11")).not.toBeNull();
-    for (const r of radios) expect(r.querySelector("svg")?.getAttribute("class")).toContain("size-5");
-    // The toggle is the same glyph size, so it reads as the same icon set.
+    // The toggle keeps the 20px glyph of the icon buttons around it.
     expect(q(container, '[data-slot="sidebar-toggle"] svg')?.getAttribute("class")).toContain("size-5");
     // Rows: a hairline drawn once, between rows; a floor, never a fixed height; stated line boxes.
     const row = sidebarRow(container, A2)!;
@@ -568,6 +653,53 @@ describe("the sidebar's structure", () => {
     expect(row.className).toContain("min-h-11");
     expect(row.className).not.toMatch(/(?:^|\s)h-\d/);
     expect(q(row, ".leading-4")?.textContent).toContain("alpha");
+  });
+
+  it("the head is one sticky block: the field, then the summary line and the three views, one of them selected", async () => {
+    // A sixth row: the filter is offered from FILTER_MIN_ROWS on.
+    extraAgents = [pane("w2:p2", "w2", "beta")];
+    const { container } = await mount("w1:p1", 1200);
+    const aside = q(container, "aside")!;
+    const block = q(aside, '[data-slot="sidebar-head-block"]')!;
+    expect(block).not.toBeNull();
+    // One block sticks and draws the one rule; the field inside it draws none of its own.
+    expect(block.className).toMatch(/\bsticky\b/);
+    expect(block.className).toContain("border-b");
+    const field = q(block, '[data-slot="session-filter"]')!;
+    expect(field.className).not.toContain("sticky");
+    expect(field.className).not.toContain("border-b");
+    const summary = q(block, '[data-slot="sidebar-summary-row"]')!;
+    // In that order: the field, then the summary row.
+    expect([...block.children]).toEqual([field, summary]);
+    const views = within(summary).getByRole("radiogroup");
+    const radios = within(views).getAllByRole("radio");
+    expect(radios).toHaveLength(3);
+    expect(radios.filter((r) => r.getAttribute("aria-checked") === "true")).toHaveLength(1);
+    // The summary line comes first in the row, the views last.
+    expect(summary.lastElementChild).toBe(views);
+    // The selected view is filled in full ink, never outlined.
+    const on = radios.find((r) => r.getAttribute("aria-checked") === "true")!;
+    expect(on.className).toContain("bg-accent");
+    expect(on.className).not.toContain("border-foreground");
+  });
+
+  it("while filtering, the count stands inside the field, and no line is reserved under it", async () => {
+    // A sixth row: the filter is offered from FILTER_MIN_ROWS on.
+    extraAgents = [pane("w2:p2", "w2", "beta")];
+    const { container } = await mount("w1:p1", 1200);
+    const aside = q(container, "aside")!;
+    const field = q(aside, '[data-slot="session-filter"]')!;
+    const input = within(field).getByRole("textbox");
+    const count = q(field, '[data-slot="session-filter-count"]')!;
+    // At rest the count is drawn invisible inside the field's box, beside the clear button.
+    expect(count.closest("label")).toBe(input.closest("label"));
+    expect(count.className).toContain("absolute");
+    expect(count.className).toContain("invisible");
+    expect(count.className).not.toContain("h-4");
+    fireEvent.change(input, { target: { value: "alpha" } });
+    await waitFor(() => expect(count.className).not.toContain("invisible"));
+    expect(count.textContent).toMatch(/\d+ of \d+/);
+    expect(count.closest("label")).toBe(input.closest("label"));
   });
 });
 
@@ -958,7 +1090,7 @@ describe("the space header", () => {
     await waitFor(() => expect(router.state.location.pathname).toBe(panePath("w1:p1")));
   });
 
-  it("gives the tabs more of the row at the medium tier: a narrower title and no position text", async () => {
+  it("gives the tabs more of the row at the medium tier: a narrower title and no position text; at the expanded tier the title takes a third", async () => {
     const medium = await mount("w1:p1", 700);
     const header = q(medium.container, '[data-slot="space-header"]')!;
     expect(q(header, '[data-slot="space-title"]')?.className).toContain("max-w-[30%]");
@@ -968,7 +1100,7 @@ describe("the space header", () => {
     cleanup();
     const expanded = await mount("w1:p1", 1200);
     const wide = q(expanded.container, '[data-slot="space-header"]')!;
-    expect(q(wide, '[data-slot="space-title"]')?.className).toContain("max-w-[45%]");
+    expect(q(wide, '[data-slot="space-title"]')?.className).toContain("max-w-1/3");
     expect(q(wide, '[data-slot="space-position"]')?.textContent).toBe("space 1 of 2");
   });
 });
@@ -1102,5 +1234,167 @@ describe("folded postures", () => {
     const phone = await mount("w1:p1", 599);
     expect(frame(phone.container).dataset.fold).toBe("flat");
     expect(q(phone.container, "aside")).toBeNull();
+  });
+});
+
+// THE KEYBOARD (M108 spec 03). A shortcut calls the act a control of this screen already makes, and is
+// offered only where that control is. The key tap itself is pinned in hooks/use-shortcuts.test.tsx; here
+// the registry is called directly, as the listener does.
+describe("the keyboard", () => {
+  afterEach(() => __resetShortcutRegistry());
+
+  function run(id: ActionId, index?: number): boolean {
+    let ran = false;
+    act(() => {
+      ran = runShortcutAction(id, index);
+    });
+    return ran;
+  }
+  const shownPane = (container: ParentNode) => q(container, '[data-testid="chat"]')?.textContent;
+
+  it("toggle_sidebar folds the sidebar to the rail and back, and goto opens it", async () => {
+    const { container } = await mount("w1:p1", 1200);
+    expect(run("toggle_sidebar")).toBe(true);
+    await waitFor(() => expect(q(container, "aside")?.dataset.slot).toBe("rail"));
+    run("toggle_sidebar");
+    await waitFor(() => expect(q(container, "aside")?.dataset.slot).toBe("wide-sidebar"));
+    run("toggle_sidebar");
+    await waitFor(() => expect(q(container, "aside")?.dataset.slot).toBe("rail"));
+    run("switch_pane");
+    await waitFor(() => expect(q(container, "aside")?.dataset.slot).toBe("wide-sidebar"));
+  });
+
+  it("offers nothing on the phone layout, where there is no sidebar or strip", async () => {
+    await mount("w1:p1", 599);
+    for (const id of ["toggle_sidebar", "switch_pane", "focus_pane_left", "focus_pane_right", "remove_from_view", "resize_wider"] as const) {
+      expect(run(id), id).toBe(false);
+    }
+  });
+
+  it("moves the focus along the columns, stops at the ends, and wraps for cycle", async () => {
+    const { container } = await mount("w1:p1", 1200);
+    await openBesideFromSidebar(container, A2);
+    expect(run("focus_pane_right")).toBe(true);
+    expect(shownPane(container)).toBe("pane:w1:p2");
+    run("focus_pane_left");
+    await waitFor(() => expect(shownPane(container)).toBe("pane:w1:p1"));
+    run("focus_pane_left");
+    expect(shownPane(container)).toBe("pane:w1:p1");
+    run("cycle_pane_previous");
+    await waitFor(() => expect(shownPane(container)).toBe("pane:w1:p2"));
+    run("cycle_pane_next");
+    await waitFor(() => expect(shownPane(container)).toBe("pane:w1:p1"));
+  });
+
+  it("cycle needs two columns", async () => {
+    await mount("w1:p1", 1200);
+    expect(run("cycle_pane_next")).toBe(false);
+    expect(run("cycle_pane_previous")).toBe(false);
+    expect(run("remove_from_view")).toBe(false);
+  });
+
+  it("moves between spaces as the chevrons do, and not past the ends", async () => {
+    const { container } = await mount("w1:p1", 1200);
+    expect(run("previous_space")).toBe(false);
+    expect(run("next_space")).toBe(true);
+    await waitFor(() => expect(shownPane(container)).toBe("pane:w2:p1"));
+    expect(run("next_space")).toBe(false);
+    expect(run("previous_space")).toBe(true);
+    await waitFor(() => expect(shownPane(container)).toBe("pane:w1:p1"));
+  });
+
+  it("closes the focused column from the view while another stands, and the pane keeps its row", async () => {
+    const { container } = await mount("w1:p1", 1200);
+    await openBesideFromSidebar(container, A2);
+    expect(columns(container)).toHaveLength(2);
+    expect(run("remove_from_view")).toBe(true);
+    await waitFor(() => expect(columns(container)).toHaveLength(1));
+    expect(sidebarRow(container, A2)).not.toBeNull();
+    expect(run("remove_from_view")).toBe(false);
+  });
+
+  it("steps the width one preset at a time and stops at the ends", async () => {
+    const { container } = await mount("w1:p1", 1200);
+    await openBesideFromSidebar(container, A2);
+    const first = () => within(columns(container)[0]!).getByRole("button", { name: /^Width / });
+    // The focus is the second column, so the step moves that one.
+    const label = () => q(container, '[data-slot="column-head"]')?.textContent ?? "";
+    expect(run("resize_narrower")).toBe(true);
+    expect(label()).toContain("1/2");
+    run("resize_wider");
+    await waitFor(() => expect(label()).toContain("4/5"));
+    run("resize_wider");
+    await waitFor(() => expect(label()).toContain("Full"));
+    run("resize_wider");
+    expect(label()).toContain("Full");
+    run("resize_narrower");
+    await waitFor(() => expect(label()).toContain("4/5"));
+    // The first column keeps its own width.
+    expect(first().textContent).toBe("1/2");
+  });
+
+  it("offers no width step where there is no width to choose", async () => {
+    // 700 less the 264 sidebar leaves 436, under two panes at the minimum width.
+    await mount("w1:p1", 700);
+    expect(run("resize_wider")).toBe(false);
+    expect(run("resize_narrower")).toBe(false);
+  });
+
+  it("gives the sidebar toggle no key in a book fold, where the toggle is not drawn", async () => {
+    posture = "book";
+    await mount("w1:p1", 1200);
+    expect(run("toggle_sidebar")).toBe(false);
+    expect(run("switch_pane")).toBe(false);
+  });
+});
+
+// THE CLOSED SIDEBAR DRAWS THE PROJECT PICTURE (issue 811, ADR 0160, round 14): the rail's tile is the
+// same tile as the open sidebar's row, so a pictured session shows the picture with the agent logo in its
+// corner, a session with none shows the logo, and with the device's switch off nothing picture-shaped is
+// drawn. The device already holds the small copy, as after a cold open, so no fetch is involved.
+describe("the rail — project pictures", () => {
+  const V = "0123456789ab0123456789ab";
+  const COPY = "data:image/png;base64,SMALL";
+  const PICTURED = { ...pane("w3:p1", "w3", "gamma"), picture: V };
+
+  beforeEach(() => {
+    __resetProjectPictures();
+    localStorage.setItem("collie:project-picture-copies:v1", JSON.stringify({ ["\u0000" + V]: COPY }));
+    __reloadProjectPictures();
+    extraAgents = [PICTURED];
+  });
+  afterEach(() => __resetProjectPictures());
+
+  async function toRail() {
+    const { container } = await mount("w1:p1", 1200);
+    fireEvent.click(q(container, '[data-slot="sidebar-toggle"]')!);
+    return waitFor(() => {
+      const el = q(container, 'aside[data-slot="rail"]');
+      expect(el).not.toBeNull();
+      return el!;
+    });
+  }
+  const tileOf = (rail: HTMLElement, p: AgentView) => sidebarRow(rail.ownerDocument.body, p)?.querySelector<HTMLElement>('[data-slot="agent-tile"]') ?? null;
+
+  it("shows the picture for a pictured session, with the agent logo in its corner, and the logo for one without", async () => {
+    const rail = await toRail();
+    const pictured = tileOf(rail, PICTURED)!;
+    expect(pictured.getAttribute("data-picture")).toBe("on");
+    expect(pictured.querySelector('img[alt=""]')?.getAttribute("src")).toBe(COPY);
+    expect(within(pictured).getAllByRole("img", { name: "claude logo" })).toHaveLength(1);
+    // The same 28 px tile as the logo alone.
+    expect(pictured.className).toContain("size-7");
+    const plain = tileOf(rail, A2)!;
+    expect(plain.getAttribute("data-picture")).toBe("off");
+    expect(plain.querySelector('img[alt=""]')).toBeNull();
+    expect(within(plain).getAllByRole("img", { name: "claude logo" })).toHaveLength(1);
+  });
+
+  it("draws nothing picture-shaped with the switch off", async () => {
+    setProjectPictures(false);
+    const rail = await toRail();
+    expect(rail.querySelectorAll('[data-slot="agent-tile"][data-picture="on"]')).toHaveLength(0);
+    expect(rail.querySelectorAll('img[src^="data:"]')).toHaveLength(0);
+    expect(tileOf(rail, PICTURED)?.getAttribute("data-picture")).toBe("off");
   });
 });

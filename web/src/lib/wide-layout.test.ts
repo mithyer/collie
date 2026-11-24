@@ -8,6 +8,7 @@ import {
   columnKeyOf,
   cycleWidth,
   dropIndexAt,
+  followTarget,
   EMPTY_STRIP,
   focusIndex,
   hasWidthChoice,
@@ -22,10 +23,17 @@ import {
   presetOf,
   prune,
   removeColumn,
+  restingScroll,
+  springAt,
+  springEasing,
+  springRestMs,
+  springRests,
   scrollTargetFor,
   shownPreset,
   spaceKeyOf,
   spaceSwipe,
+  stripGeometry,
+  stepWidth,
   wholeColumnStart,
   widthClassOf,
   type SpaceStrip,
@@ -214,6 +222,25 @@ describe("the focus rules", () => {
     expect(next.focus).toBe("a");
   });
 
+  it("a keyboard step goes one width along and stops at the ends", () => {
+    const all = ["half", "fourfifths", "full"] as const;
+    const s = strip(["a", "b"], "a");
+    const wider = stepWidth(s, "b", all, 1);
+    expect(wider.cols[1]?.preset).toBe("fourfifths");
+    expect(wider.focus).toBe("a");
+    expect(stepWidth(wider, "b", all, -1).cols[1]?.preset).toBe("half");
+    expect(stepWidth(s, "b", all, -1)).toBe(s);
+    const full = stepWidth(stepWidth(s, "b", all, 1), "b", all, 1);
+    expect(stepWidth(full, "b", all, 1)).toBe(full);
+  });
+
+  it("a keyboard step skips a width the strip is too narrow for, and ignores a column it does not have", () => {
+    const s = strip(["a"], "a");
+    expect(stepWidth(s, "a", ["fourfifths", "full"], 1).cols[0]?.preset).toBe("full");
+    expect(stepWidth(s, "a", ["full"], 1)).toBe(s);
+    expect(stepWidth(s, "zzz", ["half", "full"], 1)).toBe(s);
+  });
+
   it("Remove from view keeps the last column and hands the focus to a neighbour", () => {
     const one = strip(["a"]);
     expect(removeColumn(one, "a")).toBe(one);
@@ -268,5 +295,106 @@ describe("strip geometry", () => {
     expect(spaceSwipe(5, 70)).toBe(-1);
     expect(spaceSwipe(60, 50)).toBeNull();
     expect(spaceSwipe(0, 30)).toBeNull();
+  });
+});
+
+// THE GLIDE'S END (a width change eases, wide-layout.tsx): the target is computed from the final
+// fractions before the columns have moved, so it must be the place the strip comes to rest without one.
+// The e2e case (e2e/wide-layout.spec.ts, "a width change glides") holds the same numbers to the
+// measured page at 1440px.
+describe("the width glide", () => {
+  const W = 1120;
+
+  it("lays out the columns and the add column from the fractions", () => {
+    expect(stripGeometry([1 / 2, 4 / 5], W, true)).toEqual({ lefts: [0, 560], widths: [560, 896], addWidth: 440, contentWidth: 1896 });
+    // One column at 1/2: the add column takes the rest of the strip.
+    expect(stripGeometry([1 / 2], W, true).addWidth).toBe(560);
+    // A column never goes under the minimum in wide mode, so a fraction past the cut is its floor.
+    expect(stripGeometry([1 / 2], 900, true).widths).toEqual([450]);
+    expect(stripGeometry([1 / 2], 860, true).widths).toEqual([440]);
+    // Not wide: every column is the strip's width, with no floor.
+    expect(stripGeometry([1, 1], 700, false)).toEqual({ lefts: [0, 700], widths: [700, 700], addWidth: 440, contentWidth: 1840 });
+  });
+
+  it("grows the last column: the strip scrolls to its start", () => {
+    // 1/2 + 1/2 at scroll 0, the second focused, then the second at 4/5.
+    expect(restingScroll(stripGeometry([1 / 2, 4 / 5], W, true), 1, 0, W)).toBe(560);
+    // 4/5 to Full: already at its start.
+    expect(restingScroll(stripGeometry([1 / 2, 1], W, true), 1, 560, W)).toBe(560);
+  });
+
+  it("shrinks the last column: the old position is clamped to the new range first", () => {
+    // Full at scroll 560 back to 1/2: the range ends at 560, the column is whole, nothing moves.
+    expect(restingScroll(stripGeometry([1 / 2, 1 / 2], W, true), 1, 560, W)).toBe(560);
+    // A lone Full column scrolled to the add column's start, back to 1/2: the range ends at 0.
+    expect(restingScroll(stripGeometry([1 / 2], W, true), 0, 900, W)).toBe(0);
+  });
+
+  it("grows a column in view while the strip is scrolled right: the strip stays", () => {
+    expect(restingScroll(stripGeometry([1 / 2, 4 / 5, 1 / 2], W, true), 1, 560, W)).toBe(560);
+    expect(restingScroll(stripGeometry([1 / 2, 1, 1 / 2], W, true), 1, 560, W)).toBe(560);
+  });
+
+  it("follows the focus the way the jump did", () => {
+    const lefts = [0, 560, 1120];
+    const widths = [560, 560, 560];
+    // Not whole: to its start.
+    expect(followTarget(2, lefts, widths, 0, W, 2240)).toBe(1120);
+    // Whole, the left edge on a start: nothing.
+    expect(followTarget(1, lefts, widths, 560, W, 2240)).toBeNull();
+    // Whole, the left edge cutting a column: the nearest start that keeps the focus whole.
+    expect(followTarget(1, lefts, widths, 500, W, 2240)).toBe(560);
+  });
+
+  it("a spring starts where it was, at the speed it had", () => {
+    expect(springAt(0, 560, 0, 0)).toEqual({ x: 0, v: 0 });
+    const moving = springAt(100, 560, 2000, 0);
+    expect(moving.x).toBeCloseTo(100, 9);
+    expect(moving.v).toBeCloseTo(2000, 9);
+  });
+
+  it("from rest it never passes its end, and is within 1% by 235 ms and 0.1% by 330 ms", () => {
+    let last = 0;
+    for (let ms = 1; ms <= 1000; ms += 1) {
+      const { x } = springAt(0, 560, 0, ms / 1000);
+      expect(x).toBeGreaterThanOrEqual(last);
+      expect(x).toBeLessThanOrEqual(560);
+      last = x;
+    }
+    expect(560 - springAt(0, 560, 0, 0.235).x).toBeLessThan(5.6);
+    expect(560 - springAt(0, 560, 0, 0.225).x).toBeGreaterThan(5.6);
+    expect(560 - springAt(0, 560, 0, 0.33).x).toBeLessThan(0.56);
+    expect(560 - springAt(0, 560, 0, 0.32).x).toBeGreaterThan(0.56);
+  });
+
+  it("its velocity is the derivative of its place", () => {
+    for (const [x0, v0] of [
+      [0, 0],
+      [300, 1500],
+      [700, -4000],
+    ]) {
+      for (const t of [0.01, 0.05, 0.12, 0.3]) {
+        const h = 1e-6;
+        const slope = (springAt(x0!, 560, v0!, t + h).x - springAt(x0!, 560, v0!, t - h).x) / (2 * h);
+        expect(springAt(x0!, 560, v0!, t).v).toBeCloseTo(slope, 3);
+      }
+    }
+  });
+
+  it("rests within half a pixel and under half a pixel a frame", () => {
+    expect(springRests({ x: 559.6, v: 20 }, 560)).toBe(true);
+    expect(springRests({ x: 559.4, v: 0 }, 560)).toBe(false);
+    expect(springRests({ x: 560, v: 40 }, 560)).toBe(false);
+    // A fraction of a 1120px strip: 0.0004 of it is under half a pixel.
+    expect(springRests({ x: 0.9996, v: 0 }, 1, 1120)).toBe(true);
+    // 1/2 to Full at 1440px moves 560px: about a third of a second.
+    expect(springRestMs(560)).toBeGreaterThan(300);
+    expect(springRestMs(560)).toBeLessThan(380);
+  });
+
+  it("draws the spring as a CSS linear() easing that ends on 1", () => {
+    const easing = springEasing(340, 4);
+    expect(easing.startsWith("linear(0, ")).toBe(true);
+    expect(easing.endsWith(", 1)")).toBe(true);
   });
 });

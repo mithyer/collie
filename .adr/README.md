@@ -104,6 +104,8 @@ The rule today: Collie manages one front door, `tailscale serve`, and every othe
 | [0087](./0087-the-on-device-store-is-one-thing.md) | The phone keeps session content in one IndexedDB store, with caps and one wipe at unpair. | Accepted |
 | [0129](./0129-an-anonymous-install-count-on-by-default.md) | One anonymous install ping a day, on by default, with four ways to turn it off. | Accepted, amended in scope by 0134 |
 | [0134](./0134-the-trouble-tally-names-the-dialog-by-a-hash-of-its-key-hint-row.md) | The trouble tally may carry a hash of the dialog's key-hint row. | Accepted |
+| [0160](./0160-a-repository-file-changes-what-collie-shows-and-nothing-else.md) | A repository's own `collie.toml` changes what Collie shows and nothing else; its picture is a still raster that stands in for the agent logo, never for the Collie mark, and a push shows only the page's own copy. | Accepted, superseded in part by 0164 |
+| [0164](./0164-a-push-shows-the-project-picture-as-its-icon.md) | A push with a project picture shows it as the notification's icon, a small square; no push sets `image`. | Accepted |
 | [0034](./0034-collie-collects-nothing-and-opt-in-is-the-ceiling.md) | Collie collects nothing, and opt-in is the ceiling. | Superseded by 0129 |
 
 ### Pairing and devices
@@ -121,7 +123,8 @@ The rule today: [0144](./0144-one-lead-one-door-and-the-operator-moves-the-crown
 
 | # | Decision | Status |
 | --- | --- | --- |
-| [0144](./0144-one-lead-one-door-and-the-operator-moves-the-crown.md) | A crew has one lead and one door; code rides the operator's SSH; only the operator moves the crown. | Accepted |
+| [0144](./0144-one-lead-one-door-and-the-operator-moves-the-crown.md) | A crew has one lead and one door; code rides the operator's SSH; only the operator moves the crown. | Accepted, superseded in part by 0161 |
+| [0161](./0161-a-members-gzip-is-inflated-by-the-runtime-under-the-leads-limits.md) | The lead asks a member for gzip; the runtime inflates it as a stream, under the lead's size limit. | Accepted |
 | [0011](./0011-the-pack-protocol-is-the-mux-driver-seam.md) | The lead consumes a peer's Collie HTTP API, never its Herdr socket. | Superseded by 0144 |
 | [0012](./0012-every-machine-runs-a-collie-and-the-pack-has-a-lead.md) | Every machine runs a collie and the group has a lead (the word "pack" is replaced by 0038). | Superseded by 0144 |
 | [0013](./0013-a-peer-listens-without-becoming-a-front-door.md) | A peer opens an unpublished crew listener and publishes no front door. | Accepted |
@@ -139,7 +142,7 @@ The rule today: [0144](./0144-one-lead-one-door-and-the-operator-moves-the-crown
 
 ### Update, release and packaging
 
-The rule today: 0143 is the live record, and it names the code that holds each rule. The install kind picks the path once; a Herdr-managed checkout advances in place and is never re-linked, and every other install stages a new version beside the live one and flips `current`, with one rollback at most. A routine update stays inside the installed major, and `--major` is the consent to cross one. Each machine is on one release line, Stable or Edge; switching installs nothing, and a machine goes down a version only by a rollback or a switch back to Stable. State files only grow. A crew member takes its lead's release from GitHub by its own decision, and a crew fault blocks the lead only when the update makes it worse. The phone shows a run in one update mode, decided by one reducer. Separate records stay live for the roads they close: a packaged install is not ours to update (0035), urgency rides one changelog line (0046), Windows is a supported host (0075), the math engines are a release asset fetched on a tap (0132).
+The rule today: 0143 is the live record, and it names the code that holds each rule. The install kind picks the path once; a Herdr-managed checkout advances in place and is never re-linked, and every other install stages a new version beside the live one and flips `current`, with one rollback at most. A routine update stays inside the installed major, and `--major` is the consent to cross one. Each machine is on one release line, Stable or Edge; switching installs nothing, and a machine goes down a version only by a rollback or a switch back to Stable. State files only grow. A crew member takes its lead's release from GitHub by its own decision, and a crew fault blocks the lead only when the update makes it worse. The phone shows a run in one update mode, decided by one reducer. Separate records stay live for the roads they close: a packaged install is not ours to update (0035), urgency rides one changelog line (0046), Windows is a supported host (0075), the math engines are a release asset fetched on a tap (0132). Inside the web app, the screens a first paint does not need are lazy routes that the app preloads once it is idle, so a tab open through an update still opens them; a static import that pulls one back, or a main chunk above 2.2 MB, fails the build; the precache cap stays at 3 MiB and its history is in 0169.
 
 | # | Decision | Status |
 | --- | --- | --- |
@@ -158,6 +161,7 @@ The rule today: 0143 is the live record, and it names the code that holds each r
 | [0075](./0075-windows-is-a-supported-host.md) | Windows 11 x64 with Herdr is a supported host, held by CI and a VM rehearsal. | Accepted |
 | [0110](./0110-two-release-lines.md) | Two release lines, Stable and Edge; the switch installs nothing; state files only grow. | Superseded by 0143 |
 | [0132](./0132-the-math-engines-are-a-pack-the-host-downloads.md) | The math engines are one release asset that the host downloads only on a tap. | Accepted |
+| [0169](./0169-screens-load-on-demand-and-are-preloaded-when-idle.md) | Screens a first paint does not need are lazy routes (`lazyScreen`, `lazyChunk` for other doors), preloaded once the app is idle; the build guards; the precache cap and its history. | Accepted |
 
 ### Sends and the input box
 
@@ -183,6 +187,7 @@ The rule today: A send goes through the Send Protocol, which reads the screen be
 | [0123](./0123-report-a-problem-three-failed-sends-offer-a-prefilled-issue.md) | Three failed sends in a row offer a prefilled GitHub issue that the person opens. | Accepted |
 | [0124](./0124-a-sends-bound-starts-after-its-profile.md) | A send's time bound starts after its profile is known. | Accepted |
 | [0140](./0140-a-part-inside-the-agent-dials-the-bridge.md) | A part inside the agent program dials the bridge over a Unix socket. | Proposed |
+| [0166](./0166-an-offer-is-a-yes-to-one-draft.md) | Add to it and Replace act only on the draft the offer showed; another draft is the offer again, and Replace probes before it clears. | Accepted |
 
 ### Dialogs, cards and screen readers
 
@@ -234,18 +239,23 @@ The rule today: Chat is the default view of an agent pane (0082). A live session
 
 ### Layout and navigation
 
-The rule today: [0147](./0147-a-pane-list-keeps-its-place-and-the-footer-holds-views.md) states the pane lists and the dashboard's footer: no list is ordered by status, the operator may ask for Activity or Cache order with the clock read once, a pin is a place the operator chose, and the footer reads Crew, Dashboard, Files and the Hill, with Needs you a switch. It replaced 0063, 0066, 0068, 0070, 0071 and 0085, now stubs, and retired 0069: the rule of the glide lives in the header of `web/src/lib/glide.ts`. This section holds five topics, and the rest stay apart as they are. Back goes up one level (0067). On a large screen the pane screen is a sidebar beside a strip of panes, and two fingers move between panes (0120, 0121, which wait for one record of their own). The dashboard on a large screen is a grid of 384px Space columns under a band that repeats the sessions that need you, with every row still in its place (0158, which amends 0147 in scope). "Seen" is one shared bridge-side fact (0003), and the app stays on React Router in library mode (0051). The first frame paints from a remembered shape: a flag, a small number or a fixed word per mount, wiped with the device, replaced by every real read, and a late part waits at most 400 ms or comes at the end (0153, proposed).
+The rule today: [0147](./0147-a-pane-list-keeps-its-place-and-the-footer-holds-views.md) states the pane lists and the dashboard's footer: no list is ordered by status, the operator may ask for Activity or Cache order with the clock read once, a pin is a place the operator chose, and the footer reads Crew, Dashboard, Files and the Hill, with Needs you a switch. It replaced 0063, 0066, 0068, 0070, 0071 and 0085, now stubs, and retired 0069: the rule of the glide lives in the header of `web/src/lib/glide.ts`. This section holds five topics, and the rest stay apart as they are. Back goes up one level (0067), and Settings goes back to the page that opened it (0163, which amends 0067 in scope). On a large screen the pane screen is a sidebar beside a strip of panes, and two fingers move between panes (0120, 0121, which wait for one record of their own). The dashboard on a large screen is a grid of 384px Space columns under a band that repeats the sessions that need you, with every row still in its place (0158, which amends 0147 in scope). "Seen" is one shared bridge-side fact (0003), and the app stays on React Router in library mode (0051). The first frame paints from a remembered shape: a flag, a small number or a fixed word per mount, wiped with the device, replaced by every real read, and a late part waits at most 400 ms or comes at the end (0153, proposed). Actions is one palette of the commands that work on the screen and the panes to go to; each command is an action of the shortcut table, and the Belt's pinned pill and `prefix+g` open it (0165). A decision that blocks until it is answered is a modal over a scrim, and a task is a sheet; the palette and the draft offers share one shell (0167).
 
 | # | Decision | Status |
 | --- | --- | --- |
+| [0165](./0165-actions-is-one-palette-of-registry-actions.md) | Actions is one palette of registry actions, shown only where each works; the Belt's pill and `prefix+g` open it, and Switch pane keeps the drag. | Accepted |
+| [0167](./0167-a-modal-for-a-blocking-decision.md) | A decision that blocks until it is answered is a modal over a scrim, a task is a sheet; the palette and the draft offers share `ui/modal.tsx`. On a wide window a sheet is drawn in its look, centred (addendum 2026-11-20). | Accepted |
+| [0170](./0170-every-setting-is-declared-once.md) | Every setting is declared once in `web/src/lib/settings/registry.ts`; Settings is its eleven pages and a search, and the old addresses redirect. | Accepted |
 | [0147](./0147-a-pane-list-keeps-its-place-and-the-footer-holds-views.md) | No pane list is ordered by status; Activity and Cache order read the clock once; pins lead; the footer holds Crew, Dashboard, Files and the Hill, and Needs you is a switch. | Accepted, amended in scope by 0158 |
 | [0158](./0158-the-large-screen-dashboard-repeats-what-needs-you-in-a-band.md) | On a large screen the dashboard is a grid of 384px Space columns under a band that repeats the sessions that need you; no row leaves its place. | Accepted |
+| [0173](./0173-files-new-and-the-space-address-take-the-large-screen.md) | On a large screen Files and Changes are two columns under one header, New is a dialog over the screen it was called from, and the space address opens the pane view; a phone, a tablet and Off keep the pages. | Accepted |
+| [0163](./0163-settings-goes-back-to-the-page-that-opened-it.md) | Settings' parents are every screen that can open it; its arrow steps back onto the page it came from. | Accepted |
 | [0003](./0003-one-shared-seen.md) | "Seen" is one shared bridge-side fact, and only reads inside Collie count. | Accepted |
 | [0051](./0051-the-phone-app-runs-react-router-in-library-mode.md) | The phone app stays on React Router in library mode, and Collie owns its Vite build. | Accepted |
 | [0153](./0153-the-first-frame-paints-from-a-remembered-shape.md) | The first frame paints from a remembered shape (flag, count or fixed word); a real read wins; a late part never enters mid-page. | Proposed |
 | [0063](./0063-a-pane-keeps-its-place-when-its-state-changes.md) | No pane list is ordered by status; a pane's place is machine, space, tab and position. | Superseded by 0147 |
 | [0066](./0066-the-dashboard-has-a-footer-panes-needs-you-changes.md) | The dashboard has a footer of tabs, and its filter never sorts (the tab names have changed since). | Superseded by 0147 |
-| [0067](./0067-back-goes-up-one-level.md) | Back goes up one level: the history stack is the level tree. | Accepted |
+| [0067](./0067-back-goes-up-one-level.md) | Back goes up one level: the history stack is the level tree. | Accepted, amended in scope by 0163 |
 | [0068](./0068-the-second-tab-is-focus-not-attention.md) | The dashboard's second tab is renamed Focus and wears `CircleDot` (history, see 0085). | Superseded by 0147 |
 | [0069](./0069-a-row-glides-into-its-header.md) | One hand-started view-transition engine drives every glide; the router flag stays off. | Retired: the rule lives in `web/src/lib/glide.ts` |
 | [0070](./0070-a-pin-is-a-place-the-operator-chose.md) | A pin is a place the operator chose; pinned panes lead each list on this device. | Superseded by 0147 |
@@ -268,6 +278,9 @@ The rule today: [0148](./0148-a-theme-names-words-never-drawings-and-the-device-
 | [0136](./0136-a-theme-may-name-a-mark-and-every-mark-keeps-one-contract.md) | A theme may name a mark from a closed list, and every mark keeps one contract. | Superseded by 0148 |
 | [0137](./0137-a-theme-may-name-a-glyph-set-from-a-closed-list.md) | A theme may name a glyph set from a closed list, and every icon is named by its meaning. | Superseded by 0148 |
 | [0138](./0138-an-app-left-alone-draws-no-frame.md) | The mark moves while the page is visible (title and first rules reversed by amendments). | Superseded by 0148 |
+| [0171](./0171-the-tab-bar-stands-on-a-firm-edge-in-both-tab-looks.md) | The large screen's tab bar stands on `--edge-firm`, a derived line, with a 6px page band; `folder` cuts the open tab from the band, `plain` marks it with a 2px bar of ink; one type for both, and the phone's tab and pane rows are 44px. | Accepted |
+| [0172](./0172-derived-state-colours-are-measured-and-collie-is-held.md) | One function, `deriveTokens`, makes a theme's planes, hover, selected and open fills and ring from its base tokens: Collie's relation, then a floor; Collie is its reference within 0.02, and `applyTheme` runs it for every theme applied. | Accepted |
+| [0174](./0174-the-pane-you-are-in-wears-a-coloured-hairline.md) | The pane you are in on a large screen wears a 1px hairline in `--pane-active`, a derived token: the theme's own colour or `control-on-foreground` mixed into the page (70% light, 60% dark), then 3:1 on the recess, the page and the paper. | Accepted |
 
 ### Launch, worktrees, files and changes
 
@@ -333,7 +346,7 @@ The rule today: Speech to text is a provider seam Collie owns, off by default an
 
 ### Tricks and the Hill
 
-The rule today: Tricks that react and the local API stand on one internal event bus, and the API is read only, on a Unix socket that exists only while tricks are switched on, where tricks run (0152). The API's rights are one ordered vocabulary, `see` < `read` < `send` < `control`, which replaced 0152's word `look` (the local grant is `read`); a trick declares its level with `access`, and it carries no pairing token and no per-surface list (0154). The socket answers only a trick's own run: each run of a trick that declares `access` gets a run token in its facts, every connection names it in `hello`, the bridge holds the level, and `collie api` reads nothing by hand (0155, which changes 0152 item 6 and 0154 items 4 and 5). The yes to a trick's code, a proposed trick or a new version, is a hold of three seconds on the phone (a key presses twice), reading the code is offered and not required, and the bridge asks for the digest the card showed, never which cards were opened; a card that cannot show its code whole still offers no yes (0156). Trick code may cross the crew link as inert data and runs only on a tap on the machine that runs it (0144 rule 3, which took the addendum of 2026-11-10 to 0016), and the footer's Hill item and trick items are in 0147 (rules 7 and 12). No record decides the rest of tricks or the Hill on its own yet.
+The rule today: Tricks that react and the local API stand on one internal event bus, and the API is read only, on a Unix socket that exists only while tricks are switched on, where tricks run (0152). The API's rights are one ordered vocabulary, `see` < `read` < `send` < `control`, which replaced 0152's word `look` (the local grant is `read`); a trick declares its level with `access`, and it carries no pairing token and no per-surface list (0154). The socket answers only a trick's own run: each run of a trick that declares `access` gets a run token in its facts, every connection names it in `hello`, the bridge holds the level, and `collie api` reads nothing by hand (0155, which changes 0152 item 6 and 0154 items 4 and 5). The yes to a trick's code, a proposed trick or a new version, is a hold of three seconds on the phone (a key presses twice), reading the code is offered and not required, and the bridge asks for the digest the card showed, never which cards were opened; a card that cannot show its code whole still offers no yes (0156). Trick code may cross the crew link as inert data and runs only on a tap on the machine that runs it (0144 rule 3, which took the addendum of 2026-11-10 to 0016), and the footer's Hill item and trick items are in 0147 (rules 7 and 12). A trick that is off, with no run going, is removed on its own machine through one function for the command and the write route, after real-path checks, with one receipt per request id and one audit line (0168). No record decides the rest of tricks or the Hill on its own yet.
 
 | # | Decision | Status |
 | --- | --- | --- |
@@ -341,6 +354,7 @@ The rule today: Tricks that react and the local API stand on one internal event 
 | [0154](./0154-the-api-rights-are-one-ordered-vocabulary-and-a-trick-declares-its-level.md) | The API's rights are `see` < `read` < `send` < `control`; a trick declares `access`, no token, no per-surface list. | Accepted |
 | [0155](./0155-the-local-api-answers-a-run-token.md) | The local API answers a trick's own run: a token per run in its facts, named in `hello`, at the level the bridge holds. | Accepted |
 | [0156](./0156-approving-a-tricks-code-is-a-hold-and-reading-is-offered.md) | The yes to a trick's code is a hold of three seconds; reading is offered, not required; the bridge asks for the digest only. | Accepted |
+| [0168](./0168-a-trick-that-is-off-is-removed-on-its-machine-through-one-function.md) | One function removes a trick that is off and that no run holds, for `collie trick remove` and `POST /api/tricks/<host>/<id>/remove`; real-path checks, a receipt per `rid`, one audit line, this machine only. | Accepted |
 
 ### Process, lint and tests
 
@@ -354,13 +368,13 @@ The rule today: oxlint plus the vendored anti-slop rules is the lint gate, with 
 
 ### Other: the mirror, the mux port, configuration and translation
 
-The rule today: Collie runs no terminal emulator (0008) and owns a multiplexer port in its own vocabulary, with Herdr as one adapter (0022); an adapter declares its freshness, focus and shape (0031). "Never write the operator's screen" is stated in three places, 0008 (geometry writes), 0031 (the phone moves the terminal only on a named tap) and 0126 (never send focus when a worktree opens as a space, which replaced 0032). The operator's command rows replace the catalog on the panes they address, per surface for the bar (0018, 0043), and configuration reads default, machine file, instance file, then the environment (0040). The UI is translated by a typed dictionary (0030), and a push title is a code the phone translates (0074).
+The rule today: Collie runs no terminal emulator (0008); an adapter that reads raw VT, such as Rex's, keeps two stateless row transforms and nothing more (0162, proposed, which amends 0008 in scope). Collie owns a multiplexer port in its own vocabulary, with Herdr as one adapter (0022); an adapter declares its freshness, focus and shape (0031). "Never write the operator's screen" is stated in three places, 0008 (geometry writes), 0031 (the phone moves the terminal only on a named tap) and 0126 (never send focus when a worktree opens as a space, which replaced 0032). The operator's command rows replace the catalog on the panes they address, per surface for the bar (0018, 0043), and configuration reads default, machine file, instance file, then the environment (0040). The UI is translated by a typed dictionary (0030), and a push title is a code the phone translates (0074).
 
 One live record for this topic is being written.
 
 | # | Decision | Status |
 | --- | --- | --- |
-| [0008](./0008-collie-does-not-run-a-terminal-emulator.md) | Collie runs no terminal emulator, in the browser or in the bridge. | Accepted |
+| [0008](./0008-collie-does-not-run-a-terminal-emulator.md) | Collie runs no terminal emulator, in the browser or in the bridge. | Accepted, amended in scope by 0162 |
 | [0018](./0018-operator-command-rows-replace-the-catalog.md) | The operator's command rows replace the catalog on the panes they address. | Accepted |
 | [0022](./0022-the-mux-seam-is-a-port-collie-owns.md) | Collie owns the multiplexer port in its own vocabulary; Herdr is one adapter. | Accepted |
 | [0030](./0030-the-ui-is-translated-by-a-typed-dictionary-not-a-library.md) | The UI is translated by a typed dictionary, not an i18n library. | Accepted, amended in scope by 0074 |
@@ -368,3 +382,4 @@ One live record for this topic is being written.
 | [0040](./0040-configuration-precedence-and-the-config-file.md) | Configuration precedence is default, machine file, instance file, then the environment. | Accepted |
 | [0043](./0043-operator-bar-rows-replace-the-bar-not-the-palette.md) | Operator `bar = true` rows replace the bar, not the Agent palette. | Accepted |
 | [0074](./0074-a-push-title-is-a-code-the-phone-translates.md) | A push title is a code the phone translates. | Accepted |
+| [0162](./0162-an-adapter-that-reads-raw-vt-keeps-two-stateless-row-transforms.md) | An adapter that reads raw VT turns a cursor-forward into spaces and drops what is not SGR, row by row, and nothing more. | Proposed |

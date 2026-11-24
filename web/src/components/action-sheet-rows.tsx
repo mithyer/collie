@@ -1,6 +1,7 @@
 import { type KeyboardEvent as ReactKeyboardEvent, type ReactNode, type RefObject } from "react";
 
 import { Button } from "@/components/ui/button";
+import type { ShortcutTarget } from "@/lib/shortcuts/target";
 import { cn } from "@/lib/utils";
 import { t } from "@/lib/i18n";
 import { useLocale } from "@/hooks/use-locale";
@@ -27,9 +28,13 @@ export function ActionRow({
   hint,
   disabled = false,
   onClick,
+  target,
 }: {
   icon: ReactNode;
-  label: string;
+  /** The row's words. A node only to carry marks (the Actions palette's matched letters); no behaviour hangs on it. */
+  label: ReactNode;
+  /** The shortcut action this row runs (`shortcutTarget`), for the key hint the prefix shows on it while the menu is open. */
+  target?: ShortcutTarget;
   hint?: string;
   /** The row stays and reads as not yet available (dimmed, no tap). Absent on every other row. */
   disabled?: boolean;
@@ -40,6 +45,7 @@ export function ActionRow({
       type="button"
       disabled={disabled}
       onClick={onClick}
+      {...target}
       // `min-h-11` — a REAL 44px hit box, stated (DESIGN.md §6). `px-3 py-2.5` around a 20px
       // `text-sm` line drew 40px, five under the floor, on rows a thumb reaches for in a sheet that
       // has just slid up under it. A floor rather than a fixed height, so a row whose label wraps on
@@ -75,7 +81,8 @@ export function DestructiveActionRow({
   onClick,
 }: {
   icon: ReactNode;
-  label: string;
+  /** As {@link ActionRow}'s: a node only to carry marks. */
+  label: ReactNode;
   confirmLabel: string;
   closingLabel: string;
   armed: boolean;

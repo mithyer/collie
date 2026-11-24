@@ -7,6 +7,7 @@ import { BottomBar } from "@/components/ui/bottom-bar";
 import { Button } from "@/components/ui/button";
 import { ListGroup, LIST_ROW_CORNERS } from "@/components/ui/list-group";
 import { Notice } from "@/components/ui/notice";
+import { SettingSlot } from "@/components/setting-slot";
 import { useLocale } from "@/hooks/use-locale";
 import { useNav } from "@/hooks/use-nav";
 import { useSpaceActions } from "@/hooks/use-spaces";
@@ -156,10 +157,13 @@ export function SettingsChangeLoginRoute() {
     if (live.current) setStartError(outcome.kind === "refused" && outcome.message !== "" ? outcome.message : t("accounts.signIn.unknown"));
   }
 
+  // The large screen's header path: Profiles / <the account> / Change login.
+  const crumbs = row === undefined ? undefined : [accountName(row), t("accounts.changeLogin.action")];
+
   if (phase.kind === "result") {
     const toSession = cameFromSession(phase.from);
     return (
-      <SettingsPage title="accounts.changeLogin.action" heading={row === undefined ? undefined : accountName(row)} parent={accountPage}>
+      <SettingsPage title="accounts.changeLogin.action" heading={row === undefined ? undefined : accountName(row)} parent={accountPage} crumbs={crumbs}>
         <ChangeLoginResultView
           result={phase.result}
           reach={row === undefined ? { kind: "newOnly" } : reachOf(harness, row)}
@@ -196,7 +200,7 @@ export function SettingsChangeLoginRoute() {
   const flow = flowOf(id);
   if ((phase.kind === "running" || phase.kind === "ending") && flow !== undefined) {
     return (
-      <SettingsPage title="accounts.changeLogin.action" heading={accountName(row)} parent={accountPage}>
+      <SettingsPage title="accounts.changeLogin.action" heading={accountName(row)} parent={accountPage} crumbs={crumbs}>
         <ChangeLoginRunningView
           row={row}
           body={harness}
@@ -213,11 +217,14 @@ export function SettingsChangeLoginRoute() {
       title="accounts.changeLogin.action"
       heading={accountName(row)}
       parent={accountPage}
+      crumbs={crumbs}
       foot={
         <BottomBar className="px-4">
-          <Button className="h-11 w-full" disabled={busy} aria-busy={busy || undefined} onClick={() => void begin(row)}>
-            {t("accounts.changeLogin.action")}
-          </Button>
+          <SettingSlot ids={["accounts.login.start"]} className="w-full">
+            <Button className="h-11 w-full" disabled={busy} aria-busy={busy || undefined} onClick={() => void begin(row)}>
+              {t("accounts.changeLogin.action")}
+            </Button>
+          </SettingSlot>
         </BottomBar>
       }
     >
@@ -367,14 +374,14 @@ export function ChangeLoginRunningView({
       <AccountLine row={row} agentLabel={body?.label ?? row.harness} />
       <p className="text-sm">{t("accounts.changeLogin.runs")}</p>
       <Hint text={t("accounts.changeLogin.finishHint")} />
-      <div className="flex flex-col gap-2">
+      <SettingSlot ids={["accounts.login.open", "accounts.login.finish"]} className="flex flex-col gap-2">
         <Button className="h-11 w-full" disabled={ending} onClick={onOpen}>
           {t("accounts.changeLogin.open")}
         </Button>
         <Button variant="outline" className="h-11 w-full" disabled={ending} aria-busy={ending || undefined} onClick={onFinish}>
           {t("accounts.changeLogin.finish")}
         </Button>
-      </div>
+      </SettingSlot>
     </div>
   );
 }

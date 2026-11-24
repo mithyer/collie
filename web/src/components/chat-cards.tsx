@@ -75,6 +75,7 @@ import {
 import type { Hunk, ToolQuestion } from "@/lib/types";
 import type { DiffRow } from "@/lib/unified-diff";
 import { cn } from "@/lib/utils";
+import { FOCUS_RING, HOVER_FILL } from "@/components/ui/button";
 import { USER_WELL, USER_WELL_HUG, USER_WELL_META, USER_WELL_TEXT, USER_WELL_TIME } from "@/components/user-well";
 import { Icon } from "@/components/icons/icon";
 import type { IconKey } from "@/components/icons/keys";
@@ -185,7 +186,7 @@ export function standsAlone(item: ChatItem): boolean {
  * things that happened, and folding them buys a line and costs a tap.
  *
  * ONE means every step folds, including a lone one, and that is how "tool calls off" is drawn
- * (Settings → Appearance). The stream then carries one summary line where the cards were, which is
+ * (Settings → Look and feel). The stream then carries one summary line where the cards were, which is
  * the same treatment collie's History page gives a turn's steps — one idea, one look, two surfaces.
  *
  * AN AGENT CALL AND A QUESTION NEVER JOIN A FOLD. A delegated `task` carries a summary and, later,
@@ -259,7 +260,7 @@ function useRunFrame(): string | false {
  * the same shape as the pane's own "Show entire history" row (agent-chat.tsx).
  */
 const FOLD_ROW =
-  "flex min-h-11 w-full min-w-0 items-center justify-center gap-1.5 px-3 text-xs font-medium text-muted-foreground transition-colors active:bg-muted focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring";
+  `flex min-h-11 w-full min-w-0 items-center justify-center gap-1.5 px-3 text-xs font-medium text-muted-foreground transition-colors active:bg-muted ${FOCUS_RING} ${HOVER_FILL}`;
 
 export const ToolGroup = memo(
   function ToolGroup({ items, liveOpens = true }: { items: ChatItem[]; liveOpens?: boolean }) {
@@ -268,7 +269,7 @@ export const ToolGroup = memo(
     const waiting = useContext(CardWaitingCtx);
     // A RUNNING STEP OPENS ITS OWN RUN, UNLESS THE READER SAID NOT TO.
     //
-    // `liveOpens` is Settings → Appearance's "Tool calls", threaded down. Off, it was honoured only
+    // `liveOpens` is Settings → Look and feel's "Tool calls", threaded down. Off, it was honoured only
     // by `groupRuns(items, 1)` — which decides GROUPING, not whether a group draws open — so a run
     // with a step still running opened itself anyway, and `held` below then latched it open for
     // good. In a live session almost every run is running at some point, so "off" folded nothing:
@@ -352,7 +353,7 @@ export const ToolGroup = memo(
         type="button"
         aria-expanded={false}
         onClick={() => setOpen(true)}
-        className={`flex min-h-11 w-full min-w-0 flex-col justify-center gap-0.5 ${FOLDED_RUN[steps]} px-3 py-1.5 text-left transition-colors active:bg-muted focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring`}
+        className={`flex min-h-11 w-full min-w-0 flex-col justify-center gap-0.5 ${FOLDED_RUN[steps]} px-3 py-1.5 text-left transition-colors active:bg-muted ${FOCUS_RING} ${HOVER_FILL}`}
       >
         <span className="flex min-w-0 items-center gap-1.5 text-xs font-medium text-muted-foreground">
           <Icon name="disclosure" className="size-3.5 shrink-0" />
@@ -514,7 +515,7 @@ function Notice({ item }: { item: Extract<ChatItem, { kind: "notice" }> }) {
 
 /**
  * A compaction. Claude Code draws one rule and a label; so does this, and the recap behind it is
- * the reader's to ask for (Settings → Appearance). With the recap withheld there is no text to
+ * the reader's to ask for (Settings → Look and feel). With the recap withheld there is no text to
  * build, only the marker. With it, the recap folds behind the same label and its body enters the
  * DOM only while open.
  */
@@ -1497,7 +1498,7 @@ function LineTool({
           type="button"
           aria-expanded={onTap === undefined ? open : undefined}
           onClick={() => (onTap !== undefined ? onTap() : setOpen(!open))}
-          className="flex min-h-11 w-full min-w-0 items-center gap-2 rounded-md px-2 text-left text-xs transition-colors active:bg-muted focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"
+          className={cn("flex min-h-11 w-full min-w-0 items-center gap-2 rounded-md px-2 text-left text-xs transition-colors active:bg-muted", FOCUS_RING, HOVER_FILL)}
         >
           {row}
         </button>

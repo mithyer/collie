@@ -99,6 +99,34 @@ export type PushDecision =
       renotify: boolean;
     };
 
+/** The options of a shown push. `renotify` is not in this TS lib's NotificationOptions yet, though
+ *  browsers that support it honour it (it needs a tag). */
+export type PushOptions = NotificationOptions & { renotify?: boolean };
+
+/**
+ * The options `showNotification` gets for a push to show. The icon is the page's square copy of the pane's
+ * project picture when one was found (lib/project-picture-push.ts), else Collie's mark. The badge is always
+ * Collie's, and no push sets `image`: Android draws it full width, far larger than a picture needs.
+ */
+export function pushOptions(decision: Extract<PushDecision, { kind: "show" }>, art: { icon: string; badge: string }, picture: string | null): PushOptions {
+  const options: PushOptions = {
+    body: decision.body,
+    data: {
+      paneId: decision.paneId,
+      session: decision.session,
+      host: decision.host,
+      target: decision.target,
+      machine: decision.machine,
+      decision: decision.decision,
+    } satisfies NotifData,
+    icon: picture ?? art.icon,
+    badge: art.badge,
+    tag: decision.tag,
+    renotify: decision.renotify,
+  };
+  return options;
+}
+
 /**
  * Separates a notification slot's base from the host that owns it — the frontend half of
  * `bridge/crew/tags.ts`'s `HOST_TAG_SEP`, which the bridge documents at length and this side must

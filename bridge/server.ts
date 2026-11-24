@@ -40,6 +40,8 @@ import type { MuxAdapter, MuxAck, MuxCreatedPane, MuxOutcome, MuxGrid, MuxGridRe
 import { allCacheRules } from "./cache/rules/index.ts";
 import type { CacheOverride } from "./cache/engine.ts";
 import type { GitHeadSurface } from "./git-head.ts";
+import { checkForwardedPicture, readCappedBody, type ProjectPictureSource, type ProjectPictureSurface } from "./project-picture.ts";
+import { PROJECT_PICTURE_BYTES_MAX } from "../web/src/lib/project-picture-wire.ts";
 import { localWatchPane, peerWatchPane, type CacheWarnPane } from "./cache/watch-key.ts";
 import { watchKeyOf, type CacheWatchSurface } from "./cache/watch.ts";
 import { createCacheRulesReader } from "./operator-cache-rules.ts";
@@ -104,6 +106,7 @@ import { claudeConfigDir, discoverClaudeCommands, type ClaudeCommand } from "./c
 import { canonicalAgent } from "../web/src/lib/operator-scope.ts";
 import { createOperatorCommands } from "./operator-commands.ts";
 import { createOperatorKeys } from "./operator-keys.ts";
+import { createOperatorShortcuts } from "./operator-shortcuts.ts";
 import { createOperatorQuickReplies } from "./operator-quick-replies.ts";
 import { createOperatorFonts, resolveOperatorFont } from "./operator-fonts.ts";
 import { createLauncherSwitches, createOperatorLaunchers, DEFAULT_SWITCHES, type LauncherSwitches } from "./operator-launchers.ts";
@@ -136,6 +139,7 @@ import {
   type SentWriteAnswer,
 } from "./sent.ts";
 import { ComposerDiagStore, DIAG_COMPOSER_BODY_MAX, diagFileIo, parseComposerDiag } from "./diag-composer.ts";
+import { DIAG_PUSH_PICTURE_BODY_MAX, parsePushPictureDiag, PushPictureDiagLimit, pushPictureDiagLine } from "./diag-push-picture.ts";
 import {
   clearRecentRuns,
   memoryRecentRuns,
@@ -217,7 +221,7 @@ import {
   maskTodoList,
 } from "./answer-mask.ts";
 import { maskForwardedAnswer } from "./crew/mask.ts";
-import { forwardAuditDetail, forwardError, type LeadMerge } from "./crew/forward.ts";
+import { forwardAuditDetail, forwardError, mergeAskRequest, type LeadMerge } from "./crew/forward.ts";
 import { CWD_PARAM, folderAnswers, leadRowCarry, leadRowMarked, leadRowsRead, ROW_FIELD, rowFromLead, type LeadWrite } from "./crew/launcher-rows.ts";
 import { withCopyRows, type LauncherCopySeam } from "./crew/standby-launchers.ts";
 import { redactAnsi } from "./redact.ts";
@@ -255,7 +259,7 @@ import { modeForWire } from "./crew/mode.ts";
 import type { CrewRuntime } from "./crew/config.ts";
 import type { CrewLead } from "./crew/lead.ts";
 import { crewDeviceOf, crewGate, type GateLevel } from "./crew/peer-gate.ts";
-import { asksBound, TRICKS_ROUTE_RIGHTS, tricksAutoRoute, tricksCodeRoute, tricksMediaRoute, tricksOfficialRoute, tricksSwitchRoute, tricksTapRoute, tricksUndoRoute, tricksValueRoute, parseSince } from "./tricks/routes.ts";
+import { asksBound, TRICKS_ROUTE_RIGHTS, tricksAutoRoute, tricksCodeRoute, tricksMediaRoute, tricksOfficialRoute, tricksRemoveRoute, tricksSwitchRoute, tricksTapRoute, tricksUndoRoute, tricksValueRoute, parseSince } from "./tricks/routes.ts";
 import type { OfficialTricksSurface } from "./tricks/official-install.ts";
 import type { RepoIndexSurface } from "./tricks/repo-index.ts";
 import { placeTrickSessions } from "./tricks/panes.ts";
@@ -317,6 +321,7 @@ import type {
   OperatorCommand,
   MuxConfig,
   OperatorKeyRow,
+  OperatorShortcuts,
   OperatorFontRow,
   OperatorQuickReplyRow,
   CrewStatusResponse,
@@ -605,6 +610,15 @@ const STT_MODEL_ROUTE = /^\/api\/stt\/model\/([^/]+)$/;
 const BLOB_ROUTE = /^\/api\/blobs\/([^/]+)$/;
 
 /**
+ * `GET /api/project-picture/<version>` (ADR 0160): the picture a pane's `collie.toml` names, by the
+ * version the snapshot carried. The segment is matched opaque here and checked in the handler; the
+ * bridge serves only a picture it resolved itself, never a path the client names. Session-scoped like
+ * a blob, so a `?host=` read reaches the member whose disk holds the picture. `bridge/crew/forward.ts`
+ * mirrors this shape one-for-one (`forward.test.ts`).
+ */
+export const PROJECT_PICTURE_ROUTE = /^\/api\/project-picture\/([^/]+)$/;
+
+/**
  * `GET /api/hill/media/<decision id>/<media id>` (M96): one image of a decision, as its bytes. Both
  * segments are matched as opaque values here and checked against their patterns in the handler
  * (`hillMediaRoute`) before anything else, and only a pair the store holds names a file. Lead-local,
@@ -661,11 +675,13 @@ const TRICKS_FEATURE_ROUTE = "/api/tricks/switch";
 // is the handler's check, so the route table keeps one shape of segment.
 const PAIR_REQUEST_ROUTE = /^\/api\/pair\/request\/([^/]+)$/;
 const PAIR_APPROVE_ROUTE = /^\/api\/pair\/approve\/([^/]+)$/;
-// Take changes without asking, and go back one version (crew slice 3): write-gated like the switch.
+// Update this trick without asking, and go back one version (crew slice 3): write-gated like the switch.
 const TRICKS_AUTO_ROUTE = /^\/api\/tricks\/([^/]+)\/([^/]+)\/auto$/;
 const TRICKS_UNDO_ROUTE = /^\/api\/tricks\/([^/]+)\/([^/]+)\/undo$/;
 // A trick's settings (contract 3): one field's value, write-gated like the switch.
 const TRICKS_VALUE_ROUTE = /^\/api\/tricks\/([^/]+)\/([^/]+)\/value$/;
+/** `POST /api/tricks/<host>/<id>/remove` (ADR 0168): remove a trick of this machine that is off. */
+const TRICKS_REMOVE_ROUTE = /^\/api\/tricks\/([^/]+)\/([^/]+)\/remove$/;
 // And a picture of the trick's own `media/` folder (M94 review 11), read-gated like the list. Group 3 is
 // `media/` and the file; bridge/tricks/media.ts checks it before any path is built.
 export const TRICKS_MEDIA_ROUTE = /^\/api\/tricks\/([^/]+)\/([^/]+)\/(media\/.+)$/;
@@ -1155,6 +1171,8 @@ export function bridgeConfigBody(opts: {
   operatorCommands?: readonly OperatorCommand[];
   /** The operator's own Keys-tray rows. Same omit-when-empty rule as `operatorCommands`. */
   operatorKeys?: readonly OperatorKeyRow[];
+  /** The operator's own keyboard shortcuts. Omitted when `shortcuts.toml` holds no `[keys]` table. */
+  operatorShortcuts?: OperatorShortcuts | null;
   /** The operator's own Quick-dock groups. Same omit-when-empty rule as `operatorCommands`. */
   operatorQuickReplies?: readonly OperatorQuickReplyRow[];
   /**
@@ -1200,6 +1218,7 @@ export function bridgeConfigBody(opts: {
   if (mode !== undefined) wire.mode = mode;
   if (mine.length > 0) wire.operatorCommands = [...mine];
   if (myKeys.length > 0) wire.operatorKeys = [...myKeys];
+  if (opts.operatorShortcuts) wire.operatorShortcuts = { ...opts.operatorShortcuts };
   if (myReplies.length > 0) wire.operatorQuickReplies = [...myReplies];
   if (myFonts.length > 0) wire.operatorFonts = [...myFonts];
   // Appended last, and unconditional once an adapter is in hand: unlike `mode`, this is not
@@ -1512,6 +1531,12 @@ export function startServer(opts: {
    */
   gitHeads?: GitHeadSurface;
   /**
+   * Each pane folder's project picture (bridge/project-picture.ts, ADR 0160), read at serialise time
+   * like `gitHeads`, and the source the picture route reads. Absent means no pane carries `picture` and
+   * the route answers 404, which is every test that builds this server by hand.
+   */
+  projectPictures?: ProjectPictureSurface & ProjectPictureSource;
+  /**
    * Each pane's walky talky instance token (bridge/walky/instances.ts), read at serialise time like
    * `gitHeads`: it answers from memory, minting a token for a pane it has not seen yet. Every pane on
    * the wire then carries `instance`, the solo snapshot and the one a member serves its lead alike.
@@ -1660,6 +1685,7 @@ export function startServer(opts: {
   // `COLLIE_TRANSCRIPT` is off: no journal, no probe, and every pane reads exactly as it did in 1.8.2.
   const cache = opts.cache;
   const gitHeads = opts.gitHeads;
+  const projectPictures = opts.projectPictures;
   const walkyInstance = opts.walkyInstance;
   const walkyPaneOff = opts.walkyPaneOff;
   const paneLinked = opts.paneLinked;
@@ -1755,6 +1781,7 @@ export function startServer(opts: {
   const whois = (req: Request): DeviceAuth => requestDevice(req, cfg, pairingGate);
   // The composer diagnostic's file (bridge/diag-composer.ts): nothing touches the disk until a phone reports one.
   const composerDiag = new ComposerDiagStore(diagFileIo(cfg.stateDir), { version: opts.version });
+  const pushPictureDiag = new PushPictureDiagLimit();
   const crewLead = opts.crewLead;
   const crewStatus = opts.crewStatus;
   const peerNotifier = opts.peerNotifier;
@@ -1766,6 +1793,7 @@ export function startServer(opts: {
   const operatorCommands = createOperatorCommands(cfg.commandsFile);
   // Its sibling, on the same contract: one reader, one mtime cache, keys.toml off the hot path.
   const operatorKeys = createOperatorKeys(cfg.keysFile);
+  const operatorShortcuts = createOperatorShortcuts(cfg.shortcutsFile);
   // The third on that contract: the Quick dock's groups, quick-replies.toml off the hot path.
   const operatorQuickReplies = createOperatorQuickReplies(cfg.quickRepliesFile);
   // The fourth on that contract: the operator's own UI typefaces, theme.toml off the hot path.
@@ -2002,7 +2030,10 @@ export function startServer(opts: {
       const withAccount = account === undefined ? withUsage : { ...withUsage, account };
       // The branch rides the same way: from memory, never a wait, and no key when there is none.
       const gitHead = gitHeads?.get(p.cwd);
-      return gitHead === undefined ? withAccount : { ...withAccount, gitHead };
+      const withHead = gitHead === undefined ? withAccount : { ...withAccount, gitHead };
+      // The project picture's version rides the same way (ADR 0160): from memory, no key when there is none.
+      const picture = projectPictures?.get(p.cwd);
+      return picture === undefined ? withHead : { ...withHead, picture };
     };
     // The one place a pane leaves the bridge: the session ref is stripped to a presence flag here,
     // so an agent-reported filesystem path never reaches a browser (see toPaneWire). The flag is
@@ -2424,6 +2455,21 @@ export function startServer(opts: {
         return text("malformed URL", 400);
       }
       return blobRoute(hash, cfg.journalRoots.pi);
+    }
+
+    // ── The project picture (ADR 0160): a picture a pane's `collie.toml` names, by version ──
+    //
+    // A READ, gated like a blob: the phone fetches it with the pairing token and keeps its own copy by
+    // version. Forwarded with `?host=` to the member whose disk holds it. The lead believes nothing the
+    // member sends: it reads at most the picture cap, checks the picture's rules and the version itself,
+    // types the bytes from the bytes, and states the cache rule; anything else is the same 404 as a miss.
+    const pictureMatch = pathname.match(PROJECT_PICTURE_ROUTE);
+    if (pictureMatch && req.method === "GET") {
+      const denied = caller.gate("read");
+      if (denied) return denied;
+      const rt = await caller.resolve();
+      if (rt instanceof Response) return await forwardedPictureRoute(pictureMatch[1] ?? "", rt);
+      return await projectPictureRoute(pictureMatch[1] ?? "", opts.projectPictures);
     }
 
     // ── Changes, asked by workspace (ADR 0065): the list every pane of the space shows ──
@@ -3255,7 +3301,8 @@ export function startServer(opts: {
             // A launch of a lead row carries the row (ADR 0127 point 3): only here, on a forward. The
             // forward marks it `X-Collie-Lead-Row` only when the carry itself set the row.
             const carried = write === undefined ? { request: req, leadRow: false } : await write.request(req);
-            const askReq = merge === undefined ? carried.request : new Request(askUrl, { method: req.method });
+            // A merged ask is a new request; it keeps the phone's signal, so a phone that goes away aborts it.
+            const askReq = merge === undefined ? carried.request : mergeAskRequest(askUrl, req);
             // The lead's own record of the forward (§12): one line, the same `action` the peer will
             // write, plus the target host — two independent logs of one event, neither depending on
             // the other machine's disk.
@@ -3516,6 +3563,25 @@ export function startServer(opts: {
         const answer = await tricksValueRoute(tricks, tricksValue, body);
         return json(answer.body, req.headers.get("accept-encoding"), answer.status);
       }
+      // Removing a trick (ADR 0168): the write right, a request id, a receipt on disk, POST only. This machine's own,
+      // as the other trick writes: a `?h=<member>` would read as if it removed the member's trick.
+      const tricksRemove = TRICKS_REMOVE_ROUTE.exec(pathname);
+      if (tricksRemove !== null && req.method === "POST") {
+        const denied = guard(req, cfg, TRICKS_ROUTE_RIGHTS.remove, pairingGate);
+        if (denied) return denied;
+        if (host.kind === "member") return text(TRICKS_REMOVE_LOCAL_TEXT, 400);
+        const tricks = opts.tricks;
+        if (tricks === undefined) return jsonError({ error: "not found" }, 404, null);
+        let body: JsonValue | undefined;
+        try {
+          // SAFETY: `Request.json()` output IS a JsonValue by construction; `tricksRemoveRoute` checks the shape.
+          body = (await req.json()) as JsonValue;
+        } catch {
+          body = undefined;
+        }
+        const answer = await tricksRemoveRoute(tricks, tricksRemove, body, whois(req).device);
+        return json(answer.body, req.headers.get("accept-encoding"), answer.status);
+      }
       const tricksMedia = TRICKS_MEDIA_ROUTE.exec(pathname);
       if (tricksMedia !== null && req.method === "GET") {
         const denied = guard(req, cfg, TRICKS_ROUTE_RIGHTS.media, pairingGate);
@@ -3626,6 +3692,28 @@ export function startServer(opts: {
         const diag = parseComposerDiag(body);
         if (diag === null) return text("bad composer record", 400);
         if ((await composerDiag.record(diag, pairedLabel(req, pairingGate))) === "unwritable") return text("could not keep the record", 500);
+        return secure(new Response(null, { status: 204 }));
+      }
+      // The push picture trace (bridge/diag-push-picture.ts): why a phone's last push about a pane came with or
+      // without its project picture, and the builds of its worker and page. A verdict from a fixed list, a
+      // machine kind and two build ids; read-gated like the composer diagnostic; one log line, rate-limited,
+      // nothing kept. This machine only: `bridge/crew/forward.ts` names no `/api/diag/` route.
+      if (pathname === "/api/diag/push-picture" && req.method === "POST") {
+        const denied = browserGate("read");
+        if (denied) return denied;
+        const raw = await req.text().catch(() => "");
+        if (raw.length > DIAG_PUSH_PICTURE_BODY_MAX) return text("bad push picture record", 400);
+        let body: JsonValue | undefined;
+        try {
+          // SAFETY: `JSON.parse` output IS a JsonValue by construction; `parsePushPictureDiag` checks every key and value.
+          body = JSON.parse(raw) as JsonValue;
+        } catch {
+          body = undefined;
+        }
+        const report = parsePushPictureDiag(body);
+        if (report === null) return text("bad push picture record", 400);
+        const device = pairedLabel(req, pairingGate);
+        if (pushPictureDiag.allow(device ?? "", Date.now())) console.log(pushPictureDiagLine(report, device));
         return secure(new Response(null, { status: 204 }));
       }
       // Report a problem (ADR 0123): the setup block and, on `screen=1`, the pane's last rows, always
@@ -3922,6 +4010,7 @@ export function startServer(opts: {
         // with no restart. The path is cfg's, never the request's.
         const mine = await operatorCommands();
         const myKeys = await operatorKeys();
+        const myShortcuts = await operatorShortcuts();
         const myReplies = await operatorQuickReplies();
         // Same mtime-checked re-read, same reason: an operator who adds a face to theme.toml wants
         // it in the picker on the next page load, not after a restart.
@@ -3986,6 +4075,7 @@ export function startServer(opts: {
             mode: crew.mode,
             operatorCommands: mine,
             operatorKeys: myKeys,
+            operatorShortcuts: myShortcuts,
             operatorQuickReplies: myReplies,
             operatorFonts: myFonts,
             mux: activeMux?.herdr,
@@ -8357,12 +8447,14 @@ export function sentMembersOf(lead: Pick<CrewLead, "contributions" | "resolve" |
   return lead.contributions().map(({ state, name }) => ({
     host: state.memberId,
     label: name,
-    ask: async (params) => {
+    ask: async (params, signal) => {
       const resolved = lead.resolve({ kind: "member", id: state.memberId });
       if (resolved === undefined || resolved.kind !== "peer") return new Response("host unreachable", { status: 503 });
       const url = new URL(`http://collie.invalid/api/sent?${params.toString()}`);
       url.searchParams.set("host", state.memberId);
-      return lead.forward(new Request(url), url, resolved, { device, mask: redact ? maskForwardedAnswer : undefined });
+      // The merge's own signal rides the forward: at its budget the member's read is aborted, also while
+      // the lead's mask is still reading the whole answer (review round 9).
+      return lead.forward(new Request(url, { signal }), url, resolved, { device, mask: redact ? maskForwardedAnswer : undefined });
     },
   }));
 }
@@ -10282,13 +10374,16 @@ export async function sendRoute(
 }
 
 /**
- * A send answer as it leaves a bridge that masks secret shapes: its surface masked, and the rows of a
- * refused override (M102 spec 12) masked row by row. The rows hash stays the hash of the plain rows.
+ * A send answer as it leaves a bridge that masks secret shapes: its surface masked, the rows of a
+ * refused override (M102 spec 12) masked row by row, and the draft an offer quotes (ADR 0166). The
+ * rows hash stays the hash of the plain rows.
  */
 export function maskedAnswer(answer: SendAnswer): SendAnswer {
   const surface = answer.surface === undefined ? {} : { surface: maskSurface(answer.surface) };
   const rows = answer.rows === undefined ? {} : { rows: answer.rows.map(redactText) };
-  return { ...answer, ...surface, ...rows };
+  // The draft an offer quotes (ADR 0166) is masked like the mirror's text and the held rows.
+  const draft = answer.draftText === undefined ? {} : { draftText: redactText(answer.draftText) };
+  return { ...answer, ...surface, ...rows, ...draft };
 }
 
 /** A view send's refusal before the Send Protocol: HTTP 409 with the code, so the phone shows it and never retries. */
@@ -10512,6 +10607,8 @@ export const HILL_OFF_TEXT = "the hill is not running on this bridge";
 /** What a hill route answers with `?host=`: the hill is not merged across the crew yet. */
 /** `?h=<member>` on the tricks switch route: the switch is this machine's, set on the member itself. */
 export const TRICKS_SWITCH_LOCAL_TEXT = "the tricks switch is this machine's only; set it on the machine itself";
+/** What the remove route says for a `?h=<member>`: a trick is removed on the machine that holds it. */
+export const TRICKS_REMOVE_LOCAL_TEXT = "a trick is removed on the machine that holds it; open that machine's Collie";
 export const HILL_LOCAL_TEXT = "the hill reads this machine only for now; ask the machine itself";
 /** What the answer route says of a `rid` already used for another answer. */
 export const HILL_RID_REUSED = "request-id-reused: this rid already answered with another choice";
@@ -10824,6 +10921,37 @@ export const HILL_MEDIA_HEADERS = {
 
 /** What the image route answers for any id it does not hold, well formed or not. */
 export const HILL_MEDIA_MISSING = "no such image";
+
+/**
+ * The bytes of one project picture by version (ADR 0160), with the hill image's headers. Every miss is
+ * the same 404: an off switch, a malformed version, a version this bridge does not hold, a picture
+ * whose bytes changed since. Exported for the route test.
+ */
+export async function projectPictureRoute(version: string, source: ProjectPictureSource | undefined): Promise<Response> {
+  const picture = source === undefined ? null : await source.bytesOf(version);
+  if (picture === null) return text(HILL_MEDIA_MISSING, 404);
+  // A fresh copy, so the body is a plain ArrayBuffer-backed view whatever the reader handed back.
+  return secure(new Response(new Uint8Array(picture.bytes), { headers: { "content-type": picture.mime, ...HILL_MEDIA_HEADERS } }));
+}
+
+/**
+ * A crew member's answer to a picture read, checked on the lead before the phone sees it (ADR 0160): at
+ * most the picture cap read off the body, the picture's rules, the sha256 prefix equal to `version`, the
+ * type from the bytes. The member's headers are dropped. Every other answer is the same 404 as a miss.
+ * Exported for the route test.
+ */
+export async function forwardedPictureRoute(version: string, member: Response): Promise<Response> {
+  // A member never compresses a picture (its bridge gzips text types only), so an answer that names an
+  // encoding is not the member's picture.
+  if (!member.ok || member.headers.get("content-encoding") !== null) {
+    await member.body?.cancel().catch(() => undefined);
+    return text(HILL_MEDIA_MISSING, 404);
+  }
+  const bytes = await readCappedBody(member, PROJECT_PICTURE_BYTES_MAX);
+  const picture = bytes === null ? null : checkForwardedPicture(bytes, version);
+  if (picture === null) return text(HILL_MEDIA_MISSING, 404);
+  return secure(new Response(new Uint8Array(picture.bytes), { headers: { "content-type": picture.mime, ...HILL_MEDIA_HEADERS } }));
+}
 
 /**
  * `GET /api/hill/media/<decision id>/<media id>` (M96): the bytes of one image of a decision, with
@@ -11622,7 +11750,7 @@ Collie, then enter the code in Settings.</p>
 <p>If you are the operator: point this path at your proxy's sign-in flow. See <em>Serving Collie
 behind your own reverse proxy</em> in the README. If your front door signs in on every path and has
 no page here, set <code>COLLIE_AUTH_RETURN=1</code> and this address sends you back to Collie.</p>
-<p><a href="${base}">Back to Collie</a> · <a href="${base}settings/system">Open Settings</a></p>
+<p><a href="${base}">Back to Collie</a> · <a href="${base}settings/devices">Open Settings</a></p>
 </body>
 </html>
 `;

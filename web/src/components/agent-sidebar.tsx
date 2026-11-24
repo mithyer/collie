@@ -1,6 +1,7 @@
 
 import { useEffect, useMemo, useState } from "react";
 
+import { FOCUS_RING } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { CacheChip } from "@/components/cache-chip";
 import { HostChip } from "@/components/host-chip";
@@ -10,6 +11,7 @@ import { SessionFilterEmpty, SessionFilterField } from "@/components/session-fil
 import { MatchText } from "@/components/ui/match-text";
 import { SectionHeader } from "@/components/section-header";
 import { StatusCounts, StatusSummaryLine } from "@/components/status-counts";
+import { SUMMARY_LINE_TAP_TARGET } from "@/components/ui/tap-target";
 import { pinnedRows, shownGroups } from "@/lib/dash-view";
 import { paneRowKey, paneSpaceKey, tabKey } from "@/lib/hosts";
 import { groupPanesByWorkspace } from "@/lib/pane-groups";
@@ -136,12 +138,22 @@ interface ThreadSidebarProps {
   filterHidden?: PaneFilterHidden;
   /**
    * Where the filter block sticks and how far it bleeds, which only the scroller's owner knows: the
-   * sheet passes `SHEET_BODY_STICKY` (under its own sticky head), the large screen's sidebar its
-   * gutter. Default `top-0`, the top of the scroller.
+   * sheet passes `SHEET_BODY_STICKY` (under its own sticky head). Default `top-0`, the top of the
+   * scroller. The large screen's sidebar (`roomy`) ignores it: there the whole head block sticks.
    */
   filterClassName?: string;
   /** The query the field starts with. The app passes none: the query starts empty and is never stored. */
   initialQuery?: string;
+  /**
+   * Whether this list draws its own filter field. The Actions palette (ADR 0165) passes false: its own
+   * field is the search there, and this list is its empty state's last part. Default true.
+   */
+  filter?: boolean;
+  /**
+   * The row the Actions palette's arrow keys stand on ({@link paneRowKey}), drawn with the palette's
+   * highlight. Absent everywhere else.
+   */
+  highlightedKey?: string | null;
 }
 
 // The pane switcher behind the swipe-up "Switch pane" sheet: every agent pane under the WORKSPACE it
@@ -241,6 +253,8 @@ export function ThreadSidebar({
   filterHidden = PANE_FILTER.hidden,
   filterClassName = "top-0",
   initialQuery = "",
+  filter = true,
+  highlightedKey = null,
 }: ThreadSidebarProps) {
   useLocale();
   // THE ORDER, AND WHY IT IS READ ONCE: see `useFrozenRanks` and the long note below. Called here, above
@@ -259,7 +273,7 @@ export function ThreadSidebar({
   // field filters nothing, whatever was typed before it shrank.
   const [query, setQuery] = useState(initialQuery);
   const total = agents.length + shellPanes.length + trickRows.length;
-  const offered = filterOffered(total);
+  const offered = filter && filterOffered(total);
   const activeQuery = offered ? query : "";
   const hits = useMemo(() => {
     const options = { level: filterLevel, hidden: filterHidden, ctx: { servers } };
@@ -410,6 +424,7 @@ export function ThreadSidebar({
         onSelect={onSelect}
         roomy={roomy}
         match={hitOf(a)}
+        highlighted={highlightedKey !== null && paneRowKey(a) === highlightedKey}
       />
     );
 
@@ -417,55 +432,87 @@ export function ThreadSidebar({
     <div className={cn("flex flex-col px-2 py-3", roomy ? "gap-6" : "gap-4", className)}>
       {/* The filter block: sticky at the top of the scroller, on the panel's own fill with the rule
           that closes it, above every row, and always mounted while the list is long enough. */}
-      {offered && (
-        <SessionFilterField
-          query={query}
-          onQuery={setQuery}
-          shown={shownRows.length}
-          total={total}
-          onGo={goFirst}
-          className={cn("sticky z-10 border-b border-rule bg-card py-2", filterClassName)}
-        />
-      )}
-      {noPanes && (
-        <p className="px-2 py-2 text-sm text-muted-foreground">{t("home.empty.noAgents")}</p>
-      )}
+      {(() => {
+        const filterField = offered && (
+          <SessionFilterField
+            query={query}
+            onQuery={setQuery}
+            shown={shownRows.length}
+            total={total}
+            onGo={goFirst}
+            // In the sidebar the head block below is what sticks and draws the rule.
+            className={roomy ? undefined : cn("sticky z-10 border-b border-rule bg-card py-2", filterClassName)}
+            {...(roomy ? { variant: "sidebar" as const } : {})}
+          />
+        );
+        const emptyLine = noPanes && <p className="px-2 py-2 text-sm text-muted-foreground">{t("home.empty.noAgents")}</p>;
 
-      {/* ONE CHROME ROW, not two. The summary line is the alarm and keeps the left, where ADR 0063
-          point 3 puts urgency; the order control takes the right as glyphs. Stacked, these cost two
-          full rows plus a heading before the first pane, which on a phone was most of what the sheet
-          had to give (reported 2026-09-30). The heading below still names the order in words, so
-          dropping the labels here loses nothing a reader needs.
+        // ONE CHROME ROW, not two. The summary line is the alarm and keeps the left, where ADR 0063
+        // point 3 puts urgency; the order control takes the right as glyphs. Stacked, these cost two
+        // full rows plus a heading before the first pane, which on a phone was most of what the sheet
+        // had to give (reported 2026-09-30). The heading below still names the order in words, so
+        // dropping the labels here loses nothing a reader needs.
+        //
+        // The row is drawn while EITHER half has something, and the summary line keeps a slot of its
+        // own while there are agents, so the rows below never shift when the first pane needs you or
+        // the last one is answered.
+        const summaryRow = (agents.length > 0 || (onOrderChange && !noPanes)) && (
+          <div
+            data-slot={roomy ? "sidebar-summary-row" : undefined}
+            // The sidebar's row is 36px, the field's height: the 32px line reaches 6px above and below
+            // (SUMMARY_LINE_TAP_TARGET) and the segments 4px, so both make 44 inside the block's 8px steps.
+            className={cn("flex items-center justify-between gap-2", roomy ? "h-9 pl-2" : "px-2")}
+          >
+            {agents.length > 0 ? (
+              <StatusSummaryLine
+                panes={urgent}
+                allClear={firstUrgent === undefined}
+                onJump={onJump}
+                className={cn("min-w-0 flex-1", roomy && SUMMARY_LINE_TAP_TARGET)}
+              />
+            ) : (
+              <span className="flex-1" />
+            )}
+            {onOrderChange && !noPanes && (
+              <PaneOrderToggle
+                order={order}
+                onChange={(next) => {
+                  reread();
+                  onOrderChange(next);
+                }}
+                compact
+                segmented={roomy}
+              />
+            )}
+          </div>
+        );
 
-          The row is drawn while EITHER half has something, and the summary line keeps a slot of its
-          own while there are agents, so the rows below never shift when the first pane needs you or
-          the last one is answered. */}
-      {(agents.length > 0 || (onOrderChange && !noPanes)) && (
-        <div className={cn("flex items-center justify-between gap-2 px-2", roomy && "min-h-11")}>
-          {agents.length > 0 ? (
-            <StatusSummaryLine
-              panes={urgent}
-              allClear={firstUrgent === undefined}
-              onJump={onJump}
-              className="min-w-0 flex-1"
-            />
-          ) : (
-            <span className="flex-1" />
-          )}
-          {onOrderChange && !noPanes && (
-            <PaneOrderToggle
-              order={order}
-              onChange={(next) => {
-                reread();
-                onOrderChange(next);
-              }}
-              compact
-              // The large screen's icon buttons are 20px glyphs in 44px boxes, these three too.
-              {...(roomy ? { iconClassName: "size-5" } : {})}
-            />
-          )}
-        </div>
-      )}
+        if (!roomy) {
+          return (
+            <>
+              {filterField}
+              {emptyLine}
+              {summaryRow}
+            </>
+          );
+        }
+        // THE SIDEBAR'S HEAD (large screen): the filter and the summary row in ONE sticky block, so the
+        // three views stay in reach while the list scrolls, with the one rule that closes the head.
+        // Two 36px rows in 8px steps: 8 above the field, 8 between, 8 under the summary row. Each
+        // control's 44px reach takes 4px of a step, so two reaches meet and never overlap. The block
+        // bleeds to the sidebar's edges; its rows stand on the list's 8px box edge, their ink on 16.
+        return (
+          <>
+            {(filterField || summaryRow) && (
+              <div data-slot="sidebar-head-block" className="sticky top-0 z-10 -mx-2 flex flex-col gap-2 border-b border-rule bg-card px-2 py-2">
+                {filterField}
+                {summaryRow}
+              </div>
+            )}
+            {emptyLine}
+          </>
+        );
+      })()}
 
       {bestRows !== null ? (
         // BEST MATCH FIRST (the playground's alternative order): one flat list with no heading, the
@@ -647,13 +694,17 @@ function Section({
 const ROW_RULES =
   "[&>*+*]:relative [&>*+*]:before:pointer-events-none [&>*+*]:before:absolute [&>*+*]:before:inset-x-2 [&>*+*]:before:-top-px [&>*+*]:before:h-px [&>*+*]:before:bg-rule";
 
-function PaneRow({
+/** The Actions palette's highlight, an inset ring on the row's own rounded box (ADR 0165). */
+export const PALETTE_HIGHLIGHT = "ring-2 ring-inset ring-ring";
+
+export function PaneRow({
   id,
   pane,
   active,
   onSelect,
   roomy,
   match,
+  highlighted = false,
 }: {
   /** The row's DOM id, for the summary line's jump. Every row has one, shells too. */
   id?: string;
@@ -664,6 +715,8 @@ function PaneRow({
   roomy: boolean;
   /** How the filter's query matched this row (lib/pane-filter.ts). Absent with no query: the row is drawn as before. */
   match?: PaneMatch | undefined;
+  /** The Actions palette's highlight: the row Enter opens (ADR 0165). An inset ring, so it shows on the open row too. */
+  highlighted?: boolean;
 }) {
   const isShell = pane.kind === "shell";
   // ONE NAME, ONE PLACE (lib/pane-name.ts), the same way round as every other row in the app: the
@@ -684,21 +737,25 @@ function PaneRow({
     <button
       id={id}
       type="button"
+      data-slot="pane-row"
       // The row's full identity (paneRowKey), read back by a large screen's row gestures (a hold
       // opens "Open here" and "Open beside", a drag carries the row into the strip, ADR 0120). The
       // gestures sit on a host around this list, so the list itself takes only the tap.
       data-pane-key={paneRowKey(pane)}
       onClick={() => onSelect(pane)}
       aria-current={active ? "page" : undefined}
+      data-highlighted={highlighted ? "true" : undefined}
       className={cn(
         // The border is in the base string and transparent at rest, so an alarm edge only ever
         // changes the paint. Added by state it would pull the text 1px in and grow the row 2px,
         // which is the zig-zag every switcher row above and below it would then sit out of line
         // with. This is a gap list, not a divide-y one, so a four-sided edge is the right mark.
         "flex w-full min-w-0 items-center gap-2.5 rounded-lg border border-transparent text-left transition-colors",
+        // The house ring, outside the row: the list's own inset (8px in the sidebar, 4px in the palette) holds it clear of the scroller's edge.
+        FOCUS_RING,
         // The sidebar's 16px inset is the list's 8 plus the row's 8, and its 44px floor a little more air.
         roomy ? "min-h-11 px-2 py-2.5" : "px-2.5 py-2",
-        active ? "bg-accent text-accent-foreground" : "hover:bg-muted/60 active:bg-muted",
+        active ? "bg-(--state-on) text-accent-foreground" : "hover:bg-(--state-hover) active:bg-muted",
         // The switcher is exactly where you jump TO the thing that needs you, so it must be able to
         // SHOW that across the whole row, not only in the mark on the logo. Staying denser than the
         // dashboard is fine; being unable to mark a blocked pane is not. (isAttention, so the rule
@@ -710,6 +767,7 @@ function PaneRow({
         // The SHOWN status, so a pane that stopped on an error loses the edge once seen (shownStatus).
         isAttention(shownStatus(pane)) && "border-status-blocked/40",
         !active && isAttention(shownStatus(pane)) && "bg-status-blocked/5",
+        highlighted && PALETTE_HIGHLIGHT,
       )}
     >
       {isShell ? (
@@ -827,6 +885,7 @@ function LaunchRow({
   return (
     <button
       type="button"
+      data-slot="launch-row"
       disabled={disabled}
       aria-label={refusal}
       title={refusal}

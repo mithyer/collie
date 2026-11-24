@@ -55,8 +55,10 @@ const TABLET = { width: 820, height: 1180 } as const;
  * because it never depends on a resolver. This is why the service-worker cases can live in this
  * tier at all.
  */
-const APP_PORT = 4173;
+const APP_PORT = Number(process.env.E2E_APP_PORT ?? 4173);
 const APP_BASE_URL = `http://127.0.0.1:${APP_PORT}`;
+// `E2E_APP_PORT` moves the app target off 4173 (2026-11-21). Several worktrees run this tier on one machine, and
+// `reuseExistingServer` would hand a run the OTHER worktree's `vite preview`, its bundle and not this one.
 
 /** Tier 2 lives under `e2e/live/**` and has its own config (`e2e/live/playwright.config.ts`).
  *  It needs the live dev lane, so tier 1 never collects it; `make e2e` runs tier 2. The browser leg
@@ -73,23 +75,38 @@ const WEBKIT =
     ? false
     : Boolean(process.env.CI) || process.env.COLLIE_E2E_WEBKIT === "1";
 
-/** The two specs that deploy bundles under a running browser, through the lock in
- *  `e2e/fixtures/builds.ts`. Both use `SWAP_BASE_URL` (4174) and no other server. */
-const SWAP_SPECS = ["**/service-worker.spec.ts", "**/update-screen.spec.ts"];
+/** The specs that deploy bundles under a running browser, through the lock in
+ *  `e2e/fixtures/builds.ts`. All use `SWAP_BASE_URL` (4174) and no other server. */
+const SWAP_SPECS = ["**/service-worker.spec.ts", "**/update-screen.spec.ts", "**/swap-lazy-screen.spec.ts"];
 
-/** Which specs this run collects: `swap`, `rest`, or (unset) both. Anything else is a typo, and a
- *  typo that silently ran nothing would read as a green run. */
+/** The screen list's own spec (`e2e/screens.spec.ts`): one page per entry of `e2e/screens/list.ts`. It is in
+ *  no other set, so only `E2E_SET=screens` runs it. */
+const SCREENS_SPEC = "**/screens.spec.ts";
+
+/** R5 `contrast`, the screen list in every theme (`e2e/themes.spec.ts`), in no other set: only `E2E_SET=themes` runs it. */
+const THEMES_SPEC = "**/themes.spec.ts";
+
+/** Which specs this run collects: `swap`, `rest`, `screens`, `themes`, or (unset) swap and rest. Anything else is a typo,
+ *  and a typo that silently ran nothing would read as a green run. */
 const E2E_SET = process.env.E2E_SET;
-if (E2E_SET !== undefined && E2E_SET !== "" && E2E_SET !== "swap" && E2E_SET !== "rest") {
-  throw new Error(`E2E_SET must be "swap", "rest" or unset, got "${E2E_SET}"`);
+if (E2E_SET !== undefined && E2E_SET !== "" && E2E_SET !== "swap" && E2E_SET !== "rest" && E2E_SET !== "screens" && E2E_SET !== "themes") {
+  throw new Error(`E2E_SET must be "swap", "rest", "screens", "themes" or unset, got "${E2E_SET}"`);
 }
-const RUN_SWAP = E2E_SET !== "rest";
-const RUN_REST = E2E_SET !== "swap";
+const RUN_SCREENS = E2E_SET === "screens";
+const RUN_THEMES = E2E_SET === "themes";
+const RUN_SWAP = E2E_SET !== "rest" && !RUN_SCREENS && !RUN_THEMES;
+const RUN_REST = E2E_SET !== "swap" && !RUN_SCREENS && !RUN_THEMES;
+/** The specs that run only in a set of their own. */
+const OWN_SETS = [SCREENS_SPEC, THEMES_SPEC];
 
 /** The spec selection every project shares: never the tier-2 specs, plus the set filter. */
-const SPECS = RUN_REST
-  ? { testIgnore: RUN_SWAP ? LIVE_TEST_IGNORE : [...LIVE_TEST_IGNORE, ...SWAP_SPECS] }
-  : { testIgnore: LIVE_TEST_IGNORE, testMatch: SWAP_SPECS };
+const SPECS = RUN_SCREENS
+  ? { testIgnore: LIVE_TEST_IGNORE, testMatch: [SCREENS_SPEC] }
+  : RUN_THEMES
+    ? { testIgnore: LIVE_TEST_IGNORE, testMatch: [THEMES_SPEC] }
+    : RUN_REST
+      ? { testIgnore: RUN_SWAP ? [...LIVE_TEST_IGNORE, ...OWN_SETS] : [...LIVE_TEST_IGNORE, ...OWN_SETS, ...SWAP_SPECS] }
+      : { testIgnore: LIVE_TEST_IGNORE, testMatch: SWAP_SPECS };
 
 type WebServer = Exclude<PlaywrightTestConfig["webServer"], unknown[] | undefined>;
 
@@ -155,7 +172,7 @@ export default defineConfig({
   ],
   // Each entry starts only for the set that has a client; see the note on `E2E_SET` at the top.
   webServer: [
-    ...(RUN_REST
+    ...(RUN_REST || RUN_SCREENS || RUN_THEMES
       ? [
         {
           // The SHIPPED bundle off disk, not `vite dev`: the service worker exists only in a real build
@@ -177,12 +194,30 @@ export default defineConfig({
           stderr: "pipe",
           timeout: 60_000,
         },
+      ] satisfies WebServer[]
+      : []),
+    // The screen list's set and the themes set need the app on 4173 and nothing else.
+    ...(RUN_REST
+      ? [
         {
           // M57, the MOUNTED bundle server on 4175: `web/dist` through the bridge's own `serveStatic`
           // under `COLLIE_BASE_PATH=/collie/`. `e2e/theme-first-paint.spec.ts` is its one client. No
           // API at all; a case that needs one belongs on 4173.
           command: "bun e2e/serve-mount.ts",
           url: "http://127.0.0.1:4175/collie/",
+          reuseExistingServer: !process.env.CI,
+          stdout: "ignore",
+          stderr: "pipe",
+          timeout: 60_000,
+        },
+        {
+          // The DESIGN REFERENCE on 4176, Vite's dev server under `COLLIE_PLAYGROUND=1` (no bridge: every
+          // `/api/*` answers 404 from the playground plugin, vite.config.ts). Its phone frames carry a
+          // transform, as the website's do, and `e2e/wide-sheets.spec.ts` checks that a sheet in one stays
+          // a bottom sheet in a wide window. Its own port: 5199 is the always-on design app.
+          command: "bunx vite --host 127.0.0.1 --port 4176 --strictPort",
+          env: { COLLIE_PLAYGROUND: "1", COLLIE_DEV_TARGET: "http://127.0.0.1:9" },
+          url: "http://127.0.0.1:4176/design.html",
           reuseExistingServer: !process.env.CI,
           stdout: "ignore",
           stderr: "pipe",

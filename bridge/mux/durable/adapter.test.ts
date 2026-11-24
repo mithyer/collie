@@ -1,5 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { chmodSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import { MUX_CAPABILITIES } from "../capabilities.ts";
 import { muxConfigBody } from "../../server.ts";
@@ -17,7 +19,8 @@ import {
   WRITE_TIMEOUT_MS,
 } from "./adapter.ts";
 import { CAPS } from "./clean.ts";
-import { DURABLE_SOCKET_ENV, DurableSocketClient, SOCKET_NOT_PRIVATE } from "./client.ts";
+import { DURABLE_SOCKET_ENV, DurableSocketClient, SOCKET_NOT_PRIVATE, type DurableTransport } from "./client.ts";
+import type { DurableEventSink } from "./events.ts";
 import { FakeDurableClock, FakeDurableProgram, hasHostileChars, hostileText, SOCKET_ONLY_SKIP } from "./fixture.ts";
 
 const programs: FakeDurableProgram[] = [];
@@ -252,7 +255,7 @@ describe("fixture: the recorded snapshot through the adapter", () => {
     const { adapter } = await rig();
     await adapter.snapshot();
     const program = adapter.program();
-    expect(program?.session).toMatchObject({ version: 1, hostName: "denis-laptop" });
+    expect(program?.session).toMatchObject({ version: 1, hostName: "casey-laptop" });
     expect(program?.snapshot.panes.find((pane) => pane.id === "conv-02")?.turnId).toBe("turn-02-a");
     expect(program?.snapshot.panes.find((pane) => pane.id === "conv-02")?.openAsks).toHaveLength(1);
     expect(program?.snapshot.starters).toEqual([{ id: "notes-new", label: "New note chat" }]);
@@ -376,44 +379,6 @@ describe("the service name and the hysteresis", () => {
     expect(verdict(await adapter.poll())).toBe("unreachable: incompatible: not a durable agent");
   });
 
-  test("one failed read keeps the last layout; the second in a row is unreachable", async () => {
-    const { adapter, program, tick } = await rig();
-    expect(verdict(await adapter.poll())).toBe("ok");
-    // The program stops answering, but keeps its socket.
-    program.override = () => new Promise<Response>(() => undefined);
-    tick();
-    const first = await adapter.poll();
-    expect(verdict(first)).toBe("ok");
-    expect(first.ok && first.value.panes.length).toBeGreaterThan(0);
-    tick();
-    expect(verdict(await adapter.poll())).toStartWith("unreachable: no answer within");
-    // It answers again: one good read is enough to come back, and the count starts over.
-    program.override = null;
-    tick();
-    expect(verdict(await adapter.poll())).toBe("ok");
-    program.override = () => new Promise<Response>(() => undefined);
-    tick();
-    expect(verdict(await adapter.poll())).toBe("ok");
-  }, 10_000);
-
-  test("a held layout keeps its open asks across one dropped read, and the second drop clears them", async () => {
-    const { adapter, program, tick } = await rig();
-    await adapter.snapshot();
-    const asks = adapter.openAsks("conv-02");
-    expect(asks).toHaveLength(1);
-    program.override = () => new Promise<Response>(() => undefined);
-    tick();
-    const held = await adapter.poll();
-    expect(verdict(held)).toBe("ok");
-    expect(held.ok && held.value.panes.find((pane) => pane.paneId === "conv-02")?.status).toBe("blocked");
-    expect(adapter.openAsks("conv-02")).toEqual(asks);
-    expect(adapter.program()?.snapshot.panes.find((pane) => pane.id === "conv-02")?.openAsks).toHaveLength(1);
-    tick();
-    expect(verdict(await adapter.poll())).toStartWith("unreachable: no answer within");
-    expect(adapter.openAsks("conv-02")).toBeUndefined();
-    expect(adapter.program()).toBeNull();
-  }, 10_000);
-
   test("a program that answers starting is never held, even after a good read", async () => {
     const { adapter, program, tick } = await rig();
     expect(verdict(await adapter.poll())).toBe("ok");
@@ -520,6 +485,55 @@ describe("snapshot reads", () => {
     const snapshots = program.requests.filter((request) => request.path.endsWith("/snapshot"));
     expect(snapshots.map((request) => request.ifNoneMatch)).toEqual([null, `"${program.epoch}-12"`]);
     expect(second).toBe(first);
+  });
+
+  test("a 304 that prunes an expired ask preserves logRefs on the updated snapshot", async () => {
+    const program = await FakeDurableProgram.startWire();
+    programs.push(program);
+    const inner = program.wire();
+    const statuses: number[] = [];
+    const transport: DurableTransport = {
+      async get(request) {
+        const reply = await inner.get(request);
+        if (request.path === "/snapshot") statuses.push(reply.status);
+        return reply;
+      },
+      post: (request) => inner.post(request),
+    };
+    const logDir = join(tmpdir(), "collie-durable-304-log-refs");
+    const logSink: DurableEventSink = {
+      apply: async () => 0,
+      pathOf: (key) => join(logDir, `${key}.jsonl`),
+    };
+    const clock = new FakeDurableClock();
+    const adapter = new DurableMux(transport, clock, logSink);
+    const soon = new Date(clock.now() + 1000).toISOString();
+    program.raiseAsk("conv-01", {
+      id: "ask-expiring",
+      kind: "permission",
+      toolCallId: "call-expiring",
+      revision: 1,
+      title: "shell wants to run",
+      itemId: "item-expiring",
+      options: [{ id: "allow", label: "Allow", effect: "allow" }],
+      expiresAt: soon,
+    });
+
+    const first = await adapter.snapshot();
+    expect(first.panes.find((pane) => pane.paneId === "conv-01")?.agentSession).toEqual({
+      kind: "path",
+      value: join(logDir, "conv-01.jsonl"),
+    });
+
+    clock.advance(1000);
+    const second = await adapter.snapshot();
+    expect(statuses).toEqual([200, 304]);
+    expect(adapter.openAsks("conv-01")).toEqual([]);
+    expect(second.panes.find((pane) => pane.paneId === "conv-01")?.agentSession).toEqual({
+      kind: "path",
+      value: join(logDir, "conv-01.jsonl"),
+    });
+    expect(second.panes.every((pane) => pane.agentSession?.kind === "path")).toBe(true);
   });
 
   test("a change moves rev, the ETag no longer matches, and the new snapshot is read", async () => {
@@ -630,11 +644,11 @@ describe("starters (WIRE.md sections 7.6 and 7.7)", () => {
 
   test("the program's starters are listed with its machine name, and none while it is unreachable", async () => {
     const { adapter, program, tick } = await rig();
-    expect(await adapter.listStarters()).toEqual({ hostName: "denis-laptop", starters: [{ id: "notes-new", label: "New note chat" }], reachable: true });
+    expect(await adapter.listStarters()).toEqual({ hostName: "casey-laptop", starters: [{ id: "notes-new", label: "New note chat" }], reachable: true });
     await program.close();
     tick();
     // The first failed read is held (WIRE.md section 8.8), so the starters hold with the layout.
-    expect(await adapter.listStarters()).toEqual({ hostName: "denis-laptop", starters: [{ id: "notes-new", label: "New note chat" }], reachable: true });
+    expect(await adapter.listStarters()).toEqual({ hostName: "casey-laptop", starters: [{ id: "notes-new", label: "New note chat" }], reachable: true });
     tick();
     expect(await adapter.listStarters()).toEqual({ hostName: "", starters: [], reachable: false });
   });

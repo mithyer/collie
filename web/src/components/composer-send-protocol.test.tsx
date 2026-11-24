@@ -122,16 +122,36 @@ describe("Composer on the Send Protocol (M56 specs 05 and 06)", () => {
     renderComposer();
     await user.type(screen.getByPlaceholderText(/type a reply/i), "new words");
     await user.click(screen.getByRole("button", { name: "Send" }));
-    const strip = await screen.findByTestId("send-offers");
-    expect(strip).toHaveTextContent("Add to it");
-    expect(strip).toHaveTextContent("Replace");
-    expect(strip).toHaveTextContent("Cancel");
-    expect(screen.getByText("The box already holds a draft. Add to it, replace it, or cancel.")).toBeInTheDocument();
+    const sheet = await screen.findByTestId("send-offer-modal");
+    expect(sheet).toHaveTextContent("Add to it");
+    expect(sheet).toHaveTextContent("Replace");
+    expect(sheet).toHaveTextContent("Cancel");
     expect(loadDraft(undefined, "w1:p1")).toBe("new words"); // a refusal keeps the draft
-    await user.click(screen.getByRole("button", { name: "Replace" }));
+    await user.click(screen.getByRole("button", { name: /^Replace/ }));
     await waitFor(() => expect(sends).toHaveLength(2));
     expect(sends[1]).toMatchObject({ text: "new words", mode: "replace" });
     expect(sends[1]!.id).not.toBe(sends[0]!.id);
+  });
+
+  // The offer strip is the only control for a refused send; a near miss is a dead tap with no request
+  // (field case 2026-11-20: the bridge saw the refusal and no Add or Replace request followed). The
+  // offers are compact 32px bordered buttons, and the 44px floor is bought as a transparent reach
+  // (`CAUTION_ACTION_TAP`: 30px padding box + 2 x 7px). They are as wide as their word, not blocks.
+  it("the offers are compact buttons that keep the 44px reach, the dismiss included", async () => {
+    const user = userEvent.setup();
+    bridge([{ body: { receipt: receipt("typed_not_submitted", "changed"), offers: ["submit", "discard"] } }]);
+    renderComposer();
+    await user.type(screen.getByPlaceholderText(/type a reply/i), "new words");
+    await user.click(screen.getByRole("button", { name: "Send" }));
+    await screen.findByTestId("send-offers");
+    for (const name of ["Submit", "Discard"]) {
+      const { className } = screen.getByRole("button", { name });
+      expect(className).toContain("before:-inset-y-[7px]");
+      expect(className).not.toMatch(/(?:^|\s)flex-1(?=\s|$)/);
+    }
+    const dismiss = screen.getByRole("button", { name: "Dismiss the send offers" }).className;
+    expect(dismiss).toContain("before:-inset-[7px]");
+    expect(dismiss).toMatch(/(?:^|\s)size-8(?=\s|$)/);
   });
 
   it("a draft refusal on a pane with a returned queued card points at that card, and keeps the offers (ADR 0122)", async () => {
@@ -142,7 +162,9 @@ describe("Composer on the Send Protocol (M56 specs 05 and 06)", () => {
     await user.click(screen.getByRole("button", { name: "Send" }));
     expect(await screen.findByText("Your queued message is back in the agent as a draft. Use its card.")).toBeInTheDocument();
     expect(screen.queryByText("The box already holds a draft. Add to it, replace it, or cancel.")).toBeNull();
-    expect(screen.getByTestId("send-offers")).toHaveTextContent("Replace");
+    // The modal carries the sentence, because the notice waits behind it.
+    expect(screen.getByTestId("send-offer-modal")).toHaveTextContent("Use its card.");
+    expect(screen.getByTestId("send-offer-modal")).toHaveTextContent("Replace");
   });
 
   it("a slash command onto a draft offers Replace and Cancel only, says so, and Replace sends it as a replace", async () => {
@@ -154,13 +176,12 @@ describe("Composer on the Send Protocol (M56 specs 05 and 06)", () => {
     renderComposer();
     await user.type(screen.getByPlaceholderText(/type a reply/i), "/model");
     await user.click(screen.getByRole("button", { name: "Send" }));
-    const strip = await screen.findByTestId("send-offers");
+    const sheet = await screen.findByTestId("send-offer-modal");
     expect(sends[0]).toMatchObject({ text: "/model", mode: "command" });
-    expect(strip).not.toHaveTextContent("Add to it");
-    expect(strip).toHaveTextContent("Replace");
-    expect(strip).toHaveTextContent("Cancel");
-    expect(screen.getByText("The box already holds a draft. Replace it, or cancel.")).toBeInTheDocument();
-    await user.click(screen.getByRole("button", { name: "Replace" }));
+    expect(sheet).not.toHaveTextContent("Add to it");
+    expect(sheet).toHaveTextContent("Replace");
+    expect(sheet).toHaveTextContent("Cancel");
+    await user.click(screen.getByRole("button", { name: /^Replace/ }));
     await waitFor(() => expect(sends).toHaveLength(2));
     expect(sends[1]).toMatchObject({ text: "/model", mode: "replace" });
   });
@@ -174,9 +195,33 @@ describe("Composer on the Send Protocol (M56 specs 05 and 06)", () => {
     renderComposer();
     await user.type(screen.getByPlaceholderText(/type a reply/i), "more words");
     await user.click(screen.getByRole("button", { name: "Send" }));
-    await user.click(await screen.findByRole("button", { name: "Add to it" }));
+    await user.click(await screen.findByRole("button", { name: /^Add to it/ }));
     await waitFor(() => expect(sends).toHaveLength(2));
     expect(sends[1]).toMatchObject({ text: " more words", mode: "append" });
+  });
+
+  it("Add to it and Replace carry the offer's rows hash, and a box that changed shows the offer again over it (ADR 0166)", async () => {
+    const user = userEvent.setup();
+    const { sends } = bridge([
+      { body: { receipt: receipt("refused", "draft_present"), offers: ["append", "replace", "cancel"], rowsHash: "0abc12" } },
+      // The person typed another draft at the desk: the same refusal again, over the draft now, with its hash.
+      { body: { receipt: receipt("refused", "draft_present"), offers: ["append", "replace", "cancel"], rowsHash: "0def34" } },
+      { body: { receipt: receipt("sent"), offers: [] } },
+    ]);
+    renderComposer();
+    const field = screen.getByPlaceholderText(/type a reply/i);
+    await user.type(field, "new words");
+    await user.click(screen.getByRole("button", { name: "Send" }));
+    await user.click(await screen.findByRole("button", { name: /^Replace/ }));
+    await waitFor(() => expect(sends).toHaveLength(2));
+    expect(sends[1]).toMatchObject({ text: "new words", mode: "replace", rowsHash: "0abc12" });
+    // The offer is back, the same words as the first time (the modal's title; its notice waits behind it),
+    // and the text stays in the field.
+    expect(await screen.findByRole("dialog", { name: "The box already holds a draft" })).toBeInTheDocument();
+    expect(field).toHaveValue("new words");
+    await user.click(await screen.findByRole("button", { name: /^Add to it/ }));
+    await waitFor(() => expect(sends).toHaveLength(3));
+    expect(sends[2]).toMatchObject({ text: " new words", mode: "append", rowsHash: "0def34" });
   });
 
   it("a screen Collie cannot read takes two taps: the second carries the rows hash", async () => {
@@ -246,6 +291,172 @@ describe("Composer on the Send Protocol (M56 specs 05 and 06)", () => {
     expect(screen.getByPlaceholderText("Sending is off on this machine")).toBeDisabled();
     expect(screen.getByRole("button", { name: "Send" })).toHaveAttribute("aria-disabled", "true");
     expect(sends).toEqual([]);
+  });
+});
+
+// The draft offers open as a modal (trial, 2026-11-20, send-offer-modal.tsx): Add to it, Replace and Cancel act on a
+// draft the person may have typed at the desk, so they are a blocking choice in the app's modal (ui/modal.tsx,
+// centred), with the draft the bridge read and one bordered button per choice. Every other offer set keeps the strip.
+describe("the draft offers as a modal", () => {
+  const DRAFT = { body: { receipt: receipt("refused", "draft_present"), offers: ["append", "replace", "cancel"] } };
+  const NOTICE = "The box already holds a draft. Add to it, replace it, or cancel.";
+  const field = () => screen.getByPlaceholderText(/type a reply/i);
+
+  async function refuse(user: ReturnType<typeof userEvent.setup>, text: string) {
+    await user.type(field(), text);
+    await user.click(screen.getByRole("button", { name: "Send" }));
+    return screen.findByRole("dialog", { name: "The box already holds a draft" });
+  }
+
+  it("opens a centred modal with three buttons and their lines, and draws no strip and no notice", async () => {
+    const user = userEvent.setup();
+    bridge([DRAFT]);
+    renderComposer();
+    const dialog = await refuse(user, "new words");
+    expect(dialog).toHaveAttribute("aria-modal", "true");
+    expect(dialog).toHaveAttribute("data-placement", "center");
+    expect(screen.queryByTestId("send-offers")).toBeNull();
+    expect(screen.queryByText(NOTICE)).toBeNull();
+    expect(screen.getByRole("button", { name: /^Add to it/ })).toHaveTextContent("Your message goes after the draft. Both are sent as one message.");
+    const replace = screen.getByRole("button", { name: /^Replace/ });
+    expect(replace).toHaveTextContent("The draft is deleted. Only your message is sent.");
+    // Replace wipes the desk's draft: it wears the destructive outline. Add to it the caution one.
+    expect(replace.className).toContain("text-destructive");
+    expect(replace.className).toContain("border-destructive/60");
+    expect(screen.getByRole("button", { name: /^Add to it/ }).className).toContain("border-status-working/60");
+    // No draft text in the answer: no quote and no label.
+    expect(screen.queryByText("In the agent's box")).toBeNull();
+    expect(dialog.querySelector('[data-slot="offer-draft"]')).toBeNull();
+    expect(screen.getByRole("button", { name: /^Cancel/ })).toHaveTextContent("Nothing is sent. Your message stays here.");
+  });
+
+  it("a command onto a draft shows no Add row", async () => {
+    const user = userEvent.setup();
+    bridge([{ body: { receipt: receipt("refused", "draft_present"), offers: ["replace", "cancel"] } }]);
+    renderComposer();
+    await refuse(user, "/model");
+    expect(screen.queryByRole("button", { name: /^Add to it/ })).toBeNull();
+    expect(screen.getByRole("button", { name: /^Replace/ })).toBeInTheDocument();
+    expect(screen.queryByText("The box already holds a draft. Replace it, or cancel.")).toBeNull();
+  });
+
+  it.each([
+    ["Add to it", "append", " more words"],
+    ["Replace", "replace", "more words"],
+  ])("%s sends its offer as a new request and closes the modal", async (row, mode, text) => {
+    const user = userEvent.setup();
+    const { sends } = bridge([DRAFT, { body: { receipt: receipt("sent"), offers: [] } }]);
+    renderComposer();
+    await refuse(user, "more words");
+    await user.click(screen.getByRole("button", { name: new RegExp(`^${row}`) }));
+    expect(screen.queryByRole("dialog")).toBeNull();
+    await waitFor(() => expect(sends).toHaveLength(2));
+    expect(sends[1]).toMatchObject({ text, mode });
+  });
+
+  it("Cancel closes the modal, sends nothing and keeps the text", async () => {
+    const user = userEvent.setup();
+    const { sends } = bridge([DRAFT]);
+    renderComposer();
+    await refuse(user, "keep me");
+    await user.click(screen.getByRole("button", { name: /^Cancel/ }));
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(screen.queryByTestId("send-offers")).toBeNull();
+    expect(screen.queryByText(NOTICE)).toBeNull();
+    expect(sends).toHaveLength(1);
+    expect(field()).toHaveValue("keep me");
+  });
+
+  it.each([
+    ["the scrim", () => {
+      const scrim = document.querySelector('[data-slot="send-offer-modal"]')?.previousElementSibling;
+      if (!(scrim instanceof HTMLElement)) throw new Error("no scrim");
+      fireEvent.pointerDown(scrim);
+      fireEvent.click(scrim);
+    }],
+    ["Escape", () => fireEvent.keyDown(window, { key: "Escape" })],
+  ])("a close without a choice (%s) drops the offer, hides the notice and sends nothing", async (_how, close) => {
+    const user = userEvent.setup();
+    const { sends } = bridge([DRAFT]);
+    renderComposer();
+    await refuse(user, "keep me");
+    act(() => close());
+    expect(screen.queryByRole("dialog")).toBeNull();
+    // The strip's ✕ path: no strip comes back, and the notice stays hidden.
+    expect(screen.queryByTestId("send-offers")).toBeNull();
+    expect(screen.queryByText(NOTICE)).toBeNull();
+    expect(sends).toHaveLength(1);
+    expect(field()).toHaveValue("keep me");
+  });
+
+  it("quotes the draft the bridge read, under its label, and draws the cut line only when it was cut", async () => {
+    const user = userEvent.setup();
+    bridge([
+      { body: { receipt: receipt("refused", "draft_present"), offers: ["append", "replace", "cancel"], rowsHash: "0aaa11", draftText: "fix the login\nthen the tests" } },
+      { body: { receipt: receipt("refused", "draft_present"), offers: ["append", "replace", "cancel"], rowsHash: "0bbb22", draftText: "a very long draft", draftCut: true } },
+    ]);
+    renderComposer();
+    const dialog = await refuse(user, "words");
+    const quote = dialog.querySelector('[data-slot="offer-draft"]');
+    expect(quote).toHaveTextContent("In the agent's box");
+    expect(quote?.querySelector("blockquote")?.textContent).toBe("fix the login\nthen the tests");
+    expect(dialog.querySelector('[data-slot="offer-draft-cut"]')).toBeNull();
+    await user.click(screen.getByRole("button", { name: /^Replace/ }));
+    const again = await screen.findByRole("dialog", { name: "The box already holds a draft" });
+    await waitFor(() => expect(again.querySelector('[data-slot="offer-draft-cut"]')).toHaveTextContent("…"));
+    expect(again).toHaveTextContent("a very long draft");
+  });
+
+  // ADR 0166 in the modal: a tap over a draft that changed at the desk meets the same refusal again, with
+  // the new draft's hash and text. The modal opens again over it and quotes the NEW draft, never the old one,
+  // and the next tap carries the new hash.
+  it.each([
+    ["Replace", "replace", "Add to it", "append"],
+    ["Add to it", "append", "Replace", "replace"],
+  ])("after %s over a changed draft the modal opens again, and %s's next tap carries the new hash", async (first, firstMode, second, secondMode) => {
+    const user = userEvent.setup();
+    const { sends } = bridge([
+      { body: { receipt: receipt("refused", "draft_present"), offers: ["append", "replace", "cancel"], rowsHash: "0aaa11", draftText: "draft A at the desk" } },
+      { body: { receipt: receipt("refused", "draft_present"), offers: ["append", "replace", "cancel"], rowsHash: "0bbb22", draftText: "draft B typed since" } },
+      { body: { receipt: receipt("sent"), offers: [] } },
+    ]);
+    renderComposer();
+    expect(await refuse(user, "words")).toHaveTextContent("draft A at the desk");
+    await user.click(screen.getByRole("button", { name: new RegExp(`^${first}`) }));
+    await waitFor(() => expect(sends).toHaveLength(2));
+    expect(sends[1]).toMatchObject({ mode: firstMode, rowsHash: "0aaa11" });
+    const again = await screen.findByRole("dialog", { name: "The box already holds a draft" });
+    await waitFor(() => expect(again).toHaveTextContent("draft B typed since"));
+    expect(again).not.toHaveTextContent("draft A at the desk");
+    expect(screen.queryByTestId("send-offers")).toBeNull();
+    expect(screen.queryByText(NOTICE)).toBeNull();
+    expect(field()).toHaveValue("words");
+    await user.click(screen.getByRole("button", { name: new RegExp(`^${second}`) }));
+    expect(screen.queryByRole("dialog")).toBeNull();
+    await waitFor(() => expect(sends).toHaveLength(3));
+    expect(sends[2]).toMatchObject({ mode: secondMode, rowsHash: "0bbb22" });
+  });
+
+  it("the buttons wait while a launch starts, as the strip's buttons do", async () => {
+    const user = userEvent.setup();
+    const { sends } = bridge([DRAFT]);
+    renderComposer();
+    await refuse(user, "wait");
+    setStarting(true);
+    for (const row of [/^Add to it/, /^Replace/, /^Cancel/]) expect(screen.getByRole("button", { name: row })).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: /^Replace/ }));
+    expect(sends).toHaveLength(1);
+  });
+
+  it("another offer set (Submit and Discard) keeps the strip and opens no modal", async () => {
+    const user = userEvent.setup();
+    bridge([{ body: { receipt: receipt("typed_not_submitted", "changed"), offers: ["submit", "discard", "keys"] } }]);
+    renderComposer();
+    await user.type(field(), "half way");
+    await user.click(screen.getByRole("button", { name: "Send" }));
+    expect(await screen.findByTestId("send-offers")).toHaveTextContent("Submit");
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(screen.queryByTestId("send-offer-modal")).toBeNull();
   });
 });
 

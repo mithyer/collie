@@ -17,6 +17,8 @@ import {
   WRITE_BUDGET_MS,
 } from "./peer-client.ts";
 import { HOST_PARAM, type PeerState } from "./registry.ts";
+import { BodyRefused, wholeDeadlineMs } from "./guarded-body.ts";
+import type { CrewRequestInit } from "./transport.ts";
 
 // The LEAD side of a per-pane request: `?host=laptop` came in, the pane lives on the laptop, so the
 // request is forwarded over the crew link and the laptop's answer is handed back (CREW_PROTOCOL.md
@@ -192,6 +194,11 @@ const FORWARDABLE: readonly RegExp[] = [
   // `history` (CREW_PROTOCOL.md §9.1). The hash is matched as an opaque segment, mirroring
   // `BLOB_ROUTE` in bridge/server.ts one-for-one — `forward.test.ts` pins that correspondence.
   /^blobs\/[^/]+$/,
+  // A project picture (ADR 0160) is bytes on ONE machine's disk, named by a `collie.toml` there, so a
+  // `?host=` read is proxied byte for byte like a blob. Mirrors `PROJECT_PICTURE_ROUTE` in
+  // bridge/server.ts one-for-one. Additive-optional (§7.1): a member that predates it answers 404, and
+  // an older member sends no `picture` on its panes at all, so the phone never asks it.
+  /^project-picture\/[^/]+$/,
   // A durable program's own history (M53 spec 11): the program runs on ONE member, so its conversation list,
   // the items of one and a reopen are asked of that member. The list and the items are reads; a reopen is a
   // WRITE. Mirrors `DURABLE_CONVERSATIONS_ROUTE` and `DURABLE_CONVERSATION_ROUTE` in bridge/server.ts
@@ -274,6 +281,14 @@ export interface LeadMerge {
   answer(member: Response): Promise<Response>;
 }
 
+/**
+ * The request a {@link LeadMerge} asks the member with: a new GET on the merge's own URL that keeps the
+ * phone's signal, so a phone that goes away aborts the member's read too (review round 9).
+ */
+export function mergeAskRequest(askUrl: URL, req: Request): Request {
+  return new Request(askUrl, { method: req.method, signal: req.signal });
+}
+
 /** A forwarded read (proxied byte-for-byte, §9.1) or a forwarded write (§10.3, §12). */
 export type ForwardKind = "read" | "write";
 
@@ -341,6 +356,8 @@ export function forwardKind(route: string, method?: string): ForwardKind {
   // A blob read serves a file off the owning member's disk and changes nothing there — the same
   // shape as `pane/:id/history`, and attempted against a stale member for the same reason (§10.3).
   if (route.startsWith("blobs/")) return "read";
+  // A project picture is a file off the member's disk too, changed by nothing: a read like a blob.
+  if (route.startsWith("project-picture/")) return "read";
   // A workspace's Changes list is the pane route's `changes`, asked by space: a read. Its Files view
   // too: it needs an authorised device on the member (ADR 0083), but it changes nothing, so it is
   // attempted against a stale member and rides the read budget like any other read.
@@ -362,6 +379,17 @@ const PANE_SCREEN_ROUTE = /^pane\/[^/]+$/;
 
 /** The routes that make a pane: a launch, a tab, a space. Each carries its own request id. */
 const CREATE_ROUTES: ReadonlySet<string> = new Set(["launch", "tab", "workspace"]);
+
+/**
+ * Whether a forwarded route's answer STREAMS on to the phone: a blob, a file's picture, a project picture.
+ * Such a download has the idle limit and the long total one (guarded-body.ts, `STREAM_DEADLINE_MS`), as a
+ * big honest file on a slow link must pass. Every other
+ * forwarded answer is read in full before it is of any use (the lead masks or merges it, or the phone
+ * parses it whole), and ends by a total deadline (guarded-body.ts, `wholeDeadlineMs`).
+ */
+export function streamsToPhone(route: string): boolean {
+  return route.startsWith("blobs/") || route.startsWith("project-picture/") || /^(?:pane|workspace)\/[^/]+\/files\/image$/.test(route);
+}
 
 /**
  * The explicit budget a forwarded request dials on: {@link PANE_WRITE_BUDGET_MS} for a write to a pane (a send on a
@@ -427,6 +455,7 @@ export function forwardAuditAction(route: string, method?: string): string | nul
   if (route === "sent") return null;
   if (route === "folders" || route === "folders/star" || route === "folders/browse") return null; // reads, and a preference
   if (route.startsWith("blobs/")) return null; // a read
+  if (route.startsWith("project-picture/")) return null; // a read
   if (isWorkspaceRead(route)) return null; // a read
   if (route.startsWith("durable/")) return route.endsWith("/reopen") ? "durable.reopen" : null; // the list and the items are reads
   if (route.startsWith("tab/")) return route.endsWith("/close") ? "tab.close" : "tab.rename";
@@ -517,21 +546,17 @@ export const MEMBER_VERSION_HEADER = "x-collie-member-version";
  *   host's own ledger (.adr/0003). The lead marks nothing for a pane it does not own.
  * - `content-type` — carries the multipart boundary an upload cannot be re-assembled without (§13).
  *
- * **`accept-encoding: identity` is SET here, and the phone's own value is never forwarded.** The lead
- * asks the peer for identity bytes, so the body it holds and the body it re-emits are the same bytes.
- * Compression is **hop-local** (.adr/0023): this hop is plain, and {@link proxiedResponse} compresses
- * the lead→phone hop itself, on the phone's own `accept-encoding`.
+ * **The phone's `accept-encoding` is never forwarded, and the member hop's own is the dial's.** The
+ * dial (peer-client.ts) asks every member for gzip, and the runtime inflates it as a stream under the
+ * lead's size limit (guarded-body.ts, ADR 0161), so the body the lead holds is plain bytes. Compression
+ * is **hop-local**
+ * (ADR 0144 rule 10): {@link proxiedResponse} compresses the lead→phone hop itself, on the phone's own
+ * `accept-encoding`.
  *
- * Omitting the header is NOT enough, which is what this comment used to claim: Bun's `fetch` supplies
- * its own `accept-encoding: gzip, deflate, br, zstd` when the init carries none, so the peer gzips,
- * `fetch` transparently decompresses — and, unlike the spec's step, does **not** strip
- * `content-encoding: gzip` from the response headers. The lead then re-emitted a `gzip` header over
- * plain bytes and every peer pane rendered as "(no recent output)", because the phone's `fetch` threw
- * trying to inflate them. Setting `identity` explicitly (Bun passes it through unmodified) makes the
- * peer hop genuinely uncompressed; {@link PROXIED_RESPONSE_HEADERS} not carrying the peer's
- * `content-encoding` is the belt to this braces. The ETag is unaffected either way — it is hashed over
- * the pre-gzip body (`bridge/http-cache.ts`) — so what this costs is one tailnet hop's compression,
- * and what it buys is a header that describes the bytes.
+ * Bun leaves `content-encoding: gzip` and the packed `content-length` on the bytes it has already
+ * inflated. Before 0.32.0-beta.9 the lead re-emitted that header over plain bytes and every member pane
+ * rendered "(no recent output)", so {@link PROXIED_RESPONSE_HEADERS} carries neither.
+ * The ETag is unaffected either way: it is hashed over the pre-gzip body (`bridge/http-cache.ts`).
  *
  * `X-Crew-Device` is added here rather than on the client because it is a property of the PHONE's
  * request — the operator's device as the lead's own `deviceAuth()` resolved it (§12) — and the sweep
@@ -551,7 +576,7 @@ export function forwardHeaders(req: Request, device?: string | null): Headers {
   if (device !== null && device !== undefined && device !== "") {
     headers.set(DEVICE_HEADER, encodeDeviceHeader(device));
   }
-  headers.set("accept-encoding", "identity");
+  // No `accept-encoding` here: the dial sets it for every call (gzip, inflated by the runtime).
   return headers;
 }
 
@@ -559,8 +584,8 @@ export function forwardHeaders(req: Request, device?: string | null): Headers {
  * Response headers a proxied answer keeps. Everything else is the peer's business, not the phone's.
  *
  * **The peer's `content-encoding` is NOT on this list, because it describes the peer hop and not this
- * one.** By the time a peer's response is in hand the lead holds identity bytes — the hop asked for
- * identity, and anything the runtime compressed anyway it has already decompressed (see
+ * one.** By the time a peer's response is in hand the lead holds identity bytes: the dial inflated a
+ * gzip answer itself and dropped the member's `content-encoding` and `content-length` (see
  * {@link forwardHeaders}). Copying that header would describe bytes that no longer exist.
  *
  * Compression is not given up, it is **re-decided per hop** (.adr/0023): {@link proxiedResponse}
@@ -708,6 +733,7 @@ function withVersion(res: Response, version: string | null | undefined): Respons
 export function failureReason(failure: PeerFailure): RefusalReason {
   if (failure.state === "incompatible") return "member_incompatible";
   if (failure.state === "unreachable" && failure.attempted === false) return "link_refused";
+  if (failure.state === "unreachable" && failure.callerLeft === true) return "caller_left";
   if (failure.state === "unreachable" && failure.timedOut === true) return "link_timeout";
   return "link_lost";
 }
@@ -800,7 +826,7 @@ export type ForwardTransport = (
   link: CrewLink,
   route: string,
   params: CrewParams,
-  init: RequestInit,
+  init: CrewRequestInit,
   budgetMs?: number,
 ) => Promise<PeerOutcome<Response>>;
 
@@ -852,6 +878,11 @@ export interface ForwardDeps {
   readonly surfaceVersion?: number | null | undefined;
   /** Where a pane read that fails is logged ({@link MemberPaneReads}). Absent, nothing is logged. */
   readonly paneReads?: MemberPaneReads | undefined;
+  /**
+   * The lead's log, for an answer its own bounds cut off after the phone already had the status (a
+   * streamed body past its cap or silent past its idle limit). Absent, `console.log`.
+   */
+  readonly log?: ((line: string) => void) | undefined;
 }
 
 /**
@@ -874,16 +905,91 @@ export interface ForwardDeps {
  * mirror poll would then cost a full body. No
  * `content-length` is copied ({@link proxiedResponse}), so the new body is framed by its own length.
  */
-async function maskedAnswer(res: Response, answer: TextAnswer, mask: AnswerMask, memberId: string): Promise<Response> {
+/**
+ * `res` with its body watched: a body the lead's bounds cut off mid-stream (guarded-body.ts) calls `onCut`
+ * with the reason, so the audit line says the phone's `200` broke off, and the error goes on to the phone.
+ */
+function watchedBody(res: Response, onCut: (why: string) => void): Response {
+  if (res.body === null || res.body.locked) return res;
+  const reader = res.body.getReader();
+  const body = new ReadableStream<Uint8Array>(
+    {
+      async pull(controller) {
+        try {
+          const next = await reader.read();
+          if (next.done) controller.close();
+          else controller.enqueue(next.value);
+        } catch (err) {
+          onCut(err instanceof BodyRefused ? err.message : "the answer broke off");
+          controller.error(err);
+        }
+      },
+      cancel: (reason) => reader.cancel(reason),
+    },
+    { highWaterMark: 0 },
+  );
+  return new Response(body, { status: res.status, statusText: res.statusText, headers: res.headers });
+}
+
+// ── ONE LARGE MASKED READ AT A TIME (round 16) ──────────────────────────────────────────────────
+// Masking a 32 MB answer peaks at about 390 MB (the parse is about 12 times the text). The mask itself
+// is synchronous, so two masks never overlap; what piles up is the reads, each holding its text. So a
+// masked answer that passes LARGE_MASKED_BYTES takes the lead's one large-read slot before it reads on,
+// and keeps it until its mask is done. Ordinary answers (a screen, a diff, a file, most History pages)
+// stay below it and never wait. A read that waits does so inside its own deadline and the phone's signal.
+
+/** The size past which a masked answer needs the large-read slot: 4 MB, at most about 50 MB at its mask. */
+export const LARGE_MASKED_BYTES = 4 * 1024 * 1024;
+let largeReadTail: Promise<void> = Promise.resolve();
+
+/** Wait for the large-read slot. Its release, or null when `wait` ended first (the slot is then given on). */
+async function largeReadSlot(wait: AbortSignal): Promise<(() => void) | null> {
+  const ahead = largeReadTail;
+  const { promise, resolve: free } = Promise.withResolvers<void>();
+  largeReadTail = promise;
+  // Never before the read ahead is done, so a waiter that gives up never lets two large reads overlap.
+  const release = () => void ahead.then(free);
+  const gaveUp = new Promise<false>((resolve) => {
+    if (wait.aborted) resolve(false);
+    wait.addEventListener("abort", () => resolve(false), { once: true });
+  });
+  if (await Promise.race([ahead.then(() => true), gaveUp])) return release;
+  release();
+  return null;
+}
+
+async function maskedAnswer(res: Response, answer: TextAnswer, mask: AnswerMask, memberId: string, wait: AbortSignal): Promise<Response> {
   if (res.status < 200 || res.status >= 300 || res.status === 204 || res.body === null) return res;
-  let raw: string;
+  let release: (() => void) | null = null;
   try {
-    raw = await res.text();
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let raw = "";
+    let seen = 0;
+    for (let next = await reader.read(); !next.done; next = await reader.read()) {
+      seen += next.value.length;
+      raw += decoder.decode(next.value, { stream: true });
+      if (release !== null || seen <= LARGE_MASKED_BYTES) continue;
+      release = await largeReadSlot(wait);
+      if (release === null) {
+        await reader.cancel("the lead was reading another large answer").catch(() => undefined);
+        return forwardError("host_unreachable", `host ${memberId}: the answer did not end in time`, 503, { host: memberId });
+      }
+    }
+    raw += decoder.decode();
+    return maskedResponse(res, answer, mask, memberId, raw);
   } catch (err) {
     return forwardError("host_unreachable", `host ${memberId}: the answer broke off (${String(err)})`, 503, {
       host: memberId,
     });
+  } finally {
+    release?.();
   }
+}
+
+function maskedResponse(res: Response, answer: TextAnswer, mask: AnswerMask, memberId: string, raw: string): Response {
+  // The mask parses the answer, and a parse costs about 90 bytes per value: a body of tiny values is
+  // refused before it, as one the mask could not read.
   const masked = mask(answer, raw);
   if (masked === null) {
     return forwardError(
@@ -1146,7 +1252,14 @@ export async function forwardToPeer(req: Request, url: URL, deps: ForwardDeps): 
     if (kept === null) headers.delete("if-none-match");
     else headers.set("if-none-match", kept);
   }
-  const init: RequestInit & { duplex?: "half" } = { method: req.method, headers };
+  // The phone's own signal rides the dial: when the phone goes away, the member's read is aborted and its
+  // stream cancelled (review round 9). A write the member may have received still answers the phone
+  // `write_outcome_unknown`, the answer for any dial that ends before the member's headers.
+  const budget = budgetOf(kind, route);
+  // A large masked read waits its turn no later than its own whole deadline (`maskedAnswer`).
+  const maskWaitEnds = performance.now() + wholeDeadlineMs(budget);
+  const init: CrewRequestInit & { duplex?: "half" } = { method: req.method, headers, signal: req.signal };
+  if (!streamsToPhone(route)) init.bodyDeadlineMs = wholeDeadlineMs(budget);
   // The body is STREAMED, not buffered: an upload is up to 10 MB of multipart and the lead never
   // stores a copy of it (§13). Assigned, never conditionally spread: a bodyless method must carry
   // NEITHER key.
@@ -1167,7 +1280,7 @@ export async function forwardToPeer(req: Request, url: URL, deps: ForwardDeps): 
     route,
     forwardParams(url),
     init,
-    budgetOf(kind, route),
+    budget,
   );
   const action = forwardAuditAction(route, req.method);
   const paneId = forwardPaneId(route) ?? askPane;
@@ -1215,12 +1328,27 @@ export async function forwardToPeer(req: Request, url: URL, deps: ForwardDeps): 
   const memberRefusal = memberReason !== null && isRefusalReason(memberReason) ? { reason: memberReason, by: "member" as const } : undefined;
   record(`http ${outcome.value.status}`, memberRefusal);
   if (kind === "read" && paneId !== undefined) deps.paneReads?.record(deps.link.memberId, paneId, outcome.value.status, "the member answered it");
+  // A streamed answer the lead's bounds cut off later gets a second audit line that says so (V3).
+  const status = outcome.value.status;
   const answered =
     answer === null || deps.mask === undefined
-      ? outcome.value
-      : withSaltedTag(await maskedAnswer(outcome.value, answer, deps.mask, deps.link.memberId));
-  // The phone's own `accept-encoding` — never the peer's, which was pinned to `identity` on the way
-  // out. Compression is decided once per hop (.adr/0023).
+      ? watchedBody(outcome.value, (why) => {
+          const log = deps.log ?? ((line: string) => console.log(line));
+          // The phone left first: its signal aborted the dial, so the cut is the phone's doing, not the
+          // link's. Its own words, in the audit line and the log.
+          if (req.signal.aborted) {
+            record(`http ${String(status)}, caller left`, { reason: "caller_left", by: "lead" });
+            log(`[crew] ${deps.link.memberId}: the phone left before the answer to ${route} ended (http ${String(status)})`);
+            return;
+          }
+          // The phone already has the status and the headers; its read now ends in an error. Both lines
+          // say so: the audit line of an audited route, and the lead's log for every route.
+          record(`http ${String(status)}, body cut: ${why}`, memberRefusal);
+          log(`[crew] ${deps.link.memberId}: the answer to ${route} broke off after http ${String(status)}: ${why}`);
+        })
+      : withSaltedTag(await maskedAnswer(outcome.value, answer, deps.mask, deps.link.memberId, AbortSignal.any([req.signal, AbortSignal.timeout(Math.max(0, maskWaitEnds - performance.now()))])));
+  // The phone's own `accept-encoding`, never the member hop's, which the dial set and inflated itself.
+  // Compression is decided once per hop (ADR 0144 rule 10, ADR 0161).
   const proxied = proxiedResponse(answered, req.headers.get("accept-encoding"));
   // The member's refusal, marked as the member's; a refused write also names the member's version.
   if (memberRefusal !== undefined) proxied.headers.set(REFUSED_BY_HEADER, "member");

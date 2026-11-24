@@ -90,7 +90,7 @@ A file says which version it is. Write the lowest version that holds what the fi
 | --- | --- |
 | 1 | Colours in `light` and `dark`, and `fonts.ui`. |
 | 2 | Everything in version 1, and any of `surface`, `fonts.display` and `ansi`. |
-| 3 | Everything in version 2, and the optional tokens `pane-active`, `tab-active`, `find`. |
+| 3 | Everything in version 2, and the optional tokens `pane-active`, `tab-active`, `find`, `surface-recess`, `surface-paper`. |
 | 4 | Everything in version 3, the keys `character` and `glyphs`, and `surface.ground` as an object. |
 | 5 | Everything in version 4, and the key `characterMotion`. |
 
@@ -247,9 +247,11 @@ Each half, `light` and `dark`, takes any of these. A token that a half leaves ou
 
 | Token | What it colours | Collie, light | Collie, dark |
 | --- | --- | --- | --- |
-| `pane-active` | The frame of the active pane column on a large screen. A half that leaves it out takes the ink of the theme Collie. | `oklch(0.14 0 0)` | `oklch(0.985 0 0)` |
+| `pane-active` | The frame of the active pane column on a large screen, a 1px line. Your colour is the start, not the result: Collie mixes it into your background (70% your colour in light, 60% in dark), then moves its lightness until it has 3:1 against the recess, the page and the paper. A half that leaves it out starts from its own `control-on-foreground`. | `color-mix(in oklab, var(--control-on-foreground) 70%, var(--background))` | `color-mix(in oklab, var(--control-on-foreground) 60%, var(--background))` |
 | `tab-active` | The top edge of the open tab and the ring of the open pane, when the theme sets `tabs` to `folder`. A half that leaves it out takes its own text colour. | `oklch(0.14 0 0)` | `oklch(0.985 0 0)` |
 | `find` | The ground under a found or matched piece of text: a hit of Find in Chat, and the marked letters of the session filter. Give it an alpha, because it lies over the surface under the text and the text keeps its own colour. A half that leaves it out takes the amber of the theme Collie. | `oklch(0.879 0.169 91.605 / 0.7)` | `oklch(0.769 0.188 70.08 / 0.4)` |
+| `surface-recess` | On a large screen, the ground of the sidebar and the tab strip: one step below the page. A half that leaves it out takes the page, 0.05 darker. | `oklch(from var(--background) calc(l - 0.05) c h)` | `oklch(from var(--background) calc(l - 0.05) c h)` |
+| `surface-paper` | On a large screen, the ground of the pane you are working in: the lightest surface on the screen. A half that leaves it out takes, in light, the card 0.05 lighter, and in dark, the point halfway between the page and the card 0.05 lighter. | `oklch(from var(--card) min(1, calc(l + 0.05)) c h)` | `color-mix(in oklch, var(--background), oklch(from var(--card) calc(l + 0.05) c h))` |
 
 ## Shape and look
 

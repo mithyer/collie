@@ -1,10 +1,11 @@
 import { randomBytes } from "node:crypto";
-import { chmod, link, mkdir, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { chmod, link, lstat, mkdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 
 import type { JsonObject, JsonValue } from "../json.ts";
 import { asJsonBoolean, asJsonNumber, asJsonObject, asJsonString, parseJson } from "../../web/src/lib/json.ts";
 import { tricksStateDir, switchesPath } from "./paths.ts";
+import { holdStat, sameStat, statFactsOf, stillHolds, type StatFacts, type StatHeld } from "../stat-held.ts";
 
 // THE ON AND OFF SWITCH (M94 slice 01, version 3 since the approved copy). Bridge state, not a phone
 // preference, so two phones agree and an "off" trick does not run. One file,
@@ -468,6 +469,43 @@ export async function updateSwitches(stateDir: string, change: (switches: Switch
 }
 
 /**
+ * {@link updateSwitches} for a write that switches `id` on or approves it (the phone's switch, `collie trick on`, a
+ * version promoted, a proposal's yes, a carried trick): inside the lock the trick's folder must still be a real
+ * folder, or nothing is written and the answer is null. A remove (remove.ts) renames the folder under this same lock,
+ * so a switch on either lands first (and the remove then refuses a trick that is on) or finds the folder gone, and a
+ * removed trick is never left switched on with no folder (ADR 0168, B4).
+ */
+export async function updateSwitchesFor(stateDir: string, folder: string, change: (switches: Switches) => Switches | Promise<Switches>, now: () => number = Date.now): Promise<Switches | null> {
+  return await withSwitchLock(
+    stateDir,
+    async () => {
+      const st = await lstat(folder).catch(() => null);
+      if (st === null || !st.isDirectory()) return null;
+      const next = await change(parseSwitches(await readText(switchesPath(stateDir))).switches);
+      await writeSwitches(stateDir, next);
+      return next;
+    },
+    now,
+  );
+}
+
+/**
+ * The switch file as it is on disk now, for a writer that holds the lock and must not read a broken file as all off
+ * (remove.ts, approved.ts `forgetLeftovers`; ADR 0168, B1). A missing file is no trick on (`problem: null`). A file
+ * that cannot be read, reads empty or is not the shape answers EMPTY with its problem, and the caller refuses.
+ */
+export async function readSwitchesNow(stateDir: string): Promise<ParsedSwitches> {
+  let text: string;
+  try {
+    text = await readFile(switchesPath(stateDir), "utf8");
+  } catch (err) {
+    if (err instanceof Error && "code" in err && err.code === "ENOENT") return { switches: EMPTY, problem: null };
+    return { switches: EMPTY, problem: `switches.json cannot be read: ${err instanceof Error ? err.message : String(err)}` };
+  }
+  return parseSwitches(text);
+}
+
+/**
  * Hold the switch file's lock while `work` runs, and release it after, also when `work` throws. For a writer
  * that changes the trick folders and not the file (`collie trick update` swaps a folder), so a bridge's
  * approval or an add of the same id, which hold this lock, never see the folder half moved. A live holder is
@@ -486,7 +524,8 @@ export async function withSwitchLock<T>(stateDir: string, work: () => Promise<T>
 }
 
 /**
- * The bridge's reader: the switches behind a stat check, last read kept until the file moves.
+ * The bridge's reader: the switches behind a stat check, last read kept until the file moves, and read again
+ * while the file's modified time is within the racy window of the last read (stat-held.ts).
  *
  * Reads are TAKEN IN TURN. Two reads at once could cross: one stats the old file and is still reading it
  * when a write lands and a second read stats and reads the new one; the first then finishes last and keeps
@@ -494,30 +533,41 @@ export async function withSwitchLock<T>(stateDir: string, work: () => Promise<T>
  * (until the next write). The runner reads while an approval writes (an immediate start run after a yes),
  * so this is no longer a rare overlap. In turn, each read sees the file as it is when its turn comes.
  */
-export function createSwitchReader(stateDir: string, warn: (line: string) => void): () => Promise<Switches> {
+/** What the switch reader looks with: the clock of a read (the racy window) and the `stat`, for a test. */
+export interface SwitchLook {
+  now?: () => number;
+  stat?: (path: string) => Promise<{ size: number; mtimeMs: number; ino?: number; ctimeMs?: number }>;
+}
+
+export function createSwitchReader(stateDir: string, warn: (line: string) => void, look: SwitchLook = {}): () => Promise<Switches> {
   const path = switchesPath(stateDir);
-  let seen: string | undefined;
+  const now = look.now ?? Date.now;
+  const statOf = look.stat ?? stat;
+  // The stat of the last read (stat-held.ts), or "none" for a missing file, or undefined before the first read.
+  let seen: StatHeld | "none" | undefined;
   let current = EMPTY;
   let turn: Promise<unknown> = Promise.resolve();
   const read = async (): Promise<Switches> => {
-    let stamp: string;
+    const readAt = now();
+    let facts: StatFacts | null;
     try {
-      const st = await stat(path);
-      // The inode moves on every rename, so two writes in the same millisecond are still told apart.
-      stamp = `${String(st.mtimeMs)}:${String(st.ino)}:${String(st.size)}`;
+      // The inode moves on every rename, so two writes in the same millisecond are still told apart where the
+      // platform gives one; the racy window covers a rewrite within one timestamp tick everywhere.
+      facts = statFactsOf(await statOf(path));
     } catch {
-      stamp = "none";
+      facts = null;
     }
-    if (stamp === seen) return current;
-    if (stamp === "none") {
-      seen = stamp;
+    if (facts === null) {
+      seen = "none";
       current = EMPTY;
       return current;
     }
+    if (seen !== "none" && stillHolds(seen, facts)) return current;
     const { switches, problem } = parseSwitches(await readText(path));
-    if (problem !== null) warn(problem);
+    // A re-read of the same write (in the racy window) says a problem once, not on every look.
+    if (problem !== null && !(seen !== "none" && sameStat(seen, facts))) warn(problem);
     // Kept only after the read went through: a read that throws leaves the last good answer and asks again.
-    seen = stamp;
+    seen = holdStat(facts, readAt, { path, kind: "the switch file", warn });
     current = switches;
     return current;
   };

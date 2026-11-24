@@ -62,7 +62,7 @@ import {
   type RowReducer,
 } from "./reduce.ts";
 import { RENAME_TITLE_MAX, shortLine } from "../mux/durable/clean.ts";
-import { containedRealpath, exists, head, loadTail, readSinceFile, rootList, statFile } from "./files.ts";
+import { containedRealpath, firstContained, head, loadTail, readSinceFile, rootList, statFile } from "./files.ts";
 import { isBlobHash, resolveImage, type InlineImage } from "./pi.ts";
 import { clamp, MAX_RESULT_CHARS, MAX_TEXT_CHARS, oneLine, stripAnsi, summarizeToolInput } from "./text.ts";
 import { parseUnifiedDiff } from "./diff.ts";
@@ -76,6 +76,7 @@ import type {
   TranscriptPart,
   TranscriptSource,
 } from "./types.ts";
+import { museAttachCarriesSend } from "../../web/src/lib/harness/muse/attach.ts";
 
 /** Muse names sessions with the same canonical uuid shape Claude and Codex do. */
 const SESSION_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -843,7 +844,8 @@ export function createMuseReducer(): RowReducer {
  * and resolving a pane to one would show the operator somebody else's turn as their own.
  */
 export class MuseTranscriptSource implements TranscriptSource {
-  private readonly pathCache = new Map<string, string>();
+  // The root must travel with the cached path so cache hits re-check per-root symlink containment.
+  private readonly pathCache = new Map<string, { path: string; root: string }>();
 
   private readonly roots: string[];
 
@@ -856,7 +858,8 @@ export class MuseTranscriptSource implements TranscriptSource {
     const sessionId = ref.value.toLowerCase();
     const cached = this.pathCache.get(sessionId);
     if (cached !== undefined) {
-      if (await exists(cached)) return cached;
+      const real = await containedRealpath(cached.path, cached.root);
+      if (real !== null) return real;
       this.pathCache.delete(sessionId);
     }
 
@@ -865,31 +868,19 @@ export class MuseTranscriptSource implements TranscriptSource {
       // A hit that failed containment is `null` too — that root has nothing it may serve for this
       // uuid either way, and the next root is asked on its own terms (files.ts header).
       if (hit === null) continue;
-      this.pathCache.set(sessionId, hit);
+      this.pathCache.set(sessionId, { path: hit, root });
       return hit;
     }
     return null;
   }
 
-  /** Newest first at every level: a session being read is almost always today's. */
-  private async findUnder(root: string, sessionId: string): Promise<string | null> {
-    for (const year of await descending(root)) {
-      for (const month of await descending(join(root, year))) {
-        for (const day of await descending(join(root, year, month))) {
-          const dir = join(root, year, month, day);
-          let names: string[];
-          try {
-            names = await readdir(dir);
-          } catch {
-            continue;
-          }
-          const hit = names.find((n) => n.toLowerCase() === sessionId);
-          if (hit === undefined) continue;
-          return containedRealpath(join(dir, hit, "session.jsonl"), root);
-        }
-      }
-    }
-    return null;
+  /**
+   * Newest first at every level: a session being read is almost always today's. A refused log is
+   * skipped for the next folder of the same id, also into older days (#839, see {@link
+   * firstContained}).
+   */
+  private findUnder(root: string, sessionId: string): Promise<string | null> {
+    return firstContained(sessionLogsUnder(root, sessionId), root);
   }
 
   /**
@@ -984,6 +975,24 @@ const MAX_DISCOVER_CANDIDATES = 2000;
 /** Most candidates a discovery walk head-reads. The walk is newest-first, so a live session is
  *  almost always within the first few; past this the answer is "no session", not a slow one. */
 const MAX_DISCOVER_READS = 200;
+
+/**
+ * The `session.jsonl` of every folder named `sessionId` (any case) under `root`, in the order {@link
+ * MuseTranscriptSource} tries them: newest day first, and inside a day the larger name first (two
+ * spellings of one id on a case-sensitive disk). Lazy; an unreadable folder is passed over.
+ */
+async function* sessionLogsUnder(root: string, sessionId: string): AsyncGenerator<string> {
+  for (const year of await descending(root)) {
+    for (const month of await descending(join(root, year))) {
+      for (const day of await descending(join(root, year, month))) {
+        const dir = join(root, year, month, day);
+        for (const hit of (await descending(dir)).filter((n) => n.toLowerCase() === sessionId)) {
+          yield join(dir, hit, "session.jsonl");
+        }
+      }
+    }
+  }
+}
 
 /** Directory entries, newest-name first. Empty when the directory doesn't exist. */
 async function descending(dir: string): Promise<string[]> {
@@ -1186,5 +1195,8 @@ export function museJournal(roots: string | readonly string[]): JournalAdapter {
     sharedFolderBlind: true,
     // The `run/inbox_item_queued` and `inbox_item_drained` rows are the queue: the cards come from them (ADR 0122).
     recordsQueue: true,
+    // Muse writes an attached picture as `[Image #N]`, N in attach order, in the prompt (see the user turn
+    // above); its attach grammar maps the chips back to the sent paths. Only a text with a chip is asked.
+    spellsSend: (sent, written) => written.includes("[Image #") && museAttachCarriesSend(sent, written),
   };
 }

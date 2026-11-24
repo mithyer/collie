@@ -32,6 +32,7 @@ import durableWire from "../docs/durable-wire.md" with { type: "text" };
 import fiveMinuteInstall from "../docs/five-minute-install.md" with { type: "text" };
 import hill from "../docs/hill.md" with { type: "text" };
 import install from "../docs/install.md" with { type: "text" };
+import keyboardShortcuts from "../docs/keyboard-shortcuts.md" with { type: "text" };
 import multiplexers from "../docs/multiplexers.md" with { type: "text" };
 import security from "../docs/security.md" with { type: "text" };
 import sessions from "../docs/sessions.md" with { type: "text" };
@@ -113,6 +114,11 @@ export const DOC_PAGES: readonly DocPage[] = [
     text: configure,
   },
   {
+    name: "keyboard-shortcuts",
+    purpose: "Drive Collie from a keyboard: the prefix, every action and its keys, and shortcuts.toml",
+    text: keyboardShortcuts,
+  },
+  {
     name: "commands",
     purpose: "Every verb, putting `collie` on your PATH, and the Herdr actions that mirror them",
     text: commands,
@@ -164,7 +170,7 @@ export const DOC_PAGES: readonly DocPage[] = [
   },
   {
     name: "multiplexers",
-    purpose: "Pointing Collie at Herdr, tern, tmux, zellij or tuios, and what each terminal can answer",
+    purpose: "Pointing Collie at Herdr, the Herdr core, tern, tmux, zellij, tuios or rex, and what each terminal can answer",
     text: multiplexers,
   },
   {

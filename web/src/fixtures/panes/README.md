@@ -2580,6 +2580,7 @@ whole paste folds to `[Pasted ~N lines]`, N the lines, on both versions.
 | `oc--v226-fresh-idle.txt` | Home screen: the recent-session row, the logo, the empty box with its `Ask anything… "…"` placeholder, the model row, the rule, then the cwd row with `shift+tab agents  ctrl+p commands`, and `2.2.6` alone at the foot | not read |
 | `oc--v226-narrow--fresh-idle.txt` | The same at 50 columns: the placeholder is cut at the box's edge, the cwd row shortens to `/…/collie-…` | not read |
 | `oc--v226-session-idle.txt` | After one turn: the transcript, then an empty box whose prompt row is bare (no placeholder in a session), the model row, the rule, the cwd and token row | not read |
+| `oc--v232-herdr--esc-again.txt` | opencode 2.3.2 over Herdr 0.9.5, 57 columns, 2026-11-20: a turn running after ONE Escape. The status row under the box reads `esc again to interrupt` until a second Escape or about 5 s pass; the turn still runs | `working` |
 | `oc--v226-slash-palette.txt` | `/` typed: ten list rows over the top edge, the fill on `/agents` | not read |
 | `oc--v226-narrow--slash-palette.txt` | The same at 50 columns, descriptions cut before the closing `┃` | not read |
 | `oc--v226-slash-comp.txt` | `/comp` typed on the home screen: one row, `/review`, with the fill. No session, so no `/compact`; Enter would run `/review` | not read |
@@ -3504,7 +3505,7 @@ lab folder stands as OMP shortened it (`…-running-turn/state/harness/omp/proje
 
 ## A stale bottom frame below the live editor (captured 2026-10-25, OMP 18.6.1 under Herdr, 120 columns)
 
-One screen of Altan's own OMP pane on the dev lane, read through Herdr's pane read with its SGR bytes
+One screen of Robin's own OMP pane on the dev lane, read through Herdr's pane read with its SGR bytes
 (`~/.cache/collie-lab/omp-gang/09-stale-frame/w78p5-stale-frame.ansi`). The file is byte-faithful in
 layout, not in content: every row, column, SGR sequence and frame character is as captured, and the
 conversation text, the project names and the folder in the status row are replaced with neutral text

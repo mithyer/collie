@@ -4,9 +4,11 @@ import type { MouseEvent as ReactMouseEvent } from "react";
 import { useRevalidator } from "react-router";
 import { useReadingReleasesKeyboard } from "@/hooks/use-reading-releases-keyboard";
 import { useKeyboardOpen } from "@/hooks/use-keyboard";
+import { useWidthClass } from "@/hooks/use-width-class";
 import { useSheetPull } from "@/hooks/use-sheet-pull";
 import { usePaneNavigation } from "@/components/pane-nav";
 import { besideOf, useNewTabOrSheet } from "@/hooks/use-new-tab-or-sheet";
+import { useShortcutHandler } from "@/hooks/use-shortcut-handler";
 import { tabCreateKey, useSpaceActions } from "@/hooks/use-spaces";
 import { isQuestion, shownStatus } from "@/lib/triage";
 import { useNav } from "@/hooks/use-nav";
@@ -45,6 +47,7 @@ import { setStripsCollapsed, useStripsCollapsed } from "@/lib/strips-collapsed";
 import { ChatMessageList, TailRoomContext, type ChatMessageListHandle } from "@/components/ui/chat/chat-message-list";
 import { StretchTextContext } from "@/components/markdown-text";
 import { FabButton } from "@/components/ui/fab";
+import { FOCUS_RING, FOCUS_RING_INSET, HOVER_FILL, TRIGGER_OPEN } from "@/components/ui/button";
 import { Notice } from "@/components/ui/notice";
 import { BottomSheet, SHEET_BODY_STICKY } from "@/components/ui/sheet";
 import { DisplayPrefsContent } from "@/components/display-prefs";
@@ -61,6 +64,7 @@ import { SessionTrickCards, useSessionProposalWaiting } from "@/components/sessi
 import { HookHoldCard } from "@/components/hook-hold-card";
 import { MIRROR_SPACE, MIRROR_INVERT, MUSE_MIRROR, segmentStyle } from "@/components/mirror-space";
 import { AgentsFooter } from "@/components/agents-footer";
+import { shortcutTarget } from "@/lib/shortcuts/target";
 import { cn } from "@/lib/utils";
 import { parseAnsi } from "@/lib/ansi";
 import { splitLines } from "@/lib/blocks";
@@ -88,7 +92,7 @@ import { useAgentViewPane } from "@/hooks/use-agent-view-pane";
 import { useTrickHandlers } from "@/hooks/use-trick-handlers";
 import { DurableComposer } from "@/components/durable-composer";
 import { ThreadSidebar } from "@/components/agent-sidebar";
-import { AgentIcon } from "@/components/agent-icon";
+import { AgentTile } from "@/components/agent-tile";
 import { TabStrip } from "@/components/tab-strip";
 import { PaneStrip } from "@/components/pane-strip";
 import { StripsSummary } from "@/components/strips-summary";
@@ -96,7 +100,8 @@ import { PaneMeta } from "@/components/pane-meta";
 import { BranchLabel } from "@/components/ui/branch-label";
 import { paneGitHead } from "@/lib/git-head";
 import { CacheSheet } from "@/components/cache-sheet";
-import { PaneActionsSheet } from "@/components/pane-actions-sheet";
+import { PaneActionsSheet, togglePanePin } from "@/components/pane-actions-sheet";
+import { openActionsPalette, useActionsPaletteOpen } from "@/lib/actions-palette/state";
 import { CardWaitingCtx } from "@/components/chat-cards";
 import { chatStatusKey, SavedCopyRow, SessionStream, sharedFolderLine, type QueuedCardAction, type QueuedCardResult } from "@/components/session-stream";
 import { readingRefusal } from "@/components/send-notice";
@@ -160,7 +165,7 @@ import { openReport, signalTrouble, unreadDialogReport } from "@/lib/report/stor
 import { unreadDialogScreen } from "@/lib/report/screen";
 import { answerRouteFor, cardsOnOlderMember, holdAnswerRouteFor, textRouteFor } from "@/lib/send-path";
 import { useSessionCard, wearsExperimental } from "@/lib/session-cards";
-import { usePins } from "@/lib/pins";
+import { pinMatcher, usePins } from "@/lib/pins";
 import { paneFilesDir } from "@/lib/file-paths";
 import { changeLoginPath, changesPath, filesPath, historyPath, trickSessionPath, newPath, panePath, spacePath } from "@/lib/nav";
 import { beltMarksOf, beltTapHandlers } from "@/components/belt-trick-mark";
@@ -489,6 +494,10 @@ export function AgentChat({
   // Whether the pane's own multiplexer can rename it: gates the Rename row in Pane settings, the way
   // the ⋮ sheet gates its own (components/pane-actions-sheet.tsx asks the same question).
   const canRenamePane = useMuxCapability("renamePane", { host: agent?.host, session: scope?.session });
+  // …and close it, for the Actions palette's Close pane, which opens the ⋮ sheet on that row (ADR 0165).
+  const canClosePane = useMuxCapability("closePane", { host: agent?.host, session: scope?.session });
+  // Whether this machine opens a tab by hand, for the palette's New shell (the tab bar "+" asks the same).
+  const canCreateTab = useMuxCapability("createTab", scope);
   /**
    * The ONE reason this pane currently refuses a write, or undefined when it accepts them. Every
    * write handler below starts with it, so there is a single place that decides both which gates
@@ -515,6 +524,18 @@ export function AgentChat({
     setDrawer(null);
     setPull(0);
   };
+  // The ⋮ button, when a tap on it opened the pane menu: on a wide window the menu then stands beside it
+  // (ui/sheet.tsx `anchor`). Null for every other door (the name tap, a shortcut), which keeps the dialog.
+  const paneMenuFrom = useRef<HTMLElement | null>(null);
+  // The ⋮ button itself, for the Pane menu action (`prefix+m`): it opens the menu beside this button, as a tap does.
+  const paneMenuButton = useRef<HTMLButtonElement | null>(null);
+  // The menu was opened by the key: its first row takes the focus, so Up, Down and Enter work at once.
+  const [paneMenuByKey, setPaneMenuByKey] = useState(false);
+  useEffect(() => {
+    if (drawer === "paneMenu") return;
+    paneMenuFrom.current = null;
+    setPaneMenuByKey(false);
+  }, [drawer]);
   // The walky talky message the Messages sheet opens on: a tapped Chat card, or an id chip. The pane menu's
   // own row clears it, so that way in shows the list from the top.
   const [walkyFocus, setWalkyFocus] = useState<string | null>(null);
@@ -547,8 +568,13 @@ export function AgentChat({
   // flag and not a drawer value, because the drawer is which sheet and this is how it opens. It
   // lasts until the ⋮ sheet is no longer the open one, so a later ⋮ tap opens the list as ever.
   const [renameOnOpen, setRenameOnOpen] = useState(false);
+  // The Actions palette's Close pane opens the ⋮ sheet with its Close row armed (ADR 0165), by the same
+  // kind of flag, for the same reason, and for as long.
+  const [armCloseOnOpen, setArmCloseOnOpen] = useState(false);
   useEffect(() => {
-    if (drawer !== "paneMenu") setRenameOnOpen(false);
+    if (drawer === "paneMenu") return;
+    setRenameOnOpen(false);
+    setArmCloseOnOpen(false);
   }, [drawer]);
 
   // ── ZEN MODE — chrome-free, mirror-only viewing ───────────────────────────────
@@ -756,16 +782,23 @@ export function AgentChat({
   // pane you are in, and the pane on screen already shows its own state.
   const hereKey = agent ? paneRowKey(agent) : null;
   const elsewhereNeedsYou = agents.some((a) => shownStatus(a) === "blocked" && paneRowKey(a) !== hereKey);
-  // On a large screen's strip the sidebar beside it is the switcher, so the pill would be a second one.
-  const pullHandle =
-    !inStrip && (agents.length + shellPanes.length > 0 || launchers.length > 0)
-      ? {
-          ref: sheetPull.ref,
-          onClick: () => setDrawer("switcher"),
-          label: t(elsewhereNeedsYou ? "chat.switcher.ariaNeedsYou" : "chat.switcher.aria"),
-          alert: elsewhereNeedsYou,
-        }
-      : undefined;
+  // The Actions button is pinned on every width class. On a large screen's strip the sidebar beside it is
+  // the switcher, so there the belt is not a drag surface (no `ref`) and `pullHandle` is only the button;
+  // `switcherReachable` keeps the drag, the pane-nav handle and the `switch_pane` shortcut a phone-only thing.
+  const paletteOpen = useActionsPaletteOpen();
+  const hasSomewhereToGo = agents.length + shellPanes.length > 0 || launchers.length > 0;
+  const switcherReachable = !inStrip && hasSomewhereToGo;
+  const pullHandle = hasSomewhereToGo
+    ? {
+        ref: inStrip ? undefined : sheetPull.ref,
+        // The pill opens the Actions palette (ADR 0165); the drag up on the belt, and the pane-nav handle's,
+        // still bring up the Switch pane sheet.
+        onClick: openActionsPalette,
+        label: t(elsewhereNeedsYou ? "actions.open.ariaNeedsYou" : "actions.open.aria"),
+        alert: elsewhereNeedsYou,
+        open: paletteOpen,
+      }
+    : undefined;
   // ── PANE NAVIGATION BY GESTURE (M70 spec 03, ADR 0121) ────────────────────────
   // Two fingers (the default): hold one finger still on the reading area, then swipe a second finger.
   // Joystick: hold the handle above the belt, then steer with the same finger. Off: neither. The axes
@@ -784,7 +817,7 @@ export function AgentChat({
     scope,
     // A quick drag up on the handle is the Switch pill's drag: the switcher sheet, where there is one.
     onSwitcher:
-      pullHandle === undefined
+      !switcherReachable
         ? undefined
         : () => {
             buzz();
@@ -927,6 +960,12 @@ export function AgentChat({
   // the inside of the folder and the mirror's rule stays as its floor.
   const tabLook = useTabLook();
   const folderJoins = tabLook === "folder" && stripsExist && !zen && !folded;
+  // THE PHONE'S ROWS (ADR 0171): at the compact width the tab row and the pane row are drawn at the 44px tap floor,
+  // and the space's door is the tab row's first cell, so the pane's name in the header is one 60px target. Only
+  // while the tab row is on screen: folded, in zen or with no row, the door stays the header's second line.
+  const widthClass = useWidthClass();
+  const phoneRows = !inStrip && widthClass === "compact";
+  const doorInRow = phoneRows && stripsExist && !zen && !folded && agent != null;
   // Fold state for the "Switch pane" sheet's two long tails, shared with the dashboard so one
   // "hide the long tail" preference means the same thing in both places.
   const dash = useDashPrefs();
@@ -999,7 +1038,7 @@ export function AgentChat({
       grammarsOn ? adapterFor(agent?.agent)?.extractStatusLines(splitLines(parseAnsi(display))) ?? [] : [],
     [display, agent?.agent, grammarsOn],
   );
-  // Settings → Harness configurations: whether this device draws the lifted status line, and for
+  // Settings → Chat and terminal: whether this device draws the lifted status line, and for
   // Claude Code the background-agents block under it, for THIS pane's harness (lib/harness-prefs.ts).
   // Keyed by the same exact agent string `adapterFor` takes. Only the DRAWING is gated: the parses
   // above still run and the Terminal body still shows the real rows, which is why the strip's
@@ -2367,6 +2406,72 @@ export function AgentChat({
     composerRef.current?.focusInput();
   }
 
+  // ── The keyboard (M108): each shortcut calls the act a control of this pane already makes ─────────
+  // Offered only where that control is drawn. Zen's way in is the pane menu's row (and a floating way
+  // out), the switcher is the pull handle (the strip's sidebar stands in for it), find is withheld in
+  // Chat, and the Chat/Terminal choice is withdrawn on a pane with no screen.
+  useShortcutHandler("zen_mode", zen ? () => setZen(false) : zenAvailable && display ? enterZen : undefined);
+  useShortcutHandler("switch_pane", !switcherReachable ? undefined : () => setDrawer("switcher"));
+  useShortcutHandler("find", display && !chatShown && !agentView.showing ? openFind : undefined);
+  useShortcutHandler("toggle_chat_terminal", gridless ? undefined : () => paneViewChange(chatShown ? "terminal" : "chat"));
+  useShortcutHandler("focus_composer", () => composerRef.current?.focusInput());
+
+  // ── The Actions palette's commands (ADR 0165): each runs what the pane menu's row, or the belt's
+  // control, already runs, and is offered on exactly the terms that row is drawn on.
+  const paneWrites = agent !== undefined && !readOnly && !savedCopyWrites && hostBlock === undefined;
+  useShortcutHandler("copy_output", display && canCopyOutput ? () => void copyOutput() : undefined);
+  useShortcutHandler("conversation_history", !gridless && historyAvailable ? () => nav.down(historyPath(paneId, scope)) : undefined);
+  useShortcutHandler(
+    "walky_messages",
+    messagesSheet
+      ? () => {
+          setWalkyFocus(null);
+          setDrawer("messages");
+        }
+      : undefined,
+  );
+  useShortcutHandler("pane_settings", gridless && !programReceipts ? undefined : () => setDrawer("paneSettings"));
+  // The Pane menu is the ⋮ button's menu, so it is offered where that button is drawn (a pane that is there, and not in zen, which takes the header off).
+  useShortcutHandler(
+    "pane_menu",
+    agent !== undefined && !zen
+      ? () => {
+          paneMenuFrom.current = paneMenuButton.current;
+          setPaneMenuByKey(true);
+          setDrawer("paneMenu");
+        }
+      : undefined,
+  );
+  useShortcutHandler("pin_pane", agent !== undefined && !gridless ? () => togglePanePin({ pane: agent, pinned: pinMatcher(pins)(agent), herd }) : undefined);
+  useShortcutHandler(
+    "rename_pane",
+    paneWrites && canRenamePane.capable
+      ? () => {
+          setRenameOnOpen(true);
+          setDrawer("paneMenu");
+        }
+      : undefined,
+  );
+  useShortcutHandler(
+    "close_pane",
+    paneWrites && canClosePane.capable
+      ? () => {
+          setArmCloseOnOpen(true);
+          setDrawer("paneMenu");
+        }
+      : undefined,
+  );
+  useShortcutHandler("open_files", agent?.cwd ? () => nav.down(filesEntryPath) : undefined);
+  // New shell is the tab bar "+"'s plain create, a shell in a new tab of this space ("Just a shell").
+  useShortcutHandler(
+    "new_shell",
+    agent !== undefined && !gridless && canCreateTab.capable && !creatingTab.has(tabCreateKey(agent.workspaceId, scope))
+      ? () => void spaceActions.newTab(agent.workspaceId)
+      : undefined,
+  );
+  // New agent is the Switch pane sheet's New button: the New page, as the dashboard's.
+  useShortcutHandler("new_agent", newEntry.offered && rootData?.stale !== true ? newEntry.open : undefined);
+
   // A trick this session proposed (package I): Collie's own card, last in whichever body is on screen (Chat, the
   // mirror, or an agent view standing in for both), in that body's own scroll like a message (session-trick-card.tsx), never a band of its own. Opening its code brings
   // the fold's row to the top and stops the list following the tail, so the code grows below the row (the check is
@@ -2511,10 +2616,23 @@ export function AgentChat({
             <div className="flex items-stretch gap-2 pr-3">
               {agent ? (
                 <button
+                  ref={paneMenuButton}
                   type="button"
-                  onClick={() => setDrawer("paneMenu")}
+                  onClick={(e) => {
+                    paneMenuFrom.current = e.currentTarget;
+                    setDrawer("paneMenu");
+                  }}
+                  {...shortcutTarget("pane_menu")}
                   aria-label={t("chat.paneMenu.aria")}
-                  className="grid w-11 min-h-11 shrink-0 place-items-center self-stretch rounded-md text-muted-foreground transition-colors active:bg-muted/60 active:text-foreground"
+                  aria-haspopup="dialog"
+                  // The menu opens beside this button on a wide window and over the page on a phone; the
+                  // button wears the shared open look while either is open (ui/button.tsx `TRIGGER_OPEN`).
+                  aria-expanded={drawer === "paneMenu"}
+                  className={cn(
+                    "grid w-11 min-h-11 shrink-0 place-items-center self-stretch rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-accent-foreground active:bg-muted/60 active:text-foreground",
+                    FOCUS_RING,
+                    TRIGGER_OPEN,
+                  )}
                 >
                   <Icon name="pane-menu" className="size-5" />
                 </button>
@@ -2577,14 +2695,18 @@ export function AgentChat({
                   bookkeeping, which the conversation list behind the back arrow already lays out. The lines
                   stay; the state is still named by the dot's own label. */}
               {!gridless && (
-              <div data-slot="pane-identity-taps" className="absolute inset-x-0 -inset-y-2 flex flex-col rounded-lg">
+              // In a large screen's column the docked row is 54px (app-header.tsx), so the layer reaches 4px past the
+              // block, not 8, and stays inside the header.
+              <div data-slot="pane-identity-taps" className={cn("absolute inset-x-0 flex flex-col rounded-lg", inStrip ? "-inset-y-1" : "-inset-y-2")}>
                 <button
                   type="button"
                   onClick={() => setDrawer("paneSettings")}
                   aria-label={t("chat.header.openPaneSettingsAria", { name })}
                   data-slot="pane-identity-name"
-                  className="min-h-0 flex-1 rounded-t-lg transition-colors active:bg-muted/60"
+                  className={cn("min-h-0 flex-1 rounded-t-lg transition-colors active:bg-muted/60", doorInRow && "rounded-b-lg", FOCUS_RING_INSET, HOVER_FILL)}
                 />
+                {/* On the phone with the tab row shown the door to the space is that row's first cell, not this line. */}
+                {!doorInRow && (
                 <button
                   type="button"
                   onClick={() => openSpace(agent.workspaceId)}
@@ -2604,8 +2726,9 @@ export function AgentChat({
                   // so it is asserted mechanically in agent-chat.test.tsx. These slots are what that
                   // test reads; renaming one without updating it fails there rather than on a phone.
                   data-slot="pane-identity"
-                  className="min-h-0 flex-1 rounded-b-lg transition-colors active:bg-muted/60"
+                  className={cn("min-h-0 flex-1 rounded-b-lg transition-colors active:bg-muted/60", FOCUS_RING_INSET, HOVER_FILL)}
                 />
+                )}
               </div>
               )}
               {/* TWO lines with 4px between them — see the row's own note in app-header.tsx for why
@@ -2678,7 +2801,7 @@ export function AgentChat({
                         <span className="sr-only">{t("status.shellBadge")}</span>
                       </div>
                     ) : (
-                      <AgentIcon agent={agent.agent} className="size-4" glide="tile" />
+                      <AgentTile pane={agent} className="size-4" surface="ring-background" glide="tile" />
                     )}
                     {/* A shell pane has no agent status, so it gets no badge — the tile alone says
                         what it is, and the composer strip's "shell" says it in words. The dot IS
@@ -2745,19 +2868,22 @@ export function AgentChat({
                 <div className="flex h-3 min-w-0 items-baseline gap-2">
                   <span
                     data-slot="pane-place"
-                    className="min-w-0 shrink-[3] truncate text-[11px] leading-3 text-muted-foreground"
+                    // ONE SIZE FOR THE LINE (2026-11-21): in a large screen's column the place, the branch, the account,
+                    // the machine and the time are all 12px, and their glyphs are drawn at full strength (pane-meta.tsx).
+                    // The size goes first: tailwind-merge drops a line height that comes before a font size.
+                    className={cn(inStrip ? "text-xs" : "text-[11px]", "min-w-0 shrink-[3] truncate leading-3 text-muted-foreground")}
                   >
                     {/* In a strip the space header names the space, so the line keeps only the pane's own. */}
-                    {headerLine ?? (inStrip ? null : <CrossfadeText text={workspace} identity={paneSpaceKey(agent)} />)}
+                    {headerLine ?? (inStrip || doorInRow ? null : <CrossfadeText text={workspace} identity={paneSpaceKey(agent)} />)}
                   </span>
                   {/* The branch the pane's folder is on, after the workspace and in the same 12px
                       line box, so the 36px block above holds with or without it. The workspace gives
                       way first, then the branch, keeping its tail; the meta never does. */}
-                  {gitHead !== null && <BranchLabel head={gitHead} className="shrink leading-3 text-muted-foreground" />}
+                  {gitHead !== null && <BranchLabel head={gitHead} className={cn(inStrip && "text-xs", "shrink leading-3 text-muted-foreground")} />}
                   {/* The added account the session runs under (M101), a word after the branch. It stays whole
                       before the place and the branch give way. Nothing for a pane with none. */}
                   {agent.account !== undefined && (
-                    <span data-slot="pane-account" className="max-w-[35%] shrink-0 truncate text-[11px] leading-3 text-muted-foreground">
+                    <span data-slot="pane-account" className={cn(inStrip ? "text-xs" : "text-[11px]", "max-w-[35%] shrink-0 truncate leading-3 text-muted-foreground")}>
                       {agent.account.label}
                     </span>
                   )}
@@ -2765,6 +2891,7 @@ export function AgentChat({
                     host={agent.host}
                     cache={agent.cache}
                     onOpenCache={() => setCacheSheetOpen(true)}
+                    full={inStrip}
                     // The one descendant that takes its taps back from the surface under these lines.
                     className="pointer-events-auto ml-auto"
                   />
@@ -2836,6 +2963,7 @@ export function AgentChat({
               type="button"
               onClick={() => setZen(false)}
               aria-label={t("chat.zen.exitAria")}
+              {...shortcutTarget("zen_mode")}
               className="absolute right-3 top-3 z-20 grid size-11 place-items-center rounded-full border border-rule bg-chrome text-muted-foreground transition-colors active:bg-muted/60"
             >
               <Icon name="zen-exit" className="size-5" />
@@ -2926,7 +3054,8 @@ export function AgentChat({
               >
                 {/* `pb-1` — the 4px of page the open folder tab sits on, which lives HERE rather than
                     on the mirror so that it leaves with the tabs. See `mirrorGap` above. */}
-                <div className={tabLook === "folder" ? undefined : "pb-1"}>
+                {/* With the pane row on the phone, two 44px rows with their own air, the plain look's 4px is that row's. */}
+                <div className={tabLook === "folder" || (phoneRows && tabPanes.length > 1) ? undefined : "pb-1"}>
                 {/* In-pane tab bar: the current space's tabs above the mirror — switch tab without
                     leaving the pane, or create one with +. No "All" here (you're always in a
                     specific tab). */}
@@ -2957,6 +3086,26 @@ export function AgentChat({
                     // the space has nothing left to land on. Closing any other tab just revalidates so it
                     // drops out of the strip.
                     onClosed={(tabId) => (agent?.tabId === tabId ? closeCurrentTab(tabId) : revalidator.revalidate())}
+                    // THE SPACE'S DOOR, the row's first cell on the phone (ADR 0171): the space's name and a chevron,
+                    // 44px tall, where the header's second line used to be the way to the space overview. It keeps
+                    // that button's slot and its label, the space and the pane's state, for a screen reader.
+                    leading={
+                      doorInRow ? (
+                        <button
+                          type="button"
+                          data-slot="pane-identity"
+                          onClick={() => openSpace(agent.workspaceId)}
+                          aria-label={t("chat.header.openOverviewAria", {
+                            workspace: agent.workspaceLabel,
+                            status: t("chat.header.statusAria", { label: isShell ? t("status.shellBadge") : statusLabel(shownStatus(agent)) }),
+                          })}
+                          className={cn("-ml-2 flex h-11 max-w-[40%] shrink-0 items-center gap-1 rounded-md px-2 text-[12px] font-semibold text-foreground transition-colors", FOCUS_RING_INSET, "focus-visible:-outline-offset-4", HOVER_FILL)}
+                        >
+                          <span className="min-w-0 truncate">{agent.workspaceLabel}</span>
+                          <Icon name="row-go" className="size-3.5 shrink-0 text-muted-foreground" />
+                        </button>
+                      ) : undefined
+                    }
                     // The fold's own control, pinned to the row's trailing end where it costs no height:
                     // a 28px circle centred in the 30px tab row, its hit box the row itself and no
                     // lower (the way every tab's is: a reach below the row steals taps from the content). A transparent
@@ -2970,8 +3119,10 @@ export function AgentChat({
                         aria-expanded={true}
                         aria-label={t(foldLabelKey(stripTabs.length, tabPanes.length))}
                         className={cn(
-                          TAB_ROW_SQUARE_TAP_TARGET,
-                          "flex size-7 shrink-0 items-center justify-center rounded-full border border-transparent text-muted-foreground transition-colors hover:bg-accent active:scale-95",
+                          // The phone draws it at the 44px floor, the row's whole height; a wider window keeps the 28px circle.
+                          phoneRows ? "size-11 rounded-md" : cn(TAB_ROW_SQUARE_TAP_TARGET, "size-7 rounded-full"),
+                          "flex shrink-0 items-center justify-center border border-transparent text-muted-foreground transition-colors hover:bg-accent active:scale-95",
+                          FOCUS_RING,
                         )}
                       >
                         <Icon name="tab-fold" className="size-4" />
@@ -3988,7 +4139,9 @@ export function AgentChat({
         />
         <PaneActionsSheet
           open={drawer === "paneMenu"}
+          focusFirstRow={paneMenuByKey}
           onClose={closeDrawer}
+          anchor={paneMenuFrom}
           pane={agent ?? null}
           scope={scope}
           readOnly={readOnly}
@@ -4039,6 +4192,7 @@ export function AgentChat({
           // A durable conversation: the writes only, and Close names what it closes.
           conversation={gridless}
           openInRename={renameOnOpen}
+          armCloseOnOpen={armCloseOnOpen}
           // THE BODY SWITCH. `chatNote` is why this pane keeps the terminal when it does. One
           // standing per-device value, written here and nowhere else.
           // No Terminal row on a pane with no screen: Chat is its only view.

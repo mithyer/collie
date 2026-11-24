@@ -204,6 +204,7 @@ export const PHOSPHOR = {
   "notifications-snooze": "bell-z", // snooze notifications · lucide BellOff
   "offline": "wifi-slash", // the phone is offline · lucide WifiOff
   "ok": "check", // a calm tick in a notice: it went through · lucide Check
+  "open-actions": "list-magnifying-glass", // open the Actions palette (belt and header) · lucide TextSearch
   "open-beside": "columns", // open beside the current pane · lucide Columns2
   "open-external": "arrow-square-out", // open in another place · lucide ExternalLink
   "open-here": "swap", // open here · lucide Replace
@@ -313,6 +314,12 @@ export const PHOSPHOR = {
   "tool-search": "magnifying-glass", // a search tool call · lucide Search
   "tool-task": "robot", // a task or subagent tool call · lucide Bot
   "tour": "compass", // the guided tour · lucide Compass
+  "trick-fact-adds": "plus-square", // what a trick adds to the app, on its details page · lucide SquarePlus
+  "trick-fact-reads": "eye", // what a trick may read or do, on its details page · lucide Eye
+  "trick-fact-runs": "timer", // when a trick runs, on its details page · lucide Timer
+  "trick-fact-shows": "layout", // where a trick shows, on its details page · lucide PanelsTopLeft
+  "trick-fact-starts": "terminal-window", // what starts a trick's program, on its details page · lucide SquareTerminal
+  "trick-fact-tokens": "coins", // why a trick uses agent tokens, on its details page · lucide Coins
   "tricks": "puzzle-piece", // Collie tricks, the small add-ons a person switches on · lucide Puzzle
   "type-into-terminal": "terminal", // type into the terminal · lucide Terminal
   "typeface": "text-aa", // the typeface setting · lucide CaseSensitive
@@ -326,6 +333,8 @@ export const PHOSPHOR = {
   "user-turn": "user", // a turn or message by the person · lucide User
   "view-chat": "chats", // switch to the chat view · lucide MessagesSquare
   "view-diff": "git-diff", // show the diff view · lucide GitCompareArrows
+  "diff-split": "columns", // a diff side by side · lucide Columns2
+  "diff-unified": "rows", // a diff in one column · lucide Rows2
   "view-preview": "eye", // show the preview view · lucide Eye
   "view-source": "code", // show file source · lucide Code
   "view-terminal": "terminal-window", // switch to the terminal view · lucide SquareTerminal

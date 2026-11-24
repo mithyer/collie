@@ -1,5 +1,5 @@
 // The Report a problem sheet (ADR 0123). One sheet, four doors: the card after failed sends, the pane
-// menu's "Report a problem", Settings, System, and the unread-dialog card (amendment 2026-10-28). It
+// menu's "Report a problem", Settings, Updates and about, and the unread-dialog card (amendment 2026-10-28). It
 // shows every word the issue will hold before anything leaves, and it leaves only by the person's
 // taps: Open on GitHub (a plain link into their own browser and their own GitHub login, where GitHub's
 // form is the last check) or Copy report. Collie holds no GitHub token, the phone never calls GitHub,
@@ -215,6 +215,14 @@ export function ReportSheetView({ context, contextError, rows, episodes, fromSet
     window.open(link.url, "_blank", "noopener,noreferrer");
   }
 
+  // A link that fits opens as it always did, and the report goes to the clipboard on the same tap: the
+  // GitHub app opens the link with every field of the form empty, and the form then says the report is
+  // on the clipboard. The link holds the report, so a copy that fails stops nothing and says nothing.
+  function copyAlong(): void {
+    if (!canCopyText()) return;
+    copyText(reportText(full)).catch(() => {});
+  }
+
   return (
     <div data-slot="report-sheet" className="flex flex-col gap-3">
       {fromSettings && <p className="text-xs leading-snug text-muted-foreground">{t("report.sheet.fromSettings")}</p>}
@@ -288,7 +296,7 @@ export function ReportSheetView({ context, contextError, rows, episodes, fromSet
             href={link.url}
             target="_blank"
             rel="noopener noreferrer"
-            onClick={link.clipboard ? (event) => void openWithClipboard(event) : undefined}
+            onClick={link.clipboard ? (event) => void openWithClipboard(event) : copyAlong}
             className={cn(buttonVariants({ variant: "default" }), "h-11")}
           >
             <Icon name="open-external" className="size-4" />

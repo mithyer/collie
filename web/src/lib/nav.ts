@@ -7,9 +7,10 @@
 // The host stays in the QUERY, never in the path: a `/host/:h/pane/:paneId` shape would fork every
 // route, break every existing deep link, and force the loaders' isPaneUrl() to grow a parser.
 import { asJsonBoolean, asJsonNumber, asJsonObject, asJsonString, type JsonValue } from "./json";
-import { scopeFromSearchParams, scopeSearch, SESSION_PARAM, type Scope } from "./scope";
+import { internScope, scopeFromSearchParams, scopeKey, scopeSearch, SESSION_PARAM, type Scope } from "./scope";
 import type { AgentView } from "./types";
 import type { AgentLaunch } from "./agent-startup";
+import type { PageId } from "./settings/types";
 
 // The two Machines paths live in `machine-paths.ts` so the service worker can build them: this file
 // reads `window`, which a worker has no type for. Re-exported, so every caller still asks nav.ts.
@@ -278,18 +279,11 @@ export function readNewAt(search: string): NewAt {
 }
 
 /**
- * The Settings sections. Settings is an index of these, not a column of every card it has
- * (routes/settings-sections.tsx says why, and which card went where).
- *
- * A union rather than a bare string, so a row naming a section nobody built is a compile error
- * instead of a page that renders nothing.
- *
- * The fifth is the only one that can be absent from the index: Experiments renders while
- * `lib/experiments.ts` holds something; Tricks (M94) renders while the phone holds a tricks reply. Their
- * paths need nothing here — the two ladders below already read every `/settings/<x>` as a child of
- * the index.
+ * The Settings pages: the eleven of the registry (lib/settings/pages.ts, ADR 0170). Settings is an index of these,
+ * not a column of every card it has. A union rather than a bare string, so a row naming a page nobody built is a
+ * compile error instead of a page that renders nothing.
  */
-export type SettingsSection = "appearance" | "harnesses" | "accounts" | "device" | "voice" | "alerts" | "system" | "tricks" | "experiments";
+export type SettingsSection = PageId;
 
 /** One Settings section — a CHILD of the index, carrying the scope like every other path helper. */
 export function settingsSectionPath(section: SettingsSection, scope?: Scope): string {
@@ -320,6 +314,36 @@ export function accountPath(id: string, scope?: Scope): string {
   return `/settings/accounts/${encodeURIComponent(id)}${scopeSearch(scope)}`;
 }
 
+/**
+ * A trick's details page, below Settings → Tricks and the Hill: what the trick does, where it comes from, its code and its
+ * settings. The key is `<host>:<id>` for a trick on a machine, the same two parts its own page's id names
+ * (`trick:<host>:<id>`), and the bare `<id>` for an entry of this machine's official list that is not added
+ * yet. Neither a host nor a trick id holds a colon (lib/tricks/schema.ts `HOST`, `TRICK_ID`), so the key splits
+ * back. Encoded: the colon is written `%3A`, as a pane id's is. A CHILD of the list, and of the trick's own page
+ * it may be opened from. Carries the scope like the others.
+ */
+export function trickDetailPath(key: string, scope?: Scope): string {
+  return `/settings/tricks/${encodeURIComponent(key)}${scopeSearch(scope)}`;
+}
+
+/** The details page key of a trick on a machine: `<host>:<id>`. */
+export function trickDetailKey(host: string, id: string): string {
+  return `${host}:${id}`;
+}
+
+/** A details page key read back: the host and the id of a trick on a machine, or the id of an official entry. */
+export type TrickDetailAddress = { kind: "trick"; host: string; id: string } | { kind: "official"; id: string };
+
+/** Read a details page key (already decoded by the router). Undefined for a key of neither shape. */
+export function readTrickDetailKey(key: string): TrickDetailAddress | undefined {
+  const parts = key.split(":");
+  if (parts.length === 1 && parts[0] !== "") return { kind: "official", id: parts[0] ?? "" };
+  if (parts.length !== 2) return undefined;
+  const [host = "", id = ""] = parts;
+  if (host === "" || id === "") return undefined;
+  return { kind: "trick", host, id };
+}
+
 /** One account's Change login page, below the account's page (M101). */
 export function changeLoginPath(id: string, scope?: Scope): string {
   return `/settings/accounts/${encodeURIComponent(id)}/login${scopeSearch(scope)}`;
@@ -343,7 +367,7 @@ export function hillPath(scope?: Scope): string {
 
 /**
  * One card of Collie's own about a trick (M96 spec 14): a proposal, a new version, a trick's rights. Its own
- * page, with no Hill around it, so it works with the Hill off. Opened from Settings, Tricks and from the
+ * page, with no Hill around it, so it works with the Hill off. Opened from Settings, Tricks and the Hill and from the
  * Dashboard's line; Back steps back to either, else to the Dashboard. Carries the scope like the others.
  */
 export function trickCardPath(decisionId: string, scope?: Scope): string {
@@ -370,19 +394,24 @@ export const PAIRED_DEVICES_HASH = "paired-devices";
 export const TELEMETRY_SETTINGS_HASH = "install-count";
 
 /**
- * Settings → System → Telemetry: the page below System that holds the switch and its
- * explanation (the dashboard notice's button lands here). A CHILD of System, carrying the scope.
+ * Settings → Privacy and data → Telemetry: the page below Privacy and data that holds the switch and its
+ * explanation (the dashboard notice's button lands here). A CHILD of that page, carrying the scope.
  */
 export function installCountPath(scope?: Scope): string {
-  return `/settings/system/install-count${scopeSearch(scope)}`;
+  return `/settings/privacy/install-count${scopeSearch(scope)}`;
 }
 
 /**
- * Settings → Appearance → Character: the page below Appearance that lists the characters the header
- * can draw (ADR 0136, amended 2026-11-12). A CHILD of Appearance, carrying the scope.
+ * Settings → Look and feel → Character: the page below Look and feel that lists the characters the header
+ * can draw (ADR 0136, amended 2026-11-12). A CHILD of that page, carrying the scope.
  */
 export function characterPath(scope?: Scope): string {
-  return `/settings/appearance/character${scopeSearch(scope)}`;
+  return `/settings/look/character${scopeSearch(scope)}`;
+}
+
+/** Settings → Notifications → one machine's load alerts: the machine's own card, one level below Notifications. */
+export function machineLoadPath(id: string, scope?: Scope): string {
+  return `/settings/notifications/load/${encodeURIComponent(id)}${scopeSearch(scope)}`;
 }
 
 /** Where the dashboard notice's button opens the Telemetry card. */
@@ -394,22 +423,22 @@ export function telemetrySettingsPath(scope?: Scope): string {
 export const CHANGES_SETTINGS_HASH = "changes";
 
 /**
- * Settings → Device, scrolled to the Changes card: the Changes list's "look deeper" link (ADR 0065).
+ * Settings → Dashboard and projects, scrolled to the Changes card: the Changes list's "look deeper" link (ADR 0065).
  *
- * The fragment survived the split; the page under it did not. Both deep links name a SECTION now,
- * and they must, because a hash pointing at a card the index no longer mounts scrolls to nothing.
+ * The fragment survived both splits; the page under it did not. A deep link names a PAGE, and it must, because a
+ * hash pointing at a card the page does not mount scrolls to nothing.
  */
 export function changesSettingsPath(scope?: Scope): string {
-  return `${settingsSectionPath("device", scope)}#${CHANGES_SETTINGS_HASH}`;
+  return `${settingsSectionPath("dashboard", scope)}#${CHANGES_SETTINGS_HASH}`;
 }
 
-/** Settings → System, scrolled to the card that pairs this phone — the read-only strip's remedy. */
+/** Settings → Devices and machines, scrolled to the card that pairs this phone — the read-only strip's remedy. */
 export function pairedDevicesPath(scope?: Scope): string {
-  return `${settingsSectionPath("system", scope)}#${PAIRED_DEVICES_HASH}`;
+  return `${settingsSectionPath("devices", scope)}#${PAIRED_DEVICES_HASH}`;
 }
 
 /**
- * Where a `/settings` request with `?pair=` belongs: Settings → System, the query string intact, or
+ * Where a `/settings` request with `?pair=` belongs: Settings → Devices and machines, the query string intact, or
  * `null` when there is no code to carry.
  *
  * `collie pair` prints a QR for `/settings?pair=<code>`, and that URL outlives the page it named.
@@ -420,7 +449,7 @@ export function pairedDevicesPath(scope?: Scope): string {
  */
 export function pairLandingPath(search: string): string | null {
   if (!new URLSearchParams(search).has("pair")) return null;
-  return `/settings/system${search}`;
+  return `/settings/devices${search}`;
 }
 
 // ── Back goes up one level (ADR 0067) ────────────────────────────────────────────────────────────
@@ -511,10 +540,10 @@ const ANY_TRICK = "/trick/*";
  * Every pathname that may legitimately sit above `pathname` in the level tree, nearest first.
  *
  *   L0 `/`
- *   L1 `/space/:id`, `/settings`, `/crew`, `/hill`, `/new` (from the dashboard, a space or a pane)
+ *   L1 `/space/:id`, `/settings` (opened from the screen it was left, ADR 0163), `/crew`, `/hill`, `/new` (from the dashboard, a space or a pane)
  *   L1 `/trick/:id`, a trick session (M94 slice 03)
  *   L2 `/pane/:id`, `/new/add` (below the New page), `/space/:id/changes`, `/settings/:section`, `/settings/updates`, `/machines`
- *   L3 `/settings/accounts/add`, `/settings/accounts/:id`, `/settings/voice/host`, `/settings/voice/model`, `/settings/system/install-count`, `/settings/appearance/character`, `/pane/:id/history`, `/pane/:id/zoom`, `/pane/:id/changes` (a file view is the same path with `?repo=&path=`),
+ *   L3 `/settings/accounts/add`, `/settings/accounts/:id`, `/settings/tricks/:key` (also below `/trick/:id`), `/settings/voice/host`, `/settings/voice/model`, `/settings/system/install-count`, `/settings/appearance/character`, `/pane/:id/history`, `/pane/:id/zoom`, `/pane/:id/changes` (a file view is the same path with `?repo=&path=`),
  *      `/space/:id/changes/commit`, `/space/:id/changes/files` (a folder or a file of the tree, with
  *      `?dir=` or `?path=`)
  *   L4 `/pane/:id/changes/commit` (the commit's file view adds `&path=`), `/pane/:id/changes/files`,
@@ -551,12 +580,15 @@ export function ancestorsOf(pathname: string): string[] {
   // A trick session sits on the Dashboard (M94 slice 03). It is opened from a pane too (Switch session,
   // a belt mark), and a trick's own view may open another trick's session.
   if (head === "trick" && seg.length === 2) return ["/", ANY_PANE, ANY_TRICK];
-  if (head === "settings" && seg.length === 1) return ["/"];
+  // Settings is opened from the Dashboard's and a space's gear and from the large screen's sidebar, which
+  // stands beside a pane, and a person may arrive from Crew, the Hill, New or Conversations too. It goes
+  // back to whichever opened it (ADR 0163); a cold open has no entry behind and goes to the Dashboard.
+  if (head === "settings" && seg.length === 1) return ["/", ANY_SPACE, ANY_PANE, "/crew", "/hill", "/new", "/conversations"];
   // The hill is opened from the bottom bar's fixed Hill item (M96): down from the Dashboard, or sideways
   // from a trick's Session, where the bar stays too (amended 2026-11-10). A sideways move carries `from`,
   // so the Dashboard is its only parent either way.
   if (head === "hill" && seg.length === 1) return ["/"];
-  // A trick's card (M96 spec 14) is opened from Settings, Tricks and from the Dashboard's line.
+  // A trick's card (M96 spec 14) is opened from Settings, Tricks and the Hill and from the Dashboard's line.
   if (head === "trick-card" && seg.length === 2) return ["/", "/settings/tricks"];
   // The approver's page (ADR 0139) is opened from a QR, from outside the app: the Dashboard is its parent.
   if (head === "pair" && seg.length === 2 && id === "approve") return ["/"];
@@ -568,24 +600,28 @@ export function ancestorsOf(pathname: string): string[] {
   if (head === "new" && seg.length === 1) return ["/", ANY_SPACE, ANY_PANE];
   // "Add your own" is a level below the New page.
   if (head === "new" && seg.length === 2 && id === "add") return ["/new", "/", ANY_SPACE, ANY_PANE];
-  // Updates is the first row of the Settings index, so the index is its parent. `/settings/system`
-  // stays behind it: Updates sat in that section before, and a stored `from` pointing there is still
-  // a step UP, not a push. The crew census is opened from the System section.
-  if (head === "settings" && seg.length === 2 && id === "updates") {
-    return ["/settings", "/settings/system", "/"];
-  }
+  // Every Settings page, Updates and about included, is a child of the index (ADR 0170).
   if (head === "settings" && seg.length === 2) return ["/settings", "/"];
   // Host speech and the Whistle model sit one level below Voice.
   if (head === "settings" && seg.length === 3 && id === "voice" && (leaf === "host" || leaf === "model")) {
     return ["/settings/voice", "/settings", "/"];
   }
-  // The install count's page sits one level below System.
-  if (head === "settings" && seg.length === 3 && id === "system" && leaf === "install-count") {
-    return ["/settings/system", "/settings", "/"];
+  // The install count's page sits one level below Privacy and data.
+  if (head === "settings" && seg.length === 3 && id === "privacy" && leaf === "install-count") {
+    return ["/settings/privacy", "/settings", "/"];
   }
-  // The Character page sits one level below Appearance.
-  if (head === "settings" && seg.length === 3 && id === "appearance" && leaf === "character") {
-    return ["/settings/appearance", "/settings", "/"];
+  // The Character page sits one level below Look and feel.
+  if (head === "settings" && seg.length === 3 && id === "look" && leaf === "character") {
+    return ["/settings/look", "/settings", "/"];
+  }
+  // One machine's load alerts sit one level below Notifications.
+  if (head === "settings" && seg.length === 4 && id === "notifications" && leaf === "load") {
+    return ["/settings/notifications", "/settings", "/"];
+  }
+  // A trick's details page sits one level below Tricks. Its own page (`/trick/:id`, the header's details button)
+  // opens it too, so a step back onto that page is a step up and not a push.
+  if (head === "settings" && seg.length === 3 && id === "tricks") {
+    return ["/settings/tricks", ANY_TRICK, "/settings", "/"];
   }
   // The Add form and one account's page sit one level below Accounts.
   if (head === "settings" && seg.length === 3 && id === "accounts") {
@@ -596,13 +632,12 @@ export function ancestorsOf(pathname: string): string[] {
   if (head === "settings" && seg.length === 4 && id === "accounts" && seg[3] === "login") {
     return [`/settings/accounts/${leaf}`, ANY_PANE, "/settings/accounts", "/settings", "/"];
   }
-  if (head === "crew" && seg.length === 1) return ["/settings/system", "/settings", "/"];
-  // Machines is opened from the Settings index and from the crew card in System, so both are
-  // legitimate parents; its structural parent is Settings.
-  if (head === "machines" && seg.length === 1) return ["/settings/system", "/settings", "/"];
+  if (head === "crew" && seg.length === 1) return ["/settings/devices", "/settings", "/"];
+  // Machines is opened from Devices and machines, its structural parent.
+  if (head === "machines" && seg.length === 1) return ["/settings/devices", "/settings", "/"];
   // A machine goes up to Machines. The crew census opens one too (the member sheet's "Load and
   // alerts"), so a step back onto /crew is still a step UP and not a push.
-  if (head === "machines" && seg.length === 2) return ["/machines", "/crew", "/settings/system", "/settings", "/"];
+  if (head === "machines" && seg.length === 2) return ["/machines", "/crew", "/settings/devices", "/settings", "/"];
   return [];
 }
 
@@ -662,7 +697,7 @@ export function historyIdx(): number | undefined {
 /**
  * The back arrow, the Collie mark inside a level, and every automatic exit (a pane or a space that
  * closed under you). `fallback` is the structural parent, used when the entry behind us is not a
- * parent: a cold deep link, a Settings opened from a pane, an Updates page opened from the ribbon.
+ * parent: a cold deep link, an Updates page opened from the ribbon.
  *
  * `canGoBack` is false when the router sits on its first entry (`history.state.idx === 0`), which
  * a stale `from` could otherwise send out of the app.
@@ -683,13 +718,54 @@ export function upTarget(here: string, from: string | undefined, fallback: strin
   return pathOnly(fallback);
 }
 
+function searchOf(href: string): string {
+  const cut = href.search(/[?#]/);
+  return cut === -1 || href[cut] === "#" ? "" : href.slice(cut + 1).split("#")[0] ?? "";
+}
+
+function sameScope(a: string, b: string): boolean {
+  const sa = scopeFromSearchParams(new URLSearchParams(searchOf(a)));
+  const sb = scopeFromSearchParams(new URLSearchParams(searchOf(b)));
+  return scopeKey(sa) === scopeKey(sb);
+}
+
+/**
+ * The dashboard scope a route returns to on `nav.upTo(homePath(...))`. Most routes carry `?h=` /
+ * `?s=` in their own URL; `/new` and `/new/add` carry `?machine=` / `?s=` instead, and `/trick/*`
+ * carries neither so its caller's scope lives on `state.from`.
+ */
+export function resolveHomeScope(pathname: string, search: string, state?: JsonValue): Scope {
+  const urlScope = scopeFromSearchParams(new URLSearchParams(search));
+  const path = pathOnly(pathname);
+  if (path === "/new" || path === "/new/add") {
+    const at = readNewAt(search);
+    const host = urlScope.host ?? at.machine;
+    const session = urlScope.session ?? at.session;
+    if (host !== undefined || session !== undefined) return internScope({ host, session });
+  }
+  if (urlScope.host !== undefined || urlScope.session !== undefined) return internScope(urlScope);
+  if (path === "/new" || path === "/new/add" || path.startsWith("/trick/")) {
+    const from = readFrom(state);
+    if (from !== undefined) return internScope(scopeFromSearchParams(new URLSearchParams(searchOf(from))));
+  }
+  return internScope({});
+}
+
 /**
  * An UP move to one NAMED parent, not the nearest one: the pane's space breadcrumb goes to its space
  * even when the dashboard opened the pane. It steps back only when the entry behind us is that very
- * parent, and otherwise replaces this entry with it, so the space's own up still finds the dashboard.
+ * parent on the same host and session (`?h=` / `?s=`, because workspace ids collide across both),
+ * and otherwise replaces this entry with it, so the space's own up still finds the dashboard.
  */
 export function resolveUpTo(from: string | undefined, target: string, canGoBack = true): UpMove {
-  if (canGoBack && from !== undefined && decodedPath(pathOnly(from)) === decodedPath(pathOnly(target))) return { kind: "back" };
+  if (
+    canGoBack &&
+    from !== undefined &&
+    decodedPath(pathOnly(from)) === decodedPath(pathOnly(target)) &&
+    sameScope(from, target)
+  ) {
+    return { kind: "back" };
+  }
   return { kind: "replace", to: target };
 }
 
@@ -697,16 +773,15 @@ export function resolveUpTo(from: string | undefined, target: string, canGoBack 
 function locationKey(href: string): string {
   const cut = href.search(/[?#]/);
   const pathname = cut === -1 ? href : href.slice(0, cut);
-  const search = cut === -1 || href[cut] === "#" ? "" : href.slice(cut + 1).split("#")[0] ?? "";
-  const pairs = [...new URLSearchParams(search).entries()].map(([k, v]) => `${k}=${v}`).toSorted();
+  const pairs = [...new URLSearchParams(searchOf(href)).entries()].map(([k, v]) => `${k}=${v}`).toSorted();
   return `${decodedPath(pathname)}?${pairs.join("&")}`;
 }
 
 /**
  * An UP move to one exact LOCATION: it steps back only when the entry behind is that very pathname
- * and query, and otherwise replaces this entry with it. `resolveUpTo` compares pathnames, which is
- * right between screens and wrong inside the Files view, where every folder shares one pathname and
- * only `?dir=` tells them apart (ADR 0083).
+ * and query, and otherwise replaces this entry with it. `resolveUpTo` compares pathname and scope,
+ * which is right between screens and wrong inside the Files view, where every folder shares one
+ * pathname and only `?dir=` tells them apart (ADR 0083).
  */
 export function resolveUpToExact(from: string | undefined, target: string, canGoBack = true): UpMove {
   if (canGoBack && from !== undefined && locationKey(from) === locationKey(target)) return { kind: "back" };
@@ -834,18 +909,18 @@ export function parentChain(pathname: string, search: string): string[] {
     const chain = behind === undefined ? [homePath(view)] : [homePath(view), panePath(behind, view)];
     return [...chain, newPath({ machine: at.machine, pane: at.pane, beside: at.beside, session: at.session })];
   }
-  if (head === "settings" && seg.length === 2 && id === "updates") {
-    return [home, `/settings${q}`];
-  }
   if (head === "settings" && seg.length === 2) return [home, `/settings${q}`];
   if (head === "settings" && seg.length === 3 && id === "voice" && (leaf === "host" || leaf === "model")) {
     return [home, `/settings${q}`, `/settings/voice${q}`];
   }
-  if (head === "settings" && seg.length === 3 && id === "system" && leaf === "install-count") {
-    return [home, `/settings${q}`, `/settings/system${q}`];
+  if (head === "settings" && seg.length === 3 && id === "privacy" && leaf === "install-count") {
+    return [home, `/settings${q}`, `/settings/privacy${q}`];
   }
-  if (head === "settings" && seg.length === 3 && id === "appearance" && leaf === "character") {
-    return [home, `/settings${q}`, `/settings/appearance${q}`];
+  if (head === "settings" && seg.length === 3 && id === "look" && leaf === "character") {
+    return [home, `/settings${q}`, `/settings/look${q}`];
+  }
+  if (head === "settings" && seg.length === 4 && id === "notifications" && leaf === "load") {
+    return [home, `/settings${q}`, `/settings/notifications${q}`];
   }
   if (head === "settings" && seg.length === 3 && id === "accounts") {
     return [home, `/settings${q}`, `/settings/accounts${q}`];
@@ -853,8 +928,8 @@ export function parentChain(pathname: string, search: string): string[] {
   if (head === "settings" && seg.length === 4 && id === "accounts" && seg[3] === "login") {
     return [home, `/settings${q}`, `/settings/accounts${q}`, `/settings/accounts/${leaf}${q}`];
   }
-  if (head === "crew" && seg.length === 1) return [home, `/settings${q}`, `/settings/system${q}`];
-  if (head === "machines" && seg.length === 1) return [home, `/settings${q}`];
-  if (head === "machines" && seg.length === 2) return [home, `/settings${q}`, `/machines${q}`];
+  if (head === "crew" && seg.length === 1) return [home, `/settings${q}`, `/settings/devices${q}`];
+  if (head === "machines" && seg.length === 1) return [home, `/settings${q}`, `/settings/devices${q}`];
+  if (head === "machines" && seg.length === 2) return [home, `/settings${q}`, `/settings/devices${q}`, `/machines${q}`];
   return [];
 }

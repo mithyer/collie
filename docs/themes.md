@@ -21,7 +21,7 @@ check, and a review reads the repository's words.
 A theme that passes both is listed, with the repository's star count from GitHub. The steps are in
 [Share a theme on colliepwa.dev](#share-a-theme-on-colliepwadev).
 
-**How you get one.** Every way in starts in the **Theme** card in **Settings → Appearance**.
+**How you get one.** Every way in starts in the **Theme** card in **Settings → Look and feel**.
 
 - **Browse community themes** lists the store. Your host fetches the list, and your phone checks
   each theme again. See [Browse community themes](#browse-community-themes).
@@ -40,11 +40,11 @@ whatever a theme did. See [Troubleshooting](#troubleshooting).
 
 ## Make Collie your own
 
-Two choices in **Settings → Appearance** make the app look like yours, and both stay on this device.
+Two choices in **Settings → Look and feel** make the app look like yours, and both stay on this device.
 
 - **Theme** picks the colours, the typefaces and the shape. Pick one of four, or add one and try it before
   you keep it. See [Pick a theme](#pick-a-theme).
-- **Appearance** picks System, Light or Dark, which is the half of the theme you see.
+- **Light or dark** picks System, Light or Dark, which is the half of the theme you see.
 
 A theme you write can go further and put its own [character](#characters) in the header.
 
@@ -117,10 +117,10 @@ which the Collie theme sets to `grain`, `folder` and `box`. The words are explai
 
 ## Pick a theme
 
-Pick a theme in **Settings → Appearance**, and the whole app changes at once.
+Pick a theme in **Settings → Look and feel**, and the whole app changes at once.
 
 The **Theme** card is the first card. Tap a name and the app changes at once. Each name wears its own
-theme's corners and weight, so you see the shape before you tap. The card sits above the **Appearance**
+theme's corners and weight, so you see the shape before you tap. The card sits above the **Light or dark**
 card, which holds System, Light and Dark. These are two settings. The theme picks the colours, the shape and
 the look, and System, Light or Dark picks which half of the colours you see.
 
@@ -529,7 +529,7 @@ Each half takes any of these, in four groups.
 
 ### The optional tokens
 
-Three more tokens are optional, and they are the reason for version 3. They are not among the 43, and a theme
+Five more tokens are optional, and they are the reason for version 3. They are not among the 43, and a theme
 may leave them out.
 
 | Token | Meaning |
@@ -537,10 +537,40 @@ may leave them out.
 | `pane-active` | The frame of the active pane column on a large screen. |
 | `tab-active` | The top edge of the open tab and the ring of the open pane, when the theme sets `tabs` to `folder`. |
 | `find` | The ground under a found or matched piece of text: a hit of Find in Chat, and the marked letters of the session filter. Give it an alpha, because it lies over the surface under the text and the text keeps its own colour. |
+| `surface-recess` | On a large screen, the ground of the sidebar and the tab strip: one step below the page. |
+| `surface-paper` | On a large screen, the ground of the pane you are working in: the lightest surface on the screen. |
 
-When a theme leaves out `pane-active` in a half, that half takes the ink of the theme Collie. When it
-leaves out `tab-active`, that half takes its own text colour, so a folder tab draws its top edge in ink.
-When it leaves out `find`, that half takes the amber of the theme Collie.
+#### How Collie draws `pane-active`
+
+The colour you set for `pane-active` is where Collie starts, not the colour you see. Collie draws the frame in
+two steps:
+
+1. It mixes your colour into your `background`. In the light half the line is 70% your colour and 30% your
+   background. In the dark half it is 60% your colour and 40% your background. The mix is in OKLab.
+2. It then makes the mixed colour lighter or darker, and keeps its hue and chroma, until it has a contrast of 3:1
+   against the three grounds the line touches: `surface-recess` at its left, `background` at its right and
+   `surface-paper` inside it.
+
+For a stronger line, set a stronger start colour: darker in a light half, or more saturated.
+
+If no lightness reaches 3:1 on all three grounds, Collie uses the lightness that comes closest. The line can then
+stay under 3:1, and Collie does not tell you.
+
+When a half leaves out `pane-active`, the start colour is that half's own `control-on-foreground`. In Collie
+1.29 and earlier, a theme that left the token out took Collie's ink. A theme exported from an older Collie can carry Collie's
+old near-black (light) or near-white (dark) `pane-active`, and it draws a grey line. To get the coloured line,
+remove `pane-active` from the file, or set the colour you want.
+
+A `pane-active` with alpha is first laid over your `background`, and the result is used as the start colour. The
+line itself is always solid.
+
+The line is 1px wide in every theme. The `border` word of `surface` does not change it.
+
+When a theme leaves out `tab-active`, that half takes its own text colour, so a folder tab draws its top edge in ink.
+When it leaves out `find`, that half takes the amber of the theme Collie. A theme may set `surface-recess` and
+`surface-paper` but need not: a half that leaves them out takes its own page 0.05 darker for the recess, and for
+the paper its own card 0.05 lighter in light, halfway between the page and that in dark, so the pane you work
+in stays the lightest surface in every theme.
 Collie measures each one only in a half that sets it. See [The contrast report](#the-contrast-report). A file
 that sets one of them must say [version 3](#versions).
 
@@ -553,7 +583,7 @@ A character is the figure in the header of the app. Every character keeps the sa
 an orbit and drift slowly at rest while the app is visible. While Collie works for you they turn fast, in the character's own colours. An
 update and a reconnect turn them in the same colours for every character.
 
-A person can also pick a character for one device, in Settings > Appearance > Character. That choice
+A person can also pick a character for one device, in Settings → Look and feel → Character. That choice
 wins over the character a theme names, on that device only. It is stored on the device and is never sent
 to the bridge. "From the theme" gives the choice back to the theme.
 
@@ -615,7 +645,7 @@ key `characterMotion`, at the top level, which is `moves` or `still`. A theme wi
   a theme may set, and it is only the slow turn at rest.
 - **Working and updating still turn it.** `still` holds the character at rest only. While Collie works, while
   the app updates and when the link comes back, the beads turn as they do under every theme.
-- **A person's own switch wins.** In Settings > Appearance > Character, "Character moves" is on until you
+- **A person's own switch wins.** In Settings → Look and feel → Character, "Character moves" is on until you
   change it. Until you touch it, it follows the worn theme. From the first tap, your choice wins over every
   theme on that device. It is stored on the device and is never sent to the bridge.
 - **The system setting wins over both.** With reduced motion on in the operating system, the character
@@ -817,8 +847,8 @@ names it.
 - **The status bar follows a band.** Under `chrome: band` the browser's status bar takes the band colour, and
   under `page` it takes the page colour.
 - **`rows` reaches every list group.** That includes the list inside the Settings index.
-- **`zoom` sets no style.** It decides whether the belt carries the Zoom pill. The **Zoom pill** setting in
-  Settings, under Appearance, wins over it once you have chosen there.
+- **`zoom` sets no style.** It decides whether the belt carries the Zoom pill. The **Zoom button on the Belt** setting in
+  Settings, under Chat and terminal, wins over it once you have chosen there.
 - **`tabs` and `composer` set no style either.** The app reads the word and draws the tab row, the pane row
   and the composer itself. Under `folder` the tab row grows by no pixel, and the tap targets stay where they
   are. The colour of the edge is the optional token [`tab-active`](#the-optional-tokens).

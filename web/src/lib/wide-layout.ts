@@ -265,6 +265,19 @@ export function cycleWidth(strip: SpaceStrip, key: string, allowed: readonly Pre
 }
 
 /**
+ * One step along the allowed widths, narrower (`by` -1) or wider (+1), for the keyboard. Unlike the
+ * button it does not wrap: it stops at the narrowest and at Full, and gives back the same strip there.
+ */
+export function stepWidth(strip: SpaceStrip, key: string, allowed: readonly Preset[], by: -1 | 1): SpaceStrip {
+  const ladder = PRESETS.filter((p) => allowed.includes(p));
+  const column = strip.cols.find((c) => c.key === key);
+  if (column === undefined) return strip;
+  const next = ladder[ladder.indexOf(shownPreset(column.preset, allowed)) + by];
+  if (next === undefined) return strip;
+  return { ...strip, cols: strip.cols.map((c) => (c.key === key ? { ...c, preset: next } : c)) };
+}
+
+/**
  * "Remove from view": the column leaves this device's layout and the agent keeps running. The last
  * column stays. A removed focused column hands the focus to its right neighbour, or its left one
  * at the end, and the caller navigates there.
@@ -316,6 +329,123 @@ export function wholeColumnStart(lefts: readonly number[], scrollLeft: number): 
     if (best === null || Math.abs(left - scrollLeft) < Math.abs(best - scrollLeft)) best = left;
   }
   return best === null || Math.abs(best - scrollLeft) <= 0.5 ? null : best;
+}
+
+/**
+ * Where the strip scrolls after its columns changed, given the boxes as they now are: to the focused
+ * column when it is not whole in view ({@link scrollTargetFor}), else to the nearest column start when
+ * the left edge cuts one and the focused column stays whole from there ({@link wholeColumnStart}), else
+ * to the focused column's start. Null: the strip stays where it is.
+ */
+export function followTarget(focusAt: number, lefts: readonly number[], widths: readonly number[], scrollLeft: number, viewport: number, contentWidth: number): number | null {
+  const to = scrollTargetFor(focusAt, lefts, widths, scrollLeft, viewport, contentWidth);
+  if (to !== null) return to;
+  const whole = wholeColumnStart(lefts, scrollLeft);
+  const left = lefts[focusAt];
+  const width = widths[focusAt];
+  if (whole === null || left === undefined || width === undefined) return whole;
+  const keepsFocus = left >= whole - 0.5 && left + width <= whole + viewport + 0.5;
+  return keepsFocus ? whole : left;
+}
+
+/** The boxes of a flat strip in scroll coordinates: each column's start and width, the add column's
+ *  width, and the scrolled content's width. */
+export interface StripGeometry {
+  readonly lefts: readonly number[];
+  readonly widths: readonly number[];
+  readonly addWidth: number;
+  readonly contentWidth: number;
+}
+
+/**
+ * The flat strip's geometry as the layout draws it, from the columns' fractions alone: a column is its
+ * fraction of the strip, never under `minPane` in wide mode (its `min-width`), and the add column ends
+ * the strip, at least a pane wide and as wide as the room the last column leaves.
+ */
+export function stripGeometry(fractions: readonly number[], stripWidth: number, wide: boolean, minPane: number = MIN_PANE_WIDTH): StripGeometry {
+  const widths = fractions.map((f) => (wide ? Math.max(f * stripWidth, minPane) : f * stripWidth));
+  const lefts: number[] = [];
+  let at = 0;
+  for (const w of widths) {
+    lefts.push(at);
+    at += w;
+  }
+  const addWidth = Math.max(minPane, (1 - (fractions.at(-1) ?? 1)) * stripWidth);
+  return { lefts, widths, addWidth, contentWidth: at + addWidth };
+}
+
+/**
+ * Where the strip comes to rest after a width change, with no glide: the browser first clamps the old
+ * scroll position to the new scroll range, then the focus scroll ({@link followTarget}) runs, and
+ * `scrollTo` clamps its target to the range. A glide travels to exactly this place.
+ */
+export function restingScroll(geometry: StripGeometry, focusAt: number, scrollLeft: number, viewport: number): number {
+  const end = Math.max(0, geometry.contentWidth - viewport);
+  const clamped = Math.min(Math.max(scrollLeft, 0), end);
+  const to = followTarget(focusAt, geometry.lefts, geometry.widths, clamped, viewport, geometry.contentWidth);
+  return to === null ? clamped : Math.min(Math.max(to, 0), end);
+}
+
+// ── The view's spring ───────────────────────────────────────────────────────────────────────────
+//
+// The strip moves the way niri moves its view and resizes its windows: a critically damped spring.
+// niri's defaults for `window-resize` and `horizontal-view-movement` are
+// `spring damping-ratio=1.0 stiffness=800 epsilon=0.0001` (niri wiki, "Configuration: Animations";
+// `src/animation/spring.rs` fixes the mass at 1 and stops once the value is within `epsilon` of its end,
+// in the value's own units). With mass 1 and damping ratio 1 the motion has one rate, ω = √stiffness:
+//   x(t) = to + (A + B·t)·e^(−ω·t),  A = x0 − to,  B = v0 + ω·A.
+// From rest it never passes its end; started with a velocity toward the end it may pass it a little.
+
+/** niri's stiffness for a resize and a view movement. */
+export const VIEW_STIFFNESS = 800;
+
+/** A spring's place and speed (units per second) at a moment. */
+export interface SpringState {
+  readonly x: number;
+  readonly v: number;
+}
+
+/** Where a critically damped spring of mass 1 stands `t` seconds after it left `x0` at speed `v0`. */
+export function springAt(x0: number, to: number, v0: number, t: number, stiffness: number = VIEW_STIFFNESS): SpringState {
+  const w = Math.sqrt(stiffness);
+  const a = x0 - to;
+  const b = v0 + w * a;
+  const e = Math.exp(-w * t);
+  return { x: to + (a + b * t) * e, v: (b - w * (a + b * t)) * e };
+}
+
+/** Half a CSS pixel: a spring this close to its end draws its end. */
+export const REST_PX = 0.5;
+/** Slower than this (CSS px a second) a spring moves under half a pixel in a 60 Hz frame. */
+export const REST_SPEED = REST_PX * 60;
+
+/**
+ * The stop rule: niri's epsilon, read in CSS pixels. A spring rests once it is within half a pixel of its
+ * end AND so slow that the next frame would not move it half a pixel; `unit` is a pixel's worth of the
+ * value (1 for px, the strip's width for a fraction of it).
+ */
+export function springRests(state: SpringState, to: number, unit: number = 1): boolean {
+  return Math.abs(state.x - to) * unit <= REST_PX && Math.abs(state.v) * unit < REST_SPEED;
+}
+
+/** How long a spring from rest over `distance` px takes to rest, in ms, by the rule above. */
+export function springRestMs(distance: number, stiffness: number = VIEW_STIFFNESS): number {
+  for (let ms = 0; ms <= 3000; ms += 1) if (springRests(springAt(distance, 0, 0, ms / 1000, stiffness), 0)) return ms;
+  return 3000;
+}
+
+/**
+ * A CSS `linear()` easing that draws the spring from rest over `durationMs`, sampled `steps` times: for
+ * a CSS transition that must read like the spring (the position strip). The last point is exactly 1.
+ */
+export function springEasing(durationMs: number, steps: number = 24, stiffness: number = VIEW_STIFFNESS): string {
+  const points: string[] = [];
+  for (let i = 0; i <= steps; i += 1) {
+    const t = (durationMs / 1000) * (i / steps);
+    const p = i === steps ? 1 : 1 - springAt(1, 0, 0, t, stiffness).x;
+    points.push(String(Math.round(p * 10000) / 10000));
+  }
+  return `linear(${points.join(", ")})`;
 }
 
 /** Where a dragged row at `x` would land: the insert index (0 = before the first column, n = after

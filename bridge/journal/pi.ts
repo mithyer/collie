@@ -38,6 +38,7 @@ import {
   containedRealpath,
   containedRealpathIn,
   exists,
+  firstContained,
   head as fileHead,
   loadTail,
   readSinceFile,
@@ -691,13 +692,36 @@ function detailRows(details: JsonValue | undefined, key: string): JsonObject[] {
 }
 
 /**
+ * The attribute text of each `<task-result …>` tag in order, as `/<task-result\b([^>]*)>/g` read it:
+ * a tag runs to the next `>`, and the next tag is looked for after that. Walked by hand, because that
+ * regex read the rest of the text again from each `<task-result` that had no `>` after it (quadratic,
+ * 2.6 s at 256 KB), and the text is whatever a job printed.
+ */
+function* taskResultAttrs(content: string): Generator<string> {
+  const TAG = "<task-result";
+  let at = content.indexOf(TAG);
+  while (at !== -1) {
+    const after = at + TAG.length;
+    // `\b`: `<task-results` is not this tag.
+    if (/\w/.test(content[after] ?? "")) {
+      at = content.indexOf(TAG, at + 1);
+      continue;
+    }
+    const end = content.indexOf(">", after);
+    // No `>` after this tag means none after any later one either.
+    if (end === -1) return;
+    yield content.slice(after, end);
+    at = content.indexOf(TAG, end + 1);
+  }
+}
+
+/**
  * The status an Oh My Pi `async-result` notice gives one job. The row's `details.jobs[]` carries no
  * status (OMP 18.6.1); the notice's own text does, as `<task-result id="<job>" … status="<s>">`. A
  * notice that names none is a delivered result, so `completed`.
  */
-function asyncResultStatus(content: string, jobId: string): string {
-  for (const m of content.matchAll(/<task-result\b([^>]*)>/g)) {
-    const attrs = m[1] ?? "";
+export function asyncResultStatus(content: string, jobId: string): string {
+  for (const attrs of taskResultAttrs(content)) {
     if (/\bid="([^"]*)"/.exec(attrs)?.[1] !== jobId) continue;
     const status = /\bstatus="([^"]*)"/.exec(attrs)?.[1];
     if (status !== undefined && status !== "") return status;
@@ -1479,7 +1503,8 @@ export function resumeValueOf(processes: readonly ForegroundProcess[] | undefine
  *    per-cwd directory, so this is a scan of the project dirs, cached after the first hit.
  */
 export class PiTranscriptSource implements TranscriptSource {
-  private readonly pathCache = new Map<string, string>();
+  // The root must travel with the cached path so cache hits re-check per-root symlink containment.
+  private readonly pathCache = new Map<string, { path: string; root: string }>();
 
   /** The token totals of the logs a pane's footer is compared with (#508), kept up to date by appended bytes only. */
   private readonly footerTotals = new PiFooterTotals();
@@ -1564,7 +1589,7 @@ export class PiTranscriptSource implements TranscriptSource {
       const contained = await containedRealpath(candidate.path, candidate.root);
       if (contained === null) continue;
       if (!(await sessionCwdMatches(await sessionCwdOf(contained), discovery))) continue;
-      this.pathCache.set(candidate.id, contained);
+      this.pathCache.set(candidate.id, { path: contained, root: candidate.root });
       return { kind: "id", value: candidate.id };
     }
     return null;
@@ -1622,16 +1647,20 @@ export class PiTranscriptSource implements TranscriptSource {
     const footer = screen === null ? null : parsePiFooter(screen);
     if (footer === null) return null;
     const logs: PiFooterLog[] = [];
+    const roots = new Map<string, string>();
     for (const candidate of await this.candidateLogs(discovery)) {
       if (logs.length >= MAX_FOOTER_LOGS) break;
       const contained = await containedRealpath(candidate.path, candidate.root);
       if (contained === null) continue;
       if (!(await sessionCwdMatches(await sessionCwdOf(contained), discovery))) continue;
       logs.push({ id: candidate.id, path: contained });
+      // The root each candidate was found under: the cache serves a path only under a root that is still configured.
+      roots.set(candidate.id, candidate.root);
     }
     const found = await pickByFooter(footer, logs, this.footerTotals);
-    if (found === null) return null;
-    this.pathCache.set(found.id, found.path);
+    const root = found === null ? undefined : roots.get(found.id);
+    if (found === null || root === undefined) return null;
+    this.pathCache.set(found.id, { path: found.path, root });
     return { kind: "id", value: found.id };
   }
 
@@ -1680,20 +1709,13 @@ export class PiTranscriptSource implements TranscriptSource {
     const suffix = `_${id}.jsonl`;
     for (const root of discovery.roots) {
       if (root.realPath === null) continue;
-      for (const folder of discovery.folders) {
-        let names: string[];
-        try {
-          names = await readdir(join(root.path, folder));
-        } catch {
-          continue;
-        }
-        const hit = names.find((name) => name.toLowerCase().endsWith(suffix));
-        if (hit === undefined) continue;
-        const contained = await containedRealpath(join(root.path, folder, hit), root.path);
-        if (contained === null) continue;
-        this.pathCache.set(id, contained);
-        return { kind: "id", value: id };
-      }
+      // Only the folders this cwd is filed under: a command line names a session of THIS pane's
+      // folder, so an id must not reach a log another folder holds. Inside them, the same order as
+      // `resolve` uses, so both lookups land on the same log for one id.
+      const contained = await newestNamed(root.path, discovery.folders, suffix);
+      if (contained === null) continue;
+      this.pathCache.set(id, { path: contained, root: root.path });
+      return { kind: "id", value: id };
     }
     return null;
   }
@@ -1714,7 +1736,7 @@ export class PiTranscriptSource implements TranscriptSource {
         }
       }
       if (!matchesFolder) continue;
-      this.pathCache.set(id.toLowerCase(), contained);
+      this.pathCache.set(id.toLowerCase(), { path: contained, root: root.path });
       return { kind: "id", value: id.toLowerCase() };
     }
     return null;
@@ -1741,7 +1763,9 @@ export class PiTranscriptSource implements TranscriptSource {
     const sessionId = ref.value;
     const cached = this.pathCache.get(sessionId);
     if (cached !== undefined) {
-      if (await exists(cached)) return cached;
+      // A root that left the config (an account removed) serves nothing more, cache or not.
+      const real = this.roots.includes(cached.root) ? await containedRealpath(cached.path, cached.root) : null;
+      if (real !== null) return real;
       this.pathCache.delete(sessionId);
     }
 
@@ -1749,7 +1773,7 @@ export class PiTranscriptSource implements TranscriptSource {
     for (const root of this.roots) {
       const hit = await this.findUnder(root, suffix);
       if (hit === null) continue; // absent here, or present but not this root's to serve
-      this.pathCache.set(sessionId, hit);
+      this.pathCache.set(sessionId, { path: hit, root });
       return hit;
     }
     return null;
@@ -1782,7 +1806,10 @@ export class PiTranscriptSource implements TranscriptSource {
     return folder === null ? null : join(folder, name);
   }
 
-  /** The log whose name ends in `suffix` under one sessions root, contained by that root. */
+  /**
+   * The log whose name ends in `suffix` under one sessions root, contained by that root: every
+   * project folder is read, in the order {@link newestNamed} keeps.
+   */
   private async findUnder(root: string, suffix: string): Promise<string | null> {
     let dirs: string[];
     try {
@@ -1790,18 +1817,7 @@ export class PiTranscriptSource implements TranscriptSource {
     } catch {
       return null; // no sessions root at all — nothing to serve
     }
-    for (const dir of dirs) {
-      let names: string[];
-      try {
-        names = await readdir(join(root, dir));
-      } catch {
-        continue;
-      }
-      const hit = names.find((n) => n.toLowerCase().endsWith(suffix));
-      if (hit === undefined) continue;
-      return containedRealpath(join(root, dir, hit), root);
-    }
-    return null;
+    return newestNamed(root, dirs, suffix);
   }
 
   stat = statFile;
@@ -1895,6 +1911,37 @@ export interface PiSourceOptions {
  * lost to rounding. A log older than this is a previous run's.
  */
 const START_SLACK_MS = 5000;
+
+/**
+ * The log named `<ISO-ts>_<id>.jsonl` (`suffix` is `_<id>.jsonl`) in `folders` of `root` that `root`
+ * contains, or null. ONE order for every lookup by id (`resolve` over all project folders, a command
+ * line's id over the cwd's own), so two lookups of one id cannot land on two logs: newest name first
+ * across the folders, since pi starts a name with the session's start time; a tie on the name goes to
+ * the folder that sorts first. A refused match is skipped for the next (#840, see {@link
+ * firstContained}). An unreadable folder is passed over.
+ */
+async function newestNamed(root: string, folders: readonly string[], suffix: string): Promise<string | null> {
+  const hits: { dir: string; name: string }[] = [];
+  for (const dir of folders) {
+    let names: string[];
+    try {
+      names = await readdir(join(root, dir));
+    } catch {
+      continue;
+    }
+    for (const name of names) if (name.toLowerCase().endsWith(suffix)) hits.push({ dir, name });
+  }
+  hits.sort((a, b) => descendingText(a.name, b.name) || descendingText(b.dir, a.dir));
+  return firstContained(
+    hits.map((hit) => join(root, hit.dir, hit.name)),
+    root,
+  );
+}
+
+/** A sort order on names: the larger first, by code unit, so a time-stamped name sorts newest first. */
+function descendingText(a: string, b: string): number {
+  return a < b ? 1 : a > b ? -1 : 0;
+}
 
 /**
  * When a session log started: the ISO time in its file name (`2026-10-30T10-00-00-000Z_<id>.jsonl`,

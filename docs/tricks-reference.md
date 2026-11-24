@@ -4,7 +4,7 @@
 
 This page lists every place, part, manifest key, limit and command of a ColliePWA trick, and it is complete. It is generated from the code, so it cannot drift. It is the one list: other pages link here and do not repeat its tables.
 
-Tricks are experimental. They may change, lose settings, or be withdrawn in a patch release. They are off until you switch them on at the top of Settings → Tricks, or with `collie tricks on`.
+Tricks are experimental. They may change, lose settings, or be withdrawn in a patch release. They are off until you switch them on at the top of Settings → Tricks and the Hill, or with `collie tricks on`.
 
 ## Places
 
@@ -20,7 +20,7 @@ In the picture: 1 Dashboard tile, 2 Page, 3 Bottom bar item, 4 Status chip, 5 Be
 | `session` | Page | A page of the trick's own: a row on the Dashboard under Tricks, and a screen of its own. The code word is `session`. | A program |
 | `dashboard` | Dashboard tile | A round tile in the strip at the top of the Dashboard. The strip is hidden while no trick has a tile. | A program |
 | `status` | Status chip | One chip in the status line above the Belt, at the left end of the row; the model and the usage stay at the right end. | A program |
-| `tabbar` | Bottom bar item | An item in the Dashboard's bottom bar, after the Hill. | A program |
+| `tabbar` | Bottom bar item | An item in the Dashboard's bottom bar, after the Hill. On a large screen there is no bar: the item stands after the views, in the control of the Dashboard's header. | A program |
 | `menu` | Session settings rows | Rows in a session's settings (the sheet of the session's ⋮ button), in a group of the trick's own after Collie's rows and Close, under the heading "From the trick", then the trick's name. Agent sessions only. Adds rows to a session's settings. | A program |
 | `float` | Floating picture | A small moving picture over the app, on the Dashboard and in a session's Chat and Terminal, in the free area clear of the header, the strips, the Belt and the composer. It can draw a small moving picture over the app. It never covers a question and never blocks a tap. | A program |
 | `agent-view` | Agent view | A view of one agent session, beside Terminal and Chat. The session's own agent draws it, and the person switches it on per session. | A session's agent |
@@ -240,7 +240,7 @@ A program prints:
 
 ![The Dashboard, with a trick's item at the end of the bottom bar, after the Hill.](images/tricks/place-tabbar.png)
 
-**Where.** An item in the Dashboard's bottom bar, after the Hill.
+**Where.** An item in the Dashboard's bottom bar, after the Hill. On a large screen there is no bar: the item stands after the views, in the control of the Dashboard's header.
 
 **Shows.** One item: an icon over a short name, with a `badge` and a `tone`. It takes no view.
 
@@ -368,7 +368,7 @@ A program prints:
 
 **Where.** A small moving picture over the app, on the Dashboard and in a session's Chat and Terminal, in the free area clear of the header, the strips, the Belt and the composer. It can draw a small moving picture over the app. It never covers a question and never blocks a tap.
 
-**Shows.** One picture of the trick's `media/` folder, and one motion of a fixed list. A part says `once` (the picture plays one motion and is gone) or `stay` (it stays and shows a mood). It takes no view, no coordinates, no style and no code: Collie places and times the picture. Without `sessions` it shows on the Dashboard; with them (contract 2) it shows only in those sessions. It is hidden while a sheet, a dialog or a card that asks a question is open, while a field has focus and while a yes is held, and it comes back after. "Floating things" in Settings, Appearance, turns every picture off on a device, and each trick keeps its own switch. Pictures must be original art, never a known character.
+**Shows.** One picture of the trick's `media/` folder, and one motion of a fixed list. A part says `once` (the picture plays one motion and is gone) or `stay` (it stays and shows a mood). It takes no view, no coordinates, no style and no code: Collie places and times the picture. Without `sessions` it shows on the Dashboard; with them (contract 2) it shows only in those sessions. It is hidden while a sheet, a dialog or a card that asks a question is open, while a field has focus and while a yes is held, and it comes back after. "Moving pictures from tricks" in Settings, Look and feel, turns every picture off on a device, and each trick keeps its own switch. Pictures must be original art, never a known character.
 
 **A tap.** A once picture never takes a tap: a tap goes to what is under it. A stay picture is tap-through too, unless its part says `opens` `"page"`: a parked picture (`perch` or `idle`, never one that is moving) then takes a tap in a 44 px box and opens the trick's Page. Tapping its picture opens its page. Nothing else takes a tap.
 
@@ -529,7 +529,7 @@ The agent passes `show` this file:
 
 ## The Hill
 
-A page of Decisions: questions that a program or an agent asks the person, each answered with one tap. It ships with Collie as an experiment, off until the person switches it on in Settings → Experiments. A trick does not list it in `places`.
+A page of Decisions: questions that a program or an agent asks the person, each answered with one tap. It ships with Collie as an experiment, off until the person switches it on in Settings → Tricks and the Hill. A trick does not list it in `places`.
 
 **From a program.** A program lists Decisions in the `decisions` key of its output (the helper's `t.decide`). The list is declarative: after each run that succeeded, Collie makes the Hill agree with it, as [The list is the truth](#the-list-is-the-truth) says below. A document lists at most 20.
 
@@ -1379,12 +1379,12 @@ These are all the keys of `trick.toml`. At the same contract, any other key is r
 | `env` | list of names | no | at most 32 names of at most 64 characters: letters, digits and `_`, not starting with a digit | 1 | Environment names the program gets beyond the base list, such as `GH_TOKEN`. The person sees each one. |
 | `inputs` | list of globs | no | at most 8 globs of at most 256 characters and 6 steps, relative to a session's folder | 2 | Files the program reads from each agent session's folder. They are untrusted data: show them, never run them. |
 | `description` | text | no | at most 140 characters, plain text | 1 | One plain line that says what the trick does. Settings shows it under the name. |
-| `about` | text | no | at most 1200 characters, plain text, a blank line splits paragraphs | 1 | The text of the About sheet. |
-| `version` | text | no | 1 to 24 characters: letters, digits, `.`, `+` and `-`, such as `1.2.0` | 1 | The trick's own version. The About sheet shows it. Collie never compares it and reads no tag. |
+| `about` | text | no | at most 1200 characters, plain text, a blank line splits paragraphs | 1 | The text of the trick's details page. |
+| `version` | text | no | 1 to 24 characters: letters, digits, `.`, `+` and `-`, such as `1.2.0` | 1 | The trick's own version. The details page shows it. Collie never compares it and reads no tag. |
 | `rules` | file name | yes, with `agent-view`; refused without it | a file in the trick's folder of at most 64 characters ending in `.md`, such as `rules.md` | 2 | The instructions the agent of a session reads. The person reads them whole before they switch the trick on. |
 | `decides` | word | no | `reply`. Refused on a trick that is only an agent view | 1 | Whether its Decisions answer into a session. `reply` lets a Decision name `replyTo`, and the person's answer is typed into that session as their own message. Without it, a Decision with `replyTo` is refused. It is a right: a version that adds it asks again. |
 | `drafts` | word | no | `session`. Refused on a trick that is only an agent view | 1 | Whether its buttons may put text into a reply box. `session` lets a button set `does` to `draft`: a tap puts its `value` into the reply box of the session the page is open for, only when that box is empty, and never sends. Without it, a part with such a button is refused. The card says: "Its buttons can put text into the reply box of the session you are in. You read it and send it yourself." It is a right: a version that adds it asks again. |
-| `field` | list of tables | no | at most 12 `[[field]]` tables. Each has `key` (spelled like a trick id, each once), `kind` (`text`, `choice`, `switch` or `number`), `label` (at most 40 characters) and may have `hint` (at most 120), `default` and `required`. A `choice` lists 2 to 8 `options` of at most 40 characters; a `number` names whole `min` and `max` within 999999999 either way; a `text` value is one line of at most 200 characters; a `switch` is never `required` | 3 | Settings the person keeps for the trick, set in its About sheet on the phone. The program reads them in its facts as `values`. A value is the person's data and untrusted for the program: show it, never run it. A setting is never a secret: a key comes through `env`. A new or changed field is a new version and asks again; a changed value does not ask, and runs the trick once. |
+| `field` | list of tables | no | at most 12 `[[field]]` tables. Each has `key` (spelled like a trick id, each once), `kind` (`text`, `choice`, `switch` or `number`), `label` (at most 40 characters) and may have `hint` (at most 120), `default` and `required`. A `choice` lists 2 to 8 `options` of at most 40 characters; a `number` names whole `min` and `max` within 999999999 either way; a `text` value is one line of at most 200 characters; a `switch` is never `required` | 3 | Settings the person keeps for the trick, set on its details page on the phone. The program reads them in its facts as `values`. A value is the person's data and untrusted for the program: show it, never run it. A setting is never a secret: a key comes through `env`. A new or changed field is a new version and asks again; a changed value does not ask, and runs the trick once. |
 | `access` | word | no | `none`, `see` or `read`. Default `none` | 3 | How much of Collie's local API the trick reads through `t.api`. `see` reads lists and states, `read` adds the text of a screen. A right: a version that raises it asks again. See [Reading Collie through the local API](#reading-collie-through-the-local-api). Experimental. |
 
 In `trick.toml`:
@@ -1793,7 +1793,7 @@ Every verb of `collie trick`.
 | `list` | `collie trick list [--json] [--official]` | Lists every trick folder with its switch, state, last run and last error. |
 | `add` | `collie trick add [<name> \| <https-url>[//<folder>][#<ref>]]` | Copies a trick from a git repository into the tricks folder, off. With no source, or a repository's `collie-tricks.json` and no `//<folder>`, it lists and adds nothing. |
 | `update` | `collie trick update <id> [--ref <branch\|tag\|commit>] [--dry-run]` | Fetches an added trick again and replaces its code, keeping `config.toml`. |
-| `remove` | `collie trick remove <id>` | Deletes a trick that is off, with its state folder. |
+| `remove` | `collie trick remove <id>` | Deletes a trick that is off, with its state folder and its approved code. It refuses while a run of it is still going. |
 | `on` | `collie trick on <id>` | Switches a trick on, approving its code as it is now. It refuses inside an agent's pane. |
 | `off` | `collie trick off <id>` | Switches a trick off. |
 | `auto` | `collie trick auto <id> on\|off` | Takes new versions without asking while the powers do not change. A trick with rules never takes one. |
@@ -1803,7 +1803,7 @@ Every verb of `collie trick`.
 | `helper` | `collie trick helper <id\|folder>` | Rewrites a trick's `trick.ts` with the helper this Collie carries. |
 | `skill` | `collie trick skill [<id>]` | Prints what a trick that is on asks of an agent. With no id, prints how to write a trick. |
 | `guide` | `collie trick guide [--json]` | Prints how to write a trick and hand it to the person, as plain text for an agent. |
-| `propose` | `collie trick propose <folder> [--request-id <uuid>] [--json]` | Hands a trick folder to the person as a card of Collie's own on the lead: in the proposing session on the phone and in Settings, Tricks, and on the Hill while it is on. Nothing runs before their yes. It brings the code and the pictures of `media/` and `captures/`; `config.toml` stays behind. |
+| `propose` | `collie trick propose <folder> [--request-id <uuid>] [--json]` | Hands a trick folder to the person as a card of Collie's own on the lead: in the proposing session on the phone and in Settings, Tricks and the Hill, and on the Hill while it is on. Nothing runs before their yes. It brings the code and the pictures of `media/` and `captures/`; `config.toml` stays behind. |
 | `view` | `collie trick view <trick> <verb> [args]` | Runs one verb of an agent view, from the agent's pane. The verbs are the `trick view` commands below. |
 
 | Verb | Flag | What it does |

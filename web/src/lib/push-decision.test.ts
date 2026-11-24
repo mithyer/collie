@@ -3,7 +3,7 @@ import { resolve } from "node:path";
 
 import { describe, expect, test } from "vitest";
 
-import { decidePush, hostSlot, localisedTitle, notificationPath, tagFor } from "@/lib/push-decision";
+import { decidePush, hostSlot, localisedTitle, notificationPath, pushOptions, tagFor } from "@/lib/push-decision";
 import { scopeSearch } from "@/lib/scope";
 
 describe("decidePush", () => {
@@ -347,8 +347,44 @@ describe("decidePush — a render replaces what a skipped clear left", () => {
   });
 
   test("the worker shows a render on the decided tag, so it replaces the notification on that slot", () => {
+    // The tag rides `pushOptions` (tested below), and the worker shows exactly what it builds.
     const sw = readFileSync(resolve(import.meta.dirname, "../sw.ts"), "utf8");
-    expect(sw).toContain("    tag: decision.tag,\n");
-    expect(sw).toContain("await self.registration.showNotification(decision.title, options);");
+    expect(sw).toContain("await self.registration.showNotification(decision.title, pushOptions(decision, { icon: ICON, badge: BADGE }, look?.picture ?? null));");
+    expect(pushOptions({ kind: "show", title: "t", body: "", tag: "collie:herd:w1:p1", renotify: true }, { icon: "i", badge: "b" }, null).tag).toBe("collie:herd:w1:p1");
+  });
+});
+
+// THE PUSH'S PICTURE (issue 811, ADR 0160): the service worker puts the page's square copy of the pane's
+// project picture in the icon, sets no `image`, and keeps Collie's badge. With none, the icon is the mark.
+describe("pushOptions", () => {
+  const show = { kind: "show" as const, title: "Done", body: "Claude finished", tag: "collie:w1:p1", paneId: "w1:p1", host: "laptop", renotify: true };
+  const art = { icon: "/notification-icon-192x192.png", badge: "/badge-96x96.png" };
+
+  test("a found picture is the icon, the badge stays Collie's, and no `image` is set", () => {
+    const options = pushOptions(show, art, "data:image/png;base64,AAAA");
+    expect([options.icon, options.badge]).toEqual(["data:image/png;base64,AAAA", art.badge]);
+    expect("image" in options).toBe(false);
+    expect(options.data).toEqual({ paneId: "w1:p1", session: undefined, host: "laptop", target: undefined, machine: undefined, decision: undefined });
+    expect([options.tag, options.renotify, options.body]).toEqual(["collie:w1:p1", true, "Claude finished"]);
+  });
+
+  test("with no picture the icon is the Collie mark, and still no `image`", () => {
+    const options = pushOptions(show, art, null);
+    expect([options.icon, options.badge]).toEqual([art.icon, art.badge]);
+    expect("image" in options).toBe(false);
+  });
+
+  test("the service worker keeps the verdict of a push about a pane, with its own build, after it shows it", () => {
+    const sw = readFileSync(resolve(import.meta.dirname, "../sw.ts"), "utf8");
+    const shown = sw.indexOf("await self.registration.showNotification(decision.title, pushOptions(");
+    const kept = sw.indexOf("await keepPushPictureTrace(self.caches, self.location.origin, MOUNT, { verdict: look.verdict, machine, at: Date.now(), workerBuild: BUILD.id });");
+    expect(shown).toBeGreaterThan(0);
+    expect(kept).toBeGreaterThan(shown);
+    expect(sw).toContain('const machine = decision.host === undefined || decision.host === "" ? "lead" : "member";');
+  });
+
+  test("the service worker shows a push with these options and the picture it found", () => {
+    const sw = readFileSync(resolve(import.meta.dirname, "../sw.ts"), "utf8");
+    expect(sw).toContain("await self.registration.showNotification(decision.title, pushOptions(decision, { icon: ICON, badge: BADGE }, look?.picture ?? null));");
   });
 });

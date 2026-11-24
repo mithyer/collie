@@ -6,6 +6,8 @@ import { dropLegacyLastSeen } from "./last-seen";
 import { dropLegacySendAgain } from "./send-again";
 import { __resetStore, getRecord, putRecord, STORE_NAME } from "./store";
 import { wipeDevice } from "./wipe";
+// Registers its wipe cleaner at load, as it does in the app, where every pane row imports it.
+import "./project-picture";
 
 // EVERY STORAGE KEY THE APP WRITES HAS A DECIDED FATE AT UNPAIR (M46 spec 02).
 //
@@ -27,6 +29,7 @@ const NOT_STORAGE = new Map<string, string>([
   ["collie:herd", "a notification tag (lib/push-decision.ts)"],
   ["collie:herd@<host>", "the per-host notification tag, named in a comment"],
   ["collie.json", "a theme file name in the theme catalogue (lib/theme/catalogue.ts), not a storage key"],
+  ["collie.toml", "a repository's project file name, named in comments (lib/project-picture.ts), not a storage key"],
 ]);
 
 type Area = "local" | "session";
@@ -54,13 +57,20 @@ const KEYS = new Map<string, KeyFate>([
   ["collie:shape:", { area: "local", prefix: true, fate: "wiped", why: "remembered shape facts: a flag, a small number or a fixed word per page part (lib/remembered-shape.ts)" }],
   // Decision ids of trick proposals closed with "Not now" in their session (lib/hill/session-later.ts, 2026-11-17): they name this pairing's bridge decisions, so they go with it.
   ["collie:session-later", { area: "local", prefix: false, fate: "wiped", why: "decision ids of this pairing's trick proposals, closed in their session" }],
+  ["collie:recent-panes:v1", { area: "local", prefix: false, fate: "wiped", why: "the panes this device opened last: pane addresses and workspace names (lib/recent-panes.ts)" }],
   ["collie:slot:v1:", { area: "local", prefix: true, fate: "wiped", why: "the last pane address and workspace name of each browser tile" }],
   // Written first by the wipe and removed last; present only while a wipe is unfinished (lib/wipe.ts).
   ["collie:wipe-pending", { area: "local", prefix: false, fate: "wiped", why: "a wipe's resume mark" }],
+  // The project pictures (lib/project-picture.ts, ADR 0160): the page's own small copies, and which pane shows which.
+  ["collie:project-picture-copies:v1", { area: "local", prefix: false, fate: "wiped", why: "small copies of pictures this pairing's repositories named" }],
+  ["collie:project-picture-panes:v1", { area: "local", prefix: false, fate: "wiped", why: "which picture version each pane of this pairing shows" }],
   // ── Kept: how this phone likes to look and behave, never what a session said ──
   ["collie:theme:v1", { area: "local", prefix: false, fate: "kept", why: "preference" }],
   ["collie:design:v1", { area: "local", prefix: false, fate: "kept", why: "preference" }],
   ["collie:themes:v1", { area: "local", prefix: false, fate: "kept", why: "preference, the imported colour themes (M57)" }],
+  // The fate of the theme it was derived from (collie:design:v1 names it, collie:themes:v1 holds it), so the two never
+  // disagree after an unpair. theme-init.js uses it only for the applied theme, matched by id and the hash of its halves.
+  ["collie:derived:v1", { area: "local", prefix: false, fate: "kept", why: "cache, the derived colours of the applied theme (ADR 0172)" }],
   ["collie:key-board:v1", { area: "local", prefix: false, fate: "kept", why: "preference, this phone's key layout" }],
   ["collie:display-prefs:v4", { area: "local", prefix: false, fate: "kept", why: "preference" }],
   ["collie:dash-prefs:v1", { area: "local", prefix: false, fate: "kept", why: "preference" }],
@@ -78,6 +88,9 @@ const KEYS = new Map<string, KeyFate>([
   ["collie:trouble-signalled:v1", { area: "local", prefix: false, fate: "wiped", why: "which trouble cards already signalled today: kind, crew host, pane id and day, no content (lib/report/once.ts)" }],
   ["collie:wide-layout:v1", { area: "local", prefix: false, fate: "kept", why: "large-screen columns per space: pane addresses and widths, no content (ADR 0120)" }],
   ["collie:wide-sidebar:v1", { area: "local", prefix: false, fate: "kept", why: "preference" }],
+  ["collie:project-pictures:v1", { area: "local", prefix: false, fate: "kept", why: "preference: project pictures on or off on this device (ADR 0160)" }],
+  ["collie:enter-sends:v1", { area: "local", prefix: false, fate: "kept", why: "preference: whether Enter from a physical keyboard sends (ADR 0157)" }],
+  ["collie:diff-layout:v1", { area: "local", prefix: false, fate: "kept", why: "preference: a diff in one column or side by side on a large screen (ADR 0158)" }],
   ["collie:wide-layout-mode:v1", { area: "local", prefix: false, fate: "kept", why: "preference: Auto or Off for the large-screen layout (ADR 0120)" }],
   ["collie:enter-sends:v1", { area: "local", prefix: false, fate: "kept", why: "preference: whether Enter sends or adds a line on this device (lib/enter-sends-store.ts)" }],
   ["collie:pin-hint:v1", { area: "local", prefix: false, fate: "kept", why: "a dismissed hint" }],
@@ -87,6 +100,10 @@ const KEYS = new Map<string, KeyFate>([
   ["collie:hidden-machines:v1", { area: "local", prefix: false, fate: "kept", why: "machine names hidden here" }],
   ["collie:mirror-native:", { area: "local", prefix: true, fate: "kept", why: "a per-pane colour choice" }],
   ["collie:tour:v1", { area: "local", prefix: false, fate: "kept", why: "the tour was seen" }],
+  // A fact about this device, never a person (lib/hardware-keyboard.ts, M108): a hardware key was pressed here. It holds no private data and decides only whether the Settings row "Keyboard shortcuts" is drawn.
+  ["collie:hardware-keyboard-seen:v2", { area: "local", prefix: false, fate: "kept", why: "device fact: a hardware key was pressed here, a bare value, no content" }],
+  // The one-time keyboard hint is done on this device (lib/keyboard-hint.ts, M108): closed, opened the list, or the prefix was pressed. A device fact with no private data.
+  ["collie:keyboard-hint-done:v1", { area: "local", prefix: false, fate: "kept", why: "device fact: the one-time keyboard hint is done here, a bare value, no content" }],
   ["collie:diff-comments:v1:", { area: "session", prefix: true, fate: "wiped", why: "the Changes batch of diff comments: quoted lines and the notes on them" }],
   ["collie:tab-pane:v1:", { area: "session", prefix: true, fate: "wiped", why: "the pane id each tab was last open on, per machine, session and tab (lib/tab-pane-memory.ts)" }],
   ["collie:chat-silhouette:v1:", { area: "session", prefix: true, fate: "wiped", why: "the silhouette of each pane's Chat page: row kinds, heights and line counts, never a word (lib/chat-silhouette.ts)" }],

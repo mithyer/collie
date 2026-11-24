@@ -322,6 +322,7 @@ the same handlers. There is no second handler set, no second semantic, and no He
 | `GET` | `/crew/v1/accounts` | `GET /api/accounts` | proxied byte-for-byte, additive-optional (§7.1), added 2026-11-16 (M101 spec 06). The member's own accounts list, `{ harnesses, accounts, found }`, for the account pick in New: accounts are per machine. A row may carry `panes` (additive-optional, added 2026-11-17, M101): the ids of that machine's own panes that run in the row's folder, at most 64, absent when none; the phone reads it only from its own machine, because the Change login row is not offered over the link. For a **GET only**: the lead forwards no other method on this path (`route_not_federated`) and the member dispatches none (404). A READ (attempted against a stale member, read budget, audited on neither side, never masked); the lead keeps nothing of the answer, which holds a sign-in email. A peer that predates it answers a plain 404 and a Windows member its own `404 accounts.unavailable`; the phone reads both as "no accounts here" and hides the pick. A start with an account rides `launch` with its `account` id unchanged, and the member resolves the id against its own list (`accounts.unknown` otherwise); a `launch` with `signIn: true` over the link is refused by the member, `400 bad body` |
 | `POST` | `/crew/v1/accounts`, `/crew/v1/accounts/remove` | none: answered by the machine the phone talks to | Not forwarded (M101 spec 06): a member's accounts are added and removed on that machine only. The lead answers `?host=` with `501 route_not_federated`, and a member's surface answers 404 |
 | `GET` | `/crew/v1/blobs/:hash` | `GET /api/blobs/:hash` | proxied byte-for-byte — additive-optional (§7.1). The image an agent's own journal named, off the disk that holds it; a lead that predates it never calls it, and a peer that predates it answers 404 to a lead that does |
+| `GET` | `/crew/v1/project-picture/:version` | `GET /api/project-picture/:version` | proxied byte-for-byte, like a blob — additive-optional (§7.1). The picture a `collie.toml` on the member names, off the member's disk, by the version its pane carried (ADR 0160); a lead that predates it never calls it, and a peer that predates it answers 404 |
 | `GET` | `/crew/v1/config` | `GET /api/config` (`:288`) | consumed by the lead, not proxied |
 | `GET` | `/crew/v1/hello` | — (new) | consumed by the lead: liveness + version + member id |
 
@@ -785,6 +786,21 @@ updated machines, so build skew is the steady state (§7), and this section is t
   not know reads as absent. Nothing in `bridge/crew/merge.ts` changes, for the reason the `cache`
   bullet gives. `CREW_PROTOCOL_VERSION` stays `2`, no new route, no new verb and no new header.
 
+- **A pane gained an optional `picture`, and a read route `project-picture/:version`** (added in
+  1.30.0, ADR 0160). `picture` is the version of the project picture the pane folder's `collie.toml`
+  names on the machine the pane lives on: 24 lowercase hex characters (96 bits), the start of the
+  sha256 of the bytes. The phone fetches `GET /api/project-picture/<version>?host=<member>`, and the lead forwards it
+  like a blob, stating the hill image's no-store headers itself. The lead does not pass the member's
+  bytes on as they came: it reads at most 256 KB of the body, checks the picture's rules on it, checks
+  that the sha256 starts with the version asked for, and sets the type from the bytes. Anything else is
+  the same 404 a miss gives. Additive-optional with
+  the closed reading this section requires: **absent or malformed means no picture**, which the phone
+  draws as the agent's logo, exactly as before the field. An older member sends no `picture`, so the
+  phone never asks it for one; one that is asked anyway answers 404. An older lead passes the field
+  through untouched and refuses the route `route_not_federated`, which the phone also reads as no
+  picture. Nothing in `bridge/crew/merge.ts` changes. `CREW_PROTOCOL_VERSION` stays `2`, no new verb
+  and no new header.
+
 - **A pane gained an optional `subtitle` and an optional `badge`** (added 2026-10-13, M53). They come
   from a durable agent (`bridge/mux/durable/WIRE.md` section 7.11): one line under the pane's title
   (text, at most 120 characters) and a small mark next to it (`{ count }` from 0 to 9999, or `{ text }`
@@ -1222,6 +1238,15 @@ Stated plainly, because a crew link is remote shell access to a second machine.
   is unchanged — see the next bullet; nothing here constrains the machine that holds the keys to
   everything. And `--force` (§14) strands every peer: a promoted lead a peer does not pin is refused
   at that peer's handshake, and re-enrollment is the recovery path §14 and §8.4 already name.
+
+  **WalkyTalky reaches past "its own machine", by design.** A peer can send a WalkyTalky message to an
+  agent pane on any other machine of the crew, through the lead. The message carries the peer's
+  signature, so the receiver knows which machine sent it, and it arrives as a peer's words: the pane
+  gets one header line, and the agent reads the body as the output of a command, not as its operator's
+  instruction. What the receiving agent then does is that agent's judgment, with the operator's rights
+  on its machine. So "its own machine" is the limit of what a compromised peer can do on the wire by
+  itself. It is not the limit of what it can ask another machine's agent to do. `COLLIE_WALKY=off` on a
+  machine refuses every message for its panes.
 - **A compromised lead** reaches **everything, on every member**. This is total, and it is inherent:
   the lead holds the crew secret and a pinned link to every peer, and its whole job is driving
   terminals. **The lead is a lateral-movement hub by construction.** Naming it is the mitigation
@@ -1390,11 +1415,50 @@ body is the secret mask below, and that change keeps the status and salts the ET
 version.
 
 - `If-None-Match` from the phone is passed through to the peer.
-- **Compression is hop-local: the peer hop is `Accept-Encoding: identity`, and the peer's
-  `content-encoding` is never re-emitted.** The lead asks the peer for uncompressed bytes, so the body
-  it holds is the body it writes out; whatever the runtime compresses and transparently decompresses
-  anyway, it does *not* strip the stale `content-encoding` from the response headers, and re-emitting
-  that header describes bytes that no longer exist.
+- **Compression is hop-local, and the member hop is gzipped** *(changed in 1.30.0, ADR 0161)*. On
+  every crew request the lead sends `Accept-Encoding: gzip`, never the phone's value, and its runtime
+  inflates a gzip answer as a stream: measured on Bun 1.4.4, a read cut at 2 MB peaks at about 100 MB
+  whether the answer inflates to 32 MB or to 1 GB. The size limit below counts the inflated bytes, so
+  it holds in one place for every encoding. The runtime leaves the member's `content-encoding` and
+  `content-length` on the inflated bytes; the lead copies neither to the phone. Every released bridge
+  compresses only gzip and only when the request names it (since 0.10.0), so no version moves.
+- **A slow, stuck or broken member cannot stall or bloat the lead** *(added in 1.30.0)*. Every crew
+  machine is the operator's own and the link is pinned mutual TLS (§8.5), so these limits are written
+  for a member that fails, not for one that attacks. Two limits, on the bytes the lead reads:
+  - **Size:** 2 MB for a body the lead parses itself (the sweep, hello and every other JSON call), 32 MB
+    for every other answer (a forwarded read or write, a log page, a blob). Past it the read fails.
+  - **Time:** the call's budget (§10.1) ends at the headers. A body the lead reads itself then ends by
+    a total deadline of three times the budget from the start of the dial (3.6 s on the sweep), so a
+    stuck member never holds the sweep. A forwarded answer that is read in full before it is of any use
+    (every route but a blob, a file's picture and a project picture: the lead masks or merges it, or
+    the phone parses it whole) ends by 8 s, or the route's write budget when that is longer. The number
+    is a choice: the phone itself gives up on a read after 6 s (a poll) or 10 s (History, a file), and
+    8 s leaves the lead 2 s for the mask. An honest whole answer that needs more is cut, for example a
+    32 MB History over a link slower than about 4 MB/s; the fix for that is smaller reads (pages), never
+    a longer deadline. A download that streams on to the phone ends when no byte came for 10 s while the
+    phone waited for one, and in any case after 10 minutes: the largest answer, 32 MB, needs about
+    55 KB/s to arrive inside it.
+  - **Memory:** past 4 MB a masked answer waits for the lead's one large-read slot before it reads on,
+    and keeps it until its mask is done, so at most one such answer is held and masked at a time. It
+    waits inside its own deadline and the phone's signal; ordinary answers stay below 4 MB and never wait.
+  - **The phone:** its request signal rides the dial, so a phone that goes away ends the member's read.
+    A write the member may have received still answers `write_outcome_unknown`, and its audit line says
+    `caller_left`, not a lost link.
+
+  Past a limit the member's stream is cancelled and the request aborted. A body the lead reads ends as
+  an unreachable peer (a cut on the clock counts as the lead's own time-out, §10.4), and so does a
+  masked text answer, which the lead reads whole before the phone gets a byte. A body already streaming
+  to the phone breaks off there with an error, never as a short body that looks whole, and the lead
+  logs that the answer was cut. Nothing on the wire changes.
+- **A peer never follows a redirect** *(added after 1.29.1)*. This holds for every crew dial, the
+  lead's to a member and a member's to its lead, and for the enrollment POST of `crew join`. No
+  collie answers a crew route with a redirect, so a 3xx other than `304` is a peer that answers
+  wrongly: the dial is `unreachable`, its body is not read, and the reason names the target's origin
+  only (scheme, host, port, printable ASCII, cut to 80 characters). A followed hop would carry the
+  request, its body and the crew headers to an address the far side picked, and pass that address's
+  answer off as the peer's. A forwarded read therefore answers the phone as a member out of reach
+  does, never with a `Location`. `CREW_PROTOCOL_VERSION` does not move: a correct peer never
+  redirected.
 - **The lead→phone hop is compressed by the lead itself**, on the phone's own `Accept-Encoding`, as a
   **stream transform** over the identity bytes (`CompressionStream("gzip")`) — the transform itself
   never buffers (a text answer the lead masks is held once, for the mask, below). It applies to JSON and text bodies with a body to send;
@@ -1588,6 +1652,11 @@ never crosses a crew link.
   is decided by a probe on its own budget, never by this one.
 - The peer sweep is a *part of* the existing poll, not a second timer. A solo lead runs no sweep at
   all (§11).
+- **A member that drips its answer slows the crew's refresh.** *(added 2026-11-19)* The sweep waits
+  for every member, and a snapshot body may take up to three times the budget (§9.1, 3.6 s at the
+  default 1200 ms). While one member sends its snapshot slowly, each sweep takes that long, so every
+  member's state refreshes no faster than once in that time, not once a poll. The member reads as
+  unreachable for those sweeps, and the others stay fresh at that slower pace.
 - **An input makes the poll hot on both machines.** *(added 2026-10-05)* A `/reply` or `/keys` that
   lands tightens the owning engine to `COLLIE_POLL_MS` for `HOT_POLLS` polls (`ARCHITECTURE.md` §5).
   Forwarded to a member, it lands through the member's own dispatch, so the member goes hot there;
@@ -1856,10 +1925,11 @@ nothing.**
 **Where the gate lives.** `bridge/solo-baseline.test.ts` (+ goldens under
 `bridge/fixtures/solo-baseline/`) and `web/src/lib/solo-baseline.test.ts`. Both were landed in
 1.0.0-alpha.1, *before* any federation code existed — written afterwards they would only re-record
-whatever the new code does. They pin the table above in two layers: an exhaustive
-`Record<keyof T, true>` per wire type (so adding `servers?:`/`host?:` fails `bun run typecheck` at the
-line it was added, and `satisfies SnapshotResponse` in `server.ts` closes the loop), plus a
-byte-compared golden body and its ETag. **A failure there is not a stale golden** — it is a solo
+whatever the new code does. They hold the table above as rules: a byte-compared golden body and its
+ETag, no crew field in a solo body, no `/crew` route in `server.ts`, no crew key in the config or the
+env, and no crew state file named outside `bridge/crew/`. Since 2026-11-19 they no longer keep a
+hand-written list of every route, wire key, setting and state file: a normal addition needs no edit
+there. **A failure there is not a stale golden** — it is a solo
 instance's behaviour moving. Regenerating is a deliberate act
 (`COLLIE_REGEN_SOLO_BASELINE=1 bun test bridge/solo-baseline.test.ts`) and **must** be called out in
 the PR description with the reason and the row it renegotiates.

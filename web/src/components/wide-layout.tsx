@@ -5,12 +5,14 @@ import { Icon } from "@/components/icons/icon";
 
 import { ActionRow } from "@/components/action-sheet-rows";
 import { ThreadSidebar } from "@/components/agent-sidebar";
-import { SettingsGear, useHeaderDock } from "@/components/app-header";
+import { NAV_MARK_PX, SettingsGear, useHeaderDock } from "@/components/app-header";
+import { ActionsButton } from "@/components/actions-palette";
 import { useHostHealth } from "@/components/crew-provider";
 import { StatusDot } from "@/components/status-badge";
 import { TabStrip } from "@/components/tab-strip";
 import { ColumnControls, ColumnHeader, PaneColumnBody, columnFrame } from "@/components/strip-column";
-import { Button } from "@/components/ui/button";
+import { NAV_EDGE, RECESS_ACCENT } from "@/components/ui/nav-edge";
+import { Button, FOCUS_RING } from "@/components/ui/button";
 import { PaneGlyph } from "@/components/ui/pane-glyph";
 import { BottomSheet } from "@/components/ui/sheet";
 import { CollieWordmark } from "@/components/collie-wordmark";
@@ -23,8 +25,10 @@ import { useNoPromptsGuard } from "@/hooks/use-no-prompts-guard";
 import type { FoldPosture } from "@/hooks/use-fold-posture";
 import { useRootOverscrollLock } from "@/hooks/use-root-overscroll-lock";
 import { useRowDrag, useVerticalSwipe, type DropTarget } from "@/hooks/use-row-drag";
+import { useShortcutHandler } from "@/hooks/use-shortcut-handler";
 import { tabCreateKey, useSpaceActions } from "@/hooks/use-spaces";
 import { useStripSnap } from "@/hooks/use-strip-snap";
+import { useViewGlide } from "@/hooks/use-view-glide";
 import { queueBeltIntent, type BeltIntent } from "@/lib/belt-intent";
 import { writeRefusal } from "@/lib/host-health";
 import { hostKey, hostName, isMultiHost, paneRowKey } from "@/lib/hosts";
@@ -44,14 +48,17 @@ import { shortenHome } from "@/lib/shorten-home";
 import { COLUMN_SNAP_CLASSES, STRIP_SNAP_CLASSES, leftmostWholeColumn, shouldFollowFocus } from "@/lib/strip-snap";
 import { pickTabPane } from "@/lib/tab-pane-memory";
 import { shownStatus } from "@/lib/triage";
-import { isReadOnly, statusLabel, type AgentView } from "@/lib/types";
+import { isReadOnly, statusLabel, type AgentView, type WorkspaceView } from "@/lib/types";
+import { shortcutTarget } from "@/lib/shortcuts/target";
 import { cn } from "@/lib/utils";
+import { takeSidebarReveal } from "@/lib/new-over";
 import {
   allowedPresets,
   arrive,
   columnKeyOf,
   cycleWidth,
   dropIndexAt,
+  followTarget,
   hasWidthChoice,
   insertAt,
   isWideMode,
@@ -64,16 +71,22 @@ import {
   RAIL_WIDTH,
   removeColumn,
   scopeOfPane,
-  scrollTargetFor,
   shownPreset,
   SIDEBAR_WIDTH,
   spaceKeyOf,
   spacesInOrder,
   spaceSwipe,
-  wholeColumnStart,
+  springEasing,
+  springRestMs,
+  stepWidth,
+  stripGeometry,
   type Places,
   type SpaceStrip,
 } from "@/lib/wide-layout";
+import { enterSidebarFocus, leaveSidebarFocus, moveSidebarFocus, openSidebarFocus, settleSidebarFocus } from "@/lib/shortcuts/sidebar-focus";
+import { useShortcutMode } from "@/lib/shortcuts/state";
+import { SpaceActionsSheet } from "@/components/space-actions-sheet";
+import { useMuxDeclared } from "@/lib/mux-capability";
 import { setSidebarOpen, setSpaceStrip, spaceStrip, useSidebarOpen, useSpaceStrips } from "@/lib/wide-layout-store";
 
 // THE PANE SCREEN ON A LARGE SCREEN (ADR 0120). From 600px wide, and only on `pane/:paneId`, the
@@ -93,6 +106,14 @@ import { setSidebarOpen, setSpaceStrip, spaceStrip, useSidebarOpen, useSpaceStri
 /** A press that travels further than this is a scroll, not a tap. */
 const TAP_SLOP_PX = 10;
 
+/** The sidebar and the rail stand on the recess; see the aside below. */
+/**
+ * The house focus ring (FOCUS_RING) on the mark's button, which `CollieHome` portals into the sidebar's mark slot: the
+ * slot puts it on the button inside, so the header's own copy of the button keeps the browser's ring (DESIGN.md §14).
+ */
+const MARK_RING = "[&_button]:focus-visible:outline-2 [&_button]:focus-visible:outline-offset-2 [&_button]:focus-visible:outline-ring";
+const SIDEBAR_PLANE = cn(NAV_EDGE, RECESS_ACCENT, "bg-surface-recess [--card:var(--surface-recess)]");
+
 /** On a column: its scrollers pass a sideways overscroll up to the strip (important, to win over the
  *  transcript list's own `overscroll-contain`). Vertical overscroll is untouched. */
 const COLUMN_PASSES_X = "[&_*]:overscroll-x-auto!";
@@ -101,9 +122,10 @@ const COLUMN_PASSES_X = "[&_*]:overscroll-x-auto!";
 const RAIL_MARK_PX = 26;
 
 /** The mark's drawing in the open sidebar's top row, a step above the rail's; the row stays 48px (h-12)
- *  and the mark's tap box 44px (size-11). It was 36; 40 is a try. To change it back, change this line and
- *  the row's left padding in `SidebarTop` (`pl-3.5` here, `pl-3` at 36, and a `-ml-0.5` on the word). */
-const SIDEBAR_MARK_PX = 40;
+ *  and the mark's tap box 44px (size-11). 32 leaves 8px above and below it in the row, the head's step
+ *  (2026-11-21; it was 40, then 36). To change it, change this line and the row's left padding in
+ *  `SidebarTop` with it, so the drawing still starts 16px in: (44 - size) / 2 + padding = 16. */
+const SIDEBAR_MARK_PX = NAV_MARK_PX;
 
 interface WideLayoutProps {
   widthClass: "medium" | "expanded";
@@ -136,6 +158,19 @@ export function WideLayout({ widthClass, paneId, scope, agent, focused, fold = "
   const open = useSidebarOpen();
   const stored = useSpaceStrips();
   const reduced = useMediaQuery("(prefers-reduced-motion: reduce)");
+  // ARRIVED FROM THE SPACE ADDRESS (routes/space.tsx): the sidebar brings the landed row near its top once, with
+  // its Space's heading above it. Any other arrival moves nothing in the sidebar.
+  useEffect(() => {
+    if (!takeSidebarReveal(paneId)) return;
+    const frame = requestAnimationFrame(() => {
+      const row = document.querySelector<HTMLElement>('[data-slot="wide-layout"] aside [aria-current="page"]');
+      let scroller = row?.parentElement ?? null;
+      while (scroller !== null && !/(auto|scroll)/u.test(getComputedStyle(scroller).overflowY)) scroller = scroller.parentElement;
+      if (row === null || scroller === null) return;
+      scroller.scrollTop += row.getBoundingClientRect().top - scroller.getBoundingClientRect().top - 48;
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [paneId]);
 
   const places = useMemo<Places>(() => ({ scope, servers: root.servers, sessions: root.sessions }), [scope, root.servers, root.sessions]);
   const herd = useMemo(() => [...root.agents, ...root.shellPanes], [root.agents, root.shellPanes]);
@@ -196,14 +231,17 @@ export function WideLayout({ widthClass, paneId, scope, agent, focused, fold = "
   const allowed = allowedPresets(stripWidth, MIN_PANE_WIDTH);
   const widthChoice = wide && hasWidthChoice(stripWidth, MIN_PANE_WIDTH);
 
-  const shown = strip.cols.filter((c) => c.key === strip.focus || byColumn.has(c.key));
+  const shownOf = (s: SpaceStrip) => s.cols.filter((c) => c.key === s.focus || byColumn.has(c.key));
+  const fractionsOf = (s: SpaceStrip) => shownOf(s).map((c) => (wide ? PRESET_FRACTION[shownPreset(c.preset, allowed)] : 1));
+  const shown = shownOf(strip);
   const framed = shown.length > 1;
-  const fractions = shown.map((c) => (wide ? PRESET_FRACTION[shownPreset(c.preset, allowed)] : 1));
+  const fractions = fractionsOf(strip);
+  const signature = fractions.join(",");
   // THE ADD COLUMN ends every flat strip: a scroll or a swipe right always lands on it. It is at least
   // a pane wide, and as wide as the room the last column leaves, so the last column can still rest at
   // the left edge and one column at 1/2 has the rest of the strip as its add column. It is no column
   // of the strip: no focus, no frame, no count, never a landing for the focus that follows the view.
-  const addWidth = book ? 0 : Math.max(MIN_PANE_WIDTH, (1 - (fractions.at(-1) ?? 1)) * stripWidth);
+  const addWidth = book ? 0 : stripGeometry(fractions, stripWidth, wide).addWidth;
   const tail = stripWidth > 0 ? addWidth / stripWidth : 0;
   const focusAt = shown.findIndex((c) => c.key === strip.focus);
   // BOOK: exactly two columns, one per segment: the focused one and its right neighbour, or its left
@@ -231,9 +269,17 @@ export function WideLayout({ widthClass, paneId, scope, agent, focused, fold = "
     const target = key === strip.focus && next.focus !== null ? byColumn.get(next.focus) : undefined;
     if (target !== undefined) goTo(target);
   };
-  const cycle = (key: string) => {
-    if (spaceKey !== null) setSpaceStrip(spaceKey, cycleWidth(strip, key, allowed));
+  // A width the person picks GLIDES on the view's spring (hooks/use-view-glide.ts); every other change of
+  // the bases, a window that crosses wide mode, a column that opens or closes, is drawn in one frame as
+  // before. The strip's own scroll to the focus moves on the same spring.
+  const { claim: claimGlide, run: runGlide, follow: followView, gliding } = useViewGlide(scroller);
+  const resize = (next: SpaceStrip) => {
+    if (spaceKey === null) return;
+    const drawn = fractionsOf(next).join(",");
+    if (drawn !== signature) claimGlide(drawn);
+    setSpaceStrip(spaceKey, next);
   };
+  const cycle = (key: string) => resize(cycleWidth(strip, key, allowed));
   const moveSpace = (by: -1 | 1) => {
     const target = spaces[spaceAt + by];
     const targetKey = spaceKeys[spaceAt + by];
@@ -292,6 +338,54 @@ export function WideLayout({ widthClass, paneId, scope, agent, focused, fold = "
     queueBeltIntent(columnKeyOf(pane, places), intent);
     goTo(pane);
   };
+
+  // ── The keyboard (M108): each shortcut calls the act a control on this screen already makes ─────
+  // A shortcut is a second path to a visible control, so each is offered only where its control is: the
+  // sidebar's toggle hides in the fold, the width button where there is a width to choose, the chevrons
+  // at the ends of the spaces, and "remove from view" while more than one column stands.
+  const stepFocus = (by: -1 | 1, wraps: boolean) => {
+    if (focusAt < 0) return;
+    const to = wraps ? (focusAt + by + shown.length) % shown.length : focusAt + by;
+    const key = shown[to]?.key;
+    const pane = key === undefined ? undefined : byColumn.get(key);
+    if (pane !== undefined && to !== focusAt) goTo(pane);
+  };
+  const stepWidthOf = (by: -1 | 1) => {
+    if (strip.focus !== null) resize(stepWidth(strip, strip.focus, allowed, by));
+  };
+  const focusedKey = strip.focus;
+  useShortcutHandler("toggle_sidebar", book ? undefined : () => setSidebarOpen(!open));
+  // On the strip the sidebar IS the switcher (the pane view draws none), so opening it is "go to".
+  useShortcutHandler("switch_pane", book ? undefined : () => setSidebarOpen(true));
+  useShortcutHandler("focus_pane_left", () => stepFocus(-1, false));
+  useShortcutHandler("focus_pane_right", () => stepFocus(1, false));
+  useShortcutHandler("cycle_pane_next", framed ? () => stepFocus(1, true) : undefined);
+  useShortcutHandler("cycle_pane_previous", framed ? () => stepFocus(-1, true) : undefined);
+  useShortcutHandler("previous_space", spaceAt > 0 ? () => moveSpace(-1) : undefined);
+  useShortcutHandler("next_space", spaceAt >= 0 && spaceAt < spaces.length - 1 ? () => moveSpace(1) : undefined);
+  useShortcutHandler("remove_from_view", framed && focusedKey !== null ? () => remove(focusedKey) : undefined);
+  useShortcutHandler("resize_narrower", widthChoice ? () => stepWidthOf(-1) : undefined);
+  useShortcutHandler("resize_wider", widthChoice ? () => stepWidthOf(1) : undefined);
+  // NAVIGATE MODE walks the sidebar's rows with a focus ring and changes nothing on screen until Enter opens
+  // the focused row (lib/shortcuts/sidebar-focus.ts). Offered where the sidebar's rows are drawn: not in
+  // the fold's two-column book, where the sidebar is a rail with no toggle.
+  const canMoveInSidebar = !book || sidebarShown;
+  useShortcutHandler("navigate_down", canMoveInSidebar ? () => moveSidebarFocus(1) : undefined);
+  useShortcutHandler("navigate_up", canMoveInSidebar ? () => moveSidebarFocus(-1) : undefined);
+  useShortcutHandler("navigate_open", canMoveInSidebar ? openSidebarFocus : undefined);
+  // The mode's own enter and leave. `prefix` over the mode is neither: the ring stays. A leave by Enter
+  // has already run `openSidebarFocus` by the time this effect sees the mode, and the leave repeats safely.
+  const shortcutMode = useShortcutMode();
+  useLayoutEffect(() => {
+    if (shortcutMode === "navigate") enterSidebarFocus();
+    if (shortcutMode === "normal" || shortcutMode === "resize") leaveSidebarFocus();
+  }, [shortcutMode]);
+  // The sidebar draws its rows after it opens from a rail, and again when its list changes: place a waiting
+  // ring and keep the paint on the rows that stand now.
+  useLayoutEffect(() => {
+    settleSidebarFocus();
+  });
+  useEffect(() => leaveSidebarFocus, []);
 
   // ── Row gestures: the menu, the drag ────────────────────────────────────────────────────────
   const [menuRow, setMenuRow] = useState<string | null>(null);
@@ -353,23 +447,22 @@ export function WideLayout({ widthClass, paneId, scope, agent, focused, fold = "
     restTimer.current = setTimeout(() => setMoving(false), 900);
   }, [measure]);
   useEffect(() => () => clearTimeout(restTimer.current), []);
-  const signature = fractions.join(",");
   useLayoutEffect(() => {
     const node = scroller.current;
-    if (node === null || book) return;
+    if (node === null) return;
+    // The signature is the fractions joined, and a number's text reads back to the same number.
+    const drawn = signature === "" ? [] : signature.split(",").map(Number);
+    const input = { signature, fractions: drawn, addWidth: stripGeometry(drawn, stripWidth, wide).addWidth, stripWidth, wide, focusAt };
+    // A width the person picked: the glide moves the columns and the scroll to the same end as below.
+    if (runGlide(input, { reduced, book, onEnd: measure })) return;
+    if (book) return;
     const cols = [...node.querySelectorAll<HTMLElement>("[data-col-index]")];
     const lefts = cols.map((c) => c.offsetLeft);
     const widths = cols.map((c) => c.offsetWidth);
-    let to = scrollTargetFor(focusAt, lefts, widths, node.scrollLeft, node.clientWidth, node.scrollWidth);
-    if (to === null) {
-      const whole = wholeColumnStart(lefts, node.scrollLeft);
-      const f = cols[focusAt];
-      const keepsFocus = whole === null || f === undefined || (f.offsetLeft >= whole - 0.5 && f.offsetLeft + f.offsetWidth <= whole + node.clientWidth + 0.5);
-      to = keepsFocus ? whole : (f?.offsetLeft ?? null);
-    }
-    if (to !== null) node.scrollTo?.({ left: to, behavior: reduced ? "auto" : "smooth" });
+    const to = followTarget(focusAt, lefts, widths, node.scrollLeft, node.clientWidth, node.scrollWidth);
+    if (to !== null) followView(to, { reduced, onEnd: measure });
     measure();
-  }, [focusAt, signature, stripWidth, reduced, measure, book]);
+  }, [focusAt, signature, stripWidth, wide, reduced, measure, book, runGlide, followView]);
 
   // ── Wheel and trackpad settle on a column start; the focus follows the view, as in niri ─────
   // Touch is the browser's own momentum and mandatory snap. After a wheel gesture settles, a focused
@@ -420,6 +513,19 @@ export function WideLayout({ widthClass, paneId, scope, agent, focused, fold = "
   });
   const machine = isMultiHost(root.servers) && agent ? hostName(root.servers, agent.host) : undefined;
 
+  // ── Rename space, from the Actions palette (ADR 0165) ──────────────────────────────────────
+  // The space in view, renamed with the phone space strip's own sheet, on its rename view. Offered where the
+  // multiplexer declares `renameSpace` (a durable program that takes renames) and the device may write. On a
+  // large screen `/space/:id` opens this view (routes/space.tsx), so this is where the space strip's command lives.
+  const [renamingSpace, setRenamingSpace] = useState<WorkspaceView | null>(null);
+  const canRenameSpace = useMuxDeclared("renameSpace", scope);
+  const openWorkspace =
+    agent === undefined ? undefined : root.workspaces.find((w) => w.workspaceId === agent.workspaceId && (w.host ?? undefined) === (agent.host ?? undefined));
+  useShortcutHandler(
+    "rename_space",
+    canRenameSpace && openWorkspace !== undefined && !readOnly && !root.error ? () => setRenamingSpace(openWorkspace) : undefined,
+  );
+
   // ── The add column's sheet: the space's other panes, to move here, and a new agent ──────────
   const [adding, setAdding] = useState(false);
   const inView = new Set(shown.map((c) => c.key));
@@ -441,8 +547,12 @@ export function WideLayout({ widthClass, paneId, scope, agent, focused, fold = "
         // Folded with one column, the sidebar fills the left segment; with two, it is the rail.
         // `pt-[env(safe-area-inset-top)]`: the sidebar and the tab row beside it are the layout's top
         // edge, so the two of them clear the status bar; the header docked lower down does not
-        // (app-header.tsx). The card paints under the bar, so the strip it reserves is the panel's own.
-        className={cn("flex shrink-0 flex-col border-r border-rule bg-card pt-[env(safe-area-inset-top)]", book && sidebarShown && "fold-left-full")}
+        // (app-header.tsx). The recess paints under the bar, so the strip it reserves is the panel's own.
+        // THE RECESS (DESIGN.md §4, "The large screen's three planes"): the navigation stands one step
+        // below the page, and the step is the cut, so its right edge is only the faint `NAV_EDGE`. The list inside is the
+        // phone's switcher too, which stands on a card; here `--card` and `--accent` are re-pointed, so its
+        // grounds and the status marks backed with them take the recess, and the selected row the paper.
+        className={cn("flex shrink-0 flex-col border-r", SIDEBAR_PLANE, "pt-[env(safe-area-inset-top)]", book && sidebarShown && "fold-left-full")}
         style={book && sidebarShown ? undefined : { width: sidebarShown ? SIDEBAR_WIDTH[widthClass] : RAIL_WIDTH }}
       >
         <SidebarTop open={sidebarShown} setMark={setMark} toggle={!book} />
@@ -451,7 +561,7 @@ export function WideLayout({ widthClass, paneId, scope, agent, focused, fold = "
             containing block was the page: a word far down a long list escaped this scroller and the
             app's root and made the document taller than the screen, so a drag on the header scrolled
             the whole app up under the status bar (1.27.1). */}
-        <div {...hostProps} className="relative min-h-0 flex-1 overflow-y-auto [-webkit-touch-callout:none]">
+        <div {...hostProps} data-slot="sidebar-list" className="relative min-h-0 flex-1 overflow-y-auto [-webkit-touch-callout:none]">
           {sidebarShown ? (
             <SidebarList agent={agent} paneId={paneId} scope={scope} onSelect={goTo} />
           ) : (
@@ -471,12 +581,12 @@ export function WideLayout({ widthClass, paneId, scope, agent, focused, fold = "
           )}
         >
           {sidebarShown ? (
-            <Button variant="ghost" data-slot="new-space" className="h-11 min-w-0 flex-1 justify-start gap-2.5 px-2 text-sm font-medium" onClick={toNew}>
+            <Button variant="ghost" data-slot="new-space" {...shortcutTarget("new_space")} className="h-11 min-w-0 flex-1 justify-start gap-2.5 px-2 text-sm font-medium" onClick={toNew}>
               <Icon name="new-space" className="size-5" aria-hidden />
               <span className="truncate">{t("wide.newSpace")}</span>
             </Button>
           ) : (
-            <Button variant="ghost" size="lg" data-slot="new-space" className="size-11 px-0" aria-label={t("wide.newSpace")} onClick={toNew}>
+            <Button variant="ghost" size="lg" data-slot="new-space" {...shortcutTarget("new_space")} className="size-11 px-0" aria-label={t("wide.newSpace")} onClick={toNew}>
               <Icon name="new-space" className="size-5" aria-hidden />
             </Button>
           )}
@@ -494,24 +604,20 @@ export function WideLayout({ widthClass, paneId, scope, agent, focused, fold = "
           // The row keeps its 48px and the status bar's inset goes on top of it, in the row's own
           // ground, beside the sidebar's (the aside above says why). With no inset it is 48px as before.
           className={cn(
-            "flex h-[calc(3rem+env(safe-area-inset-top))] shrink-0 touch-none items-center gap-1 border-b border-rule bg-band-ground pt-[env(safe-area-inset-top)]",
+            // THE BAR STANDS ON A FIRM EDGE (strip-head round, 2026-11-21): `--edge-firm`, 3:1 or more against the
+            // recess above it and the page band below it in every bundled theme. The faint `NAV_EDGE` it had
+            // measured 1.0:1 where a theme's recess clamps to its page (Nightwatch, Harbour), and the open tab
+            // stands on this line in both looks (tab-strip.tsx). It meets the sidebar's own rule at 48px.
+            "flex h-[calc(3rem+env(safe-area-inset-top))] shrink-0 touch-none items-center gap-1 border-b border-edge-firm bg-surface-recess pt-[env(safe-area-inset-top)] [--band-ground:var(--surface-recess)] [--chrome:var(--surface-recess)]",
             bookPair ? "pr-1" : "pl-4 pr-1",
           )}
         >
           {/* Folded with two columns, the header is cut at the fold like the strip under it: the name
-              over the left column, the buttons over the right one, nothing on the hinge. */}
-          <div className={cn("flex min-w-0 items-center", bookPair ? "fold-left-col pl-4" : "flex-1")}>
-            {/* The bar's title: the space, in the face and weight of the pane names under it. At the
-                medium tier it gives up more of the row to the tabs: there a long name and the position
-                left the tab row under 90px on a 705px foldable, so the open tab was cut and its "+"
-                fell off the end (1.27.1). */}
-            <div
-              data-slot="space-title"
-              className={cn("min-w-0 shrink-0 truncate text-sm font-semibold", widthClass === "medium" ? "max-w-[30%]" : "max-w-[45%]")}
-            >
-              {space?.label ?? ""}
-              {machine !== undefined && <span className="font-normal text-muted-foreground"> · {machine}</span>}
-            </div>
+              over the left column, the buttons over the right one, nothing on the hinge.
+              `self-stretch`: the block is the bar's whole height, so the tab row inside it can stand on the
+              bar's lower edge exactly (it sat a pixel above it while this block was only as tall as the row). */}
+          <div className={cn("flex min-w-0 items-center self-stretch", bookPair ? "fold-left-col pl-4" : "flex-1")}>
+            <SpaceTitle label={space?.label ?? ""} machine={machine} widthClass={widthClass} besideTabs={agent !== undefined} />
             {agent !== undefined ? (
               <TabStrip
                 workspaceId={agent.workspaceId}
@@ -531,25 +637,32 @@ export function WideLayout({ widthClass, paneId, scope, agent, focused, fold = "
                 savedCopy={root.error}
                 onRenamed={revalidate}
                 onClosed={closedTab}
-                // Under the folder look the row sits on the bar's bottom edge, one pixel over the
-                // bar's own rule, so the open tab covers that rule and joins the page below the bar
-                // (tab-strip.tsx). Plain: centred in the bar, as it always was.
-                className={cn("min-w-0 flex-1 bg-transparent", tabLook === "folder" && "self-end -mb-px")}
+                bar
+                // The row stands on the bar's lower edge in both looks. Under the folder look it reaches over the
+                // edge, by the theme's border width (Nightwatch draws 2px), so the open tab covers it and opens into the page band under the bar; plain
+                // ends on the edge, so the open tab's mark of ink stands on it (tab-strip.tsx).
+                className={cn("min-w-0 flex-1 self-end bg-transparent", tabLook === "folder" && "mb-[calc(var(--surface-border-width)*-1)]")}
               />
             ) : (
               <span className="flex-1" />
             )}
-            {/* "space 1 of 2" only where the row has room for it. At the medium tier the chevrons beside
-                it still step through the spaces and the sidebar lists them all. */}
-            {spaceAt >= 0 && widthClass !== "medium" && (
-              <span data-slot="space-position" className="shrink-0 px-2 text-xs tabular-nums text-muted-foreground">
-                {t("wide.space.position", { index: spaceAt + 1, total: spaces.length })}
-              </span>
-            )}
           </div>
           {bookPair && <span aria-hidden className="fold-gutter shrink-0" />}
           {bookPair && <span aria-hidden className="flex-1" />}
-          <Button variant="ghost" size="lg" className="size-11 px-0" aria-label={t("wide.space.previous")} disabled={spaceAt <= 0} onClick={() => moveSpace(-1)}>
+          {/* THE BAR'S THIRD GROUP: where you are among the spaces and the two ways through them, and the Actions
+              palette, behind one hairline (`--border`), the same one that sets a column's controls apart from
+              its name (strip-column.tsx). So the bar reads as three groups: the title, the tabs, the controls. */}
+          <div data-slot="space-controls" className="flex shrink-0 items-center gap-1 self-center border-l border-border pl-1">
+          {/* "space 1 of 2" only where the row has room for it. At the medium tier the chevrons beside
+              it still step through the spaces and the sidebar lists them all. */}
+          {spaceAt >= 0 && widthClass !== "medium" && (
+            <span data-slot="space-position" className="shrink-0 px-2 text-xs tabular-nums text-muted-foreground">
+              {t("wide.space.position", { index: spaceAt + 1, total: spaces.length })}
+            </span>
+          )}
+          {/* The Actions palette (ADR 0165), the header's door to it; the focused pane's belt pins the same button. */}
+          <ActionsButton />
+          <Button variant="ghost" size="lg" className="size-11 px-0" aria-label={t("wide.space.previous")} {...shortcutTarget("previous_space")} disabled={spaceAt <= 0} onClick={() => moveSpace(-1)}>
             <Icon name="space-prev" className="size-5" />
           </Button>
           <Button
@@ -557,12 +670,19 @@ export function WideLayout({ widthClass, paneId, scope, agent, focused, fold = "
             size="lg"
             className="size-11 px-0"
             aria-label={t("wide.space.next")}
+            {...shortcutTarget("next_space")}
             disabled={spaceAt < 0 || spaceAt >= spaces.length - 1}
             onClick={() => moveSpace(1)}
           >
             <Icon name="space-next" className="size-5" />
           </Button>
+          </div>
         </div>
+        {/* THE PAGE BAND: 6px of the page colour under the bar's edge, across the whole strip. The folder tab is
+            cut from it (tab-strip.tsx), so the open tab opens into the work area whichever column has the focus.
+            It is the bar's height, not the columns': a column header is 6px lower on the large screen in return
+            (app-header.tsx, strip-column.tsx), so the transcript keeps its top, its height and its first line. */}
+        <div aria-hidden data-slot="space-band" className="h-1.5 shrink-0 bg-background" />
 
         {/* The strip and its position line share a box, so the line can float over the strip's top edge
             instead of taking a row of its own under it. */}
@@ -570,9 +690,11 @@ export function WideLayout({ widthClass, paneId, scope, agent, focused, fold = "
           <div
             ref={setScroller}
             data-slot="strip"
+            data-gliding={gliding || undefined}
             onScroll={onStripScroll}
             className={cn(
-              "relative flex min-h-0 flex-1 overflow-y-hidden",
+              // The strip's own ground, seen around the add column, is the recess too.
+              "relative flex min-h-0 flex-1 overflow-y-hidden bg-surface-recess",
               book ? "overflow-x-hidden" : "overflow-x-auto",
               book || drag !== null ? "snap-none overscroll-x-contain" : STRIP_SNAP_CLASSES,
             )}
@@ -600,7 +722,9 @@ export function WideLayout({ widthClass, paneId, scope, agent, focused, fold = "
                     // whose pane holds a wide line (a mirror row, a table, a status footer) grew past
                     // its 100% basis and the strip scrolled sideways inside the content. Out of wide
                     // mode the inline `minWidth` below is not set, so this is the column's floor.
-                    "flex h-full min-w-0 shrink-0 border-r border-rule",
+                    // The seam between two columns is a component edge (`--border`), not a region's rule:
+                    // a line stays quieter than the step between the planes it separates (§4).
+                    "flex h-full min-w-0 shrink-0 border-r border-border",
                     COLUMN_SNAP_CLASSES,
                     // A sideways wheel over a column must reach the strip. The transcript list is
                     // `overscroll-contain` on both axes for the phone, which stopped the chain inside
@@ -630,9 +754,10 @@ export function WideLayout({ widthClass, paneId, scope, agent, focused, fold = "
                     goTo(pane);
                   }}
                 >
-                  {/* THE FRAME: reserved on every column, drawn on the focused one while the strip shows more
-                      than one, so a focus change recolours and moves nothing (DESIGN.md §2). */}
-                  <div data-slot="column-frame" className={cn("relative flex min-w-0 flex-1 flex-col overflow-hidden bg-background", columnFrame(isFocus, framed))}>
+                  {/* THE PLANE AND THE FRAME: the focused column is the paper inside the focus frame, also when
+                      it is the only one; the frame is reserved on every column, so a focus change recolours and
+                      moves nothing (DESIGN.md §2, §4). */}
+                  <div data-slot="column-frame" className={cn("relative flex min-w-0 flex-1 flex-col overflow-hidden", columnFrame(isFocus))}>
                     {isFocus ? (
                       <>
                         <div ref={setRow} data-slot="column-head" className="shrink-0" />
@@ -677,7 +802,7 @@ export function WideLayout({ widthClass, paneId, scope, agent, focused, fold = "
               <span aria-hidden data-slot="drop-bar" className="pointer-events-none absolute inset-y-0 z-20 w-1 bg-primary" style={{ left: drag.drop.markerX - 2 }} />
             )}
           </div>
-          {!book && shown.length > 1 && <PositionStrip widths={fractions} focus={focusAt} view={view} tail={tail} moving={moving} />}
+          {!book && shown.length > 1 && <PositionStrip widths={fractions} focus={focusAt} view={view} tail={tail} moving={moving} glide={gliding} />}
         </div>
       </div>
 
@@ -757,6 +882,16 @@ export function WideLayout({ widthClass, paneId, scope, agent, focused, fold = "
           />
         </div>
       </BottomSheet>
+      <SpaceActionsSheet
+        open={renamingSpace !== null}
+        onClose={() => setRenamingSpace(null)}
+        space={renamingSpace}
+        scope={scope}
+        readOnly={readOnly}
+        savedCopy={root.error}
+        onRenamed={revalidate}
+        openInRename
+      />
     </div>
   );
 }
@@ -770,6 +905,7 @@ function SidebarTop({ open, setMark, toggle: hasToggle }: { open: boolean; setMa
       variant="ghost"
       size="lg"
       data-slot="sidebar-toggle"
+      {...shortcutTarget("toggle_sidebar")}
       className="size-11 shrink-0 px-0 text-muted-foreground"
       aria-label={t("wide.sidebar.label")}
       aria-expanded={open}
@@ -784,18 +920,18 @@ function SidebarTop({ open, setMark, toggle: hasToggle }: { open: boolean; setMa
   if (!open) {
     return (
       <div className="flex shrink-0 flex-col items-center">
-        <div ref={setMark} data-slot="sidebar-mark" className="flex h-12 items-center justify-center" />
+        <div ref={setMark} data-slot="sidebar-mark" className={cn("flex h-12 items-center justify-center", MARK_RING)} />
         <div className="flex h-12 items-center justify-center border-b border-rule">{toggle}</div>
       </div>
     );
   }
   return (
-    // `pl-3.5`: the mark's box is 44px and its drawing SIDEBAR_MARK_PX (40), so the drawing starts
-    // 14 + 2 = 16px in, on the list's inset. The word follows the box and the gap: 2px of air + 4px gap = 6px
-    // from the drawing (the 36px drawing had 4 + 4 - 2 = 6 with a `-ml-0.5` on the word; no margin is needed now).
+    // `pl-2.5`: the mark's box is 44px and its drawing SIDEBAR_MARK_PX (32), so the drawing starts
+    // 10 + 6 = 16px in, on the list's inset, the x of every text and icon below it. The word follows the
+    // box and the gap: 6px of air + 4px gap = 10px from the drawing.
     // `wordmark-lockup`: the row is the pointer target that lights the name's suffix (index.css).
-    <div className="wordmark-lockup flex h-12 shrink-0 items-center gap-1 border-b border-rule pl-3.5 pr-1">
-      <div ref={setMark} data-slot="sidebar-mark" className="flex size-11 shrink-0 items-center justify-center" />
+    <div data-slot="sidebar-top" className="wordmark-lockup flex h-12 shrink-0 items-center gap-1 border-b border-rule pl-2.5 pr-1">
+      <div ref={setMark} data-slot="sidebar-mark" className={cn("flex size-11 shrink-0 items-center justify-center", MARK_RING)} />
       {/* The product's name outside (components/collie-wordmark.tsx, the brand's outlines): Collie in the text colour, PWA in the
           herd's three colours under a pointer. Not translated. */}
       {/* The word is part of the mark's button: a tap on it is the mark's tap (home, up a level,
@@ -806,7 +942,7 @@ function SidebarTop({ open, setMark, toggle: hasToggle }: { open: boolean; setMa
         aria-hidden
         data-slot="sidebar-word"
         onClick={(e) => e.currentTarget.parentElement?.querySelector<HTMLButtonElement>('[data-slot="sidebar-mark"] button')?.click()}
-        className="flex h-11 min-w-0 flex-1 items-center truncate text-left text-lg text-foreground"
+        className={cn("flex h-11 min-w-0 flex-1 items-center truncate text-left text-lg text-foreground", FOCUS_RING)}
       >
         <CollieWordmark />
       </button>
@@ -868,9 +1004,9 @@ function SidebarList({ agent, paneId, scope, onSelect }: { agent: AgentView | un
         onLaunchOpenChange={dash.setLaunchOpen}
         order={dash.prefs.paneOrder}
         onOrderChange={dash.setPaneOrder}
-        className="px-2 py-2"
-        // The filter field sticks at the top of the sidebar's scroller, its rule across the sidebar.
-        filterClassName="top-0 -mx-2 px-2"
+        // No top pad: the head block (the filter and the summary row) sticks at the top of the scroller and
+        // draws its own 8px steps, its rule across the sidebar.
+        className="px-2 pt-0 pb-2"
         roomy
       />
       {sheet}
@@ -913,10 +1049,30 @@ function Rail({ spaces, hereKey, onSelect }: { spaces: readonly WorkspaceGroup[]
   );
 }
 
+/** The position strip's segments while a width glides: the view's spring from rest over a full-strip
+ *  change, as a CSS `linear()` easing sampled from it (lib/wide-layout.ts `springEasing`). */
+const POSITION_GLIDE_MS = springRestMs(1120);
+const POSITION_GLIDE = `width ${POSITION_GLIDE_MS}ms ${springEasing(POSITION_GLIDE_MS)}`;
+
 /** Where the strip is: one segment per column, the focused one solid, the visible window framed.
  *  It floats over the strip's top edge and takes no row of its own: shown while the strip moves, it
  *  fades out once the strip rests, the way an overlay scroll bar does. It never takes a pointer. */
-function PositionStrip({ widths, focus, view, tail, moving }: { widths: readonly number[]; focus: number; view: { start: number; size: number }; tail: number; moving: boolean }) {
+function PositionStrip({
+  widths,
+  focus,
+  view,
+  tail,
+  moving,
+  glide,
+}: {
+  widths: readonly number[];
+  focus: number;
+  view: { start: number; size: number };
+  tail: number;
+  moving: boolean;
+  /** A width change glides: the segments ease to their new shares on the glide's speed and curve. */
+  glide: boolean;
+}) {
   const total = widths.reduce((n, w) => n + w, 0) + tail || 1;
   return (
     <div
@@ -930,10 +1086,50 @@ function PositionStrip({ widths, focus, view, tail, moving }: { widths: readonly
     >
       <div className="relative flex min-w-0 flex-1 gap-px">
         {widths.map((w, i) => (
-          <span key={i} className={cn("h-full", i === focus ? "bg-foreground" : "bg-muted-foreground/40")} style={{ width: `${(w / total) * 100}%` }} />
+          <span
+            key={i}
+            className={cn("h-full", i === focus ? "bg-foreground" : "bg-muted-foreground/40", glide && "motion-reduce:transition-none!")}
+            style={{ width: `${(w / total) * 100}%`, transition: glide ? POSITION_GLIDE : undefined }}
+          />
         ))}
         <span className="pointer-events-none absolute inset-y-[-1px] border border-foreground" style={{ left: `${view.start * 100}%`, width: `${view.size * 100}%` }} />
       </div>
+    </div>
+  );
+}
+
+/**
+ * The bar's title: the space, in the face and weight of the pane names under it. At the medium tier it
+ * gives up more of the row to the tabs: there a long name and the position left the tab row under 90px
+ * on a 705px foldable, so the open tab was cut and its "+" fell off the end (1.27.1). Beside tabs it takes
+ * at most a third of the row.
+ *
+ * ONE LINE, AND THE TABS START AFTER IT. The tab row cancels its own 16px gutter so its first label sits
+ * on the route's edge, and the folder look's card then starts on the row's very first pixel: flush
+ * against the end of this title, where a long name and its machine read as running under the open tab
+ * (since 1.27.0, the folder look). `mr-3` keeps the scroller's own 12px between the two. Where room runs
+ * out the machine gives way first (`shrink-[999]`: it is gone before the name loses a letter), then the
+ * name ends in an ellipsis; `title` carries the whole line.
+ */
+export function SpaceTitle({ label, machine, widthClass, besideTabs }: { label: string; machine: string | undefined; widthClass: WideLayoutProps["widthClass"]; besideTabs: boolean }) {
+  return (
+    <div
+      data-slot="space-title"
+      title={machine === undefined ? label : `${label} · ${machine}`}
+      className={cn(
+        "mr-3 flex min-w-0 shrink-0 whitespace-nowrap text-sm font-semibold",
+        widthClass === "medium" ? "max-w-[30%]" : besideTabs ? "max-w-1/3" : "max-w-[45%]",
+      )}
+    >
+      <span data-slot="space-title-name" className="min-w-0 truncate">
+        {label}
+      </span>
+      {machine !== undefined && (
+        <span data-slot="space-title-machine" className="min-w-0 shrink-[999] truncate font-normal text-muted-foreground">
+          {"\u00a0· "}
+          {machine}
+        </span>
+      )}
     </div>
   );
 }

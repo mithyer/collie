@@ -256,6 +256,13 @@ export interface AgentView {
    */
   gitHead?: GitHead;
   /**
+   * The version of this pane's project picture (ADR 0160). Mirrors `PaneWire.picture` in
+   * bridge/types.ts. **Absent, never a placeholder**: no picture, an older bridge and an older crew
+   * member all send no key, and the phone draws the agent's logo as before. Read it through
+   * `panePicture` (lib/project-picture.ts), which drops a malformed one from a peer.
+   */
+  picture?: string;
+  /**
    * The open asks a person may answer on this pane, as data, oldest first (ADR 0100). Mirrors
    * `PaneWire.asks` in bridge/types.ts. Every open ask is listed (the bridge caps at 50); the card
    * list shows the first five and folds the rest (lib/ask.ts `shownAsks`). **Absent on every pane with
@@ -1479,12 +1486,12 @@ export interface SnapshotResponse {
   hillOff?: true;
   /**
    * Tricks as a whole are switched off on this bridge (bridge/tricks/feature-switch.ts, off by default):
-   * Settings, Tricks draws the list read-only with one line saying so. Absent while tricks are on.
+   * Settings, Tricks and the Hill draws the list read-only with one line saying so. Absent while tricks are on.
    */
   tricksOff?: true;
   /**
    * With the Hill off (M96 spec 14): the hill's revision while it holds a card of Collie's own about a
-   * trick. The phone reads `GET /api/hill`, which then serves only those cards, for Settings, Tricks, the
+   * trick. The phone reads `GET /api/hill`, which then serves only those cards, for Settings, Tricks and the Hill, the
    * Dashboard's line and the card's page. Absent with the Hill on (then `hillRev` rides) and when none is held.
    */
   trickCardsRev?: number;
@@ -2536,6 +2543,11 @@ export interface BridgeConfig {
   operatorCommands?: OperatorCommand[];
   /** The operator's own Keys-tray presets. Absent when there is no `keys.toml`. */
   operatorKeys?: OperatorKeyRow[];
+  /**
+   * The operator's own keyboard shortcuts, raw: action name to binding strings (`[]` is unbound).
+   * Absent when there is no `shortcuts.toml` with a `[keys]` table. The app parses them itself.
+   */
+  operatorShortcuts?: { [name: string]: string[] };
   /** The operator's own Quick-dock groups. Absent when there is no `quick-replies.toml`. */
   operatorQuickReplies?: OperatorQuickReplyRow[];
   /** The operator's own UI typefaces. Absent when there is no `theme.toml` (ADR 0033). */

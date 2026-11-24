@@ -437,7 +437,8 @@ export type SentMemberReply =
 export interface SentMember {
   readonly host: string;
   readonly label: string;
-  readonly ask: (params: URLSearchParams) => Promise<Response>;
+  /** Asks the member; `signal` aborts the whole ask, the member's read included. */
+  readonly ask: (params: URLSearchParams, signal?: AbortSignal) => Promise<Response>;
 }
 
 /** One entry off a member's answer, or `null` when it is not one. Its `host` is the lead's name for it. */
@@ -489,23 +490,44 @@ export async function askSentMember(member: SentMember, params: URLSearchParams,
   const late = new Promise<"timeout">((resolve) => {
     timer = setTimeout(() => resolve("timeout"), budgetMs);
   });
-  const asked = member.ask(params);
+  // The budget covers the whole answer, its body too: a member that sends its headers and then drips
+  // its body would otherwise hold the merge of every member (review round 8). At the budget the body
+  // is cancelled, also when it is already being read.
+  const stop = new AbortController();
+  // The signal reaches the forward too: with redaction on, `ask` resolves only after the lead's mask read
+  // the whole answer, so cancelling the body here alone would come too late.
+  const read = member.ask(params, stop.signal).then((res) => readSentReply(cancelledBy(res, stop.signal), member.host));
   try {
-    const first = await Promise.race([asked, late]);
+    const first = await Promise.race([read, late]);
     if (first === "timeout") {
-      // The answer that comes later is read by nobody: its body is let go.
-      void asked.then(
-        (res) => res.body?.cancel(),
-        () => undefined,
-      );
+      stop.abort();
+      void read.catch(() => undefined);
       return { ok: false, reason: "timeout" };
     }
-    return await readSentReply(first, member.host);
+    return first;
   } catch {
     return { ok: false, reason: "unreachable" };
   } finally {
     clearTimeout(timer);
   }
+}
+
+/** `res` with a body that is cancelled at the source when `signal` aborts, also in the middle of a read. */
+function cancelledBy(res: Response, signal: AbortSignal): Response {
+  if (res.body === null) return res;
+  const reader = res.body.getReader();
+  const cancel = () => void reader.cancel("timeout").catch(() => undefined);
+  if (signal.aborted) cancel();
+  else signal.addEventListener("abort", cancel, { once: true });
+  const body = new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      const next = await reader.read();
+      if (next.done) controller.close();
+      else controller.enqueue(next.value);
+    },
+    cancel: (reason) => reader.cancel(reason),
+  });
+  return new Response(body, { status: res.status, statusText: res.statusText, headers: res.headers });
 }
 
 /**

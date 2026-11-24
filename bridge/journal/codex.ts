@@ -59,7 +59,7 @@ import { asWindow } from "./model-window.ts";
 import { type Cursor, NO_CURSOR, type ReadSince } from "./cursor.ts";
 import {
   containedRealpath,
-  exists,
+  firstContained,
   FIRST_TAIL_BYTES,
   head,
   loadTail,
@@ -623,7 +623,8 @@ export function codexHistoryBase(firstLine: string): HistoryBase | null {
  * resumed conversation re-reports its NEW id and the pane record follows it.
  */
 export class CodexTranscriptSource implements TranscriptSource {
-  private readonly pathCache = new Map<string, { path: string; at: number }>();
+  // The root must travel with the cached path so cache hits re-check per-root symlink containment.
+  private readonly pathCache = new Map<string, { path: string; root: string; at: number }>();
 
   private readonly rootsNow: () => string[];
 
@@ -644,8 +645,10 @@ export class CodexTranscriptSource implements TranscriptSource {
     if (ref.kind !== "id" || !isCodexSessionId(ref.value)) return null;
     const sessionId = ref.value.toLowerCase();
     const cached = this.pathCache.get(sessionId);
-    if (cached !== undefined && this.now() - cached.at < CODEX_RESCAN_MS && (await exists(cached.path))) {
-      return cached.path;
+    // A root that left the config (an account removed) serves nothing more, cache or not.
+    if (cached !== undefined && this.now() - cached.at < CODEX_RESCAN_MS && this.roots.includes(cached.root)) {
+      const real = await containedRealpath(cached.path, cached.root);
+      if (real !== null) return real;
     }
     this.pathCache.delete(sessionId);
 
@@ -656,37 +659,19 @@ export class CodexTranscriptSource implements TranscriptSource {
       // A hit that failed containment is `null` too — that root has nothing it may serve for this
       // uuid either way, and the next root is asked on its own terms (files.ts header).
       if (hit === null) continue;
-      this.pathCache.set(sessionId, { path: hit, at: this.now() });
+      this.pathCache.set(sessionId, { path: hit, root, at: this.now() });
       return hit;
     }
     return null;
   }
 
   /**
-   * The newest file under `root` whose name `match` accepts: newest date folder first, and the
-   * largest name inside the first folder that has one.
+   * The newest file under `root` whose name `match` accepts and that `root` contains: newest date
+   * folder first, and inside a folder the largest name first. A refused name is skipped for the next
+   * one down, also into older folders (#839, see {@link firstContained}).
    */
-  private async findUnder(root: string, match: (lowerName: string) => boolean): Promise<string | null> {
-    for (const year of await descending(root)) {
-      for (const month of await descending(join(root, year))) {
-        for (const day of await descending(join(root, year, month))) {
-          const dir = join(root, year, month, day);
-          let names: string[];
-          try {
-            names = await readdir(dir);
-          } catch {
-            continue;
-          }
-          const hit = names
-            .filter((n) => n.startsWith("rollout-") && match(n.toLowerCase()))
-            .toSorted()
-            .at(-1);
-          if (hit === undefined) continue;
-          return containedRealpath(join(dir, hit), root);
-        }
-      }
-    }
-    return null;
+  private findUnder(root: string, match: (lowerName: string) => boolean): Promise<string | null> {
+    return firstContained(rolloutsUnder(root, match), root);
   }
 
   /**
@@ -807,6 +792,29 @@ async function firstLineOf(path: string): Promise<string> {
     return firstLineIn(await head(path, META_BYTES));
   } catch {
     return "";
+  }
+}
+
+/**
+ * The rollout files under `root` whose name `match` accepts, in the order {@link
+ * CodexTranscriptSource} tries them: newest date folder first, largest name first inside a folder.
+ * Lazy, so the walk stops at the first one served. An unreadable folder is passed over.
+ */
+async function* rolloutsUnder(root: string, match: (lowerName: string) => boolean): AsyncGenerator<string> {
+  for (const year of await descending(root)) {
+    for (const month of await descending(join(root, year))) {
+      for (const day of await descending(join(root, year, month))) {
+        const dir = join(root, year, month, day);
+        let names: string[];
+        try {
+          names = await readdir(dir);
+        } catch {
+          continue;
+        }
+        const hits = names.filter((n) => n.startsWith("rollout-") && match(n.toLowerCase())).toSorted().toReversed();
+        for (const hit of hits) yield join(dir, hit);
+      }
+    }
   }
 }
 

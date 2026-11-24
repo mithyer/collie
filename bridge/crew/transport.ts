@@ -55,7 +55,13 @@ export interface CrewTlsOptions {
 }
 
 /** A `fetch` init that may carry TLS material. Bun honours `tls`; the type just says so out loud. */
-export type CrewRequestInit = RequestInit & { tls?: CrewTlsOptions };
+/**
+ * A crew dial's fetch options. `bodyMax` lowers or raises the size limit on the answer (guarded-body.ts;
+ * the default is 2 MB for a body the lead reads itself, 32 MB for the rest). `bodyDeadlineMs` is a total
+ * deadline on an answer that is read in full, from the start of the dial. A `signal` is the caller's: when
+ * it aborts, the dial aborts. The dial strips the first two before the fetch.
+ */
+export type CrewRequestInit = RequestInit & { tls?: CrewTlsOptions; decompress?: boolean; bodyMax?: number; bodyDeadlineMs?: number };
 
 /**
  * The peer listener's TLS configuration, or `null` when this collie must not pin one.

@@ -301,6 +301,16 @@ export interface AgentView {
    */
   gitHead?: GitHead;
   /**
+   * The version of the project picture the pane folder's `collie.toml` names (ADR 0160): the first 24
+   * hex of the sha256 of its bytes, read off disk by `bridge/project-picture.ts` and attached at
+   * serialise time exactly as {@link gitHead} is. The phone fetches `/api/project-picture/<version>`.
+   *
+   * ABSENT, NEVER A PLACEHOLDER: no project file, no `icon`, a refused picture, the operator's
+   * `COLLIE_PROJECT_FILES=0`, a reading not taken yet and every older bridge carry no key, and the
+   * phone then draws the agent's logo as before.
+   */
+  picture?: string;
+  /**
    * How many pins the pane's session holds (M90, bridge/pins/store.ts). Set at snapshot time from the
    * store, only when above zero, never `0`, so a pane of a session with no pins and every solo body stay
    * what they were. The phone shows the Pins mark from it. An older bridge never sends it.
@@ -986,13 +996,13 @@ export interface SnapshotResponse {
   hillOff?: true;
   /**
    * Tricks as a whole are switched off on this bridge (bridge/tricks/feature-switch.ts, off by default): the
-   * phone draws the switch on Settings, Tricks and the off state from it. Absent while on, and on a bridge
+   * phone draws the switch on Settings, Tricks and the Hill and the off state from it. Absent while on, and on a bridge
    * with no tricks runner. A crew member's own value does not ride to its lead, as its `hillOff` does not.
    */
   tricksOff?: true;
   /**
    * With the Hill off (M96 spec 14): the hill's revision while it holds a card of Collie's own about a
-   * trick. The phone reads `GET /api/hill`, which then serves only those cards, for Settings, Tricks, the
+   * trick. The phone reads `GET /api/hill`, which then serves only those cards, for Settings, Tricks and the Hill, the
    * Dashboard's line and the card's page. Absent with the Hill on (then `hillRev` rides) and when none is held.
    */
   trickCardsRev?: number;
@@ -1944,6 +1954,13 @@ export interface OperatorCommand {
 }
 
 /**
+ * The operator's keyboard shortcuts as `shortcuts.toml` declares them, before the app has parsed a
+ * binding: an action name (or `prefix`) to its binding strings. A bare string in the file became a
+ * one-item list, and `""` became `[]`, which means unbound. The bridge keeps no action list.
+ */
+export type OperatorShortcuts = { [name: string]: string[] };
+
+/**
  * One operator-declared Keys-tray preset (a `[[keys]]` row in their `keys.toml`). A pane any of
  * these rows address shows them INSTEAD of the shipped Ctrl presets; a pane none of them address
  * keeps the shipped ones (ADR 0018, the same rule `commands.toml` follows). Only the PRESETS are
@@ -2495,6 +2512,12 @@ export interface BridgeConfig {
   operatorCommands?: OperatorCommand[];
   /** The operator's own Keys-tray presets. Absent/empty when there is no `keys.toml`. */
   operatorKeys?: OperatorKeyRow[];
+  /**
+   * The operator's own keyboard shortcuts, raw: action name to a list of binding strings (`""` is
+   * `[]`, unbound). Absent when there is no `shortcuts.toml` with a `[keys]` table. The app parses
+   * and validates the strings; the bridge holds no action list.
+   */
+  operatorShortcuts?: OperatorShortcuts;
   /** The operator's own Quick-dock groups. Absent/empty when there is no `quick-replies.toml`. */
   operatorQuickReplies?: OperatorQuickReplyRow[];
   /**

@@ -70,7 +70,7 @@ describe("the person's tap starts the carried tricks", () => {
     expect(await trickCodeHash(join(tricksConfigDir(deputy.configDir), "legs"))).toEqual({ ok: true, hash });
     const card = carriedCard("desk", TAP, result.failed[0]!);
     expect(card.title).toBe("The trick Leg day is off after the takeover");
-    expect(card.summary).toBe("It ran on desk, but the rights its code asks for are not the rights your lead says you approved. Collie left it off on this machine. Read its rights in Settings → Tricks before you switch it on.");
+    expect(card.summary).toBe("It ran on desk, but the rights its code asks for are not the rights your lead says you approved. Collie left it off on this machine. Read its rights in Settings → Tricks and the Hill before you switch it on.");
     // The notice keeps its kind through the file.
     await writeCarryNotices(deputy.stateDir, "desk", TAP, result.failed);
     const notices = parseCarryNotices(await readFile(join(tricksStateDir(deputy.stateDir), TAKEOVER_NOTICES_FILE), "utf8"));
@@ -78,8 +78,7 @@ describe("the person's tap starts the carried tricks", () => {
   });
 
   // The race is made with an inotify watch, which fires before the tap's rename; other platforms deliver
-  // the event later, and the test would race itself. Inline, not a skip: the Windows run's skip budget
-  // (scripts/windows-suites.ps1) counts every skipped test.
+  // the event later, and the test would race itself, so it returns early off Linux.
   test("a folder that appears while the tap writes is read after the rename: the lead's auto does not come along for it (review 7)", async () => {
     if (process.platform !== "linux") return;
     const lead = await machine("lead");

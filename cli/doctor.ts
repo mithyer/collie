@@ -25,6 +25,7 @@ import { TMUX_BINARY_OPTION } from "../bridge/mux/tmux/adapter.ts";
 import { ZELLIJ_BINARY_OPTION } from "../bridge/mux/zellij/adapter.ts";
 import { DURABLE_MUX } from "../bridge/mux/durable/adapter.ts";
 import { HERDR_CORE_MUX } from "../bridge/mux/herdr-core/adapter.ts";
+import { REX_BINARY_OPTION } from "../bridge/mux/rex/adapter.ts";
 import { TERN_BINARY_OPTION } from "../bridge/mux/tern/adapter.ts";
 import { bindIsWildcard } from "../bridge/crew/config.ts";
 import { deriveMode } from "../bridge/crew/mode.ts";
@@ -61,6 +62,8 @@ import { identityHeader, readOwnSnapshot } from "./snapshot-read.ts";
 import { collieVersionBare, type CliContext } from "./context.ts";
 import { CrewOpsStore } from "../bridge/crew/ops-store.ts";
 import { crewDelta, deltaLines } from "./crew-delta.ts";
+import { projectFileFindings } from "./project-file-finding.ts";
+import { shortcutsFinding } from "./shortcuts-finding.ts";
 import { aboutCrew, bad, ok, skipped, warn, type DoctorStatus, type Finding } from "./finding.ts";
 import { statusLineState } from "./statusline.ts";
 import { parseAccountWindowsSetting } from "../bridge/account-windows-setting.ts";
@@ -188,6 +191,11 @@ export interface DoctorDeps {
    */
   readonly ownerOnly: OwnerOnlyDeps;
   /**
+   * The folder doctor runs in, for the `project-file` row (ADR 0160). Absent, which is what every test
+   * sees, means no row.
+   */
+  readonly folder?: string;
+  /**
    * The terminal renderer, when this run landed on one (`cli/render.ts`). Absent — which is what
    * every test and every piped run sees — means the plain lines below, unchanged.
    */
@@ -314,6 +322,10 @@ export async function cmdDoctor(deps: DoctorDeps, args: readonly string[]): Prom
     ...skillOldMorph(deps),
     ...walkyRefusals(deps),
     accountWindowsFinding(deps),
+    // The `collie.toml` that speaks for the folder doctor runs in (ADR 0160): one row when there is one.
+    ...(deps.folder === undefined ? [] : await projectFileFindings({ env: deps.ctx.env, folder: deps.folder, stateDir: deps.ctx.stateDir, configDir: deps.ctx.configDir })),
+    // The lines of `shortcuts.toml` Collie dropped (M108): one row when there are some, none otherwise.
+    ...shortcutsFinding({ configDir: deps.ctx.configDir, files: deps.files }),
     // Whether the anonymous install ping is on and which switch decided (M86 spec 01). Info only.
     ...(await telemetryFindings(deps)),
     // The Whistle model (ADR 0096): one finding when the model, or the host engine that needs it, is
@@ -1549,6 +1561,7 @@ function muxTarget(settings: MuxSettings): MuxTarget {
       [TMUX_BINARY_OPTION]: settings.tmuxBin,
       [ZELLIJ_BINARY_OPTION]: settings.zellijBin,
       [TERN_BINARY_OPTION]: settings.ternBin,
+      [REX_BINARY_OPTION]: settings.rexBin,
     },
   };
 }
@@ -2361,6 +2374,7 @@ export function doctorDeps(base: {
     beacons: beaconReader(base.ctx.stateDir),
     now: () => Date.now(),
     ownerOnly: realOwnerOnlyDeps,
+    folder: process.cwd(),
     harnesses: harnessReader(base.ctx.env),
   };
 }

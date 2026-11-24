@@ -15,8 +15,8 @@
 ColliePWA is an open-source (MIT) web app for your phone. It displays your terminal AI agents,
 including Claude Code, Codex and OpenCode, and lets you answer them remotely. You host it on your
 own computer alongside [Herdr](https://herdr.dev). Support for the new Herdr core,
-[tmux](https://github.com/tmux/tmux) and [zellij](https://zellij.dev) is experimental. ColliePWA
-is served over Tailscale, so only devices on your own tailnet reach it. You install it via your browser
+[tmux](https://github.com/tmux/tmux), [zellij](https://zellij.dev), tuios, Tern and Rex is
+experimental. ColliePWA is served over Tailscale, so only devices on your own tailnet reach it. You install it via your browser
 directly to your home screen, bypassing app stores.
 
 Using Herdr? Read about the
@@ -52,7 +52,7 @@ math is enabled ([syntax](./docs/changes.md#equations)). Edge receives features 
 ## Get it on your phone in 3 steps
 
 Prerequisites: [Tailscale](https://tailscale.com) on your computer and phone, and
-[Herdr](https://herdr.dev) (or experimental Herdr core, tmux, or zellij) running on your computer.
+[Herdr](https://herdr.dev) (or experimental Herdr core, tmux, zellij, tuios, Tern or Rex) running on your computer.
 For new setups, follow **[Install in five minutes](./docs/five-minute-install.md)** for
 platform-specific instructions, including [Windows](./docs/five-minute-install.md#windows).
 Alternative options (Arch, Nix, Herdr plugin, source) are in **[Install](./docs/install.md)**.
@@ -67,11 +67,12 @@ curl -fsSL https://colliepwa.dev/install.sh | sh
 **2. Start** it on your tailnet:
 
 ```bash
-COLLIE_MUX=herdr collie start          # or: herdr-core, tmux, zellij
+COLLIE_MUX=herdr collie start          # or: herdr-core, tmux, zellij, tuios, tern, rex
 ```
 
 Without `COLLIE_MUX`, `collie start` checks for Herdr, tmux, and zellij and prompts you to pick
-one. It offers Herdr core only if the Herdr TUI is absent.
+one. It offers Herdr core only if the Herdr TUI is absent. It never looks for tuios, Tern or Rex:
+name one with `COLLIE_MUX`.
 
 **3. Put it on your phone and pair it.** Run `collie qr` and scan the code. Add ColliePWA to
 your home screen:
@@ -84,7 +85,7 @@ your home screen:
 
 ColliePWA is not on the App Store or Google Play; home-screen installation is required. Launch the
 installed app, run `collie pair` on your computer, and enter the code under
-**Settings → System → Paired devices**. Pair within the home-screen app, not the browser: iOS keeps
+**Settings → Devices and machines → Paired devices**. Pair within the home-screen app, not the browser: iOS keeps
 their storage separate. The app displays no panes until paired.
 
 Agents awaiting input appear first. Tap an agent to reply. To configure Collie using an agent,
@@ -110,8 +111,8 @@ device gating before running the service.
 ## Who this is for
 
 Collie is for developers running terminal-multiplexed AI agents who want phone access via a touch
-UI instead of an emulated terminal. Herdr is the primary target. **The Herdr core, tmux and zellij
-are experimental**: they function, but testing is limited.
+UI instead of an emulated terminal. Herdr is the primary target. **The Herdr core, tmux, zellij,
+tuios, Tern and Rex are experimental**: they function, but testing is limited.
 [Bug reports are welcome](./docs/multiplexers.md#pointing-collie-at-a-multiplexer), including reports
 of working setups.
 
@@ -154,7 +155,7 @@ runs the client in your browser against mock data without requiring installation
 | | |
 | --- | --- |
 | [**Sessions**](./docs/sessions.md) | What a session is, where sessions come from, a terminal or a durable agent, and what the phone shows for each |
-| [**Terminals**](./docs/multiplexers.md) | Pointing Collie at Herdr, the Herdr core (`herdr-core`), tmux, zellij, tuios or Tern, what each can answer, two Collies on one machine, and agent beacons. Experimental for the Herdr core, tmux, zellij, tuios and Tern; bug reports wanted |
+| [**Terminals**](./docs/multiplexers.md) | Pointing Collie at Herdr, the Herdr core (`herdr-core`), tmux, zellij, tuios, Tern or Rex, what each can answer, two Collies on one machine, and agent beacons. Experimental for the Herdr core, tmux, zellij, tuios, Tern and Rex; bug reports wanted |
 
 ### Durable agents
 
@@ -184,6 +185,7 @@ runs the client in your browser against mock data without requiring installation
 | [**Windows**](./docs/windows.md) | Windows 11 with Herdr: what is supported and what is still experimental, installing with `install.ps1`, the unsigned binary, updating, long paths, and what is not tested |
 | [**Security**](./docs/security.md) | What a Collie exposes, the defenses, and pairing a device, the credential for every request |
 | [**Configure**](./docs/configure.md) | The `.env`, your own slash commands, keys, quick replies, launchers and typefaces; appearance, Zen mode, language |
+| [**Keyboard shortcuts**](./docs/keyboard-shortcuts.md) | Driving Collie from a desktop keyboard: the prefix key, every action with its default keys, `shortcuts.toml`, the key grammar, and Herdr's names |
 | [**Themes**](./docs/themes.md) | The four looks Collie ships, picking one in Settings, importing a theme file after a preview, exporting one to edit, and writing your own: the 43 colour tokens, the shape and look words, the terminal palette, and what a theme cannot change |
 | [**Themes reference**](./docs/themes-reference.md) | Every key, colour token, shape word, ground pattern, terminal palette key, typeface, character and glyph set of a theme file, with its limits and defaults, complete and generated from the code |
 | [**Changes**](./docs/changes.md) | The Files screen: a workspace's folder with its changes marked, the changed files and their diffs, and the last commit, from the pane or the dashboard's Files tab. Read-only git, nested repos, and the two settings that decide how far it looks |
@@ -236,7 +238,8 @@ Windows 11 x64 running Herdr is maintained and tested directly. The platform sta
 experimental until an update between two real releases is proven on it. Linux and macOS are unaffected. See
 [**docs/windows.md**](./docs/windows.md) for installation, updates, and limitations. Summary:
 
-- **Tested.** The `windows.yml` workflow tests the bridge, CLI, and scripts on every push. A
+- **Tested.** The `windows.yml` workflow tests the bridge, CLI, and scripts every night, on every
+  release branch push and before each release. A
   Windows 11 VM rehearses an install, an update and a rollback before each release tag
   ([ADR 0075](./.adr/0075-windows-is-a-supported-host.md)).
 - **Installed without a toolchain.** Releases provide `collie-<version>-windows-x64.zip`,
@@ -268,13 +271,13 @@ multiplexer directly.
      │  one mux adapter, chosen per install
      ▼
   the multiplexer        owns the panes, agents and terminal state
-  Herdr · Herdr core · tmux · zellij
+  Herdr · Herdr core · tmux · zellij · tuios · Tern · Rex
 ```
 
 Under [Variant C](./docs/deployment.md#variant-c--reverse-proxy-as-the-only-front-door-no-tailscale),
 a standard reverse proxy replaces `tailscale serve`. The downstream components are unchanged.
 
-- **Only the adapter touches the multiplexer** (`bridge/mux/<name>/`: Herdr dials a Unix socket, tmux and zellij shell out to their CLIs); everything else speaks the bridge's HTTP API. What every adapter must answer is [`MUX_CONTRACT.md`](./MUX_CONTRACT.md).
+- **Only the adapter touches the multiplexer** (`bridge/mux/<name>/`: Herdr dials a Unix socket, tmux, zellij and Rex shell out to their CLIs); everything else speaks the bridge's HTTP API. What every adapter must answer is [`MUX_CONTRACT.md`](./MUX_CONTRACT.md).
 - **Polling is still the model.** The bridge takes one snapshot per tick from the adapter and the browser polls `/api/snapshot`; where the multiplexer offers an event stream (Herdr does) it only pokes the bridge's poll to go faster, it never replaces it. No resync logic.
 - **Actions are plain HTTP.** A reply or key `POST`s to `/api/pane/:id/{reply,keys}`, and the adapter types it into a real terminal (hence the security posture).
 - **The UI is a static PWA.** Vite builds `web/dist`, served from disk, so a rebuild is live with no restart.
@@ -353,7 +356,7 @@ from 1.27.4, for a dialog a short hash of its key-hint row. It also says which a
 whether the optional data link was on for them, never how many. No IP
 address is stored. No content, nothing you type or read.
 
-Turn it off on each machine in Settings, System, **Telemetry**, with `COLLIE_TELEMETRY=0` (in the
+Turn it off on each machine in Settings, Privacy and data, **Telemetry**, with `COLLIE_TELEMETRY=0` (in the
 instance's `.env` for a service), `telemetry = false` in `config.toml` or `DO_NOT_TRACK=1`. Blocking
 the host in your firewall works too. The update check is a separate anonymous request to GitHub's
 public tags API. [Details](./docs/security.md#what-leaves-your-machine) ·

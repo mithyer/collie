@@ -226,6 +226,7 @@ function cfg(overrides: Partial<Config> = {}): Config {
     tmuxBin: "",
     zellijBin: "",
     ternBin: "",
+    rexBin: "",
     socketPath: "/tmp/herdr.sock",
     port: 8787,
     host: "127.0.0.1",
@@ -253,6 +254,7 @@ function cfg(overrides: Partial<Config> = {}): Config {
     submitKeys: ["Enter"],
     commandsFile: "/nope/commands.toml",
     keysFile: "/nope/keys.toml",
+    shortcutsFile: "/nope/shortcuts.toml",
     quickRepliesFile: "/nope/quick-replies.toml",
     themeFile: "/nope/theme.toml",
     fontsDir: "/nope/fonts",
@@ -284,6 +286,7 @@ function cfg(overrides: Partial<Config> = {}): Config {
     sendProtocol: false,
     walky: true,
     walkyPairLimit: 12,
+    projectFiles: true,
     skipServe: false,
     basePath: "/",
     authReturn: false,
@@ -2123,7 +2126,7 @@ describe("pairedLabel — the name Settings credits a change to", () => {
 // Reads need the pairing token, and pairing is always on. The open-route list is short and named:
 // `/api/health` and `/api/pair`. The crew surface (`/crew/v1/*`) and the standby door have their own
 // admission and never reach `guard`. `bun test` cannot stand up `Bun.serve` (CLAUDE.md), so the
-// route table is read from the source, the way `solo-baseline.test.ts` pins it: every block that
+// route table is read from the source, the way `solo-baseline.test.ts` reads it: every block that
 // claims an `/api` path must ask a gate before it answers, except the two named here.
 describe("open routes — every /api route but health and pair asks the pairing gate", () => {
   const src = readFileSync(join(import.meta.dir, "server.ts"), "utf8");
@@ -3181,7 +3184,7 @@ describe("reservedAuthPlaceholder — what /auth/ says when no proxy answers", (
     const body = await reservedAuthPlaceholder().text();
     expect(body).toContain("<code>collie pair</code>");
     expect(body).toContain("enter the code in Settings");
-    expect(body).toContain('<a href="/settings/system">Open Settings</a>');
+    expect(body).toContain('<a href="/settings/devices">Open Settings</a>');
     expect(body).toContain('<a href="/">Back to Collie</a>');
     // The operator paragraph is still there, after the pairing one.
     expect(body.indexOf("collie pair")).toBeLessThan(body.indexOf("If you are the operator"));
@@ -3190,7 +3193,7 @@ describe("reservedAuthPlaceholder — what /auth/ says when no proxy answers", (
   test("under a mount both links carry it (ADR 0052)", async () => {
     const body = await reservedAuthPlaceholder("/collie/").text();
     expect(body).toContain('<a href="/collie/">Back to Collie</a>');
-    expect(body).toContain('<a href="/collie/settings/system">Open Settings</a>');
+    expect(body).toContain('<a href="/collie/settings/devices">Open Settings</a>');
   });
 
   test("the mount is escaped, since the page is open to anyone", async () => {
@@ -3288,6 +3291,29 @@ describe("bridgeConfigBody — /api/config reports the crew mode", () => {
   test("push disabled still round-trips its key untouched", () => {
     const body = bridgeConfigBody({ push: false, vapidPublicKey: "", build: "unknown", mode: "solo" });
     expect(body).toEqual({ push: false, vapidPublicKey: "", build: "unknown" });
+  });
+});
+
+describe("bridgeConfigBody: the operator's keyboard shortcuts", () => {
+  const base = { push: true, vapidPublicKey: "BKey", build: "abc123" } as const;
+
+  test("an instance with no shortcuts.toml sends the same body as before", () => {
+    const plain = JSON.stringify(bridgeConfigBody({ ...base, mode: "solo" }));
+    expect(JSON.stringify(bridgeConfigBody({ ...base, mode: "solo", operatorShortcuts: null }))).toBe(plain);
+    expect(JSON.stringify(bridgeConfigBody({ ...base, mode: "solo", operatorShortcuts: undefined }))).toBe(plain);
+    expect("operatorShortcuts" in bridgeConfigBody({ ...base, mode: "solo", operatorShortcuts: null })).toBe(false);
+  });
+
+  test("a [keys] table rides the wire as it was read, after the Keys-tray rows", () => {
+    const bindings = { prefix: ["ctrl+a"], zoom: [] };
+    const body = bridgeConfigBody({
+      ...base,
+      mode: "solo",
+      operatorKeys: [{ label: "A", keys: ["ctrl+a"], danger: false }],
+      operatorShortcuts: bindings,
+    });
+    expect(body.operatorShortcuts).toEqual(bindings);
+    expect(Object.keys(body).indexOf("operatorShortcuts")).toBe(Object.keys(body).indexOf("operatorKeys") + 1);
   });
 });
 
@@ -3942,9 +3968,10 @@ describe("the host gate — `?host=` selects among enrolled members and nothing 
     // this machine's accounts, one resolve for the read and one for the two writes (M101), and an
     // answer to an ask by id, the hook hold card's tap on a member's pane (M56 spec 12)) reach their runtime through the caller's resolver and
     // nothing else. One of them, the launcher rows, hands the resolver the lead's merge (ADR 0127), and
-    // two, the launch and the branch create, hand it the lead's row carry (ADR 0127 point 3).
+    // two, the launch and the branch create, hand it the lead's row carry (ADR 0127 point 3). The project
+    // picture (ADR 0160) is one more read, resolved like a blob.
     const carry = String.raw`undefined, leadRowCarry\(allowedLaunchers, homedir\(\)\)`;
-    expect([...src.matchAll(new RegExp(String.raw`await caller\.resolve\((?:leadRows|${carry})?\);`, "g"))]).toHaveLength(33);
+    expect([...src.matchAll(new RegExp(String.raw`await caller\.resolve\((?:leadRows|${carry})?\);`, "g"))]).toHaveLength(34);
     expect([...src.matchAll(/await caller\.resolve\(leadRows\);/g)]).toHaveLength(1);
     expect([...src.matchAll(new RegExp(String.raw`await caller\.resolve\(${carry}\);`, "g"))]).toHaveLength(2);
     // Exactly eight `registry.get(` calls remain, and each is a sanctioned one, named here rather
@@ -5033,7 +5060,7 @@ describe("POST /api/launch and /api/worktree?host= — the lead's row rides the 
     // Nothing before the peer branch touches `write`; inside it, the rewritten request is what is sent.
     expect(peer).not.toContain("write.request");
     expect(gate).toContain("const carried = write === undefined ? { request: req, leadRow: false } : await write.request(req);");
-    expect(gate).toContain("const askReq = merge === undefined ? carried.request : new Request(askUrl, { method: req.method });");
+    expect(gate).toContain("const askReq = merge === undefined ? carried.request : mergeAskRequest(askUrl, req);");
     // The mark rides the forward as the carry's own flag, never as a header of the phone's.
     expect(gate).toContain("leadRow: carried.leadRow,");
   });

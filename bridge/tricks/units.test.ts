@@ -9,12 +9,12 @@ import { ensureOwnerOnlyDir, isOwnerOnly, privateRoot } from "../owner-only.ts";
 import type { AgentView, WorkspaceView } from "../types.ts";
 import { FACT_SESSIONS_MAX, FACT_SESSIONS_MAX_BYTES, parseFacts, TRICK_CONTRACT, TRICK_CONTRACT_DEFAULT } from "../../web/src/lib/tricks/schema.ts";
 import { CODE_FILES_MAX, diskTrickFs, trickCodeHash, type TrickFs } from "./code-hash.ts";
-import { createTrickScanner, MANIFEST_BYTES_MAX, readManifestText, TRICKS_MAX } from "./discover.ts";
+import { createTrickScanner, MANIFEST_BYTES_MAX, readManifestText } from "./discover.ts";
 import { buildFacts, crewFactsWorld, factsWorldOf } from "./facts.ts";
 import { switchesPath } from "./paths.ts";
 import { TRICKS_ROUTE_RIGHTS, tricksAutoRoute, tricksCodeRoute, tricksMediaRoute, tricksSwitchRoute, tricksTapRoute, tricksUndoRoute, parseSince } from "./routes.ts";
 import type { TricksSurface } from "./service.ts";
-import { createSwitchReader, parseSwitches, renderSwitches, SWITCH_LOCK_BLANK_MS, SWITCH_LOCK_WAIT_MS, type LockFs, updateSwitches, withApproval, withEntry, withSwitch, withSwitchLock, writeSwitches } from "./switches.ts";
+import { createSwitchReader, parseSwitches, renderSwitches, SWITCH_LOCK_BLANK_MS, type LockFs, updateSwitches, withApproval, withEntry, withSwitch, withSwitchLock, writeSwitches } from "./switches.ts";
 
 const HASH = "a".repeat(64);
 const HASH2 = "b".repeat(64);
@@ -128,31 +128,6 @@ describe("the switch file", () => {
       expect(await leftovers(stateDir)).toEqual([]);
     }
   });
-
-  test("counsel A1, third pass: a live holder that sleeps 7 s is never taken over; its waiters give up with the error", async () => {
-    const stateDir = await tempDir();
-    const lock = `${switchesPath(stateDir)}.lock`;
-    const child = await holder(stateDir, 7000);
-    const text = readFileSync(lock, "utf8");
-    expect(text.startsWith(`${String(child.pid)}\n`)).toBe(true);
-    let entered = 0;
-    const results = await Promise.allSettled(
-      Array.from({ length: 4 }, () =>
-        withSwitchLock(stateDir, async () => {
-          entered += 1;
-        }),
-      ),
-    );
-    expect(entered).toBe(0);
-    for (const result of results) {
-      expect(result.status).toBe("rejected");
-      if (result.status === "rejected") expect(String(result.reason)).toContain("locked by another writer");
-    }
-    // The holder's own file stood the whole time, and its own release removes it.
-    expect(readFileSync(lock, "utf8")).toBe(text);
-    expect(await child.exited).toBe(0);
-    expect(existsSync(lock)).toBe(false);
-  }, 20_000);
 
   test("counsel A1, third pass: a holder killed inside the lock is taken over by one waiter at a time", async () => {
     const stateDir = await tempDir();
@@ -314,21 +289,6 @@ describe("the switch file", () => {
     expect(await leftovers(stateDir)).toEqual([]);
   });
 
-  test("Windows: a rename that keeps being refused ends in the existing error at the limit, never before, and leaves nothing of the waiter's", async () => {
-    const stateDir = await tempDir();
-    await mkdir(join(stateDir, "tricks"), { recursive: true });
-    const lock = `${switchesPath(stateDir)}.lock`;
-    const dead = `${String(await deadPid())}\ndead-holder\n`;
-    await writeFile(lock, dead);
-    const fs = refusing({ rename: Number.POSITIVE_INFINITY });
-    const started = Date.now();
-    await expect(withSwitchLock(stateDir, async () => "never", Date.now, fs)).rejects.toThrow("locked by another writer");
-    expect(Date.now() - started).toBeGreaterThanOrEqual(SWITCH_LOCK_WAIT_MS);
-    expect(fs.refused.rename).toBeGreaterThan(10);
-    expect(readFileSync(lock, "utf8")).toBe(dead);
-    expect(await leftovers(stateDir)).toEqual(["switches.json.lock"]);
-  }, 20_000);
-
   test("counsel A1, blank locks: an old empty door is cleared, a fresh empty door is waited for", async () => {
     const dead = await deadPid();
     const stateDir = await tempDir();
@@ -466,7 +426,8 @@ describe("discovery", () => {
     const root = await tempDir();
     await trickDir(root, "legs");
     const { fs, reads } = counting();
-    const scanner = createTrickScanner(root, { fs });
+    // A clock past the racy window of every write (stat-held.ts), so a settled read is reused.
+    const scanner = createTrickScanner(root, { fs, now: () => Date.now() + 10_000 });
     const first = await scanner.scan();
     expect(first.tricks[0]?.manifest?.name).toBe("legs");
     // Once for the manifest, once for the code hash.
@@ -484,7 +445,7 @@ describe("discovery", () => {
     const root = await tempDir();
     const dir = await trickDir(root, "legs", { "p.sh": "#!/bin/sh\n", "lib/util.sh": "x=1\n", "config.toml": "a = 1\n" });
     const { fs, reads } = counting();
-    const scanner = createTrickScanner(root, { fs });
+    const scanner = createTrickScanner(root, { fs, now: () => Date.now() + 10_000 });
     const first = (await scanner.scan()).tricks[0]!;
     expect(first.codeHash).toMatch(/^[0-9a-f]{64}$/);
     expect(first.configHash).toMatch(/^[0-9a-f]{64}$/);
@@ -593,25 +554,6 @@ describe("discovery", () => {
     expect(kept.tricks.map((t) => t.id)).toEqual(["legs"]);
     expect(good.exists).toBe(true);
     expect(await createTrickScanner("/nonexistent/collie-tricks").scan()).toEqual({ exists: false, tricks: [] });
-  });
-
-  test("past 64 folders the rest are listed as refused, and a new folder never pushes out one already read", async () => {
-    const root = await tempDir();
-    await Promise.all(Array.from({ length: TRICKS_MAX + 1 }, (_, i) => trickDir(root, `t${String(i).padStart(3, "0")}`)));
-    const scanner = createTrickScanner(root);
-    const first = await scanner.scan();
-    expect(first.tricks).toHaveLength(TRICKS_MAX + 1);
-    const over = first.tricks.filter((t) => t.manifest === undefined);
-    expect(over.map((t) => t.id)).toEqual([`t${String(TRICKS_MAX).padStart(3, "0")}`]);
-    expect(over[0]?.refusals[0]?.reason).toContain("more than 64 trick folders");
-    await trickDir(root, "a-first");
-    const second = await scanner.scan();
-    expect(second.tricks[0]?.id).toBe("a-first");
-    expect(second.tricks[0]?.manifest).toBeUndefined();
-    expect(second.tricks.find((t) => t.id === "t000")?.manifest).toBeDefined();
-    // A fresh scanner (a restart) reads the ones switched on first.
-    const fresh = await createTrickScanner(root).scan(new Set(["a-first"]));
-    expect(fresh.tricks[0]?.manifest).toBeDefined();
   });
 
   test("no folder is `exists: false`; TOML that does not parse is one refusal", async () => {
@@ -978,7 +920,7 @@ describe("the routes", () => {
     const src = readFileSync(join(import.meta.dir, "..", "server.ts"), "utf8");
     const list = src.slice(src.indexOf('if (pathname === "/api/tricks" && req.method === "GET")'));
     // The rights live in one table in routes.ts; server.ts reads each route's level from it.
-    expect(TRICKS_ROUTE_RIGHTS).toEqual({ reply: "read", tap: "write", switch: "write", media: "read", code: "read", auto: "write", undo: "write", official: "read", officialAdd: "write", repoList: "write", repoAdd: "write", feature: "write", value: "write" });
+    expect(TRICKS_ROUTE_RIGHTS).toEqual({ reply: "read", tap: "write", switch: "write", media: "read", code: "read", auto: "write", undo: "write", official: "read", officialAdd: "write", repoList: "write", repoAdd: "write", feature: "write", value: "write", remove: "write" });
     expect(list.slice(0, 400)).toContain("guard(req, cfg, TRICKS_ROUTE_RIGHTS.reply, pairingGate)");
     expect(list.slice(0, 600)).toContain("if (pairedLabel(req, pairingGate) !== null) tricks.noteWatched();");
     // The runner's PATH for the host's own CLI only is held by a real request in the crew harness

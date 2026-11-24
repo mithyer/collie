@@ -50,7 +50,7 @@ import {
   rememberPending,
   type RowReducer,
 } from "./reduce.ts";
-import { containedRealpath, exists, loadTail, readSinceFile, rootReader, statFile, type RootSource } from "./files.ts";
+import { containedRealpath, existingNewestFirst, firstContained, loadTail, readSinceFile, rootReader, statFile, type RootSource } from "./files.ts";
 import { MAX_OPEN_FILES_PIDS, openFiles as defaultOpenFiles, type OpenFiles } from "./open-files.ts";
 import { clamp, MAX_RESULT_CHARS, MAX_TEXT_CHARS, stripAnsi, summarizeToolInput } from "./text.ts";
 import { classifyToolCall } from "./tool-call.ts";
@@ -164,11 +164,22 @@ function processAlive(pid: number): boolean {
   }
 }
 
-/** Inner text of the first `<user_query>…</user_query>`, trimmed; null when the tag isn't present. */
+/**
+ * Inner text of the first `<user_query>…</user_query>`, trimmed; null when the tag isn't present.
+ *
+ * Found with `indexOf`, never a regex: the text is whatever a person typed, and the old
+ * `/<user_query>\s*([\s\S]*?)\s*<\/user_query>/` took time in the cube of an open tag's trailing
+ * blanks when the close was missing (8 KB took 36 s, with the bridge stopped). The first open tag
+ * pairs with the first close after it, as the regex did; a later open tag cannot find a close the
+ * first one missed.
+ */
 export function extractUserQuery(text: string): string | null {
-  const m = /<user_query>\s*([\s\S]*?)\s*<\/user_query>/.exec(text);
-  if (!m) return null;
-  const inner = (m[1] ?? "").trim();
+  const OPEN = "<user_query>";
+  const open = text.indexOf(OPEN);
+  if (open === -1) return null;
+  const close = text.indexOf("</user_query>", open + OPEN.length);
+  if (close === -1) return null;
+  const inner = text.slice(open + OPEN.length, close).trim();
   return inner === "" ? null : inner;
 }
 
@@ -503,7 +514,8 @@ export class GrokTranscriptSource implements TranscriptSource {
     const sessionId = ref.value;
     const cached = this.pathCache.get(sessionId);
     if (cached !== undefined) {
-      const real = await containedRealpath(cached.path, cached.root);
+      // A root that left the config (an account removed) serves nothing more, cache or not.
+      const real = this.roots.includes(cached.root) ? await containedRealpath(cached.path, cached.root) : null;
       if (real !== null) {
         if (real !== cached.path) this.pathCache.set(sessionId, { path: real, root: cached.root });
         return real;
@@ -520,6 +532,11 @@ export class GrokTranscriptSource implements TranscriptSource {
     return null;
   }
 
+  /**
+   * The session's `chat_history.jsonl` in a folder of `root` that `root` contains. The folders are
+   * tried newest log first ({@link existingNewestFirst}), and a refused log is skipped for the next
+   * folder that holds the id (#839, see {@link firstContained}).
+   */
   private async findUnder(root: string, sessionId: string): Promise<string | null> {
     let dirs: string[];
     try {
@@ -527,12 +544,7 @@ export class GrokTranscriptSource implements TranscriptSource {
     } catch {
       return null;
     }
-    for (const dir of dirs) {
-      const candidate = join(root, dir, sessionId, "chat_history.jsonl");
-      if (!(await exists(candidate))) continue;
-      return containedRealpath(candidate, root);
-    }
-    return null;
+    return firstContained(await existingNewestFirst(root, dirs, sessionId, "chat_history.jsonl"), root);
   }
 
   stat = statFile;

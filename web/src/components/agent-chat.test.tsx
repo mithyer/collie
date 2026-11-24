@@ -66,6 +66,7 @@ import { ROOT_ROUTE_ID } from "@/lib/loaders";
 import { withHeaderHost } from "@/test/header-host";
 import { CROSSFADE_QUIET_MS } from "@/components/ui/crossfade-text";
 import { COLLAPSE_MS } from "./ui/collapse";
+import { runShortcutAction } from "@/lib/shortcuts/registry";
 import { AgentChat } from "./agent-chat";
 import { saveChatTail } from "@/lib/chat-tail";
 import { __resetMaskedHint, maskedHintRetired } from "@/lib/masked-hint";
@@ -147,6 +148,14 @@ async function openPaneMenu(user: User) {
 async function openFind(user: User) {
   await openPaneMenu(user);
   await user.click(screen.getByRole("button", { name: "Find in output" }));
+}
+
+
+// The Belt's pill opens Actions since ADR 0165; the pane list keeps its drag, its handle and its action.
+function openSwitcher(): void {
+  act(() => {
+    runShortcutAction("switch_pane");
+  });
 }
 
 describe("AgentChat — reply flow", () => {
@@ -553,23 +562,30 @@ describe("AgentChat — the pane header's identity block", () => {
     expect(name + gap + placeBox).toBeLessThan(44);
   });
 
-  it("carries the WORKSPACE on line 2, never the tab crumb or the cwd", () => {
+  it("carries the WORKSPACE on the space's door, never the tab crumb or the cwd", () => {
     // The one place rule (lib/pane-name.test.ts pins the rule itself); the header now takes only the
     // `space` half of it, because the tab strip directly under the header already names the open tab.
+    // On the phone with the tab row shown the door is that row's first cell (ADR 0171), so line 2 holds no
+    // space name; with no tab row it is line 2 again (the next assertion).
     const base = fixtureAgents[0]!; // workspaceLabel "webapp", tab w1:t1, cwd /home/you/webapp
+    const bare = renderChat({ agent: base, agents: [base] }).container;
+    expect(slot(bare, "place")?.textContent).toBe("webapp");
+    cleanup();
     const tab = { tabId: "w1:t1", workspaceId: "w1", number: 1, label: "review", focused: false, paneCount: 1 };
+    const door = (c: HTMLElement) => c.querySelector('nav [data-slot="pane-identity"]')?.textContent;
     const named = renderChat({ agent: base, agents: [base], tabs: [tab] }).container;
-    expect(slot(named, "place")?.textContent).toBe("webapp");
+    expect(door(named)).toBe("webapp");
+    expect(slot(named, "place")?.textContent).toBe("");
     cleanup();
     // A named tab, a positional tab or no tab at all — the tab's title never reaches this line, only
     // the tab strip below shows it now.
     const numbered = renderChat({ agent: base, agents: [base], tabs: [{ ...tab, label: "2" }] }).container;
-    expect(slot(numbered, "place")?.textContent).toBe("webapp");
+    expect(door(numbered)).toBe("webapp");
     cleanup();
     // The path is gone from this line, even for a pane sitting away from its space root.
     const worktree = { ...base, cwd: "/home/you/webapp/worktrees/fix-42" };
     const away = renderChat({ agent: worktree, agents: [worktree], tabs: [tab] }).container;
-    expect(slot(away, "place")?.textContent).toBe("webapp");
+    expect(door(away)).toBe("webapp");
     expect(away.textContent).not.toContain("worktrees/fix-42");
   });
 
@@ -839,7 +855,7 @@ describe("AgentChat — raw-terminal escape hatch", () => {
     renderChat({ agent, agents: [agent], text: "body\n" });
 
     await user.click(screen.getByRole("button", { name: "Display settings" }));
-    const toggle = screen.getByRole("switch", { name: "Render this pane natively" });
+    const toggle = screen.getByRole("switch", { name: "Keep this pane's own colours" });
     // Muse renders natively already, so the switch starts on with nothing stored.
     expect(toggle).toBeChecked();
     expect(paneMirrorOverride(undefined, agent.paneId)).toBeUndefined();
@@ -1192,7 +1208,7 @@ describe("AgentChat — block-grammar scoping (an agent with no adapter)", () =>
     // above the whole chrome block.
     for (const text of [STATUS_TEXT, MENU_TEXT]) {
       const { container } = renderChat({ text });
-      const handle = screen.getByRole("button", { name: "Switch pane" });
+      const handle = screen.getByRole("button", { name: "Actions" });
       const belt = container.querySelector('[data-slot="composer-actions"]')!;
       // The composer's own box, reached through the actions belt inside it — the status band this
       // used to reach through is gone (composer.tsx says where it went).
@@ -1394,15 +1410,16 @@ describe("AgentChat — status rides the header title slot, not the tab strip", 
   it("shows a live status in place of the title, and the tab strip's + stays usable", () => {
     renderChat({ tabs: fixtureTabs });
 
-    // The title is showing, no status yet. Line 2 now names the workspace alone — the tab crumb
-    // left this line for the tab strip under the header.
-    expect(screen.getByText("webapp")).toBeInTheDocument();
+    // No status yet: line 2 holds no space name on the phone, whose tab row carries the space's door (ADR 0171).
+    const place = () => document.querySelector('[data-slot="pane-place"]')!;
+    expect(place().textContent).toBe("");
+    expect(screen.queryByRole("status")).not.toBeInTheDocument();
 
     act(() => setStatus("Sent", "success"));
 
-    // The title's own text is gone from the header slot — the status replaced it in place.
-    expect(screen.queryByText("webapp")).not.toBeInTheDocument();
+    // The status shows in the header, and the door keeps the space's name.
     expect(screen.getByRole("status")).toHaveTextContent("Sent");
+    expect(document.querySelector('nav [data-slot="pane-identity"]')).toHaveTextContent("webapp");
 
     // The tab strip's "+" never moved and is still enabled — the control the operator just
     // tapped to earn this exact status, on the old placement, is untouched by the swap.
@@ -1419,7 +1436,7 @@ describe("AgentChat — status rides the header title slot, not the tab strip", 
     act(() => vi.advanceTimersByTime(2500));
 
     expect(screen.queryByRole("status")).not.toBeInTheDocument();
-    expect(screen.getByText("webapp")).toBeInTheDocument();
+    expect(document.querySelector('[data-slot="pane-place"]')?.textContent).toBe("");
   });
 });
 
@@ -1584,7 +1601,7 @@ describe("AgentChat \u2014 the pane menu in the header", () => {
     await waitFor(() => expect(screen.queryByRole("navigation", { name: "Panes" })).toBeNull());
     await waitFor(() => expect(container.querySelector('[data-slot="pane-identity-taps"]')).toBeNull());
     expect(container.querySelector('[data-slot="pane-lines"]')).not.toBeNull();
-    expect(screen.queryByRole("button", { name: "Switch pane" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Actions" })).toBeNull();
     expect(screen.queryByRole("button", { name: "Files" })).toBeNull();
     await openPaneMenu(user);
     const sheet = screen.getByRole("dialog");
@@ -2408,7 +2425,7 @@ describe("the pane fits its viewport", () => {
     const kb = withSoftKeyboard();
     try {
       const { container } = renderChat({ text: STATUS_TEXT });
-      expect(screen.queryByRole("button", { name: "Switch pane" })).not.toBeNull();
+      expect(screen.queryByRole("button", { name: "Actions" })).not.toBeNull();
 
       // A soft keyboard only stands on a focused field (use-keyboard.ts), so the caret goes in first,
       // the way tapping the composer does on the phone.
@@ -2419,7 +2436,7 @@ describe("the pane fits its viewport", () => {
       // the tree is the a11y half of that claim: what is not on screen must not still be focusable.
       await waitFor(() => expect(screen.queryByText("[Opus 4.8] ~/webapp · main")).toBeNull());
       // …and the grip stays, keyboard or no keyboard. It is in no `Collapse` at all.
-      expect(screen.queryByRole("button", { name: "Switch pane" })).not.toBeNull();
+      expect(screen.queryByRole("button", { name: "Actions" })).not.toBeNull();
 
       // THE NAVIGATION ROWS ARE ON A DIFFERENT LIST NOW, and the distinction is the point. They
       // were once declined here outright — "the tab row is how you know where you are, and losing
@@ -2578,7 +2595,7 @@ describe("AgentChat — zen mode", () => {
     expect(screen.queryByRole("navigation", { name: /tabs/i })).not.toBeInTheDocument();
     expect(container.querySelector('[data-slot="chrome-block"]')).toBeNull();
     expect(screen.queryByRole("textbox")).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Switch pane" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Actions" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Pane actions" })).not.toBeInTheDocument();
 
     // The header ELEMENT stays, and here — with no strip band mounted above it — it is what
@@ -3265,9 +3282,8 @@ describe("AgentChat: Launch section in the switcher", () => {
 
   it("shows the Launch section in the switcher when launchers are declared", async () => {
     declareLaunchers();
-    const user = userEvent.setup();
     renderChat();
-    await user.click(screen.getByRole("button", { name: "Switch pane" }));
+    openSwitcher();
     expect(await screen.findByText("Launch")).toBeInTheDocument();
     expect(screen.getByText("Runs & quota")).toBeInTheDocument();
     expect(screen.getByText("rumen-peek")).toBeInTheDocument();
@@ -3277,7 +3293,7 @@ describe("AgentChat: Launch section in the switcher", () => {
     declareLaunchers();
     const user = userEvent.setup();
     renderChat();
-    await user.click(screen.getByRole("button", { name: "Switch pane" }));
+    openSwitcher();
     await screen.findByText("rumen-peek");
 
     await user.click(screen.getByText("Runs & quota"));
@@ -3308,7 +3324,7 @@ describe("AgentChat: Launch section in the switcher", () => {
     );
     const user = userEvent.setup();
     renderChat();
-    await user.click(screen.getByRole("button", { name: "Switch pane" }));
+    openSwitcher();
     await user.click(await screen.findByText("Runs & quota"));
     await waitFor(() => expect(posted).toEqual({ command: "rumen-peek", paneId: agent.paneId, requestId: A_REQUEST_ID }));
   });
@@ -3341,7 +3357,7 @@ describe("AgentChat: Launch section in the switcher", () => {
       declareNoPrompts(posted);
       const user = userEvent.setup();
       renderChat();
-      await user.click(screen.getByRole("button", { name: "Switch pane" }));
+      openSwitcher();
       await user.click(await screen.findByText("Claude, no prompts"));
       const sheet = await screen.findByRole("dialog", { name: "Start without prompts?" });
       expect(within(sheet).getByTestId("no-prompts-command")).toHaveTextContent("claude --yolo");
@@ -3358,7 +3374,7 @@ describe("AgentChat: Launch section in the switcher", () => {
       const agent = fixtureAgents[0]!;
       const user = userEvent.setup();
       renderChat();
-      await user.click(screen.getByRole("button", { name: "Switch pane" }));
+      openSwitcher();
       await user.click(await screen.findByText("Claude, no prompts"));
       await user.click(within(await screen.findByRole("dialog", { name: "Start without prompts?" })).getByRole("button", { name: "Start" }));
       await waitFor(() => expect(posted).toEqual([{ command: "claude --yolo", paneId: agent.paneId, requestId: A_REQUEST_ID }]));
@@ -3371,7 +3387,7 @@ describe("AgentChat: Launch section in the switcher", () => {
       rememberNoPromptsConfirm("", "claude --yolo");
       const user = userEvent.setup();
       renderChat();
-      await user.click(screen.getByRole("button", { name: "Switch pane" }));
+      openSwitcher();
       await user.click(await screen.findByText("Claude, no prompts"));
       await waitFor(() => expect(posted).toHaveLength(1));
       expect(screen.queryByRole("dialog", { name: "Start without prompts?" })).toBeNull();
@@ -3380,9 +3396,8 @@ describe("AgentChat: Launch section in the switcher", () => {
 
   it("is not offered on a read-only device", async () => {
     declareLaunchers();
-    const user = userEvent.setup();
     renderChat({ device: { enforced: true, device: "spare-phone", authorized: false } });
-    await user.click(screen.getByRole("button", { name: "Switch pane" }));
+    openSwitcher();
     // The sheet itself still opens (it's switch-only otherwise), but nothing in it offers a write
     // this device isn't authorised to make.
     expect(await screen.findByRole("dialog")).toBeInTheDocument();
@@ -3391,9 +3406,8 @@ describe("AgentChat: Launch section in the switcher", () => {
   });
 
   it("does not show the switch handle's launcher affordance when nothing is declared", async () => {
-    const user = userEvent.setup();
     renderChat();
-    await user.click(screen.getByRole("button", { name: "Switch pane" }));
+    openSwitcher();
     expect(screen.queryByText("Launch")).toBeNull();
   });
 });
@@ -3703,7 +3717,7 @@ describe("AgentChat — the hand setting", () => {
     expect(scrollerOf(container).className).toContain("[direction:rtl]");
     expect(boxOf(container).className).toMatch(/(?:^|\s)flex-row-reverse(?=\s|$)/);
     // The Switch block stands at the belt's left end.
-    expect(screen.getByRole("button", { name: /^Switch pane/ }).parentElement!.parentElement!.className).toMatch(
+    expect(screen.getByRole("button", { name: /^Actions/ }).parentElement!.parentElement!.className).toMatch(
       /(?:^|\s)left-0(?=\s|$)/,
     );
   });
@@ -4956,7 +4970,7 @@ describe("AgentChat — the model label and a footer that already names it", () 
   });
 });
 
-// Settings → Harness configurations. The switch is per harness and only DRAWS less: the strip, and for
+// Settings → Chat and terminal. The switch is per harness and only DRAWS less: the strip, and for
 // Claude Code the background-agents block, leave the Chat view, and the model label comes back above
 // the belt because nothing on screen names the model any more.
 describe("AgentChat — the status line switch of Harness configurations", () => {
@@ -5300,19 +5314,6 @@ describe("AgentChat: Stop on a pane with a screen", () => {
 describe("AgentChat — the focused column of a large screen's strip (ADR 0120)", () => {
   afterEach(() => __resetBeltIntents());
 
-  it("hides the belt's Switch pill, which the sidebar replaces, and keeps it below 600 px", () => {
-    const phone = renderChat();
-    expect(within(phone.container).queryByRole("button", { name: "Switch pane" })).not.toBeNull();
-    cleanup();
-    const { container } = renderChat({ inStrip: true });
-    expect(within(container).queryByRole("button", { name: "Switch pane" })).toBeNull();
-    // The belt itself stays, with the reply box under it.
-    expect(within(container).getByRole("button", { name: "Keys" })).toBeInTheDocument();
-    expect(within(container).getByPlaceholderText(/type a reply/i)).toBeInTheDocument();
-    // The column is the bound, so the phone's width ladder stands down.
-    expect(container.querySelector(".md\\:max-w-screen-md")).toBeNull();
-  });
-
   it("runs a belt tap left in another column through this pane's own composer, once", async () => {
     const agent = fixtureAgents[0]!;
     queueBeltIntent(paneScopeKey(undefined, agent.paneId), { kind: "action", id: "keys" });
@@ -5328,7 +5329,8 @@ describe("AgentChat — the focused column of a large screen's strip (ADR 0120)"
     const phone = renderChat(strips);
     expect(within(phone.container).queryByRole("navigation", { name: "Tabs" })).not.toBeNull();
     expect(within(phone.container).queryByRole("navigation", { name: "Panes" })).not.toBeNull();
-    expect(phone.container.querySelector('[data-slot="pane-place"]')?.textContent).not.toBe("");
+    // On the phone the space's name is the tab row's first cell, the door to the space (ADR 0171).
+    expect(phone.container.querySelector('nav [data-slot="pane-identity"]')?.textContent).not.toBe("");
     cleanup();
     const { container } = renderChat({ ...strips, inStrip: true });
     expect(within(container).queryByRole("navigation", { name: "Tabs" })).toBeNull();

@@ -4,9 +4,10 @@ import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 
 import { SHIPPED_FONTS } from "@/lib/design";
-import { ALL_THEME_TOKENS, OPTIONAL_THEME_TOKENS, SHIPPED_THEME_IDS, THEME_TOKENS, contrast, contrastReport, parseTheme, type Theme } from "@/lib/theme/schema";
+import { ALL_THEME_TOKENS, DERIVED_THEME_TOKENS, OPTIONAL_THEME_TOKENS, derivedRootValue, paneFrameMix, SHIPPED_THEME_IDS, THEME_TOKENS, contrast, contrastReport, parseTheme, type Theme } from "@/lib/theme/schema";
 import { SHIPPED_FONTS as FACES } from "@/lib/shipped-fonts";
 import { SURFACE_DEFAULTS, SURFACE_TOKENS, ansiDeclarations, displayDeclarations, fullSurfaceDeclarations, wordDeclarations } from "@/lib/theme/surface";
+import { DERIVED_TOKENS } from "@/lib/theme/derive";
 import { buildThemesCss } from "@/lib/theme/themes-css";
 
 // The default theme is data now, and the stylesheet is still the thing that paints it. These tests
@@ -44,16 +45,33 @@ function shipped(id: string): Theme {
 /** The token a theme may leave out (schema version 3): index.css's pair holds when it does. */
 const OPTIONAL: ReadonlySet<string> = new Set(OPTIONAL_THEME_TOKENS);
 
+/** The optional tokens whose default is derived from other tokens, not a pair of colours: `collie` holds no value for them. */
+const DERIVED: ReadonlySet<string> = new Set(Object.keys(DERIVED_THEME_TOKENS));
+const PAIRED_TOKENS = ALL_THEME_TOKENS.filter((t) => !DERIVED.has(t));
+
 /** The surface words that set no CSS property: the app reads them itself. */
 const APP_READ_WORDS: ReadonlySet<string> = new Set(["zoom", "tabs", "composer"]);
 
 describe("the theme collie equals index.css", () => {
-  const tokens = rootTokens();
+  // A derived token may be written as a `light-dark()` of two expressions (the paper); it is held by its own
+  // test below, not as a colour pair the file for `collie` repeats.
+  const tokens = rootTokens().filter((t) => !DERIVED.has(t.token));
   const collie = shipped("collie");
+
+  it("holds no derived token in collie.json", () => {
+    // Every theme is filled from collie.json before deriveTokens runs, so a derived value there would reach every
+    // theme as if the theme had set it: it would become every theme's start colour (ADR 0174, the pane frame).
+    // The ring is a base token too, and Collie's ring is the start a theme without its own takes: that is meant.
+    for (const token of DERIVED_TOKENS) {
+      if (token === "ring") continue;
+      expect(Object.hasOwn(collie.light ?? {}, token), `collie.json light holds ${token}: it would become every theme's start colour`).toBe(false);
+      expect(Object.hasOwn(collie.dark ?? {}, token), `collie.json dark holds ${token}: it would become every theme's start colour`).toBe(false);
+    }
+  });
 
   it("finds all 43 tokens in index.css, in the order of the token list, and the optional one", () => {
     expect(tokens.map((t) => t.token).filter((t) => !OPTIONAL.has(t))).toEqual([...THEME_TOKENS]);
-    expect(tokens.map((t) => t.token).filter((t) => OPTIONAL.has(t)).toSorted()).toEqual([...OPTIONAL_THEME_TOKENS].toSorted());
+    expect(tokens.map((t) => t.token).filter((t) => OPTIONAL.has(t)).toSorted()).toEqual(OPTIONAL_THEME_TOKENS.filter((t) => !DERIVED.has(t)).toSorted());
   });
 
   it("reads the multi-line pairs whole", () => {
@@ -69,13 +87,20 @@ describe("the theme collie equals index.css", () => {
 
   it("holds every token of both halves, string for string", () => {
     const byName = new Map(tokens.map((t) => [t.token, t]));
-    for (const token of ALL_THEME_TOKENS) {
+    for (const token of PAIRED_TOKENS) {
       const row = byName.get(token);
       expect({ token, light: collie.light?.[token] }).toEqual({ token, light: row?.light });
       expect({ token, dark: collie.dark?.[token] }).toEqual({ token, dark: row?.dark });
     }
-    expect(Object.keys(collie.light ?? {})).toHaveLength(ALL_THEME_TOKENS.length);
-    expect(Object.keys(collie.dark ?? {})).toHaveLength(ALL_THEME_TOKENS.length);
+    expect(Object.keys(collie.light ?? {})).toHaveLength(PAIRED_TOKENS.length);
+    expect(Object.keys(collie.dark ?? {})).toHaveLength(PAIRED_TOKENS.length);
+  });
+
+  it("declares each derived token once in index.css, as the expression the schema writes for a missing half", () => {
+    for (const token of ["pane-active", "surface-recess", "surface-paper"] as const) {
+      expect(css).toContain(`  --${token}: ${derivedRootValue(token)};`);
+    }
+    expect(Object.keys(DERIVED_THEME_TOKENS).toSorted()).toEqual(["pane-active", "surface-paper", "surface-recess"]);
   });
 
   it("carries Atkinson for the text, Aldrich for the titles and the shipped author", () => {
@@ -300,6 +325,13 @@ describe("themes.css", () => {
     const result = buildThemesCss(files);
     expect(result.ok ? "" : result.errors.join("\n")).toBe("");
     expect(result.ok && result.css).toBe(read("src/themes.css"));
+  });
+
+  it("writes a shipped theme's own pane-active mixed into the page, as the first frame must draw it (ADR 0174)", () => {
+    const nightwatch = shipped("nightwatch");
+    const own = { light: nightwatch.light?.["pane-active"] ?? "", dark: nightwatch.dark?.["pane-active"] ?? "" };
+    expect(own.light).not.toBe("");
+    expect(read("src/themes.css")).toContain(`  --pane-active: light-dark(${paneFrameMix(own.light, "light")}, ${paneFrameMix(own.dark, "dark")});\n`);
   });
 
   it("writes no block for the default theme", () => {

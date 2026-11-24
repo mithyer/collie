@@ -27,7 +27,7 @@ phone first, in the home screen app, because that app keeps its own storage, sep
 Then run `collie pair` on the host. The steps are in
 [Put Collie on your phone and pair it](five-minute-install.md#put-collie-on-your-phone-and-pair-it).
 
-In Collie, go to **Settings** → **System** → **Paired devices**, and enter the code with a label
+In Collie, go to **Settings** → **Devices and machines** → **Paired devices**, and enter the code with a label
 for the device. On a desktop, you can instead scan or open the QR code printed by the command,
 which opens that screen in a browser tab with the code already filled in. On a phone, type the
 code in the home screen app, because the camera opens the QR code in a browser tab.
@@ -265,6 +265,14 @@ Key security boundaries and risks:
   ([above](#pair-a-device--the-write-credential)), so revoke a lost phone at once. The built-in
   idle lock merely blanks an unattended screen and provides no actual security boundary
   ([ADR 0007](../.adr/0007-the-idle-lock-is-a-pause-not-a-gate.md)).
+- **Every machine of a crew is trusted in full.** A [crew](crew.md) is for machines that are all
+  yours. The lead drives the terminals of every member, so whoever controls the lead controls every
+  machine of the crew. A member drives only its own terminals, but its agents can send WalkyTalky
+  messages to agent sessions on your other machines, and an agent that acts on such a message acts
+  with your rights there ([WalkyTalky](#walkytalky)). So treat a crew machine that was taken over as
+  a crew that was taken over. Join only a machine that you would give a shell on the others. When you
+  lose one, run `collie crew remove <member>` and then `collie crew rotate` on the lead, and change
+  the keys that agents on the other machines can read.
 - **All local system users can reach the port.** Standard terminal multiplexer sockets (`tmux`,
   `zellij`, `herdr`) use filesystem permissions to restrict access to other local users. Collie
   listens on a local TCP port, which exposes it to every local UID. Reads need the pairing token,
@@ -368,6 +376,7 @@ Key security boundaries and risks:
 | `COLLIE_DEVICE_ALLOWLIST` | Comma-separated device ids allowed to write; every other device stays read-only ([`docs/deployment.md`](deployment.md)). |
 | `COLLIE_REDACT=off` | Turns off the secret mask on pane text, diffs and file text ([below](#what-leaves-the-machine-is-masked)). On by default. |
 | `COLLIE_SENT=off` | Keeps no record of the shell lines you send ([below](#sent-the-shell-lines-you-sent)). On by default. |
+| `COLLIE_PROJECT_FILES=0` | Reads no repository's `collie.toml` and serves no project picture ([A project's own picture](configure.md#a-projects-own-picture)). On by default. |
 
 > 🚫 **Never use `tailscale funnel` with Collie.** Funnel routes traffic to the public internet,
 > whereas `tailscale serve` restricts access to your private tailnet. There is no supported use case
@@ -572,7 +581,7 @@ Some ordinary text is masked too, for example a line of prose or YAML that reads
 What you type and send is never masked, and the audit trail keeps its own rules
 (`COLLIE_AUDIT_CONTENT`).
 
-The switch lives on the bridge only, as `COLLIE_REDACT`. Settings → System shows it read-only, as
+The switch lives on the bridge only, as `COLLIE_REDACT`. Settings → Devices and machines → Connection shows it read-only, as
 "Secret masking". The phone has no switch on purpose: a switch on the phone would let any paired
 phone, or a stolen one, turn the mask off. To read a masked value, read it on the machine. The first
 time a pane shows masked text, a short line on the phone says so, once per device. If you paste
@@ -716,7 +725,7 @@ the same fact for its own pane. The names come from fixed lists in Collie, and a
 keeps only the pairs it has seen, in its state file, and the list goes with the install ID when the count
 is off. A crew member reports its own agents and pings for itself.
 
-Turning it off is one switch: Settings, System, **Telemetry**. `COLLIE_TELEMETRY=0`,
+Turning it off is one switch: Settings, Privacy and data, **Telemetry**. `COLLIE_TELEMETRY=0`,
 `telemetry = false` in `config.toml` or `DO_NOT_TRACK=1` do the same, and so does blocking the one
 host it goes to, `ping.colliepwa.dev`, in your firewall. The first ping waits a day after the first
 start of a build that has it. The exact message is written down in the contract in the repository,
@@ -728,8 +737,8 @@ Besides the daily ping, the one unprompted outbound call is the update check: an
 tags API (`bridge/update.ts`) that compares your version to the newest tag. It carries no data about
 you or your machine, only the static user-agent `collie-update-check`.
 
-A trick's About sheet adds one more read, made by the bridge and never by the phone. When a trick came
-from a repository on `github.com`, the sheet shows its stars and the date of its last commit. The bridge
+A trick's details page adds one more read, made by the bridge and never by the phone. When a trick came
+from a repository on `github.com`, the page shows its stars and the date of its last commit. The bridge
 asks GitHub's public API once per repository with an anonymous HTTPS `GET`, with the user-agent
 `collie-trick-facts` and nothing about you:
 
@@ -746,7 +755,7 @@ to host** or runs `collie stt whistle`, and it sends no data about you ([The spe
 (Whistle)](#the-speech-engine-whistle)).
 
 The math engines download is another outbound call, and it also happens only on a tap: **Download
-the math engines**, or picking an engine in **Settings → Appearance → Math** while the host has
+the math engines**, or picking an engine in **Settings → Look and feel → Math** while the host has
 none. The bridge makes two anonymous HTTPS `GET`s to GitHub, with the user-agent `Collie/<version>`
 and nothing about you:
 

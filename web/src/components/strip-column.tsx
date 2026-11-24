@@ -32,6 +32,7 @@ import { paneScopeKey, type Scope } from "@/lib/scope";
 import { isUnseen, shownStatus } from "@/lib/triage";
 import type { AgentView } from "@/lib/types";
 import { statusLabel } from "@/lib/types";
+import { shortcutTarget } from "@/lib/shortcuts/target";
 import { cn } from "@/lib/utils";
 import type { Preset } from "@/lib/wide-layout";
 
@@ -80,14 +81,20 @@ export function ColumnControls({
 }) {
   useLocale();
   return (
-    <>
+    // ONE GROUP BEHIND A HAIRLINE (strip-head round, 2026-11-21): the width and Remove from view, and in the focused
+    // column the pane menu before them, read as the column's controls, apart from its name; the bar's own
+    // controls carry the same hairline (wide-layout.tsx).
+    <div data-slot="column-controls" className="flex shrink-0 items-center self-center border-l border-border pl-1">
       {preset !== null && (
         <Button
-          variant="outline"
+          variant="ghost"
           size="lg"
           data-slot="column-width"
-          // A stated width, so 1/2, 4/5 and Full are one box and a cycle moves nothing (DESIGN.md §2).
-          className="w-14 shrink-0 px-0 text-xs tabular-nums"
+          // A stated width, so 1/2, 4/5 and Full are one box and a cycle moves nothing (DESIGN.md §2). A WORD, not
+          // a box: the bordered box was the heaviest thing in the header (2026-11-21), so it keeps the box's ink and
+          // weight and loses only the border, with the ghost button's hover. Not the muted ink: on a column's paper in
+          // a generated mid-grey theme that fell under 4.5:1 (e2e/themes, R5), where the full ink holds.
+          className="w-14 shrink-0 px-0 text-xs font-medium tabular-nums text-foreground"
           aria-label={t("wide.width.aria", { width: presetWord(preset) })}
           onClick={own(onCycle)}
         >
@@ -98,6 +105,7 @@ export function ColumnControls({
         variant="ghost"
         size="lg"
         data-slot="column-remove"
+        {...shortcutTarget("remove_from_view")}
         className="size-11 shrink-0 px-0 text-muted-foreground"
         aria-label={t("wide.removeFromView")}
         // Says what the button does NOT do: the pane stays alive and stays in the sidebar.
@@ -107,7 +115,7 @@ export function ColumnControls({
       >
         <Icon name="remove-from-view" className="size-5" />
       </Button>
-    </>
+    </div>
   );
 }
 
@@ -120,7 +128,9 @@ export function ColumnHeader({ pane, controls, onFocus }: { pane: AgentView; con
   useLocale();
   const head = paneGitHead(pane);
   return (
-    <div data-slot="column-header" className="flex min-h-15 shrink-0 items-center gap-1 border-b border-band-rule bg-band-ground py-1 pl-4 pr-2">
+    // 54px and the firm edge, like the focused column's docked header (app-header.tsx): the space bar's page band
+    // takes the other 6px, so every column's body starts where it did.
+    <div data-slot="column-header" className="flex min-h-13.5 shrink-0 items-center gap-1 border-b border-edge-firm bg-band-ground py-1 pl-4 pr-2">
       <PaneGlyph pane={pane} className="size-8" markOn="bg-band-ground" named />
       {/* The name is the column's way in for a keyboard: Enter on it gives the column the focus. */}
       <button type="button" onClick={own(onFocus)} className="min-h-11 min-w-0 flex-1 pl-2 text-left focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring">
@@ -131,7 +141,7 @@ export function ColumnHeader({ pane, controls, onFocus }: { pane: AgentView; con
         </div>
         {/* No space name: the space header above the strip is the one bar that names it. What is the
             column's own stays: its branch, its machine, its state. */}
-        <div data-slot="column-header-line" className="flex min-w-0 items-baseline gap-2 text-[11px] leading-4 text-muted-foreground">
+        <div data-slot="column-header-line" className="flex min-w-0 items-baseline gap-2 text-xs leading-4 text-muted-foreground">
           {head !== null && <BranchLabel head={head} className="min-w-0 shrink truncate" />}
           <span className="shrink-0">{statusLabel(shownStatus(pane))}</span>
           <HostChip host={pane.host} variant="glyph" className="ml-auto self-center" />
@@ -210,7 +220,9 @@ export function PaneColumnBody({
 
   return (
     <>
-      <div data-slot="column-body" className="relative min-h-0 min-w-0 flex-1 border-t border-rule">
+      {/* `border-transparent`: the header above closes this seam with its own rule (DESIGN.md §4, "A boundary
+          is drawn once"); the 1px stays so the body starts where it did. */}
+      <div data-slot="column-body" className="relative min-h-0 min-w-0 flex-1 border-t border-transparent">
         <TailRoomContext.Provider value={modelTagShows({ model: pane.model, usage: pane.usage }) ? MODEL_TAG_ROOM : 0}>
         {chat ? (
           <SessionStream
@@ -298,7 +310,47 @@ export function PaneColumnBody({
   );
 }
 
-/** The class a column's frame takes: reserved on every column, drawn on the focused one (§2). */
-export function columnFrame(focused: boolean, framed: boolean): string {
-  return cn("border-2", focused && framed ? "border-pane-active" : "border-transparent");
+/**
+ * THE FOCUSED COLUMN IS THE PAPER (DESIGN.md §4, "The large screen's three planes"). The whole column
+ * stands on `--surface-paper`, the lightest surface on the screen, and a column without focus on the page.
+ * Each plane re-points the grounds its children already read, so the pane's own header (`bg-band-ground`),
+ * its bottom block (`bg-chrome`) and the status marks backed with those grounds follow the plane, and the
+ * phone, which never draws a column frame, keeps its own. On the paper the inert fill (`--muted`) is the
+ * page: a run of tool steps, a code block and the reply box are set into the paper in the page's tone. On
+ * the page, in dark, it is the paper (light keeps the theme's own), so those fills lean toward the focused column and never outshine it: in dark
+ * the paper is only a small lift over the page (index.css), and a theme's own `--muted` stood above it on a
+ * black page (Nightwatch), so a column without focus drew a Belt and a reply box lighter than the focus.
+ *
+ * Inside both planes: the Belt takes ONE tint, `--muted` at 20% over its ground, which sits between the
+ * ground and the reply box (`--muted` at 40%), both short of the other plane, so never lighter than the paper; its brand wash is a
+ * phone look and is dropped here. The reading area's top rule is not drawn: the header above already
+ * closes that seam (§4, "A boundary is drawn once"), 4px higher.
+ */
+export const PAPER_PLANE =
+  "bg-surface-paper [--band-ground:var(--surface-paper)] [--chrome:var(--surface-paper)] [--muted:var(--background)] [--accent:var(--state-on-paper)] [--state-hover:var(--state-hover-paper)] [--state-on:var(--state-on-paper)] [--state-open:var(--state-open-paper)]";
+export const PAGE_PLANE =
+  "bg-background [--band-ground:var(--background)] [--chrome:var(--background)] dark:[--muted:var(--surface-paper)] [--accent:var(--state-on-page)] [--state-hover:var(--state-hover-page)] [--state-on:var(--state-on-page)] [--state-open:var(--state-open-page)]";
+const IN_EITHER_PLANE =
+  "[&_[data-slot=composer-actions]]:bg-muted/20 [&_[data-slot=belt-track]]:bg-transparent [&_[data-slot=pane-reading]]:border-t-transparent";
+
+/**
+ * THE FOCUS FRAME: a 1px hairline in `--pane-active`, on the paper (ADR 0174). Since the pane-frame round of
+ * 2026-11-21 that token is a derived colour: Collie's relation is the "on" ink (`--control-on-foreground`) mixed
+ * into the page in OKLab, 70% in light and 60% in dark (index.css), and `deriveTokens` (lib/theme/derive.ts) holds
+ * it at 3:1 or more against the three grounds it touches, the recess or the page beside it and the paper inside
+ * it, in every theme. A theme that sets its own `pane-active` has it mixed the same way. The old 2px frame of the ink
+ * mixed 65% into the page was a grey ring a pixel from the keyboard focus ring (`--ring`, also 2px grey), so it
+ * read as a click's leftover focus; the coloured hairline does not. It carries the focus where the paper cannot:
+ * the Terminal view, whose mirror stays dark, and a theme whose page is black.
+ */
+export const FOCUS_FRAME = "border-pane-active";
+
+/**
+ * The class a column's frame takes: the plane, and the 1px frame, reserved on every column and drawn on the
+ * focused one, with one column in the strip too, so a focus change recolours and moves nothing (§2). `border-[1px]`
+ * and not `border`: the bare width follows a theme's `border` word (2px under `strong`, Nightwatch), and the
+ * hairline is 1px in every theme (`border-px` is no width to tailwind-merge, which dropped it beside the colour).
+ */
+export function columnFrame(focused: boolean): string {
+  return cn("border-[1px]", IN_EITHER_PLANE, focused ? cn(PAPER_PLANE, FOCUS_FRAME) : cn(PAGE_PLANE, "border-transparent"));
 }

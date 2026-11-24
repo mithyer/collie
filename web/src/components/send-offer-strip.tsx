@@ -4,8 +4,10 @@
 
 import { Icon } from "@/components/icons/icon";
 import { Button } from "@/components/ui/button";
+import { ACTION_ICON_TAP, CAUTION_ACTION, CAUTION_ACTION_TAP } from "@/components/ui/notice";
 import { useLocale } from "@/hooks/use-locale";
 import { t } from "@/lib/i18n";
+import { cn } from "@/lib/utils";
 import type { SendOffer } from "@/lib/surface/send";
 
 interface SendOfferStripProps {
@@ -33,20 +35,29 @@ const LABEL_KEYS = {
 export function SendOfferStrip({ offers, disabled, onOffer, onDismiss, capConfirm = false }: SendOfferStripProps) {
   useLocale();
   return (
-    <div className="mb-2 flex flex-wrap items-center gap-1.5 rounded-md bg-muted/40 px-2.5 py-1.5 text-xs text-muted-foreground" data-testid="send-offers">
+    <div className="mb-2 flex flex-wrap items-center gap-x-2 gap-y-3.5 py-1.5" data-testid="send-offers">
       {offers.map((offer) => (
-        <Button key={offer} variant="ghost" size="sm" className="h-7 px-2 text-xs font-medium" disabled={disabled} onClick={() => onOffer(offer)}>
+        <Button
+          key={offer}
+          type="button"
+          variant="outline"
+          size="sm"
+          className={cn(CAUTION_ACTION, CAUTION_ACTION_TAP, "touch-manipulation")}
+          disabled={disabled}
+          onClick={() => onOffer(offer)}
+        >
           {t(offer === "commit" && capConfirm ? "composer.protocol.commitCapPast" : LABEL_KEYS[offer])}
         </Button>
       ))}
       <Button
+        type="button"
         variant="ghost"
         size="icon"
-        className="ml-auto size-6 shrink-0 text-muted-foreground"
+        className={cn("ml-auto size-8 shrink-0 touch-manipulation text-muted-foreground", ACTION_ICON_TAP)}
         aria-label={t("composer.protocol.dismissAria")}
         onClick={onDismiss}
       >
-        <Icon name="dismiss" className="size-3" />
+        <Icon name="dismiss" className="size-4" />
       </Button>
     </div>
   );

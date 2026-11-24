@@ -6,7 +6,7 @@ Every glyph the app draws is named by what it means. A theme's `glyphs` picks th
 them (ADR 0137). A family with no fitting glyph for a key draws the lucide one, shown as `(lucide)`.
 Phosphor's three sets share one map; the fill and duotone files add `-fill` and `-duotone`.
 
-337 keys.
+346 keys.
 
 Phosphor Fill draws these keys in the regular weight, so a cross stays a cross and an empty or
 not-started state stays empty: `action-check`, `action-x`, `answered`, `clear`, `close`, `confirm`, `copied`, `copy-failed`, `decision-dismissed`, `dismiss`, `done`, `mod-icon-check`, `mod-icon-x`, `mod-step-done`, `mod-step-failed`, `mod-step-todo`, `ok`, `plan-done`, `plan-pending`, `remove`, `selected`, `sent-ok`, `update-step-done`, `update-step-failed`, `update-step-skipped`, `voice-setup`, `zoom-out`.
@@ -189,6 +189,7 @@ These keys are solid in every set: `Icon` fills the lucide and iconoir glyph, an
 | `messages` | messages | `MessagesSquare` | `chats` | `multi-bubble` |
 | `needs-you` | only panes that need me | `CircleDot` | `radio-button` | `one-point-circle` |
 | `new-agent` | start a new agent | `Plus` | `plus` | `plus` |
+| `open-actions` | open the Actions palette (belt and header) | `TextSearch` | `list-magnifying-glass` | `input-search` |
 | `open-beside` | open beside the current pane | `Columns2` | `columns` | `view-columns-2` |
 | `open-here` | open here | `Replace` | `swap` | `data-transfer-both` |
 | `pane-count` | count of panes | `LayoutGrid` | `squares-four` | `view-grid` |
@@ -230,6 +231,8 @@ These keys are solid in every set: `Icon` fills the lucide and iconoir glyph, an
 | `row-go` | this row opens another screen | `ChevronRight` | `caret-right` | `nav-arrow-right` |
 | `show-ignored` | ignored files are shown | `Eye` | `eye` | `eye` |
 | `view-diff` | show the diff view | `GitCompareArrows` | `git-diff` | `git-compare` |
+| `diff-split` | a diff side by side | `Columns2` | `columns` | `view-columns-2` |
+| `diff-unified` | a diff in one column | `Rows2` | `rows` | `table-rows` |
 | `view-preview` | show the preview view | `Eye` | `eye` | `eye` |
 | `view-source` | show file source | `Code` | `code` | `code` |
 
@@ -294,6 +297,12 @@ These keys are solid in every set: `Icon` fills the lucide and iconoir glyph, an
 | `theme-light` | light theme | `Sun` | `sun` | `sun-light` |
 | `theme-system` | theme follows the system | `MonitorSmartphone` | `devices` | `computer` |
 | `tour` | the guided tour | `Compass` | `compass` | `compass` |
+| `trick-fact-adds` | what a trick adds to the app, on its details page | `SquarePlus` | `plus-square` | `plus-square` |
+| `trick-fact-reads` | what a trick may read or do, on its details page | `Eye` | `eye` | `eye` |
+| `trick-fact-runs` | when a trick runs, on its details page | `Timer` | `timer` | `timer` |
+| `trick-fact-shows` | where a trick shows, on its details page | `PanelsTopLeft` | `layout` | `app-window` |
+| `trick-fact-starts` | what starts a trick's program, on its details page | `SquareTerminal` | `terminal-window` | `terminal` |
+| `trick-fact-tokens` | why a trick uses agent tokens, on its details page | `Coins` | `coins` | `coins` |
 | `typeface` | the typeface setting | `CaseSensitive` | `text-aa` | `text-size` |
 | `update-available` | an update is available | `CircleArrowUp` | `arrow-circle-up` | `arrow-up-circle` |
 | `voice-broken` | voice option is broken | `CircleX` | `x-circle` | `xmark-circle` |

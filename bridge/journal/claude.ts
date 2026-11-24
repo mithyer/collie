@@ -27,7 +27,7 @@
 // Claude writes when a session is compacted.
 
 import { readdir, stat } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 
 import { observedClaim, type Sourced } from "../cache/claims.ts";
 import type { CacheProbe, ChoiceOnly } from "../cache/engine.ts";
@@ -54,9 +54,12 @@ import { choicesBeforeFirstTurn, claudeResets, effortChosenAfter, lastTwoTurns, 
 // from there for the same reason. The rule it enforces is not pi's, though: a journal is an AGENT's
 // output, so an `http://` value in a block never becomes a fetch the phone makes.
 import { resolveImage } from "./pi.ts";
+import { liftedSpelling } from "../../web/src/lib/harness/claude/paste.ts";
 import {
   containedRealpath,
   exists,
+  existingNewestFirst,
+  firstContained,
   head,
   loadTail,
   readSinceFile,
@@ -93,8 +96,14 @@ export function isAgentId(value: string): boolean {
 
 /** Inner text of the first `<tag>…</tag>`, trimmed; null when the tag isn't present. */
 function inner(tag: string, text: string): string | null {
-  const m = new RegExp(`<${tag}>([\\s\\S]*?)</${tag}>`).exec(text);
-  return m ? (m[1] ?? "").trim() : null;
+  // `indexOf`, not `<tag>([\s\S]*?)</tag>`: on an open tag repeated with no close that regex read the
+  // rest of the text again from each one (quadratic, 2 s at 256 KB). The first open tag pairs with
+  // the first close after it, as the regex did.
+  const open = `<${tag}>`;
+  const start = text.indexOf(open);
+  if (start === -1) return null;
+  const end = text.indexOf(`</${tag}>`, start + open.length);
+  return end === -1 ? null : text.slice(start + open.length, end).trim();
 }
 
 /** True when the content IS this envelope (rather than merely mentioning the tag in prose). */
@@ -114,8 +123,66 @@ function isEnvelope(tag: string, text: string): boolean {
  * the operator said, not an edge case. The tags are Claude Code's own and the operator never typed
  * them; drawn as text they open the turn with markup, and in the queue row they took a tenth of its
  * 200 characters.
+ *
+ * The grammar, as the regex `(^|\n)<pasted_content id="([0-9a-f]+)">\n?([\s\S]*?)\n?<\/pasted_content(?:\s+id="\2")?>`
+ * had it: an open tag at the start or after a line break, a hex id, one optional line break, the
+ * pasted text up to the FIRST close that fits (an unlabelled `</pasted_content>` or one with the same
+ * id), one optional line break before that close. It is walked by hand now, because the text is
+ * whatever a person pasted: on open tags repeated with no close, that regex read the rest of the
+ * prompt again from each one (quadratic, 2.6 s at 256 KB, the bridge stopped meanwhile).
  */
-const PASTED_CONTENT = /(^|\n)<pasted_content id="([0-9a-f]+)">\n?([\s\S]*?)\n?<\/pasted_content(?:\s+id="\2")?>/g;
+const PASTE_OPEN = '<pasted_content id="';
+const PASTE_CLOSE = "</pasted_content";
+const PASTE_ID = /[0-9a-f]+/y;
+const PASTE_CLOSE_ID = /\s+id="([0-9a-f]+)">/y;
+
+/** One close tag: where it starts, where it ends, and the id it names (null: unlabelled). */
+interface PasteClose {
+  at: number;
+  end: number;
+  id: string | null;
+}
+
+/** Every close tag in `text`, in order. A `</pasted_content` of neither shape closes nothing. */
+function pasteCloses(text: string): PasteClose[] {
+  const closes: PasteClose[] = [];
+  for (let at = text.indexOf(PASTE_CLOSE); at !== -1; at = text.indexOf(PASTE_CLOSE, at + PASTE_CLOSE.length)) {
+    const after = at + PASTE_CLOSE.length;
+    if (text[after] === ">") {
+      closes.push({ at, end: after + 1, id: null });
+      continue;
+    }
+    PASTE_CLOSE_ID.lastIndex = after;
+    const m = PASTE_CLOSE_ID.exec(text);
+    if (m) closes.push({ at, end: PASTE_CLOSE_ID.lastIndex, id: m[1] ?? "" });
+  }
+  return closes;
+}
+
+/**
+ * The first close at or after `from` that fits an open tag with `id`. Each list is read once from its
+ * front, so the calls must come with `from` never moving back, as the walk in `unwrapPastes` does.
+ */
+function pasteCloseFinder(closes: readonly PasteClose[]): (id: string, from: number) => PasteClose | undefined {
+  const lists = new Map<string | null, { closes: PasteClose[]; next: number }>();
+  for (const close of closes) {
+    const list = lists.get(close.id);
+    if (list) list.closes.push(close);
+    else lists.set(close.id, { closes: [close], next: 0 });
+  }
+  const firstIn = (key: string | null, from: number): PasteClose | undefined => {
+    const list = lists.get(key);
+    if (!list) return undefined;
+    while (list.next < list.closes.length && list.closes[list.next]!.at < from) list.next++;
+    return list.closes[list.next];
+  };
+  return (id, from) => {
+    const plain = firstIn(null, from);
+    const named = firstIn(id, from);
+    if (!plain || !named) return plain ?? named;
+    return plain.at < named.at ? plain : named;
+  };
+}
 
 /** The text with each recorded paste replaced by what was pasted, trimmed at both ends. A tag with no
  *  matching close (same id) is left as it is.
@@ -126,7 +193,29 @@ const PASTED_CONTENT = /(^|\n)<pasted_content id="([0-9a-f]+)">\n?([\s\S]*?)\n?<
  *  a receipt. Change the two together when Claude Code changes the wrapper. */
 export function unwrapPastes(text: string): string {
   if (!text.includes("<pasted_content ")) return text;
-  return text.replace(PASTED_CONTENT, "$1$3").trim();
+  const firstClose = pasteCloseFinder(pasteCloses(text));
+  let out = "";
+  let copied = 0;
+  for (let at = text.indexOf(PASTE_OPEN); at !== -1; ) {
+    PASTE_ID.lastIndex = at + PASTE_OPEN.length;
+    const id = at === 0 || text[at - 1] === "\n" ? PASTE_ID.exec(text)?.[0] : undefined;
+    const idEnd = at + PASTE_OPEN.length + (id?.length ?? 0);
+    if (id === undefined || !text.startsWith('">', idEnd)) {
+      at = text.indexOf(PASTE_OPEN, at + 1);
+      continue;
+    }
+    const body = text[idEnd + 2] === "\n" ? idEnd + 3 : idEnd + 2;
+    const close = firstClose(id, body);
+    if (close === undefined) {
+      at = text.indexOf(PASTE_OPEN, at + 1);
+      continue;
+    }
+    const bodyEnd = close.at > body && text[close.at - 1] === "\n" ? close.at - 1 : close.at;
+    out += text.slice(copied, at) + text.slice(body, bodyEnd);
+    copied = close.end;
+    at = text.indexOf(PASTE_OPEN, copied);
+  }
+  return (out + text.slice(copied)).trim();
 }
 
 /**
@@ -1116,6 +1205,29 @@ export function handedOverTo(lines: readonly string[]): string | null {
   return null;
 }
 
+/** Bounds on the shared per-directory sibling metadata snapshot for continuation following. */
+const DIR_SCAN_MAX = 64;
+/** Matches CacheTracker's 5 s floor so N panes in one project folder share a single directory scan. */
+export const DIR_SCAN_TTL_MS = 5_000;
+
+interface DirFileMeta {
+  readonly size: number;
+  readonly mtimeMs: number;
+}
+
+interface DirScan {
+  readonly dirMtimeMs: number;
+  readonly scannedAt: number;
+  readonly files: ReadonlyMap<string, DirFileMeta>;
+}
+
+/** Optional seams for testing continuation directory caching without stubbing node:fs globally. */
+export interface ClaudeTranscriptSourceDeps {
+  readonly now?: () => number;
+  readonly stat?: (path: string) => Promise<DirFileMeta>;
+  readonly readdir?: (path: string) => Promise<readonly string[]>;
+}
+
 /**
  * Real filesystem source rooted at Claude's projects directory.
  *
@@ -1142,15 +1254,29 @@ export class ClaudeTranscriptSource implements TranscriptSource {
    */
   private readonly handOvers = new Map<string, { size: number; mtimeMs: number; next: string | null }>();
 
+  /**
+   * Shared short-TTL per-directory `.jsonl` stat snapshots for {@link followContinuation}, plus
+   * in-flight coalescing, so N panes in a large project folder share one scan per tick instead of
+   * executing N full `readdir` + `stat` sweeps.
+   */
+  private readonly dirScans = new Map<string, DirScan>();
+  private readonly inFlightDirScans = new Map<string, Promise<ReadonlyMap<string, DirFileMeta> | null>>();
+
   private readonly rootsNow: () => string[];
+  private readonly now: () => number;
+  private readonly statFs: (path: string) => Promise<DirFileMeta>;
+  private readonly readdirFs: (path: string) => Promise<readonly string[]>;
 
   /** The roots now: fixed, or the live list an added account joins (M101). */
   private get roots(): string[] {
     return this.rootsNow();
   }
 
-  constructor(roots: RootSource) {
+  constructor(roots: RootSource, deps: ClaudeTranscriptSourceDeps = {}) {
     this.rootsNow = rootReader(roots);
+    this.now = deps.now ?? Date.now;
+    this.statFs = deps.stat ?? stat;
+    this.readdirFs = deps.readdir ?? readdir;
   }
 
   async resolve(ref: AgentSessionRef): Promise<string | null> {
@@ -1160,13 +1286,16 @@ export class ClaudeTranscriptSource implements TranscriptSource {
     const sessionId = ref.value;
     const cached = this.pathCache.get(sessionId);
     if (cached !== undefined) {
-      // Re-verify: a cached path can vanish when a session is deleted.
+      // Re-verify per-root containment on every hit: exists() follows symlinks, so a file replaced
+      // by an outward link after the first resolve would otherwise be served.
       //
       // The cache memoises only the EXPENSIVE part — the global scan that maps a uuid to its file,
       // which never changes. Continuation-following must still run on every call, because the
       // conversation rotates into a new file WHILE the bridge is up: caching its result would pin the
       // answer to whatever was true at the first request and go stale minutes later.
-      if (await exists(cached.path)) return this.follow(cached.path, cached.root);
+      // A root that left the config (an account removed) serves nothing more, cache or not.
+      const real = this.roots.includes(cached.root) ? await containedRealpath(cached.path, cached.root) : null;
+      if (real !== null) return this.follow(real, cached.root);
       this.pathCache.delete(sessionId);
     }
 
@@ -1240,26 +1369,21 @@ export class ClaudeTranscriptSource implements TranscriptSource {
    * One root's projects directories, searched for `<sessionId>.jsonl`. The contained real path, or null.
    *
    * Null covers both "not here" and "here, but pointing out of this root": the caller moves on to the
-   * next root either way.
+   * next root either way. A log by this name that points out of this root is not this root's to serve,
+   * and it is never accepted under a sibling root either (files.ts header); the next project folder
+   * of the SAME root that holds the name is asked instead (#839, see {@link firstContained}), so a
+   * planted or dangling symlink in one project folder cannot blank the log that sits in another.
+   * The logs are tried newest modified first ({@link existingNewestFirst}): the folder names carry no time.
    */
   private async scanRoot(sessionId: string, root: string): Promise<string | null> {
     const file = `${sessionId}.jsonl`;
-    let dirs: string[];
+    let dirs: readonly string[];
     try {
-      dirs = await readdir(root);
+      dirs = await this.readdirFs(root);
     } catch {
       return null; // this projects dir doesn't exist — a profile that isn't on this machine
     }
-    for (const dir of dirs) {
-      const candidate = join(root, dir, file);
-      if (!(await exists(candidate))) continue;
-      // A log by this name exists here but points out of this root, so it is not this root's to serve —
-      // and we do not go on to accept it under a sibling root either (files.ts header). Abandoning the
-      // root rather than the whole search is the only multi-root difference: a planted symlink in one
-      // profile can't blank the history of the others.
-      return containedRealpath(candidate, root);
-    }
-    return null;
+    return firstContained(await existingNewestFirst(root, dirs, file), root);
   }
 
   /**
@@ -1326,6 +1450,67 @@ export class ClaudeTranscriptSource implements TranscriptSource {
   }
 
   /**
+   * Return a shared short-TTL `(size, mtimeMs)` snapshot for `.jsonl` siblings in `dir`.
+   * Re-scans immediately when `stat(dir).mtimeMs` changes (a new rotation file created or deleted)
+   * or after {@link DIR_SCAN_TTL_MS} (so in-place writes to existing siblings and transient `stat`
+   * failures are picked up on the next tick). Concurrent callers for the same directory share one
+   * in-flight scan.
+   */
+  private async dirEntries(dir: string): Promise<ReadonlyMap<string, DirFileMeta> | null> {
+    const pending = this.inFlightDirScans.get(dir);
+    if (pending !== undefined) return pending;
+
+    const at = this.now();
+    let dirMtimeMs: number;
+    try {
+      dirMtimeMs = (await this.statFs(dir)).mtimeMs;
+    } catch {
+      return null;
+    }
+
+    // Re-check after the async stat so callers that raced into statFs(dir) still coalesce.
+    const inFlight = this.inFlightDirScans.get(dir);
+    if (inFlight !== undefined) return inFlight;
+
+    const cached = this.dirScans.get(dir);
+    if (cached !== undefined && at - cached.scannedAt < DIR_SCAN_TTL_MS && dirMtimeMs === cached.dirMtimeMs) {
+      return cached.files;
+    }
+
+    const scan = (async (): Promise<ReadonlyMap<string, DirFileMeta> | null> => {
+      let names: readonly string[];
+      try {
+        names = await this.readdirFs(dir);
+      } catch {
+        return null;
+      }
+      const files = new Map<string, DirFileMeta>();
+      for (const name of names) {
+        if (!name.endsWith(".jsonl")) continue;
+        try {
+          const st = await this.statFs(join(dir, name));
+          files.set(name, { size: st.size, mtimeMs: st.mtimeMs });
+        } catch {
+          continue;
+        }
+      }
+      if (!this.dirScans.has(dir) && this.dirScans.size >= DIR_SCAN_MAX) {
+        const oldest = this.dirScans.keys().next().value;
+        if (oldest !== undefined) this.dirScans.delete(oldest);
+      }
+      this.dirScans.set(dir, { dirMtimeMs, scannedAt: this.now(), files });
+      return files;
+    })();
+
+    this.inFlightDirScans.set(dir, scan);
+    try {
+      return await scan;
+    } finally {
+      this.inFlightDirScans.delete(dir);
+    }
+  }
+
+  /**
    * Follow a rotated conversation to the log it actually continues in.
    *
    * The id Herdr reports can name a FROZEN PREFIX (see {@link conversationRoot}), so serving it
@@ -1335,8 +1520,9 @@ export class ClaudeTranscriptSource implements TranscriptSource {
    * Two guards keep this from making things worse:
    *  - a candidate must be at least as large as the log we already have, so following can never show
    *    LESS history than not following;
-   *  - only the first line of each sibling is read (plus a stat), so the scan is a few milliseconds
-   *    over a directory of ~40 logs. That matters, because `resolve` runs on the cache tracker's
+   *  - only the first line of each sibling is read, and the sibling sizes and times now come from the
+   *    shared snapshot of {@link dirEntries}, at most {@link DIR_SCAN_TTL_MS} old (the pane's own file is
+   *    still read fresh), so the scan is a few milliseconds over a directory of ~40 logs. That matters, because `resolve` runs on the cache tracker's
    *    floor tick as well as on a History tap.
    *
    * A sibling whose own end records a hand-over is never picked: {@link handedOverTo} is Claude
@@ -1348,29 +1534,25 @@ export class ClaudeTranscriptSource implements TranscriptSource {
    */
   private async followContinuation(path: string, root: string): Promise<string> {
     const dir = dirname(path);
+    const selfName = basename(path);
     let self: LogStamp;
     try {
-      const st = await stat(path);
+      const st = await this.statFs(path);
       self = { root: conversationRoot(await head(path)), size: st.size, mtimeMs: st.mtimeMs };
     } catch {
       return path;
     }
     if (self.root === null) return path;
 
+    const entries = await this.dirEntries(dir);
+    if (entries === null) return path;
+
     let best = { path, size: self.size, mtimeMs: self.mtimeMs };
-    let names: string[];
-    try {
-      names = await readdir(dir);
-    } catch {
-      return path;
-    }
-    for (const name of names) {
-      if (!name.endsWith(".jsonl")) continue;
+    for (const [name, st] of entries) {
+      if (name === selfName) continue;
+      if (st.mtimeMs <= best.mtimeMs || st.size < self.size) continue;
       const candidate = join(dir, name);
-      if (candidate === path) continue;
       try {
-        const st = await stat(candidate);
-        if (st.mtimeMs <= best.mtimeMs || st.size < self.size) continue;
         // Containment AGAIN, before a byte of the candidate is read. The directory got here from a
         // path `resolve` already validated, but a sibling INSIDE it can still be a symlink out of the
         // root — and anything that writes into the projects tree can plant one. Following it would
@@ -1430,6 +1612,8 @@ export function claudeJournal(roots: RootSource): JournalAdapter {
     sendQueuedNow: ["ctrl+Enter"],
     // The `queue-operation` rows are the queue (createQueueTracker): the cards come from them (ADR 0122).
     recordsQueue: true,
+    // A picture's path is written `[Image #N]` in the queue row and the prompt (the paste grammar's own rule).
+    spellsSend: liftedSpelling,
   };
 }
 

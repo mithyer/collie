@@ -577,7 +577,7 @@ These limits also hold:
 - `herdr plugin install` is not a Windows install path. Use `install.ps1`, then `collie start`.
 - Herdr's action buttons do not exist on Windows, because they need `bash`.
 - A permission that a hook holds is not on Windows yet. Collie builds no hold socket there, so every permission stays a screen ask.
-- Tricks do not run on a Windows machine yet. `collie trick on`, `collie trick add` and `collie trick view` say so, and the Tricks card in Settings, Experiments shows that one line. An agent cannot post to the Hill or use WalkyTalky there either, because Collie builds no WalkyTalky socket on Windows.
+- Tricks do not run on a Windows machine yet. `collie trick on`, `collie trick add` and `collie trick view` say so, and the Tricks card in Settings, Tricks and the Hill shows that one line. An agent cannot post to the Hill or use WalkyTalky there either, because Collie builds no WalkyTalky socket on Windows.
 - The nightly harness lab runs on Linux only. It is not on Windows.
 - Herdr's Windows build is made by the Herdr project. Collie depends on it and does not control it.
 
@@ -627,8 +627,10 @@ Two words on this page have a fixed meaning:
 What the support rests on:
 
 - The `windows.yml` workflow, a CI workflow, runs the bridge, cli and scripts tests on
-  `windows-latest` for every pull request and every push to `main`. It is not yet a required check.
-  The maintainer plans to make it one after about ten green runs in a row.
+  `windows-latest` every night, on every push to a release branch, and before each release. A red
+  night opens one GitHub issue labelled `windows-nightly`, and the next green night closes it. It is
+  not a required check. The maintainer plans to make it one after about ten green nightly runs in a
+  row.
 - Each release builds `collie-<version>-windows-x64.zip` with a `.sha256` file.
 - Before each release tag, the maintainer runs a rehearsal, `make win-rehearse`. It installs a
   release on a fresh Windows 11 VM, updates it from the terminal and from the phone's endpoint,

@@ -3,6 +3,7 @@ import type { Page } from "@playwright/test";
 import { partKey, type MenuRow, type WireTrickInfo, type WireTrickPart } from "@/lib/tricks/schema";
 import { fixtureKiroChat, fixtureKiroHistory, fixtureKiroSnapshot, fixtureLaunchersWithAgents, KIRO_PANE_ID } from "@/test/handlers";
 
+import { openSwitcher } from "../fixtures/actions";
 import { installApiStub, installCrewWorld, installPaneWorld, paneCapture } from "../fixtures/api";
 import { finger, press } from "./touch";
 import { installWorld, type SnapshotControl } from "./world";
@@ -64,7 +65,7 @@ export const SCREENS: ScreenRecipe[] = [
   { id: "session-terminal", group: "Session", title: "Session, Terminal view", world: "plain", path: "/pane/w2%3Ap1", prefs: { paneView: "terminal" } },
   { id: "session-agent-view", group: "Session", title: "Session, agent view", world: "kiro", path: `${PANE}`, prefs: { paneView: "view" } },
   { id: "session-actions-sheet", group: "Session", title: "Session sheet with trick groups", world: "kiro", path: PANE, open: (p) => tapByName(p, "Pane actions") },
-  { id: "sheet-pane-switcher", group: "Session", title: "Switch pane sheet, with its New button", world: "kiro", path: PANE, open: (p) => tapByName(p, "Switch pane") },
+  { id: "sheet-pane-switcher", group: "Session", title: "Switch pane sheet, with its New button", world: "kiro", path: PANE, open: (p) => openSwitcher(p) },
   { id: "session-pane-settings", group: "Session", title: "Pane settings (name line)", world: "kiro", path: PANE, open: (p) => tapByName(p, /^Pane settings for /u) },
   { id: "session-history", group: "Session", title: "Session History", world: "kiro", path: `${PANE}/history` },
   { id: "session-zoom", group: "Session", title: "Zoomed output", world: "plain", path: "/pane/w2%3Ap1/zoom", prefs: { paneView: "terminal" }, still: true, open: (p) => p.waitForTimeout(2500) },
@@ -78,15 +79,16 @@ export const SCREENS: ScreenRecipe[] = [
 
   // ── Settings ─────────────────────────────────────────────────────────────
   { id: "settings", group: "Settings", title: "Settings index", world: "rich", path: "/settings" },
-  { id: "settings-appearance", group: "Settings", title: "Settings, Appearance", world: "rich", path: "/settings/appearance" },
-  { id: "settings-harnesses", group: "Settings", title: "Settings, Harnesses", world: "rich", path: "/settings/harnesses" },
-  { id: "settings-device", group: "Settings", title: "Settings, Device", world: "rich", path: "/settings/device" },
+  { id: "settings-look", group: "Settings", title: "Settings, Look and feel", world: "rich", path: "/settings/look" },
+  { id: "settings-chat", group: "Settings", title: "Settings, Chat and terminal", world: "rich", path: "/settings/chat" },
+  { id: "settings-keys", group: "Settings", title: "Settings, Keys and touch", world: "rich", path: "/settings/keys" },
   { id: "settings-voice", group: "Settings", title: "Settings, Voice", world: "rich", path: "/settings/voice" },
-  { id: "settings-alerts", group: "Settings", title: "Settings, Alerts", world: "rich", path: "/settings/alerts" },
-  { id: "settings-experiments", group: "Settings", title: "Settings, Experiments", world: "rich", path: "/settings/experiments" },
-  { id: "settings-tricks", group: "Settings", title: "Settings, Tricks", world: "rich", path: "/settings/tricks" },
-  { id: "settings-system", group: "Settings", title: "Settings, System (pairing)", world: "rich", path: "/settings/system" },
-  { id: "settings-updates", group: "Settings", title: "Updates card", world: "rich", path: "/settings/updates" },
+  { id: "settings-notifications", group: "Settings", title: "Settings, Notifications", world: "rich", path: "/settings/notifications" },
+  { id: "settings-dashboard", group: "Settings", title: "Settings, Dashboard and projects", world: "rich", path: "/settings/dashboard" },
+  { id: "settings-tricks", group: "Settings", title: "Settings, Tricks and the Hill", world: "rich", path: "/settings/tricks" },
+  { id: "settings-devices", group: "Settings", title: "Settings, Devices and machines (pairing)", world: "rich", path: "/settings/devices" },
+  { id: "settings-privacy", group: "Settings", title: "Settings, Privacy and data", world: "rich", path: "/settings/privacy" },
+  { id: "settings-updates", group: "Settings", title: "Settings, Updates and about", world: "rich", path: "/settings/updates" },
 
   // ── Other pages ──────────────────────────────────────────────────────────
   { id: "new", group: "Pages", title: "New page", world: "rich", path: "/new" },

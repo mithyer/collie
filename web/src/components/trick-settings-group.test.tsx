@@ -2,14 +2,14 @@ import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 
-import { TrickAboutSheet } from "@/components/trick-about-sheet";
+import { TrickDetail } from "@/components/trick-detail";
 import { TrickSettingsGroup } from "@/components/trick-settings-group";
 import { slotLine } from "@/components/tricks-settings-card";
 import type { JsonValue } from "@/lib/json";
 import type { FieldValue, TrickField, WireTrickInfo } from "@/lib/tricks/schema";
 import { readTrick } from "@/lib/tricks/wire";
 
-// The Settings group of a trick's About sheet (contract 3): one 44 px row per field, the row's "Needs setup".
+// The Settings group of a trick's details page (contract 3): one 44 px row per field, the row's "Needs setup".
 
 const FIELDS: TrickField[] = [
   { key: "repo", kind: "text", label: "Repository", hint: "owner/name", required: true },
@@ -42,7 +42,7 @@ function group(trick: Partial<WireTrickInfo> = {}, extra: { canWrite?: boolean; 
 describe("TrickSettingsGroup", () => {
   it("draws one row per field, each with a 44 px floor, its label and its control by kind", () => {
     const { section } = group();
-    expect(within(section).getByText("Settings")).toBeInTheDocument();
+    expect(within(section).getByText("This trick's settings")).toBeInTheDocument();
     const rows = [...section.querySelectorAll("[data-field]")];
     expect(rows.map((row) => [row.getAttribute("data-field"), row.getAttribute("data-kind")])).toEqual([
       ["repo", "text"],
@@ -117,13 +117,13 @@ describe("TrickSettingsGroup", () => {
   });
 });
 
-describe("in the About sheet and on the row", () => {
-  it("the sheet draws the group only with a write handler", () => {
-    const { unmount } = render(<TrickAboutSheet trick={TRICK} open onClose={vi.fn()} onValue={vi.fn(async () => null)} />);
-    expect(screen.getByRole("dialog").querySelector('[data-section="settings"]')).not.toBeNull();
+describe("on the details page and on the row", () => {
+  it("the page draws the group only with a write handler", () => {
+    const { unmount } = render(<TrickDetail trick={TRICK} onValue={vi.fn(async () => null)} />);
+    expect(document.querySelector<HTMLElement>('[data-slot="trick-detail"]')!.querySelector('[data-section="settings"]')).not.toBeNull();
     unmount();
-    render(<TrickAboutSheet trick={TRICK} open onClose={vi.fn()} />);
-    expect(screen.getByRole("dialog").querySelector('[data-section="settings"]')).toBeNull();
+    render(<TrickDetail trick={TRICK} />);
+    expect(document.querySelector<HTMLElement>('[data-slot="trick-detail"]')!.querySelector('[data-section="settings"]')).toBeNull();
   });
 
   it("the row says Needs setup while a required field is empty, and that the values do not read", () => {

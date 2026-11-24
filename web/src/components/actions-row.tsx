@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState, type CSSProperties, type ReactNode } from "react";
 
-import { Button } from "@/components/ui/button";
+import { Button, TRIGGER_OPEN } from "@/components/ui/button";
 import { Collapse } from "@/components/ui/collapse";
 import {
   DurableBar,
@@ -20,6 +20,7 @@ import { useLocale } from "@/hooks/use-locale";
 import { hasResizeObserver } from "@/lib/env";
 import { t as translate } from "@/lib/i18n";
 import type { OperatorCommand } from "@/lib/types";
+import { shortcutTarget } from "@/lib/shortcuts/target";
 import { cn } from "@/lib/utils";
 import { Icon } from "@/components/icons/icon";
 import type { IconKey } from "@/components/icons/keys";
@@ -320,6 +321,9 @@ const PINNED_MARK_BADGE = "pointer-events-none absolute top-0.5 right-0.5 rounde
  *  trailing spacer. Altan, from his phone, 2026-09-23: "add a wider margin right to the belt content". */
 const BELT_END_AIR = 16;
 
+/** The lead-in of the pinned block that fades the pills out before the hairline: its `pl-16` and its mask's `4rem`. */
+const PINNED_FADE = "4rem";
+
 /**
  * The pinned Switch block's own width, read off its DOM node — the trailing spacer's width must
  * equal this exactly, or the last pill either stops short of the hairline (spacer too wide) or
@@ -466,12 +470,18 @@ export interface ActionsRowProps {
    */
   handle?: {
     /** {@link import("@/hooks/use-sheet-pull").useSheetPull}'s ref — the finger-tracked drag. It
-     *  lands on the BELT, not on the pill: the whole band is the drag surface. */
-    ref: (node: HTMLElement | null) => void;
-    /** The tap, on the SWITCH PILL. Opens the same switcher sheet the drag opens. */
+     *  lands on the BELT, not on the pill: the whole band is the drag surface. Absent on a large
+     *  screen's strip, where the button is drawn and the drag is not (the sidebar is the switcher,
+     *  and `touch-pan-x` with no listener behind it would forbid a vertical gesture for nothing). */
+    ref?: (node: HTMLElement | null) => void;
+    /** The tap, on the pinned button: the Actions palette. */
     onClick: () => void;
-    /** ALREADY TRANSLATED. The button's accessible name — "Switch pane". */
+    /** ALREADY TRANSLATED. The button's accessible name: "Actions". */
     label: string;
+    /** The thing the button opens is open now (the Actions palette): the pill says
+     *  `aria-expanded` and wears the shared open look (ui/button.tsx `TRIGGER_OPEN`). Fill and ink only, so the box
+     *  and the pinned block's measured width do not move. */
+    open?: boolean;
     /** Another pane needs you: a red dot on the mark's corner. The label says so in words. */
     alert?: boolean;
   };
@@ -712,7 +722,7 @@ export function ActionsRow({ general, agent, mine, onRun, disabled, durable, sto
       }
       className={cn(
         "relative -mx-3 mb-1 flex items-center border-b border-border bg-foreground/6",
-        handle && "touch-pan-x",
+        handle?.ref && "touch-pan-x",
       )}
     >
       {/* OverflowEdges measures this scroller and fades only the end that still hides something.
@@ -758,10 +768,29 @@ export function ActionsRow({ general, agent, mine, onRun, disabled, durable, sto
           SCALED since 2026-09-23: `py-1` is `py-(--belt-pad)` now, 4px at the default scale and 5px
           and 6px at the larger two, and the pills' `::before` reaches exactly that far again
           (`--belt-reach`, STRIP_ROW_PILL), so every pill answers the whole band. */}
-      <OverflowEdges edges={pinned ? (left ? "right" : "left") : "both"} cue="none">
+      {/* A mouse scrolls it three ways (ui/overflow-edges.tsx): the wheel, a drag, and an arrow over each edge that still
+          hides pills. The arrows stand in from the end the pinned block owns, by that block's own measured width. */}
+      <OverflowEdges
+        edges={pinned ? (left ? "right" : "left") : "both"}
+        cue="none"
+        wheel
+        drag
+        arrows={{
+          // The pinned block's own width runs under its fade (`pl-16`, 4rem: the lead-in that fades the pills out),
+          // and the scroller's visible edge is where that fade ends, at the hairline. The arrow stands there, so its
+          // side touches the edge and the fade lies under it; measured from the block's outer edge it floated 4rem
+          // (and 4px) inside the strip.
+          left: pinned && left ? `calc(${switchInset}px - ${PINNED_FADE})` : "0px",
+          right: pinned && !left ? `calc(${switchInset}px - ${PINNED_FADE})` : "0px",
+          leftLabel: translate("belt.scroll.left"),
+          rightLabel: translate("belt.scroll.right"),
+        }}
+      >
         {(scrollerRef) => (
           <div
             ref={scrollerRef}
+            // The large screen's columns drop the brand wash by this name (strip-column.tsx, `columnFrame`).
+            data-slot="belt-track"
             className={cn(
               STRIP_SCROLLER,
               "bg-primary/10 py-(--belt-pad) overflow-y-hidden",
@@ -913,6 +942,11 @@ export function ActionsRow({ general, agent, mine, onRun, disabled, durable, sto
               left
                 ? "[mask-image:linear-gradient(to_left,transparent,black_4rem)]"
                 : "[mask-image:linear-gradient(to_right,transparent,black_4rem)]",
+              // While a mouse's arrow stands on this end the fade is done by the arrow's far side (2.5rem), so the
+              // pills under the arrow are fully hidden and a label is never cut by its round edge.
+              left
+                ? "[[data-slot=composer-actions]:has([data-slot=scroll-arrow][data-side=left])_&]:[mask-image:linear-gradient(to_left,transparent,black_2.5rem)]"
+                : "[[data-slot=composer-actions]:has([data-slot=scroll-arrow][data-side=right])_&]:[mask-image:linear-gradient(to_right,transparent,black_2.5rem)]",
             )}
           >
             <span className="absolute inset-0 bg-chrome" />
@@ -1130,7 +1164,10 @@ export function ActionsRow({ general, agent, mine, onRun, disabled, durable, sto
                 size="sm"
                 aria-label={handle.label}
                 aria-haspopup="dialog"
+                aria-expanded={handle.open === true}
                 onClick={handle.onClick}
+                // The pinned button is the Actions key's control: the key hint layer shows that key on it.
+                {...shortcutTarget("open_actions")}
                 // No padding and no border: what is left of the pill is `STRIP_ROW_PILL`'s own box,
                 // narrowed on this one pill alone. `w-8 min-w-8` drops `min-w-11`'s 44px floor — the
                 // floor every OTHER pill on this belt still stands on — down to 32px, the operator's
@@ -1142,9 +1179,10 @@ export function ActionsRow({ general, agent, mine, onRun, disabled, durable, sto
                 // square with the pill's own scaled height, 37px at the default scale. Its hit box
                 // reaches 3px left (half the 6px gap to a pill beside it, 7px when it stands alone)
                 // and 7px right (into `pr-3`), 47px across.
-                className={cn(`${STRIP_ROW_PILL} ${PINNED_PILL}`, pinnedReach(!agents && !jobs && !pins && !clear && !changes && !zoom, true, hand))}
+                className={cn(`${STRIP_ROW_PILL} ${PINNED_PILL}`, pinnedReach(!agents && !jobs && !pins && !clear && !changes && !zoom, true, hand), TRIGGER_OPEN)}
               >
-                <Icon name="pane-switcher" className={cn(BELT_ICON, "text-primary")} />
+                {/* The Actions mark since ADR 0165: this pill opens the Actions palette, not the pane list. Its ink follows the open fill. */}
+                <Icon name="open-actions" className={cn(BELT_ICON, handle.open === true ? "text-control-on-foreground" : "text-primary")} />
                 {/* The needs-you mark (the triangle), on the mark's top-right corner, absolutely placed
                     so it never moves the belt. The chrome-coloured disc and ring cut it out of the
                     glyph it overlaps. 10px since 2026-10-14: at 12px the triangle read as heavy as the

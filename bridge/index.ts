@@ -54,6 +54,7 @@ import type { AgentStatus, AgentView, CrewMode, CrewStatusResponse, Launcher, Ma
 import { EventPoker } from "./event-poker.ts";
 import { durableLogDir, moveFlatLogs, sourceLogDir } from "./durable/log.ts";
 import { GitHeads, nodeGitHeadDisk } from "./git-head.ts";
+import { ProjectPictures, projectPictureDenied } from "./project-picture.ts";
 import { exePathOf, exeReplaced } from "./exe-replaced.ts";
 import {
   herdrActionCommand,
@@ -76,6 +77,7 @@ import {
   factoryFor,
   type MuxTarget,
 } from "./mux/registry.ts";
+import { REX_BINARY_OPTION } from "./mux/rex/adapter.ts";
 import { TERN_BINARY_OPTION } from "./mux/tern/adapter.ts";
 import { TMUX_BINARY_OPTION } from "./mux/tmux/adapter.ts";
 import type { MuxAdapter } from "./mux/types.ts";
@@ -125,6 +127,7 @@ import {
 } from "./crew/deposed.ts";
 import { LeadContact } from "./crew/lead-contact.ts";
 import { forwardAuditDetail } from "./crew/forward.ts";
+import { CREW_JSON_MAX, wholeDeadlineMs } from "./crew/guarded-body.ts";
 import { deputyAnchorOf, dialTls, peerListenerTls } from "./crew/transport.ts";
 import { commitCrewChange, CREW_PROTOCOL_VERSION } from "./crew/enrollment.ts";
 import { CrewLead } from "./crew/lead.ts";
@@ -1054,6 +1057,12 @@ const accounts = new Accounts({
 // session's poll feeds it its folders, and the server reads it from memory at serialise time.
 const gitHeads = new GitHeads();
 
+// Each pane folder's project picture (bridge/project-picture.ts, ADR 0160): one for the whole bridge,
+// fed by the same poll as the branches and read from memory at serialise time. The operator's
+// `COLLIE_PROJECT_FILES=0` turns every repository's `collie.toml` off.
+// The private folders come from the one list `collie doctor` uses too (projectPictureDenied).
+const projectPictures = new ProjectPictures(cfg.projectFiles, projectPictureDenied({ stateDir: cfg.stateDir, configDir: dirname(cfg.commandsFile) }));
+
 // Which panes the operator asked to be warned about before their prompt cache goes cold, and the
 // deadlines already warned (bridge/cache/watch.ts). Loaded here beside the other two preference stores;
 // the file does not exist until an operator toggles something or a warning actually goes out.
@@ -1818,6 +1827,7 @@ function terminalAdapter(socketPath: string): BuiltAdapter {
       [TMUX_BINARY_OPTION]: cfg.tmuxBin,
       [ZELLIJ_BINARY_OPTION]: cfg.zellijBin,
       [TERN_BINARY_OPTION]: cfg.ternBin,
+      [REX_BINARY_OPTION]: cfg.rexBin,
     },
   };
   return { adapter: createMux(muxRegistry, cfg.mux, target), target };
@@ -2069,6 +2079,8 @@ const makeSession: SessionFactory = (name, endpoint, isPrimary) => {
   engine.onUpdate(
     (s) => void gitHeads.refresh([...[...s.agents, ...s.shellPanes].map((p) => p.cwd), ...spaceFolders(s.workspaces)]),
   );
+  // The project pictures ride it too, for the agent panes only: a picture replaces an agent's logo.
+  engine.onUpdate((s) => void projectPictures.refresh(s.agents.map((p) => p.cwd)));
 
   // The prompt-cache probe rides the same poll, and for the reason the tracker's header gives:
   // `localSnapshot` is synchronous, so the disk read cannot happen at serialise time. It is fired and
@@ -3559,12 +3571,14 @@ if (crewLead !== undefined && walkyMemberId !== null) {
         const held = trustStore.current();
         return held === null || held.crew === null ? null : { keyPem: held.self.keyPem, crewId: held.crew.crewId };
       },
-      post: async (memberId, segment, payload): Promise<CrewDialAnswer> => {
+      post: async (memberId, segment, payload, signal): Promise<CrewDialAnswer> => {
         const resolved = lead.resolve({ kind: "member", id: memberId });
         if (resolved === undefined || resolved.kind !== "peer") return { kind: "refused", reason: "no such member" };
         const url = new URL(`http://collie.invalid/api/pane/${encodeURIComponent(segment)}/walky`);
         url.searchParams.set("host", memberId);
-        const req = new Request(url, { method: "POST", headers: { "content-type": "application/json" }, body: payload });
+        // The leg's signal rides the forward: at the leg's bound the member's dial is aborted, its answer
+        // body included, not only no longer waited for (review round 9).
+        const req = new Request(url, { method: "POST", headers: { "content-type": "application/json" }, body: payload, signal });
         const res = await lead.forward(req, url, resolved, {
           device: null,
           audit: (entry) => audit.record({ action: entry.action, host: entry.host, device: null, detail: forwardAuditDetail(entry) }),
@@ -3803,7 +3817,8 @@ async function walkyToLead(payload: string, route: string = CREW_WALKY_ROUTE, bu
     { memberId: lead.memberId, address: lead.address },
     route,
     undefined,
-    { method: "POST", headers: { "content-type": "application/json" }, body: payload },
+    // Read in full below, so it ends by the whole-answer deadline (review round 9).
+    { method: "POST", headers: { "content-type": "application/json" }, body: payload, bodyMax: CREW_JSON_MAX, bodyDeadlineMs: wholeDeadlineMs(budgetMs) },
     budgetMs,
     true,
   );
@@ -4258,6 +4273,12 @@ const forgetTrick = (id: string): void => {
   views?.forgetTrick(id);
   trickHill?.forget({ id, name: id, memberId: bridgeId.id });
 };
+// At each good scan: the views and Hill keys of a trick id with no folder go (ADR 0168), so a remove that crashed
+// after its commit, or a folder deleted by hand, leaves nothing a later trick of that id would inherit.
+const pruneTrickStores = (present: ReadonlySet<string>): void => {
+  views?.forgetAbsentTricks(present);
+  trickHill?.forgetAbsent(present, bridgeId.id);
+};
 const tricks =
   cfg.tricksDir === undefined
     ? undefined
@@ -4270,6 +4291,7 @@ const tricks =
         // A trick's decisions go into the hill (M94, M96); `<stateDir>/hill/tricks.json` keeps the map.
         decisions: trickHill,
         forgetTrick,
+        pruneTrickStores,
         inputs: tricksInputs,
         crewWide: () => crewLead !== undefined,
         world: (memberId, opts) => {
@@ -4340,10 +4362,11 @@ const tricks =
         // Only a lead or a solo bridge that is not deposed schedules tricks (§18.12): a peer, a deputy and
         // a deposed lead run no timer, so one trick never runs on two machines of a crew.
         active: () => crew.mode !== "peer" && deposed === null,
-        // And says so: Settings → Tricks and `collie trick list` on such a machine name the lead that runs them.
+        // And says so: Settings → Tricks and the Hill and `collie trick list` on such a machine name the lead that runs them.
         runsOn: tricksRunsOn,
-        // Every version the bridge approves, declines or undoes, `auto` included, leaves an audit line.
-        audit: (entry) => audit.record({ action: entry.action, detail: entry.detail }),
+        // Every version the bridge approves, declines or undoes, `auto` included, leaves an audit line; a remove
+        // names the paired device that asked (ADR 0168).
+        audit: (entry) => audit.record({ action: entry.action, device: entry.device ?? null, detail: entry.detail }),
         // A new version that waits gets its card on the Hill; the card goes when nothing waits any more.
         versions: versionCards,
         // Fault B: a trick stopped for its rights says so on the Hill too, once per trick and mismatch.
@@ -4390,7 +4413,7 @@ const officialTricks =
         forgetTrick,
         repoFacts,
       });
-// A repository's index (bridge/tricks/repo-index.ts): Settings, Tricks, "Add from a repository". Nothing is
+// A repository's index (bridge/tricks/repo-index.ts): Settings, Tricks and the Hill, "Add a trick from a repository". Nothing is
 // fetched until the person taps; github.com, gitlab.com and codeberg.org only; the fetch slot is shared.
 const repoTricks =
   tricks === undefined || cfg.tricksDir === undefined
@@ -4449,6 +4472,7 @@ const server = listenOrExit("front door", cfg.host, cfg.port, () => startServer(
   subagents: subagents ?? undefined,
   usage,
   gitHeads,
+  projectPictures,
   walkyInstance: (session, paneId) => walkyInstances.tokenOf(session, paneId),
   // The pane read's `linked` (M99 spec 15): the session half of the send pick, one function.
   paneLinked: paneIsLinked,

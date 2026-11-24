@@ -1,4 +1,6 @@
 import { useEffect, useState } from "react";
+import { rememberPanePictures } from "@/lib/project-picture";
+import { reportPushPictureTrace } from "@/lib/push-picture-trace";
 import {
   Outlet,
   useLoaderData,
@@ -11,6 +13,8 @@ import {
 
 import { useNavTrail } from "@/hooks/use-nav";
 import { useSlotMemory } from "@/hooks/use-slot-memory";
+import { useShortcuts } from "@/hooks/use-shortcuts";
+import { ActionsPaletteDoor } from "@/components/actions-palette";
 import { readAgentLaunch } from "@/lib/agent-startup";
 import { usePolling } from "@/hooks/use-polling";
 import { usePollBusy } from "@/hooks/use-poll-busy";
@@ -27,12 +31,17 @@ import { AppHeaderHost } from "@/components/app-header";
 import { StripHost } from "@/components/ui/strip-host";
 import { ScreenTransition } from "@/components/screen-transition";
 import { ReportDoor } from "@/components/report-door";
+import { NewOverHost } from "@/components/new-over";
 import { CrewProvider } from "@/components/crew-provider";
 import { CollieMark } from "@/components/collie-mark";
 import { TourHost } from "@/components/tour-sheet";
+import { KeyboardHintCard } from "@/components/keyboard-hint-card";
+import { ShortcutBarHost } from "@/components/shortcut-bar-host";
+import { ShortcutHintLayer } from "@/components/shortcut-hint-layer";
+import { ShortcutHelpDoor } from "@/components/shortcut-help-door";
 import { TrickFloatLayer } from "@/components/trick-float-layer";
 import { describeThrownError } from "@/lib/api-error-message";
-import { findPane, paneRowKey } from "@/lib/hosts";
+import { findPane, leadHost, paneRowKey } from "@/lib/hosts";
 import { homePath } from "@/lib/nav";
 import { scopeFromUrl } from "@/lib/session";
 import { noteLeadName, noteSnapshotCrew, noteSnapshotRun } from "@/lib/update-run-store";
@@ -112,6 +121,8 @@ export function RootLayout() {
   useBusyWhile(useNavigation().state !== "idle");
   // The history the tab has walked, for the Files breadcrumb's pop (lib/nav-trail.ts).
   useNavTrail();
+  // The desktop keyboard shortcuts (M108): one listener for the whole app, on the machine and session in view.
+  useShortcuts(pane?.scope ?? data.scope);
   // Which pane this tab reopens on, when it came through `/slot/<n>` (lib/slots.ts).
   useSlotMemory();
   // The open pane as a ROW, so a peer's pane that shares its id is not silenced along with it.
@@ -123,6 +134,17 @@ export function RootLayout() {
   // A notification whose clear the bridge skipped (its daily budget, bridge/push.ts rule 4) closes here
   // instead, once a live snapshot says nothing waits on it any more.
   useNotificationSweep(data);
+  // Which picture each pane shows (ADR 0160), for the next cold open and for a push's icon.
+  // The lead's id goes with it: a push from the lead's own session names no host, so the worker's map does not either.
+  const agents = data.agents;
+  const lead = leadHost(data.servers);
+  useEffect(() => {
+    rememberPanePictures(agents, lead);
+  }, [agents, lead]);
+  // The worker's last push picture verdict goes to the bridge's log once per page life (lib/push-picture-trace.ts).
+  useEffect(() => {
+    void reportPushPictureTrace();
+  }, []);
   // THE PUSH RACE. `usePushSetup` can raise the browser's permission prompt on its own, behind the
   // tour's backdrop, so it waits until the tour has decided it is not showing. "pending" is what
   // makes this correct rather than racy: a child's effect runs before the parent's, but the state it
@@ -178,6 +200,8 @@ export function RootLayout() {
       {/* Report a problem (ADR 0123): the one sheet the composer's card, the pane menu and Settings open
           through lib/report/store.ts. Renders nothing until the first open, and loads the sheet then. */}
       <ReportDoor />
+      {/* New over the screen it was called from, on a large screen (components/new-over.tsx). */}
+      <NewOverHost />
       {/* `relative` makes this column the containing block of last resort, so its `overflow-hidden`
           also clips an absolute element no closer box contains (an `sr-only` word deep in a list).
           Without it such an element grew the DOCUMENT, and the page scrolled under the header
@@ -260,6 +284,19 @@ export function RootLayout() {
       {/* The floating pictures of the tricks (the `float` place): one layer over the page, under the toast and the
           sheets, tap-through. It draws on the Dashboard and a session only, and stays out of the way of every card. */}
       <TrickFloatLayer pane={openPane} trickSessions={data.trickSessions ?? NO_TRICK_SESSIONS} />
+      {/* The desktop shortcuts' two surfaces (M108): the mode bar along the foot of the window while the
+          prefix or a sticky mode is active, and the shortcut list's sheet, which the `help` action and the
+          Settings row open. Both read the keymap that `useShortcuts` above publishes. */}
+      <ShortcutBarHost />
+      {/* Each control an action key would press wears that key while the prefix waits (components/shortcut-hint-layer.tsx). */}
+      <ShortcutHintLayer />
+      <ShortcutHelpDoor />
+      {/* The Actions palette (ADR 0165): one searchable list of this screen's commands and the panes to go
+          to, opened by the Belt's Actions button, the header buttons and `prefix+g`. */}
+      <ActionsPaletteDoor scope={pane?.scope ?? data.scope} openPane={openPane} />
+      {/* The one-time hint for a device that has shown a hardware key press: a card at the top right,
+          below the header (components/keyboard-hint-card.tsx). */}
+      <KeyboardHintCard />
     </CrewProvider>
   );
 }

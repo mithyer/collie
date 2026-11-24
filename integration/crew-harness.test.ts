@@ -1,4 +1,5 @@
 import { emptyConfigLayer } from "../bridge/config-source.ts";
+import { CREW_JSON_MAX } from "../bridge/crew/guarded-body.ts";
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { get as httpGet } from "node:http";
@@ -1299,7 +1300,7 @@ describe("a cold handshake priced above the budget", () => {
       expect((await client.snapshot(link)).ok).toBe(true);
       expect(proxy.state.accepts).toBe(2);
       expect((await client.snapshot(link)).ok).toBe(true);
-      expect((await client.proxy(link, "snapshot")).ok).toBe(true);
+      expect((await client.proxy(link, "snapshot", undefined, { bodyMax: CREW_JSON_MAX })).ok).toBe(true);
       expect(proxy.state.accepts).toBe(2);
     } finally {
       proxy.stop();
@@ -2466,7 +2467,7 @@ describe("walky talky in a crew of four, on the real wire", () => {
 
   /**
    * A Claude Code screen drawn from what Herdr was told to write into the pane, the way
-   * `bridge/surface/protocol.test.ts` draws one: a rule, the box (`❯`, the dim placeholder while it is
+   * `bridge/surface/protocol.rig.ts` draws one: a rule, the box (`❯`, the dim placeholder while it is
    * empty), a rule, the status row. `fake-herdr.ts` answers every `pane.read` with a fixed text, and the
    * Send Protocol will not type a message into a screen it cannot read (`inbox-only: unconfirmed`, no
    * write) nor trust a screen that never reacts to its probe character (`probe failed`). So the pane's

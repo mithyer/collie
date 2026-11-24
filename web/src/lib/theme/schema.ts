@@ -22,7 +22,7 @@
 // wrong shape.
 //
 // VERSIONS. The parser reads 1, 2, 3, 4 and 5 and hands back the LOWEST version that holds the content: 5
-// when the theme sets a `characterMotion`, else 4 when it sets a `character` or `glyphs`, else 3 when it sets an optional token (`pane-active`, `tab-active`, `find`), else 2 when it carries
+// when the theme sets a `characterMotion`, else 4 when it sets a `character` or `glyphs`, else 3 when it sets an optional token (`pane-active`, `tab-active`, `find`, `surface-recess`, `surface-paper`), else 2 when it carries
 // a surface block, a display face or a palette, else 1. So a colour-only theme is stored and
 // exported as version 1, and a Collie from before version 2 (1.21.x after a rollback) still reads it.
 // A version 1 file has no surface block, which means the default word for every shape token. A
@@ -135,12 +135,55 @@ export type ThemeToken = (typeof THEME_TOKENS)[number];
  * open pane, drawn only under the surface word `tabs: folder` (lib/tab-look.ts); its `:root` pair is
  * the foreground ink of each half. `find` is the ground of a found or matched piece of text (Find in
  * Chat, the session filter's matched letters); it may carry alpha, and its `:root` pair is the amber
- * the app drew before the token existed. All three are appended after the list above, so no earlier
- * file or order moves.
+ * the app drew before the token existed. `surface-recess` and `surface-paper` are the large screen's
+ * recess and paper; their default is derived (see {@link DERIVED_THEME_TOKENS}). All are appended after
+ * the list above, so no earlier file or order moves.
  */
-export const OPTIONAL_THEME_TOKENS = ["pane-active", "tab-active", "find"] as const;
+export const OPTIONAL_THEME_TOKENS = ["pane-active", "tab-active", "find", "surface-recess", "surface-paper"] as const;
 
 export type OptionalThemeToken = (typeof OPTIONAL_THEME_TOKENS)[number];
+
+/**
+ * The optional tokens whose default is DERIVED from the theme's own tokens rather than a fixed pair: the
+ * large screen's recess and paper (DESIGN.md §4, index.css). Their `:root` value is an expression per
+ * half (one `light-dark()` in index.css, or the bare expression when both halves share it), so the theme
+ * file for `collie` holds no value for them, and a theme that sets one half only gets the expression in
+ * the other (`lightDark`). The paper in dark sits halfway between the page and the card 0.05 lighter:
+ * the full step read as too bright a sheet on a desktop (2026-11-21); light keeps the full step. The frame of the
+ * active pane, `pane-active`, joined them on 2026-11-21 (ADR 0174): the "on" ink mixed into the page.
+ */
+export const DERIVED_THEME_TOKENS = {
+  "pane-active": {
+    light: "color-mix(in oklab, var(--control-on-foreground) 70%, var(--background))",
+    dark: "color-mix(in oklab, var(--control-on-foreground) 60%, var(--background))",
+  },
+  "surface-recess": { light: "oklch(from var(--background) calc(l - 0.05) c h)", dark: "oklch(from var(--background) calc(l - 0.05) c h)" },
+  "surface-paper": {
+    light: "oklch(from var(--card) min(1, calc(l + 0.05)) c h)",
+    dark: "color-mix(in oklch, var(--background), oklch(from var(--card) calc(l + 0.05) c h))",
+  },
+} as const satisfies Partial<Record<OptionalThemeToken, { light: string; dark: string }>>;
+
+/** The one CSS value index.css declares for a derived token: the shared expression, or a `light-dark()`. */
+export function derivedRootValue(token: DerivedThemeToken): string {
+  const { light, dark } = DERIVED_THEME_TOKENS[token];
+  return light === dark ? light : `light-dark(${light}, ${dark})`;
+}
+
+export type DerivedThemeToken = keyof typeof DERIVED_THEME_TOKENS;
+
+/**
+ * A theme's own `pane-active` as the stylesheet draws it before `deriveTokens` has run: the same mix into the page as
+ * Collie's relation, with the theme's colour in place of `--control-on-foreground` (ADR 0174). `themes.css` writes it
+ * for a shipped theme, `theme-init.js` for an imported one, so the first frame never shows the raw start colour.
+ */
+export function paneFrameMix(value: string, half: "light" | "dark"): string {
+  return DERIVED_THEME_TOKENS["pane-active"][half].replace("var(--control-on-foreground)", value);
+}
+
+export function isDerivedThemeToken(token: string): token is DerivedThemeToken {
+  return Object.hasOwn(DERIVED_THEME_TOKENS, token);
+}
 
 /** Every token a half may name: the 43, then the optional ones. */
 export const ALL_THEME_TOKENS = [...THEME_TOKENS, ...OPTIONAL_THEME_TOKENS] as const;
@@ -1083,6 +1126,24 @@ export function isColour(value: string): boolean {
   return normaliseColour(value) !== undefined;
 }
 
+/** A colour the grammar accepts, in its parts: sRGB channels 0 to 1 for hex, L C H for oklch, and the alpha. */
+export type ColourParts = { form: "hex"; rgb: [number, number, number]; alpha: number } | { form: "oklch"; l: number; c: number; h: number; alpha: number };
+
+/**
+ * The parts of a colour, read by this grammar and nothing else, or `undefined` when the grammar refuses the value
+ * (`lib/theme/derive.ts` reads every colour here, so it accepts exactly what a theme file may hold).
+ */
+export function readColour(value: string): ColourParts | undefined {
+  const text = normaliseColour(value);
+  if (text === undefined) return undefined;
+  if (text.startsWith("#")) {
+    const byte = (i: number) => Number.parseInt(text.slice(i, i + 2), 16) / 255;
+    return { form: "hex", rgb: [byte(1), byte(3), byte(5)], alpha: text.length === 9 ? byte(7) : 1 };
+  }
+  const o = readOklch(text);
+  return o === undefined ? undefined : { form: "oklch", ...o };
+}
+
 // ── Colour arithmetic ─────────────────────────────────────────────────────────────────────────
 //
 // oklch to oklab is polar to Cartesian; oklab to linear sRGB is Björn Ottosson's published pair of
@@ -1282,8 +1343,9 @@ export function fillHalves(theme: Theme, base: Theme): FilledHalves {
  * happen when the base theme itself is incomplete: a build error, not a user's.
  */
 export function lightDark(filled: FilledHalves, token: AnyThemeToken): string {
-  const l = filled.light[token];
-  const d = filled.dark[token];
+  const derived = isDerivedThemeToken(token) ? DERIVED_THEME_TOKENS[token] : undefined;
+  const l = filled.light[token] ?? derived?.light;
+  const d = filled.dark[token] ?? derived?.dark;
   if (l === undefined || d === undefined) throw new Error(`theme token "${token}" has no value in both halves`);
   return `light-dark(${l}, ${d})`;
 }
@@ -1408,6 +1470,13 @@ export function contrastReport(theme: Theme, base: Theme): Finding[] {
       const value =
         mark === undefined || page === undefined || ink === undefined ? 1 : ratio(ink, over(mark, page, mark.alpha));
       push("foreground on find", value, TEXT_FLOOR);
+    }
+    // The large screen's recess and paper carry the sidebar's and the focused pane's text: the ink and
+    // the muted ink are held to the text floor on each, only in a half that sets it.
+    for (const plane of ["surface-recess", "surface-paper"] as const) {
+      if (theme[half]?.[plane] === undefined) continue;
+      push(`foreground on ${plane}`, contrast(values.foreground ?? "", values[plane] ?? ""), TEXT_FLOOR);
+      push(`muted-foreground on ${plane}`, contrast(values["muted-foreground"] ?? "", values[plane] ?? ""), TEXT_FLOOR);
     }
 
     // THE GROUND AND THE BAND (M57 spec 17). A gradient or a grain changes the page colour under the

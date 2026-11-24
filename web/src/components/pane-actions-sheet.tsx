@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type RefObject } from "react";
 import { Icon } from "@/components/icons/icon";
 
 import { BottomSheet } from "@/components/ui/sheet";
@@ -14,6 +14,7 @@ import { useLocale } from "@/hooks/use-locale";
 import * as api from "@/lib/api";
 import { describeApiError, describeThrownError } from "@/lib/api-error-message";
 import { t } from "@/lib/i18n";
+import { shortcutTarget } from "@/lib/shortcuts/target";
 import { useMuxCapability, useMuxName } from "@/lib/mux-capability";
 import { branchOffOffered } from "@/lib/branch-off";
 import { setStatus } from "@/lib/status";
@@ -92,6 +93,12 @@ interface PaneActionsSheetProps {
    * when the sheet opens; ignored where the pane cannot be renamed.
    */
   openInRename?: boolean;
+  /**
+   * Open with the Close row already armed ("Tap again to close"), so one more tap closes. The Actions
+   * palette's Close pane (ADR 0165) opens the menu this way: the confirm a person sees is this sheet's
+   * own, and nothing closes without a tap on it. Read when the sheet opens, like {@link openInRename}.
+   */
+  armCloseOnOpen?: boolean;
   /**
    * WHICH BODY THE PANE DRAWS, and the one place that value is written (ADR 0071's shape).
    *
@@ -177,6 +184,11 @@ interface PaneActionsSheetProps {
   };
   /** The tricks store the trick groups read, for a test or the playground. Absent: the app's own. */
   tricksStore?: TricksStore;
+  /** The button the sheet was opened from, when a tap on it opened it: on a wide window the sheet is then
+   *  a menu beside it (ui/sheet.tsx `anchor`). Absent for a hold, the Actions palette or a shortcut. */
+  anchor?: RefObject<HTMLElement | null>;
+  /** The menu was opened by the Pane menu key: beside its button, the first row takes the focus (ui/sheet.tsx `focusFirstRow`). */
+  focusFirstRow?: boolean;
 }
 
 const NO_HERD: readonly AgentView[] = [];
@@ -196,6 +208,23 @@ type Mode = "actions" | "rename";
 // read-only they're replaced by a note.
 /** The icon of a row of this sheet. */
 const ROW_ICON = "size-4 shrink-0 text-muted-foreground";
+
+/**
+ * Pin or unpin a pane on this device, the Pin to top row's act: the pin store's write, then the answer,
+ * either the caller's (the dashboard moves the row and shows it) or a toast. The Actions palette's
+ * `pin_pane` runs the same function from the pane view (ADR 0165).
+ */
+export function togglePanePin(input: {
+  pane: AgentView;
+  pinned: boolean;
+  herd: readonly AgentView[];
+  onPinChange?: ((pane: AgentView, pinned: boolean) => void) | undefined;
+}): void {
+  const next = !input.pinned;
+  setPinned(input.pane, next, input.herd);
+  if (input.onPinChange) input.onPinChange(input.pane, next);
+  else setStatus(next ? t("paneActions.pin.done") : t("paneActions.unpin.done"), "success");
+}
 
 /**
  * Where the body switch row takes the operator: the other body, or, while an agent view shows, the
@@ -222,6 +251,7 @@ export function PaneActionsSheet({
   onReport,
   onMessages,
   openInRename = false,
+  armCloseOnOpen = false,
   onZen,
   paneView,
   onPaneViewChange,
@@ -232,6 +262,8 @@ export function PaneActionsSheet({
   conversation = false,
   agentViews,
   tricksStore: trickStore,
+  anchor,
+  focusFirstRow,
 }: PaneActionsSheetProps) {
   useLocale();
   // Whether this pane is pinned on this device, read live from the store so the row's word is right
@@ -252,7 +284,7 @@ export function PaneActionsSheet({
   // success branch closes the sheet — and that is correct: the pane VANISHING is the outcome, and a
   // success `setStatus` on top of it would announce a fact the screen is already making.
   const closeEcho = useActionEcho();
-  const { pending, confirm, reset } = usePendingConfirm();
+  const { pending, confirm, reset, arm } = usePendingConfirm();
   const inputRef = useRef<HTMLInputElement>(null);
   // Rename and close are writes, and both are §10.3 writes to a specific machine — the PANE's, read
   // off the row rather than from the ambient scope, because a pane's host is the only thing that
@@ -296,6 +328,7 @@ export function PaneActionsSheet({
     if (!open) return;
     setLabel(pane?.paneLabel ?? "");
     reset();
+    if (armCloseOnOpen && pane && canClose.capable) arm(pane.paneId);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, pane?.paneId]);
 
@@ -395,11 +428,8 @@ export function PaneActionsSheet({
    */
   function togglePin() {
     if (!pane) return;
-    const next = !pinned;
     onClose();
-    setPinned(pane, next, herd);
-    if (onPinChange) onPinChange(pane, next);
-    else setStatus(next ? t("paneActions.pin.done") : t("paneActions.unpin.done"), "success");
+    togglePanePin({ pane, pinned, herd, onPinChange });
   }
 
   const confirming = !!pane && pending === pane.paneId;
@@ -408,6 +438,8 @@ export function PaneActionsSheet({
     <BottomSheet
       open={open}
       onClose={onClose}
+      anchor={anchor}
+      focusFirstRow={focusFirstRow}
       title={
         pane ? (
           // Every row below acts on THIS pane on THIS machine — rename, close, focus — so the
@@ -451,6 +483,7 @@ export function PaneActionsSheet({
             <ActionRow
               icon={<Icon name="find-in-pane" className="size-4 shrink-0 text-muted-foreground" />}
               label={t("chat.find.label")}
+              target={shortcutTarget("find")}
               onClick={() => {
                 // Close FIRST, then act. Both land in one React event, so the sheet unmounts in the
                 // same commit that mounts the find bar — see the focus note in agent-chat.tsx.
@@ -511,6 +544,7 @@ export function PaneActionsSheet({
                 )
               }
               label={t(bodyRowTarget(paneView, agentViews?.showing === true) === "terminal" ? "chat.mode.terminal" : "chat.mode.chat")}
+              target={shortcutTarget("toggle_chat_terminal")}
               hint={paneViewNote}
               onClick={() => {
                 onClose();
@@ -540,6 +574,7 @@ export function PaneActionsSheet({
             <ActionRow
               icon={<Icon name="pane-settings" className="size-4 shrink-0 text-muted-foreground" />}
               label={t("paneActions.settings.label")}
+              target={shortcutTarget("pane_settings")}
               onClick={() => {
                 onClose();
                 onSettings();
@@ -555,6 +590,7 @@ export function PaneActionsSheet({
             <ActionRow
               icon={<Icon name="zen-enter" className="size-4 shrink-0 text-muted-foreground" />}
               label={t("chat.zen.label")}
+              target={shortcutTarget("zen_mode")}
               onClick={() => {
                 onClose();
                 onZen();

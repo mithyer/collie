@@ -21,6 +21,7 @@ import { readHeldCancelAnswer, readSendReceipts, readSendReply, type SendReply }
 import { readReportContext, type ReportContext } from "./report/context";
 import type { TroubleSignal } from "./report/signal";
 import type { ComposerDiagRecord } from "./composer-offscreen";
+import type { PushPictureReport } from "./project-picture-push";
 import { REQUEST_ID, type HeldCancelAnswer, type SendReceiptRow, type SendRequestBody } from "./surface/send";
 import type { AnswerBody } from "./surface/ask";
 import { boundedDraft, CLEAR_OUTCOMES, CLEAR_REASONS, type ClearBody, type ClearReceipt } from "./surface/clear";
@@ -2829,6 +2830,19 @@ export async function postComposerDiag(record: ComposerDiagRecord): Promise<void
 }
 
 /**
+ * The push picture trace (lib/push-picture-trace.ts): the worker's last verdict and the two builds. A fixed
+ * list and build ids only; the bridge writes one log line and keeps nothing. Fire and forget, like the
+ * composer diagnostic: an older bridge answers 404, an offline phone throws, neither is a person's problem.
+ */
+export async function postPushPictureDiag(report: PushPictureReport): Promise<void> {
+  try {
+    await doReq<undefined>("/api/diag/push-picture", { method: "POST", body: JSON.stringify(report) });
+  } catch {
+    // Nothing to do.
+  }
+}
+
+/**
  * "Go back now" (M60 spec 01): from an Edge build down to the Stable release the bridge offered as
  * `back`. The one downgrade a person starts from here besides a rollback. The request id becomes the
  * run id, as on a rollback.
@@ -3655,6 +3669,22 @@ export async function setTrickValue(host: string, trick: string, body: { rid: st
   // A changed value runs the trick again about a second after the last write.
   stampTricks();
   return info;
+}
+
+/**
+ * Remove a trick that is off from the machine (ADR 0168): `POST /api/tricks/<host>/<id>/remove` with `{ rid }`, one
+ * request id per confirm, so a retry of the same confirm removes once. The bridge deletes the trick's folder, its
+ * state folder and its approved copies. A refusal (409 `on`, `running`, `link`; 404; 403 for a device that may not
+ * write) throws with its status and `error`; a body of another shape throws too.
+ */
+export async function removeTrick(host: string, trick: string, rid: string): Promise<{ rid: string; id: string }> {
+  const path = `/api/tricks/${encodeURIComponent(host)}/${encodeURIComponent(trick)}/remove`;
+  const raw = asJsonObject(await req<JsonValue>(path, { method: "POST", body: JSON.stringify({ rid }) }));
+  const id = asJsonString(raw?.id);
+  if (raw?.code !== "removed" || id === undefined) throw new Error(`${path} answered with a body that is not a remove receipt`);
+  // The list loses the trick at the next read; ask for it now.
+  stampTricks();
+  return { rid, id };
 }
 
 /**

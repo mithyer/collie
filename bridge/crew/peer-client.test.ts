@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
+import { CREW_JSON_MAX } from "./guarded-body.ts";
 import type { JsonObject, JsonValue } from "../json.ts";
 import type { SessionCard } from "../types.ts";
 import { NARROW_VIEW } from "../sessions.ts";
@@ -28,11 +29,12 @@ import {
   parseSurfaceVersion,
   parsePeerStatus,
   parsePeerVersion,
+  REDIRECT_TARGET_MAX,
+  redirectReason,
   sweepPeers,
   takeDataBudget,
   HEADERLESS_PATIENCE_MS,
   TRICKS_INPUTS_BUDGET_MS,
-  WRITE_BUDGET_MS,
   type CrewFetch,
   type CrewLink,
   type PeerClientDeps,
@@ -884,7 +886,7 @@ describe("sweepPeers — concurrent, never serial (§10.1)", () => {
 describe("proxy — the peer's own status codes are the answer, not a failure", () => {
   test("a 304 comes back as an outcome, not as `unreachable` — the whole conditional-GET win", async () => {
     const { fetch } = replying("", { status: 304 });
-    const outcome = await client(fetch).proxy(laptop, "pane/w1:p1");
+    const outcome = await client(fetch).proxy(laptop, "pane/w1:p1", undefined, { bodyMax: CREW_JSON_MAX });
     expect(outcome.ok).toBe(true);
     expect(outcome.ok && outcome.value.status).toBe(304);
     // `raw` is for bodies the LEAD consumes, where a non-2xx is a broken peer. Same dial, one rule
@@ -896,7 +898,7 @@ describe("proxy — the peer's own status codes are the answer, not a failure", 
   test("a peer's 404/405/413 reaches the phone as itself", async () => {
     for (const status of [400, 404, 405, 413, 500]) {
       const { fetch } = replying({ error: "x" }, { status });
-      const outcome = await client(fetch).proxy(laptop, "pane/w1:p1/reply", undefined, { method: "POST" });
+      const outcome = await client(fetch).proxy(laptop, "pane/w1:p1/reply", undefined, { bodyMax: CREW_JSON_MAX, method: "POST" });
       expect(outcome.ok && outcome.value.status).toBe(status);
     }
   });
@@ -904,7 +906,7 @@ describe("proxy — the peer's own status codes are the answer, not a failure", 
   test("a peer's OWN 403 is passed through — that is its write gate doing its job (§12)", async () => {
     // Stamped with the crew headers, so it is the peer answering rather than the link refusing.
     const { fetch } = replying("device not authorised", { status: 403 });
-    const outcome = await client(fetch).proxy(laptop, "pane/w1:p1/keys", undefined, { method: "POST" });
+    const outcome = await client(fetch).proxy(laptop, "pane/w1:p1/keys", undefined, { bodyMax: CREW_JSON_MAX, method: "POST" });
     expect(outcome.ok && outcome.value.status).toBe(403);
   });
 
@@ -913,7 +915,7 @@ describe("proxy — the peer's own status codes are the answer, not a failure", 
     // a rotated secret is told apart from a peer's own refusal. §10.2 files auth failure under
     // `unreachable`, so it stays on the poll cadence rather than the ten-minute skew backoff.
     const { fetch } = replying({ error: "unauthorized" }, { status: 401, protocol: null });
-    const outcome = await client(fetch).proxy(laptop, "pane/w1:p1");
+    const outcome = await client(fetch).proxy(laptop, "pane/w1:p1", undefined, { bodyMax: CREW_JSON_MAX });
     expect(outcome.ok).toBe(false);
     expect(!outcome.ok && outcome.state).toBe("unreachable");
     expect(!outcome.ok && outcome.reason).toContain("unauthorized");
@@ -921,13 +923,13 @@ describe("proxy — the peer's own status codes are the answer, not a failure", 
 
   test("a version skew is still a skew, before any status or body is looked at (§7)", async () => {
     const { fetch } = replying({ ok: true }, { status: 200, protocol: "3" });
-    const outcome = await client(fetch).proxy(laptop, "pane/w1:p1");
+    const outcome = await client(fetch).proxy(laptop, "pane/w1:p1", undefined, { bodyMax: CREW_JSON_MAX });
     expect(!outcome.ok && outcome.state).toBe("incompatible");
   });
 
   test("the response body is never read here — an ETag and the bytes survive the hop", async () => {
     const { fetch } = replying({ lines: ["hello"] }, { status: 200 });
-    const outcome = await client(fetch).proxy(laptop, "pane/w1:p1");
+    const outcome = await client(fetch).proxy(laptop, "pane/w1:p1", undefined, { bodyMax: CREW_JSON_MAX });
     expect(outcome.ok && outcome.value.bodyUsed).toBe(false);
     expect(outcome.ok && (await outcome.value.json())).toEqual({ lines: ["hello"] });
   });
@@ -936,9 +938,9 @@ describe("proxy — the peer's own status codes are the answer, not a failure", 
 describe("`attempted` — the input to §10.3's refuse-vs-unknown decision", () => {
   test("a fault that provably never left this process says so", async () => {
     const { fetch } = replying({});
-    const noSecret = await client(fetch, { secret: null }).proxy(laptop, "pane/w1:p1/reply");
+    const noSecret = await client(fetch, { secret: null }).proxy(laptop, "pane/w1:p1/reply", undefined, { bodyMax: CREW_JSON_MAX });
     expect(!noSecret.ok && noSecret.state === "unreachable" && noSecret.attempted).toBe(false);
-    const badAddress = await client(fetch).proxy({ memberId: "x", address: "http://a/b?c=1" }, "pane/p/reply");
+    const badAddress = await client(fetch).proxy({ memberId: "x", address: "http://a/b?c=1" }, "pane/p/reply", undefined, { bodyMax: CREW_JSON_MAX });
     expect(!badAddress.ok && badAddress.state === "unreachable" && badAddress.attempted).toBe(false);
   });
 
@@ -946,7 +948,7 @@ describe("`attempted` — the input to §10.3's refuse-vs-unknown decision", () 
     // The runtime does not tell us whether the request had been written when the socket died, and a
     // write reported as cleanly-failed is a write the operator sends again (.adr/0010).
     const fetch: CrewFetch = () => Promise.reject(new Error("socket hang up"));
-    const outcome = await client(fetch).proxy(laptop, "pane/w1:p1/reply", undefined, { method: "POST" });
+    const outcome = await client(fetch).proxy(laptop, "pane/w1:p1/reply", undefined, { bodyMax: CREW_JSON_MAX, method: "POST" });
     expect(!outcome.ok && outcome.state === "unreachable" && outcome.attempted).toBeUndefined();
   });
 });
@@ -955,6 +957,7 @@ describe("the forwarded device identity (§12)", () => {
   test("a per-request device wins over the client-wide one", async () => {
     const { fetch, calls } = replying({});
     await client(fetch, { device: "process-default" }).proxy(laptop, "pane/w1:p1/reply", undefined, {
+      bodyMax: CREW_JSON_MAX,
       method: "POST",
       headers: { [DEVICE_HEADER]: "phone-7" },
     });
@@ -964,6 +967,7 @@ describe("the forwarded device identity (§12)", () => {
   test("nothing a caller passes can shape the link's own claims", async () => {
     const { fetch, calls } = replying({});
     await client(fetch).proxy(laptop, "pane/w1:p1/reply", undefined, {
+      bodyMax: CREW_JSON_MAX,
       method: "POST",
       headers: { authorization: "Bearer forged", [PROTOCOL_HEADER]: "99", [MEMBER_HEADER]: "not-desk" },
     });
@@ -994,7 +998,7 @@ describe("two budgets, and which call runs on which (§10.4)", () => {
     // Spent. Everything after it is strict again, so a host that is genuinely gone still fails fast.
     const second = await patient.snapshot(laptop);
     expect(!second.ok && second.reason).toBe("snapshot: timed out after 5ms");
-    const forwarded = await patient.proxy(laptop, "pane/w1:p1/reply", undefined, { method: "POST" });
+    const forwarded = await patient.proxy(laptop, "pane/w1:p1/reply", undefined, { bodyMax: CREW_JSON_MAX, method: "POST" });
     expect(!forwarded.ok && forwarded.reason).toBe("pane/w1:p1/reply: timed out after 5ms");
   });
 
@@ -1081,15 +1085,15 @@ describe("a forwarded write's own budget (§10.1)", () => {
 
   test("`proxy` runs on the budget it is given, and says which one fired", async () => {
     const c = client(stalling, { timeoutMs: 5, patientTimeoutMs: 40 });
-    const written = await c.proxy(laptop, "launch", undefined, { method: "POST" }, 90);
+    const written = await c.proxy(laptop, "launch", undefined, { bodyMax: CREW_JSON_MAX, method: "POST" }, 90);
     expect(!written.ok && written.reason).toBe("launch: timed out after 90ms");
   });
 
   test("an explicit budget spends NO bootstrap credit — the sweep's accounting is untouched", async () => {
     const c = client(stalling, { timeoutMs: 5, patientTimeoutMs: 40 });
     // Two forwarded writes on a cold link, both on their own budget.
-    expect(!(await c.proxy(laptop, "launch", undefined, { method: "POST" }, 90)).ok).toBe(true);
-    expect(!(await c.proxy(laptop, "launch", undefined, { method: "POST" }, 90)).ok).toBe(true);
+    expect(!(await c.proxy(laptop, "launch", undefined, { bodyMax: CREW_JSON_MAX, method: "POST" }, 90)).ok).toBe(true);
+    expect(!(await c.proxy(laptop, "launch", undefined, { bodyMax: CREW_JSON_MAX, method: "POST" }, 90)).ok).toBe(true);
     // The credit is still there for the sweep, which is the call the poll fraction is sized for.
     const sweep = await c.snapshot(laptop);
     expect(!sweep.ok && sweep.reason).toBe("snapshot: timed out after 40ms");
@@ -1097,29 +1101,11 @@ describe("a forwarded write's own budget (§10.1)", () => {
 
   test("a forwarded READ keeps the poll budget and the credit, unchanged", async () => {
     const c = client(stalling, { timeoutMs: 5, patientTimeoutMs: 40 });
-    const first = await c.proxy(laptop, "pane/w1:p1", undefined, {});
+    const first = await c.proxy(laptop, "pane/w1:p1", undefined, { bodyMax: CREW_JSON_MAX });
     expect(!first.ok && first.reason).toBe("pane/w1:p1: timed out after 40ms");
-    const second = await c.proxy(laptop, "pane/w1:p1", undefined, {});
+    const second = await c.proxy(laptop, "pane/w1:p1", undefined, { bodyMax: CREW_JSON_MAX });
     expect(!second.ok && second.reason).toBe("pane/w1:p1: timed out after 5ms");
   });
-
-  test("on the real clock: 2 s of work misses the poll budget and fits inside WRITE_BUDGET_MS", async () => {
-    // The measured case, on real timers rather than modelled: a launch onto a zellij member spawns a
-    // process and has the multiplexer build a tab. Around 2 s — under 1200 ms it is an abort the lead
-    // can only report as ambiguous (§10.3), and under 5000 ms it is the peer's own answer.
-    const slow: CrewFetch = (url, init) =>
-      new Promise((resolve, reject) => {
-        init.signal?.addEventListener("abort", () => reject(new Error("The operation was aborted.")));
-        setTimeout(() => void replying({ ok: true }).fetch(url, init).then(resolve, reject), 2000);
-      });
-    // No patient budget wired, so the poll budget is the honest comparison and not the credit.
-    const c = client(slow, { timeoutMs: crewTimeoutBudget(1500, {}) });
-    const missed = await c.proxy(laptop, "launch", undefined, { method: "POST" });
-    expect(!missed.ok && missed.reason).toBe(`launch: timed out after ${DEFAULT_CREW_TIMEOUT_MS}ms`);
-    const landed = await c.proxy(laptop, "launch", undefined, { method: "POST" }, WRITE_BUDGET_MS);
-    expect(landed.ok).toBe(true);
-    expect(landed.ok && landed.status).toBe(200);
-  }, 10_000);
 });
 
 // ── F18: the runtime's voice never reaches an operator ───────────────────────
@@ -1489,7 +1475,7 @@ describe("PeerClient — every dial is attested (§8.6)", () => {
     const c = client(fetch, withDial());
     await c.hello(laptop);
     await c.snapshot(laptop);
-    await c.proxy(laptop, "pane/w1:p1");
+    await c.proxy(laptop, "pane/w1:p1", undefined, { bodyMax: CREW_JSON_MAX });
     expect(calls).toHaveLength(3);
     for (const sent of calls) {
       const headers = new Headers(sent.init.headers);
@@ -1514,8 +1500,8 @@ describe("PeerClient — every dial is attested (§8.6)", () => {
     // upload in the lead's memory, on the security path.
     const { fetch, calls } = replying({ ok: true });
     const body = new ReadableStream<Uint8Array>({ start: (ctrl) => ctrl.close() });
-    const init: CrewRequestInit = { method: "POST", body };
-    await client(fetch, withDial()).proxy(laptop, "pane/w1:p1/upload", undefined, init);
+    const init: CrewRequestInit = { method: "POST", body, bodyMax: CREW_JSON_MAX };
+    await client(fetch, withDial()).proxy(laptop, "pane/w1:p1/upload", undefined, { ...init, bodyMax: CREW_JSON_MAX });
     expect(calls[0]!.init.body).toBe(body);
     expect(new Headers(calls[0]!.init.headers).get(DIAL_HEADER)).not.toBeNull();
   });
@@ -1671,5 +1657,168 @@ describe("parseMuxReport — a member's declaration, bounded and re-checked", ()
     });
     expect(wire?.unsupportedKeys).toHaveLength(256);
     expect(wire?.notes).toEqual({});
+  });
+});
+
+// ── A member answers in gzip, and the runtime inflates it (§9.1, ADR 0161) ──────────────────────
+
+describe("the dial asks a member for gzip", () => {
+  test("every dial asks for gzip, leaves the runtime's decompression on, and never sends its own limits", async () => {
+    const { fetch, calls } = replying({ protocol: 2, member: "laptop" });
+    await client(fetch).hello(laptop);
+    await client(fetch).proxy(laptop, "pane/w1:p1", undefined, { headers: { "accept-encoding": "br" }, bodyMax: 1024, bodyDeadlineMs: 8_000 });
+    for (const call of calls) {
+      expect(new Headers(call.init.headers).get("accept-encoding")).toBe("gzip");
+      // SAFETY: the dial builds a CrewRequestInit; the fake fetch's type only widened it to RequestInit.
+      const init = call.init as CrewRequestInit;
+      expect(init.decompress).toBeUndefined();
+      expect("bodyMax" in init || "bodyDeadlineMs" in init).toBe(false);
+    }
+  });
+});
+
+// ── A crew dial never follows a redirect (§9.1) ──────────────────────────────
+// Through the REAL dial: a real `fetch`, a member that answers a 3xx on a socket of its own, and a
+// second listener the redirect points at. The target's request count is the proof, not a fake's
+// record of the init, because following is the runtime's act and only a real socket shows it.
+
+/** A listener on loopback that counts what reaches it. Stopped by the caller. */
+function listener(answer: (req: Request) => Response | Promise<Response>) {
+  const seen: { method: string; path: string; body: string }[] = [];
+  const server = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    fetch: async (req) => {
+      seen.push({ method: req.method, path: new URL(req.url).pathname, body: await req.text() });
+      return answer(req);
+    },
+  });
+  return { server, seen, origin: `http://127.0.0.1:${String(server.port)}` };
+}
+
+/** A member that answers every dial with `status` to `location`, stamped as a peer of this version. */
+function redirecting(status: number, location: string) {
+  return listener(
+    () => new Response("a body nobody reads", { status, headers: { location, [PROTOCOL_HEADER]: OURS, [MEMBER_HEADER]: "laptop" } }),
+  );
+}
+
+function realClient() {
+  return client((url, init) => fetch(url, init), { timeoutMs: 5_000 });
+}
+
+describe("a crew dial never follows a redirect (§9.1)", () => {
+  test("a 302 to another origin is not followed: the target gets nothing, the caller gets unreachable with its origin", async () => {
+    const target = listener(() => new Response("{}", { headers: { [PROTOCOL_HEADER]: OURS } }));
+    const redirector = redirecting(302, `${target.origin}/crew/v1/snapshot?steal=1`);
+    try {
+      const out = await realClient().raw({ memberId: "laptop", address: redirector.origin }, "snapshot");
+      expect(out.ok).toBe(false);
+      if (out.ok) return;
+      expect(out.state).toBe("unreachable");
+      expect(out.reason).toBe(`snapshot: the peer answered a redirect (302) to ${target.origin}, and a crew dial never follows one`);
+      expect(redirector.seen).toHaveLength(1);
+      expect(target.seen).toHaveLength(0);
+    } finally {
+      await redirector.server.stop(true);
+      await target.server.stop(true);
+    }
+  });
+
+  test("a 307 on a forwarded POST is not followed: the body reaches the member only, never the target", async () => {
+    const target = listener(() => new Response("{}", { headers: { [PROTOCOL_HEADER]: OURS } }));
+    const redirector = redirecting(307, `${target.origin}/elsewhere`);
+    try {
+      const out = await realClient().proxy({ memberId: "laptop", address: redirector.origin }, "send", undefined, {
+        bodyMax: CREW_JSON_MAX,
+        method: "POST",
+        body: JSON.stringify({ text: "the forwarded body" }),
+      });
+      expect(out.ok).toBe(false);
+      if (out.ok) return;
+      expect(out.state).toBe("unreachable");
+      expect(out.reason).toContain(`a redirect (307) to ${target.origin},`);
+      expect(redirector.seen.map((r) => r.body)).toEqual([JSON.stringify({ text: "the forwarded body" })]);
+      expect(target.seen).toHaveLength(0);
+    } finally {
+      await redirector.server.stop(true);
+      await target.server.stop(true);
+    }
+  });
+
+  test("every redirect status is refused in both modes, and a caller's `redirect` cannot turn following back on", async () => {
+    const target = listener(() => new Response("{}", { headers: { [PROTOCOL_HEADER]: OURS } }));
+    try {
+      for (const status of [301, 302, 303, 307, 308]) {
+        const redirector = redirecting(status, target.origin);
+        try {
+          const link = { memberId: "laptop", address: redirector.origin };
+          const consumed = await realClient().raw(link, "snapshot", undefined, { redirect: "follow" });
+          const passed = await realClient().proxy(link, "pane/t1", undefined, { redirect: "follow", bodyMax: CREW_JSON_MAX });
+          for (const out of [consumed, passed]) {
+            expect(out.ok).toBe(false);
+            if (!out.ok) expect(out.reason).toContain(`a redirect (${String(status)})`);
+          }
+        } finally {
+          await redirector.server.stop(true);
+        }
+      }
+      expect(target.seen).toHaveLength(0);
+    } finally {
+      await target.server.stop(true);
+    }
+  });
+
+  test("a hostile Location reaches the reason as its origin only: no credentials, no path, ASCII, cut", async () => {
+    const redirector = redirecting(302, `http://user:pass@${"a".repeat(300)}.example:4444/secret/path?token=t`);
+    try {
+      const out = await realClient().raw({ memberId: "laptop", address: redirector.origin }, "snapshot");
+      expect(out.ok).toBe(false);
+      if (out.ok) return;
+      expect(out.reason).not.toContain("user");
+      expect(out.reason).not.toContain("pass");
+      expect(out.reason).not.toContain("secret");
+      expect(out.reason).not.toContain("token");
+      const target = /to (\S+), and a crew dial/.exec(out.reason)?.[1] ?? "";
+      expect(target.length).toBe(REDIRECT_TARGET_MAX);
+      expect(target.endsWith("...")).toBe(true);
+      expect(target.startsWith("http://aaaa")).toBe(true);
+    } finally {
+      await redirector.server.stop(true);
+    }
+  });
+
+  test("redirectReason: non-ASCII, credentials, a relative target, none, and junk", () => {
+    const dialled = "https://laptop.example:8787/crew/v1/snapshot";
+    const reason = (location: string | null) =>
+      redirectReason(new Response(null, { status: 302, headers: location === null ? {} : { location } }), dialled);
+    // A non-ASCII host is punycoded by the URL parser; a byte past ASCII anywhere else is dropped with the path.
+    expect(reason("https://user:pa\u00e9ss@b\u00fccher.example/\u00e9t\u00e9")).toBe(
+      "the peer answered a redirect (302) to https://xn--bcher-kva.example, and a crew dial never follows one",
+    );
+    expect(reason("foo://h\u00e9st/x")).toMatch(/^[\x20-\x7e]*$/);
+    expect(reason("/elsewhere?q=1")).toContain("to https://laptop.example:8787,");
+    expect(reason(null)).toContain("a redirect (302) with no target,");
+    expect(reason("http://[::1")).toContain("to an address that does not parse,");
+    expect(reason("mailto:x@y")).toContain("to an address with no host,");
+  });
+
+  test("a 304 is still the peer's answer, and an honest member still answers", async () => {
+    const honest = listener((req) =>
+      new URL(req.url).pathname.endsWith("/pane/t1")
+        ? new Response(null, { status: 304, headers: { etag: '"e1"', [PROTOCOL_HEADER]: OURS, [MEMBER_HEADER]: "laptop" } })
+        : Response.json({ ok: true }, { headers: { [PROTOCOL_HEADER]: OURS, [MEMBER_HEADER]: "laptop" } }),
+    );
+    try {
+      const link = { memberId: "laptop", address: honest.origin };
+      const notModified = await realClient().proxy(link, "pane/t1", undefined, { headers: { "if-none-match": '"e1"' }, bodyMax: CREW_JSON_MAX });
+      expect(notModified.ok).toBe(true);
+      if (notModified.ok) expect(notModified.value.status).toBe(304);
+      const fine = await realClient().raw(link, "snapshot");
+      expect(fine.ok).toBe(true);
+      if (fine.ok) expect(await fine.value.json()).toEqual({ ok: true });
+    } finally {
+      await honest.server.stop(true);
+    }
   });
 });

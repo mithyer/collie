@@ -7,6 +7,7 @@ import { cacheChipView } from "@/lib/cache-view";
 import { t } from "@/lib/i18n";
 import type { PaneCache } from "@/lib/types";
 import { cn } from "@/lib/utils";
+import { FOCUS_RING } from "@/components/ui/button";
 import { Icon } from "@/components/icons/icon";
 
 // How long this pane's prompt cache stays warm, as one small run of type.
@@ -81,6 +82,14 @@ const TONE_CLASS = {
   cold: "text-status-info/70",
 } as const;
 
+/** The same tones at their tokens' full strength: the large screen's pane header (2026-11-21), where the place
+ *  line has one ink for its words and one full tint per glyph, never a third, faded strength. */
+const FULL_TONE_CLASS = {
+  warm: "text-status-done",
+  expiring: "text-status-blocked",
+  cold: "text-status-info",
+} as const;
+
 interface CacheChipProps {
   cache: PaneCache | undefined;
   /**
@@ -96,10 +105,12 @@ interface CacheChipProps {
    */
   variant?: "row" | "button";
   onOpen?: () => void;
+  /** Draw the glyph at its token's full strength ({@link FULL_TONE_CLASS}). */
+  fullTone?: boolean;
   className?: string;
 }
 
-export function CacheChip({ cache, variant = "row", onOpen, className }: CacheChipProps) {
+export function CacheChip({ cache, variant = "row", onOpen, fullTone = false, className }: CacheChipProps) {
   useLocale();
   // One subscription per chip, one interval for the document. Subscribing unconditionally (rather than
   // only when there is something to count down) keeps the hook order fixed — the hide decision below
@@ -108,7 +119,7 @@ export function CacheChip({ cache, variant = "row", onOpen, className }: CacheCh
   const view = cacheChipView(cache, now);
   if (view === null) return null;
 
-  const ink = TONE_CLASS[view.tone];
+  const ink = (fullTone ? FULL_TONE_CLASS : TONE_CLASS)[view.tone];
   const label = t(`cache.${cache?.state === "cold" ? "cold" : cache?.state === "expiring" ? "expiring" : "warm"}`);
 
   const body = (
@@ -154,7 +165,7 @@ export function CacheChip({ cache, variant = "row", onOpen, className }: CacheCh
         data-slot="cache-chip"
         onClick={onOpen}
         aria-label={`${label}, ${view.label}`}
-        className={cn(shared, "transition-opacity active:opacity-60")}
+        className={cn(shared, "rounded-sm transition-opacity hover:text-foreground active:opacity-60", FOCUS_RING)}
       >
         {body}
       </button>

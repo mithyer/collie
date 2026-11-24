@@ -11,9 +11,10 @@ import { t } from "@/lib/i18n";
 import type { WireCodeFile, WireCodeIndex, WireCodeIndexFile } from "@/lib/tricks/code-wire";
 import { markWord } from "@/lib/tricks/code-words";
 import { cn } from "@/lib/utils";
+import { FOCUS_RING, HOVER_FILL } from "@/components/ui/button";
 
-// "READ THE CODE": THE CODE OF A TRICK, ONE FOLD FOR EACH FILE (2026-11-17, package F), in a trick's About sheet
-// (components/trick-about-sheet.tsx). What a person can read before a switch on, and after.
+// "READ THE CODE": THE CODE OF A TRICK, ONE FOLD FOR EACH FILE (2026-11-17, package F), on a trick's details page
+// (components/trick-detail.tsx). What a person can read before a switch on, and after.
 //
 //   * The sheet asks the bridge for the INDEX when it opens: the names, the sizes and how many lines of each
 //     file the text search flags. No code in it. A file's code is asked only when its fold opens, once.
@@ -152,7 +153,7 @@ function CodeFold({ fact, read }: { fact: WireCodeIndexFile; read: (file: string
         aria-controls={open ? id : undefined}
         data-slot="trick-code-toggle"
         onClick={toggle}
-        className={cn(ROW, "focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring")}
+        className={cn(ROW, FOCUS_RING, HOVER_FILL)}
       >
         <span className="min-w-0 flex-1 font-mono text-xs break-all">{fact.file}</span>
         {fact.flagged > 0 && (
@@ -213,8 +214,8 @@ export function TrickCodeFolds({ reader, scope }: { reader: TrickCodeReader; sco
   }, [scope]);
   const label = t("settings.tricks.about.code.title");
   return (
-    <section data-section="code" className="pt-4">
-      <SectionLabel className="mb-1.5 block">{label}</SectionLabel>
+    <section data-section="code" className="pt-6">
+      <SectionLabel className="mb-2 block">{label}</SectionLabel>
       {state.kind === "loading" && <Said line="code-loading">{t("settings.tricks.about.code.loading")}</Said>}
       {state.kind === "failed" && <Said line="code-failed">{failedLine(state.why)}</Said>}
       {state.kind === "ready" && (

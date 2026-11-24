@@ -44,6 +44,7 @@ import {
 import { member } from "./fixtures.ts";
 import { CrewRegistry, type PeerState } from "./registry.ts";
 import { readSend, readSendReply } from "../../web/src/lib/send-protocol.ts";
+import type { CrewRequestInit } from "./transport.ts";
 
 // The lead's forwarding path (CREW_PROTOCOL.md §5, §9.1, §10.3, §12, §13).
 //
@@ -82,11 +83,11 @@ const SKEWED: PeerState = {
 };
 
 /** Records every dial, so "was this attempted?" and "was it retried?" are assertable facts. */
-function transportOf(answer: (init: RequestInit) => PeerOutcome<Response>) {
+function transportOf(answer: (init: CrewRequestInit) => PeerOutcome<Response>) {
   const calls: {
     route: string;
     params: CrewParams;
-    init: RequestInit;
+    init: CrewRequestInit;
     budgetMs: number | undefined;
   }[] = [];
   const transport: ForwardTransport = async (_link, route, params, init, budgetMs) => {
@@ -252,6 +253,21 @@ describe("which routes cross a link", () => {
     expect(forwardAuditAction(`blobs/${hash}`)).toBeNull();
     // No pane id to name: a blob is addressed by content, not by terminal.
     expect(forwardPaneId(`blobs/${hash}`)).toBeUndefined();
+  });
+
+  test("a project picture crosses the link as a READ, like a blob (ADR 0160)", () => {
+    const version = "abcdef012345abcdef012345";
+    expect(crewRouteFor(`/api/project-picture/${version}`)).toBe(`project-picture/${version}`);
+    expect(apiPathFor(`project-picture/${version}`)).toBe(`/api/project-picture/${version}`);
+    expect(forwardKind(`project-picture/${version}`)).toBe("read");
+    expect(forwardAuditAction(`project-picture/${version}`)).toBeNull();
+    // Addressed by content, never by a pane.
+    expect(forwardPaneId(`project-picture/${version}`)).toBeUndefined();
+    // The same opaque segment server.ts matches, and nothing deeper.
+    const server = readFileSync(join(import.meta.dir, "..", "server.ts"), "utf8");
+    const route = server.match(/^export const PROJECT_PICTURE_ROUTE = (.+);$/m)![1]!;
+    expect(route).toBe("/^\\/api\\/project-picture\\/([^/]+)$/");
+    expect(crewRouteFor("/api/project-picture/x/y")).toBeNull();
   });
 
   test("the routes §5 excludes are excluded — and stay that way by construction", () => {
@@ -722,14 +738,6 @@ describe("the lead compresses the phone hop itself (.adr/0023)", () => {
     expect(new Uint8Array(await res.arrayBuffer())).toEqual(bytes);
     expect(res.headers.get("etag")).toBe('"png"');
   });
-
-  test("the peer hop stays identity no matter what the phone asked for (the beta.9 invariant)", async () => {
-    const [, peer] = peerJson();
-    const { transport, calls } = transportOf(() => ok(peer));
-    const [req, url] = get("/api/pane/w1:p1?host=laptop", { "accept-encoding": "gzip, deflate, br, zstd" });
-    await forward(req, url, { transport });
-    expect(new Headers(calls[0]!.init.headers).get("accept-encoding")).toBe("identity");
-  });
 });
 
 // ── The forwarded request: what the peer sees, and what it must never see ────
@@ -768,9 +776,8 @@ describe("request shaping", () => {
     for (const banned of ["cookie", "origin", "authorization", "x-tailnet-device"]) {
       expect(headers.get(banned)).toBeNull();
     }
-    // Identity bytes only, and ASKED FOR rather than merely not-forwarded: Bun's `fetch` supplies its
-    // own `accept-encoding: gzip, …` when the init carries none, so an absent header is a gzipped hop.
-    expect(headers.get("accept-encoding")).toBe("identity");
+    // The browser's `accept-encoding` is not forwarded: the dial sets the member hop's own (ADR 0161).
+    expect(headers.get("accept-encoding")).toBeNull();
   });
 
   test("a device name outside ASCII is forwarded, not thrown on (#324)", () => {
@@ -845,6 +852,28 @@ describe("a text reply to a member that sent no Surface reader version (an older
       // The body still streams on whole: the refusal check reads a clone.
       expect(await new Response(calls[0]?.init.body).text()).toBe(`{"text":"hi","submit":true,"id":"phone-req-0001"}`);
     }
+  });
+
+  // An offer is a yes to one draft (ADR 0166): the phone's Add to it and Replace carry the rows hash of the
+  // offer, and the member compares it before any key. The lead reads none of it and adds no field.
+  test("an Add to it or a Replace streams on with its rows hash, byte for byte", async () => {
+    for (const mode of ["append", "replace"]) {
+      const body = `{"text":"new words","submit":true,"id":"phone-req-0002","mode":"${mode}","rowsHash":"0abc12"}`;
+      const { transport, calls } = transportOf(() => ok(new Response(`{"ok":true}`)));
+      const [req, url] = post(REPLY, body);
+      await forward(req, url, { transport, surfaceVersion: 2 });
+      expect(calls.map((c) => c.route), mode).toEqual(["pane/w1:p1/reply"]);
+      expect(await new Response(calls[0]?.init.body).text(), mode).toBe(body);
+    }
+  });
+
+  // The member's answer to such a tap comes back to the phone as the member sent it, the draft's text included (Brief 6).
+  test("a member's draft offer comes back with its draftText and draftCut, byte for byte", async () => {
+    const answer = `{"ok":false,"textDelivered":false,"send":{"offers":["append","replace","cancel"],"rowsHash":"0def34","draftText":"half a thought","draftCut":true}}`;
+    const { transport } = transportOf(() => ok(new Response(answer, { headers: { "content-type": "application/json" } })));
+    const [req, url] = post(REPLY, `{"text":"new words","submit":true,"id":"phone-req-0003"}`);
+    const res = await forward(req, url, { transport, surfaceVersion: 2 });
+    expect(await res.text()).toBe(answer);
   });
 
   test("keys, raw text with submit false, other routes and a body that is not JSON go to the old member as before", async () => {
@@ -949,6 +978,7 @@ describe("a write to a member that is not reachable (§10.3)", () => {
       [{ ok: false, state: "unreachable", reason: "timed out after 6400ms", timedOut: true, receivedAt: 2 }, "unknown", "link_timeout"],
       [{ ok: false, state: "unreachable", reason: "socket hang up", receivedAt: 2 }, "unknown", "link_lost"],
       [{ ok: false, state: "unreachable", reason: "no crew secret", attempted: false, receivedAt: 2 }, "refused", "link_refused"],
+      [{ ok: false, state: "unreachable", reason: "the caller went away", callerLeft: true, receivedAt: 2 }, "unknown", "caller_left"],
     ];
     for (const [failure, outcome, reason] of cases) {
       const { transport } = transportOf(() => failure);
@@ -960,7 +990,6 @@ describe("a write to a member that is not reachable (§10.3)", () => {
       expect(res.headers.get("x-collie-by")).toBe("lead");
     }
   });
-
   test("a member's own refusal code reaches the phone as the member's, and the lead's line names it", async () => {
     const refused = new Response(`{"receipt":{"outcome":"refused"}}`, { status: 404, headers: { "content-type": "application/json", "x-collie-reason": "no_pane", "x-collie-by": "bridge" } });
     const { transport } = transportOf(() => ok(refused));
@@ -1745,6 +1774,19 @@ describe("journal, uploads and state stay host-local", () => {
     // The ETag IS the hash, and the lead re-emits it rather than recomputing anything (§9.1).
     expect(res.headers.get("etag")).toBe(`"${hash}"`);
     expect(new Uint8Array(await res.arrayBuffer())).toEqual(png);
+  });
+  test("a member's project picture is one read; an older member's 404 reaches the phone as a 404", async () => {
+    const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+    const fresh = transportOf(() => ok(new Response(png, { status: 200, headers: { "content-type": "image/png" } })));
+    const [req, url] = get("/api/project-picture/abcdef012345abcdef012345?host=laptop");
+    const res = await forward(req, url, { transport: fresh.transport });
+    expect(fresh.calls).toHaveLength(1);
+    expect(fresh.calls[0]!.route).toBe("project-picture/abcdef012345abcdef012345");
+    expect(new Uint8Array(await res.arrayBuffer())).toEqual(png);
+    // A member that predates the route answers 404; the phone then keeps the agent logo.
+    const old = transportOf(() => ok(new Response("not found", { status: 404 })));
+    const [req2, url2] = get("/api/project-picture/abcdef012345abcdef012345?host=laptop");
+    expect((await forward(req2, url2, { transport: old.transport })).status).toBe(404);
   });
 
   // ── What §5 does NOT carry, pinned (M22/04) ───────────────────────────────

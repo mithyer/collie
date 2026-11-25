@@ -3863,6 +3863,29 @@ replaced with `/home/demo/sandbox/collie-labs/codex-v0166-logo-arts/project`, a 
 | `codex--v0166-warning-art-empty--w120.txt` | `idle` | Started with a `-c` override: the logo, the empty box, and `? for shortcuts` with `⚠ 1 warning · f2 to view` after wide spacing |
 | `codex--v0166-warning-typed--w120.txt` | `draft` | `x` typed: the logo is gone, and `⚠ 1 warning · f2 to view` stands alone on the footer row |
 
+## Codex 0.171.0 after a goal that ended achieved (captured 2026-11-22, issue 847, tmux, 120x40)
+
+After a `/goal` that Codex marked achieved, the footer row holds `← for agents · ? for shortcuts` at the left and, at
+the right edge, `Goal achieved (Ns)`; started with a `-c` override it also holds `⚠ 1 warning · f2 to view` after it.
+Once the box holds a character Codex hides the shortcut text and leaves the right segment alone, in the same place, no
+word added or changed; Backspace brings the row back as it was. The seconds count did not move in any read, also 30 s
+later. The segment matches no hint pattern, so the probe counted one more row under the box and every send was held,
+then refused `probe_failed`, until `idle.volatile.below.losesText` let a hint row lose words.
+
+Taken with `tmux capture-pane -e -p` on a scratch tmux socket. The probed reads were taken 100 ms, 400 ms and 2 s
+after the probe character and were alike; the files keep the 100 ms one. The backspace reads match the idle reads byte
+for byte. The lab's folder was replaced with `~/sandbox/codex-v0171-goals/project`, a path of the same length; nothing
+else was changed.
+
+| Fixture | State | What it shows |
+| --- | --- | --- |
+| `codex--v0171-goal-achieved-empty--w120.txt` | `idle` | Plain `codex`: the achieved goal, the empty dim box, the status row, and the hint row with `Goal achieved (2s)` at its right edge |
+| `codex--v0171-goal-achieved-probe--w120.txt` | `draft` | The probe character `⌁` in the box: only `Goal achieved (2s)` stays on the footer row, in the same place |
+| `codex--v0171-goal-achieved-backspace--w120.txt` | `idle` | After Backspace: the same as the idle read |
+| `codex--v0171-goal-achieved-warning-empty--w120.txt` | `idle` | Started with a `-c` override: the hint row with `Goal achieved (1s) · ⚠ 1 warning · f2 to view` at its right edge |
+| `codex--v0171-goal-achieved-warning-probe--w120.txt` | `draft` | The probe character in the box: only `Goal achieved (1s) · ⚠ 1 warning · f2 to view` stays, in the same place |
+| `codex--v0171-goal-achieved-warning-backspace--w120.txt` | `idle` | After Backspace: the same as the idle read |
+
 ## herdr-core corpus (captured 2026-10-30, M78 spec 04, hc 0.1.14, Claude Code 2.1.314, pi 1.3.0, omp 18.6.1)
 
 The first captures taken through a bridge on `COLLIE_MUX=herdr-core`: a scratch core (`HC_SESSION=m78-lab`,
@@ -4246,3 +4269,48 @@ longer texts. The cursor cell of a focused row is a no-break space, which the ro
 | `pi--v160-rpiv-single-free-wrapped--w200.txt` | A long text that wrapped inside Latin words and then inside a run of Chinese letters (hung rows five columns in) | the field's text with a space where a Latin word wrapped and none between two Chinese letters |
 | `pi--v160-rpiv-single-free-wrapped-words--w200.txt` | A text of short words wrapped at word boundaries (the space is on neither side of the break) | the field's text with single spaces |
 
+
+## Claude Code 2.1.331 draft taller than its box (captured 2026-11-23, Herdr 0.9.5, 59 x 16)
+
+Claude Code caps its input box at a share of the terminal's height. A draft that wraps past that
+cap scrolls the box: the `❯` row leaves the top, and the top edge carries a count of the hidden rows,
+`─── ↑ 5 more ───` (the bundle's ``h>0?`↑ ${h} more`:""``, in every release from 2.1.322 to 2.1.331).
+The frame walk needed the `❯` row, so a long send typed its text and stopped short of Enter
+(`typed_not_submitted`), and every later send was refused as `no-match` until the box was emptied.
+The profile's `idle.frame.scroll.marker` names that edge.
+
+Captured in a throwaway Herdr tab split down to 59 x 16, in an empty `/tmp/collie-lab`, with
+`claude --settings '{"statusLine":{"type":"command","command":"true"}}'` so no status line drew,
+and the draft typed with `herdr pane send-text`. `herdr pane read --source visible --format ansi
+--raw`, CRLF as read, cut to the blank row above the box: the rows above it held the welcome banner
+and a notice from a local plugin. Nothing else was altered.
+
+| Fixture | What's in it | Reads as |
+| --- | --- | --- |
+| `claude--v2331-draft-scrolled-up--w59.txt` | A 404-character draft scrolled to its last three rows under `─── ↑ 5 more ───`, the bypass-permissions mode row under the box | draft, frame `scrolled`, S1 compares the tail |
+
+## omp 18.22.0 prompt suggestion in three themes (captured 2026-11-24, issue 854, herdr 0.9.5, 120 columns by 40 rows)
+
+omp's prompt suggestion (`composer.predictions`: on by default since 19.0.0, a setting since 18.10) fills
+the empty box after a turn in the active theme's `dim` colour: one foreground, no attribute. The rig's
+scratch omp 18.22.0 (the newest version npm's 7-day age guard allowed that day; it draws the suggestion
+with the same editor code as 19.0.1) ran with `composer.predictions: true` and `theme.dark` set to
+`titanium` (omp's default), `dark` and `light` in turn, switched live in its scratch `config.yml`, so the
+same suggestion `Mountains.` shows in three colours. Each screen was read as the bridge reads it
+(`herdr pane read --source visible --format ansi`), transport CRLF normalised to LF. Privacy: the folder
+shows as the rig's scratch path (`…uggestion-rig/state/harness/omp/project`), the prompts are lab
+prompts, nothing else private was on screen.
+
+The six files live in `web/src/fixtures/surface/`, beside omp 19.0.1's suggestion capture, not in
+this folder: omp 18.22's box (a status row over `╰─`, with no `╭─` top) is a layout the omp chrome
+reader's corpus tests do not cover, and the dark and light screens read as a draft on purpose (only
+the probe tells them apart). The tests that read them name the folder.
+
+| Fixture | State | What it shows |
+| --- | --- | --- |
+| `omp--v18-22-0-suggestion-titanium--w120.txt` | `idle` | `╰─ Mountains.` in `rgb(107,114,128)`, titanium's `dim`, the one colour the profile names (`idle.placeholders.fg`): reads empty |
+| `omp--v18-22-0-suggestion-dark--w120.txt` | `idle` | The same suggestion in `rgb(95,102,115)`, the built-in `dark` theme's `dim`. A pure read takes it for a draft; the Send Protocol and Clear prove it by the probe (`idle.placeholders.anyStyle`) |
+| `omp--v18-22-0-suggestion-light--w120.txt` | `idle` | The same in `rgb(118,118,118)`, the built-in `light` theme's `dim`, typed text there is `rgb(0,0,0)` |
+| `omp--v18-22-0-suggestion-probe-dark--w120.txt` | `draft` | One probe character `⌁` typed into the dark box: the suggestion is gone, the box shows `⌁` alone in the typed colour `rgb(229,229,231)`. One Backspace brings `Mountains.` back |
+| `omp--v18-22-0-suggestion-typed-light--w120.txt` | `draft` | `hey` typed in the light theme, in `rgb(0,0,0)`: a typed draft, the suggestion gone |
+| `omp--v18-22-0-suggestion-under-typed-dark--w120.txt` | `draft` | `Moun` typed (it starts the suggestion), so omp keeps the rest `tains.` after it in the `dim` colour: `Moun` in `rgb(229,229,231)`, `tains.` in `rgb(95,102,115)`. A real draft: a probe after `Moun` keeps `Moun` |

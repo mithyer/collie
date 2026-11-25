@@ -555,12 +555,29 @@ export interface SecretMask {
  * cursor's rows in view: after typing, the LAST rows. A box read at that height may hold more text
  * above its first row, so the Send Protocol compares only the visible rows, against the end of the text
  * it typed, and empties such a box only when it knows how long the draft is.
+ *
+ * Two ways mark a box scrolled, each on its own: `rows` on a box whose prompt row is in view, and
+ * `marker` on one whose prompt row scrolled out. Claude Code 2.1.331 caps its box at a share of the
+ * pane's height, so no row count tells; its `rows` is `maxDraftRows` (a box the walk never reads that
+ * tall), and only its `marker` decides.
  */
 export interface FrameScroll {
   /** Which rows stay in view: `tail`, the last ones (the cursor's, at the end of a typed text). */
   readonly keeps: "tail";
-  /** The box's height in draft rows once it scrolls. A box that shows fewer rows shows the whole draft. */
+  /**
+   * The row count that marks a box with its prompt row in view as scrolled: a box that shows this many
+   * non-blank draft rows or more may hide text above them; one that shows fewer shows the whole draft.
+   * It decides nothing about a box whose prompt row is out of view (`marker`). A layout whose height
+   * no count tells sets it to `maxDraftRows`, so the count never decides there.
+   */
   readonly rows: number;
+  /**
+   * The top-edge label that marks a box as scrolled past its prompt row (Claude Code's `↑ 2 more`):
+   * where the walk up from the bottom edge meets an edge with this label and no prompt row, the rows
+   * between the edges are the visible tail of a longer draft. Such a box always hides text above its
+   * view, whatever the rows in view hold. Absent: a box with no prompt row is no box.
+   */
+  readonly marker?: string;
 }
 
 /** The ghost text after the cursor ({@link Profile.idle.inlineHint}). */
@@ -625,6 +642,16 @@ export interface Profile {
        */
       readonly anyText?: true;
       /**
+       * The empty box may show a suggestion in free words drawn in any style: the harness paints it in
+       * its theme's colour, which a profile cannot list (omp's prompt suggestion takes the `dim` colour
+       * of whichever of about a hundred themes is active, issue 854). So even a styled read cannot tell
+       * it from a typed draft, and the Send Protocol and Clear prove such a box by behaviour on every
+       * read: one probe character makes the whole text go (the box shows the probe alone), and one
+       * Backspace brings the same text back. A typed draft keeps its text when a character is typed,
+       * so it never passes. Optional.
+       */
+      readonly anyStyle?: true;
+      /**
        * False when a reverse-video cell on the first glyph of the hole is typed text, not a caret on a
        * ghost suggestion. Absent means the caret is skipped (a hole is still a placeholder when one
        * leading reverse-video cell is followed by faint or ghost-coloured cells). For a box whose hint
@@ -657,6 +684,14 @@ export interface Profile {
          * under the box. Optional.
          */
         readonly hints?: readonly string[];
+        /**
+         * A hint row under the box may lose text once the box holds a character: the harness hides
+         * one part of the row and leaves the rest standing (Codex drops `? for shortcuts` and keeps
+         * the segment after it). The Send Protocol then counts a later row under the box as that hint
+         * row when its words are the hint row's words with some left out, in order, at least one
+         * kept. A row with a word added or changed, or a row no hint row gives, still counts. Optional.
+         */
+        readonly losesText?: true;
         /**
          * Rows the harness draws under its box that are neither a statusline nor a dialog, each with a
          * name and a regular expression source (Claude Code's agents panel and its hints). The frame
@@ -1375,11 +1410,13 @@ function commandListFooter(value: JsonValue, path: string): CommandListFooter {
   return { pattern: compiled.source, maxRows: whole(field(node, "maxRows", path), `${path}.maxRows`, 1) };
 }
 
-/** `idle.volatile.below`: its row counts, and the hint rows, named footer rows, other screens' rows and command list only when the profile names them. */
+/** `idle.volatile.below`: its row counts, and `losesText` (only true, only beside hints), the hint rows, named footer rows, other screens' rows and command list only when the profile names them. */
 function volatileBelow(node: JsonObject): Profile["idle"]["volatile"]["below"] {
   const maxRows = whole(field(node, "maxRows", "idle.volatile.below"), "idle.volatile.below.maxRows", 0);
   const footerMaxRows = whole(field(node, "footerMaxRows", "idle.volatile.below"), "idle.volatile.below.footerMaxRows", 0);
-  const base: Profile["idle"]["volatile"]["below"] = { maxRows, footerMaxRows };
+  if (node.losesText !== undefined && node.losesText !== true) fail("idle.volatile.below.losesText", "must be true when present");
+  if (node.losesText === true && node.hints === undefined) fail("idle.volatile.below.losesText", "needs idle.volatile.below.hints: only a hint row may lose text");
+  const base: Profile["idle"]["volatile"]["below"] = node.losesText === true ? { maxRows, footerMaxRows, losesText: true } : { maxRows, footerMaxRows };
   const withHints =
     node.hints === undefined
       ? base
@@ -1484,8 +1521,10 @@ function parsePlaceholders(node: JsonObject): Profile["idle"]["placeholders"] {
       : { ...withPrefixes, patterns: textList(node.patterns, "idle.placeholders.patterns", 1).map((item, i) => pattern(item, `idle.placeholders.patterns[${String(i)}]`).source) };
   if (node.anyText !== undefined && node.anyText !== true && node.anyText !== false) fail("idle.placeholders.anyText", "must be true or false");
   const withAnyText = node.anyText === true ? { ...withPatterns, anyText: true as const } : withPatterns;
+  if (node.anyStyle !== undefined && node.anyStyle !== true && node.anyStyle !== false) fail("idle.placeholders.anyStyle", "must be true or false");
+  const withAnyStyle = node.anyStyle === true ? { ...withAnyText, anyStyle: true as const } : withAnyText;
   if (node.caretOnGhost !== undefined && node.caretOnGhost !== true && node.caretOnGhost !== false) fail("idle.placeholders.caretOnGhost", "must be true or false");
-  const withCaret = node.caretOnGhost === false ? { ...withAnyText, caretOnGhost: false as const } : withAnyText;
+  const withCaret = node.caretOnGhost === false ? { ...withAnyStyle, caretOnGhost: false as const } : withAnyStyle;
   if (node.fg === undefined) return withCaret;
   return { ...withCaret, fg: colourList(node.fg, "idle.placeholders.fg") };
 }
@@ -1555,7 +1594,8 @@ function parseScroll(value: JsonValue, maxDraftRows: number): FrameScroll {
   const keeps = oneOf(field(node, "keeps", "idle.frame.scroll"), "idle.frame.scroll.keeps", SCROLL_KEEPS);
   const rows = whole(field(node, "rows", "idle.frame.scroll"), "idle.frame.scroll.rows", 1);
   if (rows > maxDraftRows) fail("idle.frame.scroll.rows", "must not pass maxDraftRows: the walk would never read a box that tall");
-  return { keeps, rows };
+  if (node.marker === undefined) return { keeps, rows };
+  return { keeps, rows, marker: pattern(node.marker, "idle.frame.scroll.marker").source };
 }
 
 /** `idle.frame`: the three anchors, the bounds, and the interior walk's own fields when the profile names that walk. */

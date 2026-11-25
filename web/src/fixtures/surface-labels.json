@@ -1455,6 +1455,11 @@
    "version": "2.1.323",
    "state": "popup"
   },
+  "claude--v2331-draft-scrolled-up--w59.txt": {
+   "harness": "claude",
+   "version": "2.1.331",
+   "state": "draft"
+  },
   "claude--wizard-multiselect-checked.txt": {
    "harness": "claude",
    "version": "unversioned",
@@ -2479,6 +2484,36 @@
    "harness": "codex",
    "version": "0.166.0",
    "state": "draft"
+  },
+  "codex--v0171-goal-achieved-empty--w120.txt": {
+   "harness": "codex",
+   "version": "0.171.0",
+   "state": "idle"
+  },
+  "codex--v0171-goal-achieved-probe--w120.txt": {
+   "harness": "codex",
+   "version": "0.171.0",
+   "state": "draft"
+  },
+  "codex--v0171-goal-achieved-backspace--w120.txt": {
+   "harness": "codex",
+   "version": "0.171.0",
+   "state": "idle"
+  },
+  "codex--v0171-goal-achieved-warning-empty--w120.txt": {
+   "harness": "codex",
+   "version": "0.171.0",
+   "state": "idle"
+  },
+  "codex--v0171-goal-achieved-warning-probe--w120.txt": {
+   "harness": "codex",
+   "version": "0.171.0",
+   "state": "draft"
+  },
+  "codex--v0171-goal-achieved-warning-backspace--w120.txt": {
+   "harness": "codex",
+   "version": "0.171.0",
+   "state": "idle"
   },
   "codex--v0166-trust--w120.txt": {
    "harness": "codex",

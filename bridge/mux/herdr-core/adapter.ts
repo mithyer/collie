@@ -428,6 +428,10 @@ export class HerdrCoreMux implements MuxAdapter {
     const rows = read.text.replace(/\n$/u, "").split("\n");
     const text = (cut.keep === null ? rows : rows.slice(-cut.keep)).join("\n");
     const grid: MutableGrid = { paneId, text, truncated: cut.truncated, revision: this.revisionFor(paneId, screen) };
+    // `unstyled` is the field's own definition: the text carries no colour escape. A plain read always has none, so the state engine
+    // does not guess a session name from a mode badge it cannot tell from a name. A styled read (observer paint proved) keeps its
+    // colour and is never marked; a proved paint of a screen with no colour at all is marked, as nothing in it could tell them apart.
+    if (!text.includes("\u001b")) grid.unstyled = true;
     if (!read.complete) grid.partial = true;
     if (cut.note !== undefined) grid.olderNote = cut.note;
     return grid;

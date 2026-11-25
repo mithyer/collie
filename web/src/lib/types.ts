@@ -2601,6 +2601,8 @@ export interface UploadCapability {
   textTypes: string[];
   /** Dogr addition: the host answers "do you already hold these bytes?" (mirrors bridge/types.ts). */
   reuse?: boolean;
+  /** Dogr addition: the host can attach a conversation's picture by reference (mirrors bridge/types.ts). */
+  blob?: boolean;
 }
 
 /**

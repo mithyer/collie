@@ -1180,6 +1180,16 @@ while it is being used again; the audit log records it as an `upload` with `reus
 not that object is a `400`. `GET /api/config` reports `upload.reuse: true`, so a client can tell a
 build that answers from one that would take the JSON for a broken upload.
 
+**Attaching a picture the conversation already shows (Dogr build).** A picture in a conversation is a
+blob this host already holds (`/api/blobs/<64 hex>`), so a client need not download it and send it
+back. It posts the same route with `{ "blob": "<64 hex>" }`. Collie resolves the hash the way the blob
+route does (inside the agent's own blob folders and its inline-blob store, nothing else), accepts it
+only when its bytes are a picture type and fit `COLLIE_MAX_UPLOAD_MB`, and copies it into
+`<state-dir>/uploads` under a name of the usual shape (owner-only, never overwriting); asking again
+finds that copy by its bytes instead of making a second one. The answer is the same pair as above,
+`found: true` with the path, or `found: false`, which a client takes as "upload the bytes you hold".
+The audit log records an `upload` with `blob`. `GET /api/config` reports `upload.blob: true`.
+
 Raising `COLLIE_MAX_UPLOAD_MB` raises two other numbers with it. The bridge reads a whole upload into
 memory before it can measure it, so a large cap plus several uploads at once is that much memory. And
 the runtime's body limit applies to every route, not only the upload one, so a large cap lets a large

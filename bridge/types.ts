@@ -2583,6 +2583,12 @@ export interface UploadCapability {
    * to the upload route, bridge/upload-reuse.ts). Absent on a host that does not.
    */
   reuse?: boolean;
+  /**
+   * Dogr addition: this host can attach a picture of a conversation by reference (a JSON `{ blob }`
+   * body to the upload route: it copies its own blob into the uploads folder, bridge/upload-reuse.ts).
+   * Absent on a host that cannot.
+   */
+  blob?: boolean;
 }
 
 /**

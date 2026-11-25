@@ -1169,6 +1169,17 @@ NUL or a stray control byte is refused whatever it is called. The shipped list i
 > **Note.** `COLLIE_UPLOAD_EXTRA_TYPES` adds text types only. An image needs a signature to check it
 > against, so there is no binary format you can add this way.
 
+**Asking before sending (Dogr build).** A client that is about to upload can first ask whether the
+host already holds the same bytes. It posts the same route with a JSON body, `{ "sha256": "<64 hex>",
+"size": <bytes> }`, and gets back `{ "ok": true, "found": true, "path": "..." }` or
+`{ "ok": true, "found": false }`. There is no index to keep: Collie looks in `<state-dir>/uploads`,
+keeps only the regular files whose name has the upload shape and whose size equals the asked size,
+and hashes at most the eight newest of those, so the host measures the bytes itself and a wrong
+answer cannot be planted. A hit refreshes the file's time, so the 48-hour sweep does not take it
+while it is being used again; the audit log records it as an `upload` with `reused`. A body that is
+not that object is a `400`. `GET /api/config` reports `upload.reuse: true`, so a client can tell a
+build that answers from one that would take the JSON for a broken upload.
+
 Raising `COLLIE_MAX_UPLOAD_MB` raises two other numbers with it. The bridge reads a whole upload into
 memory before it can measure it, so a large cap plus several uploads at once is that much memory. And
 the runtime's body limit applies to every route, not only the upload one, so a large cap lets a large

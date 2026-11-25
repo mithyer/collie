@@ -1,8 +1,9 @@
 import { createHash } from "node:crypto";
-import { lstat, readdir, readFile, utimes } from "node:fs/promises";
+import { lstat, mkdir, readdir, readFile, utimes, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import type { JsonValue } from "./json.ts";
+import { imageExtFromBytes } from "./uploads.ts";
 
 // Reusing an upload that is already on this machine (Dogr addition, see collie-fork.md).
 //
@@ -24,6 +25,14 @@ import type { JsonValue } from "./json.ts";
 //
 // A hit refreshes the file's modification time, so the sweep does not remove it a moment after the
 // client was told to use it.
+//
+// A SECOND QUESTION, ABOUT A PICTURE THE CHAT ALREADY SHOWS. A picture in a conversation is a blob this
+// machine already holds (`/api/blobs/<64 hex>`, `journal/pi.ts` `resolveBlobPath`), so a client that
+// wants to attach it to a message should not have to download it and upload it again. It asks
+// `{ "blob": "<64 hex>" }` on the same route; the machine copies its own file into the uploads folder
+// under a name of the usual shape (or finds the copy it made before) and answers with that path, in the
+// same two answers as above. The client only ever names a hash; the machine decides whether it holds
+// such a blob, what it is (by its bytes: a picture or nothing), and where the copy goes.
 //
 // TEST:upload-reuse.test.ts
 
@@ -81,6 +90,27 @@ export function parseReuseAsk(text: string, maxBytes: number): ReuseAsk | null {
   if (typeof sha256 !== "string" || !/^[0-9a-fA-F]{64}$/.test(sha256)) return null;
   if (typeof size !== "number" || !Number.isSafeInteger(size) || size < 1 || size > maxBytes) return null;
   return { sha256: sha256.toLowerCase(), size };
+}
+
+/**
+ * Read a question about a blob from a request body.
+ *
+ * @param text The body text.
+ * @returns The blob's hash (64 hex, lowercase) when the body is `{ blob: <64 hex> }`, otherwise null.
+ *          A body with a `sha256` is the other question and is not a blob question.
+ */
+export function parseBlobAsk(text: string): string | null {
+  if (text.length > REUSE_ASK_MAX_CHARS) return null;
+  let body: JsonValue;
+  try {
+    body = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  if (body === null || typeof body !== "object" || Array.isArray(body)) return null;
+  const { blob } = body;
+  if (typeof blob !== "string" || !/^[0-9a-fA-F]{64}$/.test(blob)) return null;
+  return blob.toLowerCase();
 }
 
 /** The slice of the disk the lookup needs, injectable so the decision can be tested without one. */
@@ -154,4 +184,63 @@ export async function findReusable(dir: string, ask: ReuseAsk, fs: ReuseFs = rea
     return candidate.path;
   }
   return null;
+}
+
+/** What a copy of a blob needs from outside: where to put it, under which pane's name, and how big it may be. */
+export interface BlobCopy {
+  /** The blob's own file, already resolved and checked to lie inside a blob folder (`resolveBlobPath`). */
+  readonly source: string;
+  /** The uploads folder (`<stateDir>/uploads`). */
+  readonly dir: string;
+  /** The pane the client is writing to; it only becomes part of the file name. */
+  readonly paneId: string;
+  /** The largest file this machine accepts (`cfg.maxUploadBytes`). */
+  readonly maxBytes: number;
+  /** The clock, in milliseconds; replaced in tests. */
+  readonly now?: number;
+  /** Eight hex characters for the name; replaced in tests. */
+  readonly nonce?: string;
+}
+
+/**
+ * Make a blob available as an upload: the path of a picture file in the uploads folder with the blob's
+ * bytes in it.
+ *
+ * Only a picture counts, judged by its bytes (the same check the upload route makes), and only one the
+ * machine would have accepted as an upload (not empty, not over the size limit); anything else is a
+ * miss and the client uploads the bytes it already holds. A copy made earlier is found by its bytes
+ * (the same lookup as {@link findReusable}) so asking twice makes one file.
+ *
+ * @param copy Where the blob is, where the copy goes, and the limits.
+ * @param fs The disk for the lookup, replaced in tests.
+ * @returns The full path of the file to use, or null when the blob is not an acceptable picture.
+ */
+export async function holdBlob(copy: BlobCopy, fs: ReuseFs = realFs): Promise<string | null> {
+  const meta = await fs.stat(copy.source);
+  if (meta === null || meta.size < 1 || meta.size > copy.maxBytes) return null;
+  let bytes: Uint8Array;
+  try {
+    bytes = await readFile(copy.source);
+  } catch {
+    return null;
+  }
+  // The file may have changed between the stat and the read; the size we judged must still be true.
+  if (bytes.byteLength !== meta.size) return null;
+  const ext = imageExtFromBytes(bytes.subarray(0, 16));
+  if (ext === null) return null;
+  const sha256 = createHash("sha256").update(bytes).digest("hex");
+  const held = await findReusable(copy.dir, { sha256, size: bytes.byteLength }, fs);
+  if (held !== null) return held;
+  const safePane = copy.paneId.replace(/[^A-Za-z0-9_-]/g, "_");
+  const name = `${safePane}-${(copy.now ?? Date.now()).toString(36)}-${copy.nonce ?? crypto.randomUUID().slice(0, 8)}.${ext}`;
+  const path = join(copy.dir, name);
+  try {
+    // 0700 / 0600: pictures may hold private things, like every upload (server.ts `uploadPane`).
+    await mkdir(copy.dir, { recursive: true, mode: 0o700 });
+    // "wx": never overwrite a file that is already there under this name.
+    await writeFile(path, bytes, { flag: "wx", mode: 0o600 });
+  } catch {
+    return null;
+  }
+  return path;
 }

@@ -6,7 +6,9 @@ import { join } from "node:path";
 
 import {
   findReusable,
+  holdBlob,
   isReuseAsk,
+  parseBlobAsk,
   parseReuseAsk,
   REUSE_MAX_HASHED,
   type ReuseFs,
@@ -153,5 +155,81 @@ describe("findReusable", () => {
     await utimes(path, old, old);
     await findReusable(dir, { sha256: sha("something else"), size: 8 });
     expect(Math.abs((await stat(path)).mtimeMs - old.getTime())).toBeLessThan(2000);
+  });
+});
+
+describe("parseBlobAsk", () => {
+  const hash = "b".repeat(64);
+
+  test("reads a blob hash and lowercases it", () => {
+    expect(parseBlobAsk(JSON.stringify({ blob: hash.toUpperCase() }))).toBe(hash);
+  });
+
+  test("refuses anything that is not a 64-hex blob name", () => {
+    for (const bad of ["", "abc", "../".repeat(22), "g".repeat(64), "b".repeat(63), 7, null, ["b".repeat(64)]]) {
+      expect(parseBlobAsk(JSON.stringify({ blob: bad }))).toBeNull();
+    }
+    expect(parseBlobAsk("not json")).toBeNull();
+    expect(parseBlobAsk(JSON.stringify([hash]))).toBeNull();
+    expect(parseBlobAsk(JSON.stringify({ blob: hash, pad: "x".repeat(600) }))).toBeNull();
+  });
+
+  test("the other question is not a blob question", () => {
+    expect(parseBlobAsk(JSON.stringify({ sha256: hash, size: 10 }))).toBeNull();
+  });
+});
+
+describe("holdBlob", () => {
+  const dirs: string[] = [];
+  afterEach(async () => {
+    for (const d of dirs.splice(0)) await rm(d, { recursive: true, force: true });
+  });
+  const PNG = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3, 4, 5, 6, 7, 8]);
+
+  async function setup(bytes: Uint8Array): Promise<{ root: string; source: string; dir: string }> {
+    const root = await mkdtemp(join(tmpdir(), "hold-blob-"));
+    dirs.push(root);
+    const source = join(root, "blob");
+    await writeFile(source, bytes);
+    return { root, source, dir: join(root, "uploads") };
+  }
+
+  test("copies a picture into the uploads folder under a name of the upload shape, owner-only", async () => {
+    const { source, dir } = await setup(PNG);
+    const path = await holdBlob({ source, dir, paneId: "t1", maxBytes: MAX, now: 1_700_000_000_000, nonce: "0a1b2c3d" });
+    expect(path).toBe(join(dir, `t1-${(1_700_000_000_000).toString(36)}-0a1b2c3d.png`));
+    expect(sha(new Uint8Array(await Bun.file(path ?? "").arrayBuffer()))).toBe(sha(PNG));
+    expect(((await stat(path ?? "")).mode & 0o777).toString(8)).toBe("600");
+    expect(((await stat(dir)).mode & 0o777).toString(8)).toBe("700");
+  });
+
+  test("asking twice makes one file: the second answer is the first copy", async () => {
+    const { source, dir } = await setup(PNG);
+    const first = await holdBlob({ source, dir, paneId: "t1", maxBytes: MAX });
+    const second = await holdBlob({ source, dir, paneId: "t2", maxBytes: MAX });
+    expect(second).toBe(first);
+  });
+
+  test("a file that is not a picture by its bytes is a miss", async () => {
+    const { source, dir } = await setup(new TextEncoder().encode("just some words in a file"));
+    expect(await holdBlob({ source, dir, paneId: "t1", maxBytes: MAX })).toBeNull();
+  });
+
+  test("an empty file and one over the size limit are misses", async () => {
+    const empty = await setup(new Uint8Array());
+    expect(await holdBlob({ source: empty.source, dir: empty.dir, paneId: "t1", maxBytes: MAX })).toBeNull();
+    const big = await setup(PNG);
+    expect(await holdBlob({ source: big.source, dir: big.dir, paneId: "t1", maxBytes: PNG.byteLength - 1 })).toBeNull();
+  });
+
+  test("a source that is not there is a miss", async () => {
+    const { root, dir } = await setup(PNG);
+    expect(await holdBlob({ source: join(root, "nothing"), dir, paneId: "t1", maxBytes: MAX })).toBeNull();
+  });
+
+  test("the pane only becomes part of the name after its odd characters are replaced", async () => {
+    const { source, dir } = await setup(PNG);
+    const path = await holdBlob({ source, dir, paneId: "../x y", maxBytes: MAX, nonce: "deadbeef" });
+    expect(path === null ? "" : path.slice(dir.length + 1)).toMatch(/^___x_y-[0-9a-z]+-deadbeef\.png$/);
   });
 });

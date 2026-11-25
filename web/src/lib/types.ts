@@ -2599,6 +2599,8 @@ export interface UploadCapability {
   imageTypes: string[];
   /** Text extensions accepted, bare and lowercase. The bridge takes these from the name. */
   textTypes: string[];
+  /** Dogr addition: the host answers "do you already hold these bytes?" (mirrors bridge/types.ts). */
+  reuse?: boolean;
 }
 
 /**

@@ -290,6 +290,7 @@ import {
   type WhistleRouteDeps,
 } from "./stt/whistle-http.ts";
 import { uploadTooLarge } from "./uploads.ts";
+import { findReusable, isReuseAsk, parseReuseAsk, REUSE_ASK_MAX_CHARS, type UploadReuseResponse } from "./upload-reuse.ts";
 import { MUX_LOGO_PATH, OPERATOR_FONTS_PATH, isErrorBlocked, isQuestionPane, journalAgentOf, toPaneWire } from "./types.ts";
 import type { LaunchCheckResponse, MachineAlertsResponse } from "./types.ts";
 import { parseMachineAlerts } from "./machine-parse.ts";
@@ -4090,6 +4091,7 @@ export function startServer(opts: {
               maxBytes: cfg.maxUploadBytes,
               imageTypes: [...IMAGE_EXTS],
               textTypes: [...TEXT_EXTS, ...cfg.uploadExtraTypes],
+              reuse: true,
             },
             // The lead's own switch, for the lead's own answer only. A member-scoped read leaves the
             // key out rather than inventing a value: the lead masks member text again whenever ITS
@@ -9490,6 +9492,8 @@ async function uploadPane(
   session: string,
 ): Promise<Response> {
   const ae = req.headers.get("accept-encoding");
+  // Dogr addition: a JSON body is a question ("do you already hold these bytes?"), not an upload.
+  if (isReuseAsk(req.headers.get("content-type"))) return reuseAnswer(cfg, paneId, req, audit, device, session, ae);
   // Reject an oversize upload by its declared Content-Length BEFORE buffering — req.formData()
   // reads the whole body into memory first, so a 100 MB "image" would be materialised just to fail
   // the size check below. Multipart adds a boundary + part headers, so allow a small slack.
@@ -9553,6 +9557,37 @@ async function uploadPane(
       ae,
     );
   }
+}
+
+/**
+ * Answer a client's question whether this machine already holds a file (bridge/upload-reuse.ts): the
+ * path of the earlier upload when the bytes are the same, so the client sends nothing, or `found: false`.
+ * A body that is not a valid question is a 400, which an older client treats like any refusal and
+ * answers by uploading.
+ */
+async function reuseAnswer(
+  cfg: Config,
+  paneId: string,
+  req: Request,
+  audit: AuditLog,
+  device: string | null,
+  session: string,
+  ae: string | null,
+): Promise<Response> {
+  // A question is two short fields: refuse a long body by its declared length before reading it.
+  if (Number(req.headers.get("content-length") ?? 0) > REUSE_ASK_MAX_CHARS * 4) return text("question too long", 413);
+  const ask = parseReuseAsk(await req.text(), cfg.maxUploadBytes);
+  if (ask === null) return text("expected {sha256, size}", 400);
+  const path = await findReusable(join(cfg.stateDir, "uploads"), ask);
+  if (path === null) return json({ ok: true, found: false } satisfies UploadReuseResponse, ae);
+  audit.record({
+    action: "upload",
+    paneId,
+    session,
+    device,
+    detail: { reused: true, size: ask.size, saved: basename(path) },
+  });
+  return json({ ok: true, found: true, path } satisfies UploadReuseResponse, ae);
 }
 
 /**

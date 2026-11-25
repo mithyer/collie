@@ -2578,6 +2578,11 @@ export interface UploadCapability {
   imageTypes: string[];
   /** Text extensions accepted, bare and lowercase — taken from the name, with a binary veto. */
   textTypes: string[];
+  /**
+   * Dogr addition: this host answers "do you already hold these bytes?" (a JSON `{ sha256, size }` body
+   * to the upload route, bridge/upload-reuse.ts). Absent on a host that does not.
+   */
+  reuse?: boolean;
 }
 
 /**

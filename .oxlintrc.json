@@ -272,6 +272,15 @@
       "rules": {
         "anti-slop/no-runtime-typeof": "off"
       }
+    },
+    {
+      // The Dogr build's upload reuse (bridge/upload-reuse.ts): the one reader of the untrusted JSON body of "do you already hold these bytes?". Every `typeof` sits in `parseReuseAsk`, which IS the parse.
+      "files": [
+        "**/bridge/upload-reuse.ts"
+      ],
+      "rules": {
+        "anti-slop/no-runtime-typeof": "off"
+      }
     }
   ]
 }

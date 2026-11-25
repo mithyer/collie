@@ -26,6 +26,15 @@ import { redactAnsi, redactText } from "./redact.ts";
 export function maskPaneRead<T extends PaneReadResponse>(body: T): T {
   const masked = { ...body, text: redactAnsi(body.text) };
   if (body.logicalText !== undefined) masked.logicalText = redactAnsi(body.logicalText, false);
+  // Dogr build: the rows of a scrollback answer (bridge/scrollback.ts) are masked the same way, row by row. The keys stay: they
+  // were made from rows already masked, and the mask is a fixed point on its own output.
+  const held = masked.scrollback;
+  if (held !== undefined && held.state === "rows") {
+    // Built row by row with a direct assignment (no spread inside `map`): a row has three members, the text `s`, its key `k` and `i`.
+    const rows: typeof held.rows = [];
+    for (const row of held.rows) rows.push({ s: redactAnsi(row.s), k: row.k, i: row.i });
+    masked.scrollback = { ...held, rows };
+  }
   return masked;
 }
 

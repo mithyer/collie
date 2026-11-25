@@ -290,6 +290,7 @@ import {
   whistleStatus,
   type WhistleRouteDeps,
 } from "./stt/whistle-http.ts";
+import { parseAsk, SCROLLBACK_PARAM, scrollbackBody, scrollbackRead, type ScrollbackOptions } from "./scrollback.ts";
 import { uploadTooLarge } from "./uploads.ts";
 import {
   findReusable,
@@ -5467,6 +5468,8 @@ export async function readPane(
   req: Request,
   hint?: MuxReadHint,
 ): Promise<Response> {
+  // A phone's scrollback question (Dogr build, bridge/scrollback.ts) is a read of its own: no ETag, nothing kept here.
+  if (url.searchParams.has(SCROLLBACK_PARAM)) return scrollbackPane(herdr, cfg.redact, paneId, url, req, hint);
   const linesParam = Number.parseInt(url.searchParams.get("lines") ?? "", 10);
   // Clamp to a sane ceiling — don't trust the client (or Herdr) to bound an enormous read.
   const lines =
@@ -5525,6 +5528,43 @@ export async function readPane(
     return withBuildHeader(
       secure(gzipJsonResponse(data, req.headers.get("accept-encoding"), { etag })),
       build,
+    );
+  } catch (err) {
+    return text(`${herdr.mux} read failed: ${errorText(err)}`, 502);
+  }
+}
+
+/**
+ * `GET /api/pane/:id?scrollback=newest|after|before&anchor=...` (Dogr build): the rows the phone does not hold yet, cut against one
+ * history read (bridge/scrollback.ts). Nothing is kept on this machine; the phone owns what it has seen. A question that is no
+ * question is a 400 with its word, a read the multiplexer refused is a 502 like any pane read.
+ * @param herdr The multiplexer to read from.
+ * @param redact Mask secrets in every row (`COLLIE_REDACT`).
+ * @param paneId The pane asked about.
+ * @param url The request URL; the question is in its query.
+ * @param req The request (its `accept-encoding` decides gzip).
+ * @param hint What the state engine knows about the pane.
+ * @returns The JSON answer, or a plain-text 400 or 502.
+ */
+// TEST:bridge/scrollback-route.test.ts[scrollbackPane]
+export async function scrollbackPane(
+  herdr: Pick<MuxAdapter, "mux" | "readGrid">,
+  redact: boolean,
+  paneId: string,
+  url: URL,
+  req: Request,
+  hint: MuxReadHint | undefined,
+): Promise<Response> {
+  const question = parseAsk(url.searchParams);
+  if (!question.ok) return text(`scrollback: ${question.refusal}`, 400);
+  const options: ScrollbackOptions = { redact };
+  if (hint !== undefined) options.hint = hint;
+  try {
+    const result = await scrollbackRead(herdr, paneId, question.ask, options);
+    if (result.kind === "refused") return text(`${herdr.mux} read failed: ${result.detail}`, 502);
+    return withBuildHeader(
+      secure(gzipJsonResponse(scrollbackBody(result), req.headers.get("accept-encoding"))),
+      await buildId(),
     );
   } catch (err) {
     return text(`${herdr.mux} read failed: ${errorText(err)}`, 502);

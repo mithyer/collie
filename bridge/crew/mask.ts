@@ -106,7 +106,15 @@ function isObject(value: JsonValue | undefined): value is JsonObject {
 }
 
 function isPaneRead(body: JsonObject): body is JsonObject & PaneReadResponse {
-  return typeof body.text === "string" && (body.logicalText === undefined || typeof body.logicalText === "string");
+  return typeof body.text === "string" && (body.logicalText === undefined || typeof body.logicalText === "string") && isScrollbackMember(body.scrollback);
+}
+
+/** The `scrollback` member of a pane read (Dogr build, bridge/scrollback.ts): absent, or rows whose text is a string, which is all the mask walks. */
+function isScrollbackMember(value: JsonValue | undefined): boolean {
+  if (value === undefined) return true;
+  if (!isObject(value)) return false;
+  if (value.state !== "rows") return true;
+  return Array.isArray(value.rows) && value.rows.every((row) => isObject(row) && typeof row.s === "string");
 }
 
 /** A turn as `redactEntry` walks it: a `parts` list of objects, an image part with its `url` a string. */

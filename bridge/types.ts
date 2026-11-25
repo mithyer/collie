@@ -14,6 +14,7 @@ import type { AgentSessionRef, TranscriptEntry } from "./journal/types.ts";
 import type { MuxCapability, MuxSpaceCapacity, MuxTopologyLatency } from "./mux/capabilities.ts";
 import type { SttWireIdentity } from "./stt/config.ts";
 import type { PaneJob } from "./jobs-journal.ts";
+import type { ScrollbackPayload } from "./scrollback.ts";
 import type { PaneSubagent } from "./subagents.ts";
 import type { PaneTodo } from "./todos.ts";
 import type { UpdateRun } from "./update-run.ts";
@@ -1475,6 +1476,11 @@ export interface PaneReadResponse {
    * Absent on every other read.
    */
   olderNote?: string;
+  /**
+   * Set only on the answer to a scrollback question (`?scrollback=`, Dogr build, bridge/scrollback.ts): the rows the phone does not
+   * hold yet. `text` then holds the screen the rows were cut against. Absent on every other read.
+   */
+  scrollback?: ScrollbackPayload;
 }
 
 /**

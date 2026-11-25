@@ -168,6 +168,7 @@ import type { Push, PushMessage, PushSubscription } from "./push.ts";
 import { RefreshCoalescer } from "./refresh.ts";
 import { herdTagFor, selectView, type SessionRegistry, type SessionRuntime, widenedPanes } from "./sessions.ts";
 import type { Snooze } from "./snooze.ts";
+import { canPreview, makePreview, PREVIEW_TYPE } from "./blob-preview.ts";
 import { IMAGE_EXTS, TEXT_EXTS, TEXT_SNIFF_BYTES, uploadExt } from "./uploads.ts";
 import { compareSemver, type UpdateMonitor } from "./update.ts";
 import { readStagingLog } from "./staging-log.ts";
@@ -1133,8 +1134,16 @@ export function sniffBlobType(head: Uint8Array): string {
  * stored, no browser ever has one to send back. The body is `Bun.file(real)` rather than
  * `await file.bytes()` — the runtime streams it, and a 16 MiB screenshot is never held whole in this
  * process.
+ *
+ * Dogr build: `preview` asks for a small WebP of a still PNG or JPEG ({@link makePreview}); every other case, and every failure
+ * of the conversion, answers the original, so a client that never asks is not changed at all.
+ * TEST:bridge/blob-preview.test.ts
  */
-export async function blobRoute(hash: string, sessionRoots: readonly string[]): Promise<Response> {
+export async function blobRoute(
+  hash: string,
+  sessionRoots: readonly string[],
+  options: { readonly preview?: boolean } = {},
+): Promise<Response> {
   if (!isBlobHash(hash)) return text("invalid blob hash", 400);
   const real = await resolveBlobPath(hash, sessionRoots);
   if (real === null) return text("blob not found", 404);
@@ -1151,6 +1160,12 @@ export async function blobRoute(hash: string, sessionRoots: readonly string[]): 
   };
   const file = Bun.file(real);
   headers["content-type"] = sniffBlobType(new Uint8Array(await file.slice(0, BLOB_SNIFF_BYTES).arrayBuffer()));
+  if (options.preview === true && canPreview(headers["content-type"])) {
+    // The whole file is read here (it is under BLOB_MAX_BYTES), only for a picture that can be made smaller; a null answer
+    // means the original is the better one, and it is streamed as before.
+    const small = await makePreview(new Uint8Array(await file.arrayBuffer()), headers["content-type"]);
+    if (small !== null) return secure(new Response(small, { headers: { ...headers, "content-type": PREVIEW_TYPE } }));
+  }
   return secure(new Response(file, { headers }));
 }
 
@@ -2463,7 +2478,7 @@ export function startServer(opts: {
       } catch {
         return text("malformed URL", 400);
       }
-      return blobRoute(hash, cfg.journalRoots.pi);
+      return blobRoute(hash, cfg.journalRoots.pi, { preview: url.searchParams.get("view") === "preview" });
     }
 
     // ── The project picture (ADR 0160): a picture a pane's `collie.toml` names, by version ──

@@ -1190,6 +1190,16 @@ finds that copy by its bytes instead of making a second one. The answer is the s
 `found: true` with the path, or `found: false`, which a client takes as "upload the bytes you hold".
 The audit log records an `upload` with `blob`. `GET /api/config` reports `upload.blob: true`.
 
+**A small copy of a conversation picture (Dogr build).** `GET /api/blobs/<64 hex>?view=preview` answers a
+lossy WebP (quality 80, longest edge at most 1080 pixels, never enlarged) of a still PNG or JPEG, for a
+phone that only needs to look at it. It is used only when it is smaller than the stored file; a GIF or
+WebP (which may be animated), a picture over 40 million pixels, a runtime without `Bun.Image`, any decode
+error, or a result that is not smaller all answer the stored file, so the same address without the query,
+or from a Collie that does not know the query, is the original byte for byte (and is what attaching and
+sharing use). At most two conversions run at once. Measured on 100 real screenshots from one machine
+(50 PNG, 50 JPEG): the previews came to about 22 percent of the PNG bytes and 51 percent of the JPEG
+bytes. Nothing is stored: the answer is `private, no-store` like the original.
+
 Raising `COLLIE_MAX_UPLOAD_MB` raises two other numbers with it. The bridge reads a whole upload into
 memory before it can measure it, so a large cap plus several uploads at once is that much memory. And
 the runtime's body limit applies to every route, not only the upload one, so a large cap lets a large

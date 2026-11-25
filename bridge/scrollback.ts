@@ -93,7 +93,7 @@ export interface ScrollbackAsk {
 export interface ScrollbackAnswer {
   /** The rows, oldest first. */
   rows: ScrollRow[];
-  /** The anchor names exactly one place in the history this side read. False for `newest`. */
+  /** The anchor names exactly one place in the history this side read. Always true for `newest`, which has no anchor. */
   found: boolean;
   /** `after`: how many settled rows lie between the anchor and the first row sent (they were left out). */
   skipped: number;

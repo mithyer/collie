@@ -369,14 +369,15 @@ describe("the late-probe window: a probe drawn late on an idle pane (M80 spec 09
     expect(answer.receipt?.gapsMs.probe).toBe(160);
   });
 
-  test("a running turn keeps today's path: no probe window, the probe refuses inside its own bound", async () => {
+  test("a message into a running turn that queues it reads on in the window too (2026-11-26); a pane that never draws refuses after it", async () => {
     const { pane, send } = omp();
     pane.inTurn = true;
     pane.swallow = true;
     const answer = await send("look at the tests too");
     expect(answer.receipt).toMatchObject({ outcome: "refused", reason: "probe_failed" });
-    expect(answer.receipt?.gapsMs.probe).toBeLessThanOrEqual(BOUNDS.probe.ms);
+    expect(answer.receipt?.gapsMs.probe).toBeGreaterThanOrEqual(LATE_PROBE.ms);
   });
+
 
   test("omp's first redraw after its start is slow: a pane that echoes nothing for 1.5 s, then echoes, opens /model on the first tap (slow echo)", async () => {
     // The leg's omp case 1, the first case after omp's start: the launch window is open (`POST /api/launch`),

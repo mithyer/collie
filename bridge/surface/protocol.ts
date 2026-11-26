@@ -173,7 +173,9 @@
 // for LATE_PROBE before it refuses. A character that shows in that window is a live probe, and the send
 // goes on from there (Backspace, the text, Enter); one that still shows nowhere ends `probe_failed` as
 // before, and `gapsMs.probe` carries the whole wait. A free, responsive pane never waits for it: the
-// window opens only after the probe's reads saw nothing. A running turn keeps its own rules (queue, hold).
+// window opens only after the probe's reads saw nothing. A running turn keeps its own rules (queue, hold),
+// and on a harness that queues what it is sent in a turn the window opens there too (2026-11-26): the
+// probe is judged on the box alone, and a busy agent draws a key late in a turn as much as at rest.
 // One rule for every harness: omp 18.6.1 right after its start under load (the browser leg's model
 // picker, M80 spec 08) refused the same way, its box idle and empty, the probe read twice in 242 ms.
 // A probe that shows in the window but changed more than the box gets one second chance (2026-11-01,
@@ -366,6 +368,14 @@ export const BOUNDS = {
  * request's bound grows by it.
  */
 export const LATE_PROBE = { reads: 2, ms: 3200, firstGapMs: 1000 } as const;
+
+/**
+ * The Backspace half of a probe the agent draws late, or in a turn the send queues into (see {@link LATE_PROBE}): an
+ * agent too busy to draw the character is as slow to draw the Backspace. The first read keeps the usual 80 ms (a quick
+ * agent loses nothing); the reads that follow come 240, 560, 1200 and 2480 ms after the key, the last inside the
+ * request's bound, which grows by {@link LATE_PROBE}'s `ms`.
+ */
+export const LATE_BACK = { reads: 5, ms: LATE_PROBE.ms, firstGapMs: 80 } as const;
 
 /** The session lock's bound: the sum of the step bounds a send can take (the notice wait stands in for S1 and S2). A request past it ends `unknown`. */
 export const LOCK_BOUND_MS = BOUNDS.s0.ms + BOUNDS.probe.ms + BOUNDS.s1.ms + BOUNDS.s2.ms;
@@ -6835,8 +6845,14 @@ export class SendProtocol {
       throw err;
     }
     const readsLeft = Math.max(PROBE_BACK_MIN_READS, budget.reads - typed.reads);
+    // An agent that drew the probe late, or that is busy with a turn the send queues into, draws the Backspace as late as
+    // the character: its half reads as patiently as the late window did, or a probe it showed ends
+    // `probe_failed` on its Backspace (pi in a long session, 2026-11-26).
+    const patient = shownLate || this.queuedInTurn(state, s0);
+    if (patient) this.stretch(state, LATE_PROBE.ms);
+    const backBound = patient ? LATE_BACK : { reads: readsLeft, ms: Math.max(PROBE_BACK_FLOOR_MS, budget.ms - spent) };
     // Never less than one read's time: a half cut to its first gap slept and never read.
-    const back = await this.poll(state, "probe", { reads: readsLeft, ms: Math.max(PROBE_BACK_FLOOR_MS, budget.ms - spent) }, (snap) => {
+    const back = await this.poll(state, "probe", backBound, (snap) => {
       if (s0.frame !== null) {
         if (snap.frame === null) return "wait";
         return boxText(snap.frame) === boxText(s0.frame) ? "pass" : "wait";
@@ -6875,13 +6891,29 @@ export class SendProtocol {
 
   /**
    * Whether the late-probe window opens ({@link LATE_PROBE}, the header): the probe's reads saw the
-   * screen and no character on it, and the pane's turn read idle at S0. A running turn, a queued or
-   * streamed send, and a probe that showed somewhere (it failed, or went elsewhere) keep today's path.
+   * screen and no character on it, and the pane's turn read idle at S0, or running on a harness that
+   * queues what it is sent in a turn (the send is queued at S0 and its probe is judged on the box alone,
+   * `boxOnly` in {@link probe}). A busy agent draws a key late whatever its turn is doing: a pi session
+   * with a long transcript drew the probe 0.3 to 1.5 s late while its turn ran, so every send ended
+   * `probe_failed`, and the late character then stood in the box, so every next one ended `draft_present`
+   * (2026-11-26). A streamed send, a manual one, a command and a probe that showed somewhere (it failed,
+   * or went elsewhere) keep today's path.
    */
   private lateWindowOpens(state: RunState, s0: Snap, typed: { readonly snap: Snap | null; readonly verdict: Verdict }, probe: string): boolean {
     if (typed.verdict !== "wait" || typed.snap === null) return false;
-    if (s0.surface.turn !== "idle" || state.queued || state.streamed) return false;
+    if (state.streamed) return false;
+    const idleTurn = s0.surface.turn === "idle" && !state.queued;
+    if (!idleTurn && !this.queuedInTurn(state, s0)) return false;
     return countIn(typed.snap.texts, probe) === countIn(s0.texts, probe);
+  }
+
+  /**
+   * Whether this send goes into a turn S0 read as running, queued on a harness that takes a message in a turn:
+   * the probe is then judged on the box alone (`boxOnly` in {@link probe}), so a character drawn late can be
+   * told from the turn's own redraws. A command, a manual send and a box with no frame are not this.
+   */
+  private queuedInTurn(state: RunState, s0: Snap): boolean {
+    return s0.surface.turn === "running" && state.queued && s0.frame !== null && !state.command && !state.manual && queuesInTurn(state.match);
   }
 
   /**

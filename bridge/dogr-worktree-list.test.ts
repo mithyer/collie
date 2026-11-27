@@ -29,7 +29,7 @@ describe("Dogr's worktree list", () => {
       ok: true,
       worktrees: [
         { path: "/work/feature", branch: "feature/a", unavailable: false },
-        { path: "/work/locked", branch: null, unavailable: true },
+        { path: "/work/locked", branch: null, unavailable: false },
         { path: "/work/gone", branch: "gone", unavailable: true },
       ],
     });

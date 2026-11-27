@@ -14,7 +14,7 @@ export interface DogrWorktree {
   path: string;
   /** The branch without its refs/heads prefix, or null for a detached checkout. */
   branch: string | null;
-  /** Git says this entry is locked or may be pruned, or its folder cannot be resolved. */
+  /** The entry cannot be opened safely because it is prunable, missing, or would be changed by Collie's path trimming. */
   unavailable: boolean;
 }
 
@@ -67,7 +67,8 @@ export async function listDogrWorktrees(repoRoot: string, deps?: DogrWorktreeLis
     worktrees.push({
       path: block.path,
       branch: block.branch?.startsWith(prefix) ? block.branch.slice(prefix.length) : block.branch,
-      unavailable: path === null || block.locked || block.prunable,
+      // A lock prevents pruning, not opening. Collie's create route trims cwd, so a path ending in whitespace is unsafe.
+      unavailable: path === null || block.prunable || block.path.trim() !== block.path || path.trim() !== path,
     });
   }
   return { ok: true, worktrees };

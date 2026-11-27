@@ -42,6 +42,7 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { stampPackageJson, stampToml, tomlVersion } from "./release-tag.ts";
+import { stampDogrWorktreeRoute } from "./dogr-worktree-stamp.ts";
 
 /** `vX.Y.Z-dogr.N`: three plain numbers, then `-dogr.` and a counter with no leading zero. */
 const DOGR_TAG = /^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)-dogr\.([1-9]\d*)$/;
@@ -268,27 +269,40 @@ async function main(argv: readonly string[]): Promise<number> {
 		}
 	}
 	const repo = flag(argv, "repo");
-	if (argv.includes("--stamp") && repo !== null) {
-		// Check every spot before writing any, so a refusal leaves the tree as it was.
-		const changed: { path: string; text: string; file: string }[] = [];
-		for (const spot of REPO_SPOTS) {
-			const path = join(root, spot.file);
-			if (!existsSync(path)) {
-				console.error(`✗ dogr-stamp: ${spot.file} is missing`);
-				return 1;
-			}
-			const done = stampRepoSpot(readFileSync(path, "utf8"), spot, repo);
-			if (!done.ok) {
-				console.error(`✗ dogr-stamp: ${done.reason}`);
-				return 1;
-			}
-			changed.push({ path, text: done.text, file: spot.file });
+	if (argv.includes("--stamp")) {
+		// Validate the route and every repository spot before writing any file; both stamps touch server.ts.
+		const serverFile = "bridge/server.ts";
+		const serverPath = join(root, serverFile);
+		if (!existsSync(serverPath)) {
+			console.error(`✗ dogr-stamp: ${serverFile} is missing`);
+			return 1;
 		}
-		for (const c of changed) writeFileSync(c.path, c.text);
+		const route = stampDogrWorktreeRoute(readFileSync(serverPath, "utf8"));
+		if (!route.ok) {
+			console.error(`✗ dogr-stamp: ${route.reason}`);
+			return 1;
+		}
+		const changed = new Map<string, string>([[serverFile, route.text]]);
+		if (repo !== null) {
+			for (const spot of REPO_SPOTS) {
+				const path = join(root, spot.file);
+				if (!existsSync(path)) {
+					console.error(`✗ dogr-stamp: ${spot.file} is missing`);
+					return 1;
+				}
+				const done = stampRepoSpot(changed.get(spot.file) ?? readFileSync(path, "utf8"), spot, repo);
+				if (!done.ok) {
+					console.error(`✗ dogr-stamp: ${done.reason}`);
+					return 1;
+				}
+				changed.set(spot.file, done.text);
+			}
+		}
+		for (const [file, contents] of changed) writeFileSync(join(root, file), contents);
 		if (existsSync(join(root, ".git"))) {
-			spawnSync("git", ["-C", root, "update-index", "--assume-unchanged", "--", ...changed.map((c) => c.file)]);
+			spawnSync("git", ["-C", root, "update-index", "--assume-unchanged", "--", ...changed.keys()]);
 		}
-		console.error(`stamped ${repo} as the update repository in ${changed.length} files (this checkout only)`);
+		console.error(`stamped the Dogr worktree route${repo === null ? "" : ` and ${repo} as the update repository`} (this checkout only)`);
 	}
 	if (stamp !== null && argv.includes("--stamp")) {
 		writeFileSync(files.toml, stampToml(text.toml, stamp));

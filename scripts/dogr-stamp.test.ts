@@ -204,7 +204,11 @@ function scratch(version: string): string {
 	for (const spot of REPO_SPOTS) {
 		const path = join(root, spot.file);
 		mkdirSync(dirname(path), { recursive: true });
-		writeFileSync(path, `// stand-in\n${spot.text}\n`);
+		// The server is also the worktree-route stamp's target, so its stand-in needs both anchors.
+		const worktreeAnchors = spot.file === "bridge/server.ts"
+			? 'import { parseWorktreeFolderBody, saveWorktreeFolder, worktreeFolderAnswer } from "./worktree-folder-route.ts";\n    // ── Structural creates: new tab / new space (each opens a fresh shell pane) ──\n'
+			: "";
+		writeFileSync(path, `// stand-in\n${spot.text}\n${worktreeAnchors}`);
 	}
 	return root;
 }
